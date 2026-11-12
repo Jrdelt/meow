@@ -53,47 +53,45 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 3, Step 3 complete (`meow map`: petgraph
-  topology + embedded Cytoscape page). Owner asked to build straight through
-  Phases 2-4 without pausing; checkpoint after every step.
-- **Last Verified Commit:** `feat(phase3-step3)` — see `git log -n 1
-  --oneline`.
+- **Active Phase & Step:** Phase 3 complete (Step 4, `meow hud`, was last).
+  Owner asked to build straight through Phase 4 without pausing; checkpoint
+  after every step.
+- **Last Verified Commit:** `feat(phase3-step4)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
-  Phase 3 so far: `coordinator`, `ipc`, `queue`, `topology`, `webui`,
-  `assets/`. Tests: unit tests per module plus
-  `tests/{cli,pty,shims,cve,recon}.rs`.
-- **In-Progress / Partial Work:** `hud` and `report` report "not built yet".
-  `vault`/`ai_usage`/`prompt_cache` tables are unused.
-- **Next Exact Action:** Phase 3, Step 4 — `src/hud.rs`: Ratatui 0.30 TUI over
-  the coordinator WebSocket (`tokio-tungstenite`): host list, node/endpoint
-  inspector, Evidence vs Hypothesis checklist, CVE feed, queue status,
-  notices, manual catch-up notes box, verdict keys, and `[L]`/`[C]`/`[R]`
-  triggers (wired to AI in Phase 4). Render logic must be testable with
-  `ratatui::backend::TestBackend`.
+  Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
+  `assets/`). Tests: per module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
+- **In-Progress / Partial Work:** `meow report` reports "not built yet".
+  `vault`, `ai_usage`, `prompt_cache` tables are unused. No AI tier exists;
+  the HUD has no `[L]`/`[C]`/`[R]` keys yet (it shows the "[R] Deep Research
+  Ready" indicator only).
+- **Next Exact Action:** Phase 4, Step 1 — `src/vault.rs`: deterministic
+  two-way Privacy Vault in `state.db` (`<<HOST_01>>`, `<<DOM_01>>`,
+  `<<PATH_01>>`, `<<SEC_01>>`; IPs, domains/SANs, paths, usernames, auth
+  headers, JWTs, Base64/URL-encoded credentials, SSH keys, high-entropy
+  strings), longest-match-first, inside JSON string values only, plus a
+  streaming unmasker with a `<<...>>` hold-back buffer. Then Step 2: LLM01
+  sandboxed prompts + `[L]`/`[C]`/`[R]` clients with budget lock; Step 3:
+  `chats/<host>.md` and `meow report`.
 - **Blockers / Notes:**
-  - Add a crate only in the step that first uses it (owner decision).
-    Terminal control via `ratatui::crossterm` only.
+  - Add a crate only in the step that first uses it. Terminal control via
+    `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
+    host must not).
   - Parsers emit `graph::Observation`; only `Graph::apply` mutates hosts.
     Advisories enter via `Graph::add_advisory` as `UnverifiedHypothesis`.
-  - While a session is live the coordinator is the only writer of
-    `graph.json`; helpers call `ipc::send` and fall back to the files when
-    it returns `None`. New requests go into `coordinator::Command`.
+  - A live coordinator is the only writer of `graph.json`; helpers call
+    `ipc::send` and fall back to the files on `None`. New requests go into
+    `coordinator::Command` (HTTP `/api/command` and WebSocket share it).
   - Helper targeting: `--local`, `--session`, `$MEOW_WORKSPACE`,
     `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`.
-  - `$MEOW_HOME` overrides `~/.meow` (tests). `$MEOW_TAP_LOG=<file>` dumps
-    clean tap lines. Create files via `private_open_options()` /
-    `write_private_atomic()` only.
-  - Shims: zsh/bash tested end to end; `init.ps1` never run. Bash strips
-    `ignoredups`/`erasedups` in-session; `MEOW_BASH_LEGACY=1` forces no-`PS0`.
-  - Windows code is compile-checked only (`cargo clippy --target
+  - `$MEOW_HOME` overrides `~/.meow` (tests). Create files via
+    `private_open_options()` / `write_private_atomic()` only.
+  - Map page: no inline scripts, no `innerHTML`; checked by hand in Chromium
+    (Playwright), not in `cargo test`. Cytoscape 3.33.1 is vendored (MIT).
+  - Recon tests use stand-in tools; real `nmap` was smoke-tested on 127.0.0.1
+    only, `katana`/`feroxbuster` never. `init.ps1` has never been run.
+  - Windows is compile-checked only (`cargo clippy --target
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
-    `gcc-mingw-w64-x86-64`); macOS has never been built.
-  - CI workflow deferred: repo is private, macOS runners cost Actions minutes.
-  - Map page: `assets/map.{html,js,css}` + vendored `cytoscape.min.js`
-    (3.33.1, MIT). No inline scripts and no `innerHTML`: scraped text must
-    stay inert. Checked by hand in Chromium via Playwright, not in `cargo test`.
-  - Recon runs only inside a live session; light mode refuses it and pauses
-    queued stages. Tests use stand-in tools (`tests/recon.rs`); real `nmap`
-    was smoke-tested on 127.0.0.1 only, `katana`/`feroxbuster` never.
+    `gcc-mingw-w64-x86-64`); macOS has never been built. No CI: the repo is
+    private and macOS runners cost Actions minutes.

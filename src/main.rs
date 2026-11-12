@@ -14,6 +14,7 @@ use meow::coordinator::{self, Command as Request, Coordinator};
 use meow::cve::{self, CveClient, CveSettings};
 use meow::db::Db;
 use meow::graph::Graph;
+use meow::hud;
 use meow::ipc;
 use meow::lock::{LockError, SessionLock};
 use meow::mode::Mode;
@@ -175,6 +176,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("[+] Open this URL in a browser on this machine (it contains the session token):");
                 println!("    {url}");
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Hud { .. } => {
+            hud::run(&workspace)?;
             Ok(ExitCode::SUCCESS)
         }
         other => {

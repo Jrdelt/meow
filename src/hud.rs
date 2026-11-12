@@ -1,0 +1,1085 @@
+//! `meow hud`: the companion terminal panel.
+//!
+//! It attaches to a live session over the coordinator WebSocket and shows
+//! the host list, a node and sub-path inspector, the evidence-versus-
+//! hypothesis checklist for each advisory, the CVE feed, the background
+//! queue and the notice log. A catch-up box takes operator notes, and
+//! verdict keys confirm or dismiss hypotheses. When no session is running
+//! it opens the workspace files read-only.
+//!
+//! This is a separate process from the PTY host, so reading terminal events
+//! with crossterm is fine here.
+
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::Frame;
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::checklist;
+use crate::coordinator::{Command, Notice, RuntimeInfo};
+use crate::db::Db;
+use crate::evidence::{sanitize, VerificationStatus};
+use crate::graph::{Advisory, Graph, Host, PathNode};
+use crate::mode::Mode;
+use crate::queue::{self, TaskRow};
+use crate::workspace::Workspace;
+
+const MAX_PATH_LINES: usize = 40;
+const MAX_FACT_LINES: usize = 60;
+
+/// What the coordinator pushes on every change.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Snapshot {
+    pub session: String,
+    pub mode: Mode,
+    pub graph: Graph,
+    #[serde(default)]
+    pub tasks: Vec<TaskRow>,
+    #[serde(default)]
+    pub notices: Vec<Notice>,
+}
+
+impl Snapshot {
+    /// Reads the workspace files directly, for when no session is running.
+    pub fn offline(workspace: &Workspace) -> Result<Self> {
+        let tasks = if workspace.state_db_path().is_file() {
+            queue::tasks(&Db::open(&workspace.state_db_path())?, 20)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            session: workspace.name.clone(),
+            mode: workspace.profile.mode,
+            graph: Graph::load(&workspace.graph_path())?,
+            tasks,
+            notices: Vec::new(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Hosts,
+    Advisories,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    None,
+    Quit,
+    Send(Command),
+}
+
+pub struct Model {
+    pub snapshot: Option<Snapshot>,
+    /// A live session is attached (commands can be sent).
+    pub live: bool,
+    pub focus: Focus,
+    host_index: usize,
+    advisory_index: usize,
+    inspector_scroll: u16,
+    /// The note being typed in the catch-up box, if it is open.
+    pub note: Option<String>,
+    pub status: String,
+}
+
+fn advisory_rank(advisory: &Advisory) -> (bool, i64) {
+    // Known-exploited first, then by severity score, highest first.
+    (!advisory.kev, -(advisory.cvss.unwrap_or(0.0) * 10.0) as i64)
+}
+
+impl Model {
+    pub fn new(live: bool) -> Self {
+        Self {
+            snapshot: None,
+            live,
+            focus: Focus::Hosts,
+            host_index: 0,
+            advisory_index: 0,
+            inspector_scroll: 0,
+            note: None,
+            status: String::new(),
+        }
+    }
+
+    pub fn hosts(&self) -> Vec<&Host> {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.graph.hosts.values().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn selected_host(&self) -> Option<&Host> {
+        self.hosts().get(self.host_index).copied()
+    }
+
+    /// The selected host's advisories, most urgent first.
+    pub fn advisories(&self) -> Vec<&Advisory> {
+        let mut list: Vec<&Advisory> = self
+            .selected_host()
+            .map(|h| h.advisories.iter().collect())
+            .unwrap_or_default();
+        list.sort_by_key(|a| advisory_rank(a));
+        list
+    }
+
+    pub fn selected_advisory(&self) -> Option<&Advisory> {
+        self.advisories().get(self.advisory_index).copied()
+    }
+
+    fn clamp(&mut self) {
+        self.host_index = self.host_index.min(self.hosts().len().saturating_sub(1));
+        self.advisory_index = self
+            .advisory_index
+            .min(self.advisories().len().saturating_sub(1));
+    }
+
+    /// Handles one text message from the coordinator.
+    pub fn apply_message(&mut self, text: &str) {
+        let Ok(message) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        match message.get("type").and_then(Value::as_str) {
+            Some("state") => {
+                // Keep the selection on the same host across updates.
+                let selected = self.selected_host().map(|h| h.address.clone());
+                match serde_json::from_value::<Snapshot>(message["state"].clone()) {
+                    Ok(snapshot) => self.snapshot = Some(snapshot),
+                    Err(error) => {
+                        self.status = format!("unreadable state from the session: {error}")
+                    }
+                }
+                if let Some(address) = selected {
+                    if let Some(index) = self.hosts().iter().position(|h| h.address == address) {
+                        self.host_index = index;
+                    }
+                }
+                self.clamp();
+            }
+            Some("result") => {
+                self.status = match message.get("ok").and_then(Value::as_bool) {
+                    Some(true) => "done".to_owned(),
+                    _ => format!(
+                        "refused: {}",
+                        sanitize(
+                            message
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown error"),
+                            200
+                        )
+                    ),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let (index, len) = match self.focus {
+            Focus::Hosts => (
+                &mut self.host_index,
+                self.snapshot.as_ref().map_or(0, |s| s.graph.hosts.len()),
+            ),
+            Focus::Advisories => {
+                let len = self.selected_host().map_or(0, |h| h.advisories.len());
+                (&mut self.advisory_index, len)
+            }
+        };
+        if len == 0 {
+            return;
+        }
+        *index = (*index as isize + delta).clamp(0, len as isize - 1) as usize;
+        if self.focus == Focus::Hosts {
+            self.advisory_index = 0;
+            self.inspector_scroll = 0;
+        }
+    }
+
+    fn verdict(&mut self, status: VerificationStatus) -> Action {
+        let (Some(host), Some(advisory)) = (self.selected_host(), self.selected_advisory()) else {
+            self.status = "select a host and an advisory first".to_owned();
+            return Action::None;
+        };
+        Action::Send(Command::Verdict {
+            address: host.address.clone(),
+            advisory: advisory.id.clone(),
+            status,
+        })
+    }
+
+    /// Handles one key press and says what, if anything, to do about it.
+    pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Action::Quit;
+        }
+        // The catch-up box captures all typing while it is open.
+        if let Some(note) = &mut self.note {
+            match key.code {
+                KeyCode::Esc => self.note = None,
+                KeyCode::Backspace => {
+                    note.pop();
+                }
+                KeyCode::Char(ch) => note.push(ch),
+                KeyCode::Enter => {
+                    let text = self.note.take().unwrap_or_default();
+                    if text.trim().is_empty() {
+                        return Action::None;
+                    }
+                    if !self.live {
+                        self.status =
+                            "read-only: no session is running for this workspace".to_owned();
+                        return Action::None;
+                    }
+                    return Action::Send(Command::Note {
+                        address: self.selected_host().map(|h| h.address.clone()),
+                        text,
+                    });
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
+        let action = match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(-1);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(1);
+                Action::None
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                self.focus = match self.focus {
+                    Focus::Hosts => Focus::Advisories,
+                    Focus::Advisories => Focus::Hosts,
+                };
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.inspector_scroll = self.inspector_scroll.saturating_add(8);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                self.inspector_scroll = self.inspector_scroll.saturating_sub(8);
+                Action::None
+            }
+            KeyCode::Char('n') => {
+                self.note = Some(String::new());
+                Action::None
+            }
+            KeyCode::Char('c') => self.verdict(VerificationStatus::Confirmed),
+            KeyCode::Char('f') => self.verdict(VerificationStatus::FalsePositive),
+            KeyCode::Char('u') => self.verdict(VerificationStatus::UnverifiedHypothesis),
+            KeyCode::Char('1') => Action::Send(Command::SetMode { mode: Mode::Light }),
+            KeyCode::Char('2') => Action::Send(Command::SetMode { mode: Mode::Mild }),
+            KeyCode::Char('3') => Action::Send(Command::SetMode {
+                mode: Mode::Aggressive,
+            }),
+            _ => Action::None,
+        };
+        if matches!(action, Action::Send(_)) && !self.live {
+            self.status = "read-only: no session is running for this workspace".to_owned();
+            return Action::None;
+        }
+        action
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const GOOD: Style = Style::new().fg(Color::Green);
+const WARN: Style = Style::new().fg(Color::Yellow);
+const BAD: Style = Style::new().fg(Color::Red);
+const TITLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+fn status_style(status: VerificationStatus) -> Style {
+    match status {
+        VerificationStatus::Confirmed => BAD,
+        VerificationStatus::FalsePositive => GOOD,
+        VerificationStatus::UnverifiedHypothesis => WARN,
+        VerificationStatus::Observed => DIM,
+    }
+}
+
+fn panel(title: &str, focused: bool) -> Block<'_> {
+    let style = if focused { TITLE } else { DIM };
+    Block::bordered().title(title).border_style(style)
+}
+
+fn path_lines(node: &PathNode, depth: usize, out: &mut Vec<Line<'static>>) {
+    for (name, child) in &node.children {
+        if out.len() >= MAX_PATH_LINES {
+            return;
+        }
+        let slash = if child.children.is_empty() { "" } else { "/" };
+        let status = child.status.map(|s| format!("  {s}")).unwrap_or_default();
+        out.push(Line::from(vec![
+            Span::raw(format!("{}/{name}{slash}", "  ".repeat(depth + 3))),
+            Span::styled(status, DIM),
+        ]));
+        path_lines(child, depth + 1, out);
+    }
+}
+
+fn inspector_lines(host: &Host) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled(host.label(), TITLE)];
+    if let Some(os) = &host.os {
+        lines.push(Line::styled(format!("OS: {os}"), DIM));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Ports", TITLE));
+    for port in host.ports.values() {
+        let style = if port.is_open() { Style::new() } else { DIM };
+        lines.push(Line::styled(
+            format!("  {} {}", port.label(), port.state),
+            style,
+        ));
+        if let Some(server) = port.http.as_ref().and_then(|h| h.server.as_ref()) {
+            lines.push(Line::styled(format!("      Server: {server}"), DIM));
+        }
+        if !port.tls_sans.is_empty() {
+            let names: Vec<&str> = port.tls_sans.iter().map(String::as_str).collect();
+            lines.push(Line::styled(
+                format!("      SAN: {}", names.join(", ")),
+                DIM,
+            ));
+        }
+        let mut paths = Vec::new();
+        path_lines(&port.paths, 0, &mut paths);
+        let truncated = paths.len() >= MAX_PATH_LINES;
+        lines.extend(paths);
+        if truncated {
+            lines.push(Line::styled("      ... more paths not shown", DIM));
+        }
+    }
+    if host.ports.is_empty() {
+        lines.push(Line::styled("  none seen", DIM));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Evidence (Observed)", TITLE));
+    let facts = host
+        .facts
+        .iter()
+        .chain(host.ports.values().flat_map(|p| p.facts.iter()))
+        .take(MAX_FACT_LINES);
+    for fact in facts {
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {} ", fact.claim)),
+            Span::styled(
+                format!(
+                    "[{} / {:?}]",
+                    fact.record.source.as_str(),
+                    fact.record.confidence
+                ),
+                DIM,
+            ),
+        ]));
+    }
+    lines
+}
+
+fn advisory_detail(snapshot: &Snapshot, host: &Host, advisory: &Advisory) -> Vec<Line<'static>> {
+    let list = checklist::for_advisory(&snapshot.graph, host, advisory);
+    let (done, total) = list.progress();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(advisory.id.clone(), TITLE),
+            Span::raw("  "),
+            Span::styled(
+                advisory.record.verification_status.to_string(),
+                status_style(advisory.record.verification_status),
+            ),
+        ]),
+        Line::raw(advisory.title.clone()),
+        Line::styled(
+            format!(
+                "{}  {}",
+                advisory.port.as_deref().unwrap_or("-"),
+                advisory.matched
+            ),
+            DIM,
+        ),
+        Line::raw(""),
+        Line::styled(format!("Verification checklist ({done}/{total})"), TITLE),
+    ];
+    for item in &list.items {
+        let (mark, style) = if item.done {
+            ("[x]", GOOD)
+        } else {
+            ("[ ]", DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{mark} {}", item.label), style),
+            Span::styled(format!("  {}", item.detail), DIM),
+        ]));
+    }
+    if list.research_ready()
+        && advisory.record.verification_status == VerificationStatus::UnverifiedHypothesis
+    {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "[R] Deep Research Ready",
+            GOOD.add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
+    let Some(snapshot) = &model.snapshot else {
+        frame.render_widget(
+            Paragraph::new(" meow hud: waiting for the session ..."),
+            area,
+        );
+        return;
+    };
+    let mode_style = match snapshot.mode {
+        Mode::Light => GOOD,
+        Mode::Mild => WARN,
+        Mode::Aggressive => BAD,
+    };
+    let link = if model.live {
+        Span::styled("live", GOOD)
+    } else {
+        Span::styled("read-only (no session running)", WARN)
+    };
+    let line = Line::from(vec![
+        Span::styled(" meow hud ", TITLE),
+        Span::raw(format!("| {} | mode ", snapshot.session)),
+        Span::styled(snapshot.mode.as_str(), mode_style),
+        Span::raw(format!(
+            " | {} hosts | {} advisories | ",
+            snapshot.graph.hosts.len(),
+            snapshot.graph.advisory_count()
+        )),
+        link,
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+    let items: Vec<ListItem> = model
+        .hosts()
+        .iter()
+        .map(|host| {
+            let open = host
+                .advisories
+                .iter()
+                .filter(|a| {
+                    a.record.verification_status == VerificationStatus::UnverifiedHypothesis
+                })
+                .count();
+            let mut spans = vec![Span::raw(host.label())];
+            spans.push(Span::styled(
+                format!("  p:{}", host.open_ports().count()),
+                DIM,
+            ));
+            if open > 0 {
+                spans.push(Span::styled(format!(" h:{open}"), WARN));
+            }
+            if host.advisories.iter().any(|a| a.kev) {
+                spans.push(Span::styled(" KEV", BAD));
+            }
+            if checklist::host_research_ready(&snapshot.graph, host) {
+                spans.push(Span::styled(" [R]", GOOD));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(panel("Hosts", model.focus == Focus::Hosts))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(model.host_index));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+    let [list_area, detail_area] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
+    let advisories = model.advisories();
+    let items: Vec<ListItem> = advisories
+        .iter()
+        .map(|advisory| {
+            let score = advisory
+                .cvss
+                .map(|s| format!(" {s:.1}"))
+                .unwrap_or_default();
+            let mut spans = vec![Span::raw(format!("{}{score}", advisory.id))];
+            if advisory.kev {
+                spans.push(Span::styled(" KEV", BAD));
+            }
+            spans.push(Span::styled(
+                format!(" {}", advisory.record.verification_status),
+                status_style(advisory.record.verification_status),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let title = format!("CVE feed: hypotheses and findings ({})", advisories.len());
+    let list = List::new(items)
+        .block(panel(&title, model.focus == Focus::Advisories))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default()
+        .with_selected((!advisories.is_empty()).then_some(model.advisory_index));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    let detail = match (model.selected_host(), model.selected_advisory()) {
+        (Some(host), Some(advisory)) => advisory_detail(snapshot, host, advisory),
+        _ => vec![Line::styled(
+            "No advisories matched for this host yet.",
+            DIM,
+        )],
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .block(panel("Evidence vs. hypothesis", false)),
+        detail_area,
+    );
+}
+
+fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
+    let [queue_area, notice_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+    let mut lines: Vec<Line> = Vec::new();
+    for task in snapshot.tasks.iter().take(4) {
+        let mut spans = vec![Span::raw(format!("recon {} ", task.target))];
+        for stage in &task.stages {
+            let style = match stage.status.as_str() {
+                "done" => GOOD,
+                "running" => WARN.add_modifier(Modifier::BOLD),
+                "failed" | "interrupted" => BAD,
+                _ => DIM,
+            };
+            spans.push(Span::styled(
+                format!("{}:{} ", stage.stage.as_str(), stage.status),
+                style,
+            ));
+        }
+        lines.push(Line::from(spans));
+        if let Some(active) = task.stages.iter().rev().find(|s| !s.detail.is_empty()) {
+            lines.push(Line::styled(
+                format!("  {}", sanitize(&active.detail, 200)),
+                DIM,
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "No recon tasks. Queue one with `meow recon <target>`.",
+            DIM,
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(panel("Background queue", false)),
+        queue_area,
+    );
+
+    let notices: Vec<Line> = snapshot
+        .notices
+        .iter()
+        .rev()
+        .take(notice_area.height.saturating_sub(2) as usize)
+        .map(|notice| {
+            Line::from(vec![
+                Span::styled(format!("{} ", notice.at.get(11..19).unwrap_or("")), DIM),
+                Span::raw(sanitize(&notice.text, 300)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(notices).block(panel("Notices", false)),
+        notice_area,
+    );
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, model: &Model) {
+    let [input_area, help_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let input = match &model.note {
+        Some(text) => {
+            let target = model
+                .selected_host()
+                .map_or("workspace".to_owned(), |h| h.address.clone());
+            Line::from(vec![
+                Span::styled(format!(" note for {target}> "), TITLE),
+                Span::raw(text.clone()),
+                Span::styled("_", TITLE),
+            ])
+        }
+        None => Line::styled(format!(" {}", model.status), WARN),
+    };
+    frame.render_widget(Paragraph::new(input), input_area);
+    let help = if model.note.is_some() {
+        " Enter save   Esc cancel"
+    } else {
+        " Up/Down select   Tab panel   n note   c confirm   f false positive   u reopen   1/2/3 mode   PgUp/PgDn scroll   q quit"
+    };
+    frame.render_widget(Paragraph::new(Line::styled(help, DIM)), help_area);
+}
+
+/// Draws the whole panel. Pure: everything comes from `model`.
+pub fn draw(frame: &mut Frame, model: &Model) {
+    let [header, body, activity, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(8),
+        Constraint::Length(8),
+        Constraint::Length(2),
+    ])
+    .areas(frame.area());
+    draw_header(frame, header, model);
+    draw_footer(frame, footer, model);
+    let Some(snapshot) = &model.snapshot else {
+        return;
+    };
+    let [hosts, right] =
+        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(body);
+    let [inspector, advisories] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
+    draw_hosts(frame, hosts, model, snapshot);
+    let lines = match model.selected_host() {
+        Some(host) => inspector_lines(host),
+        None => vec![Line::styled(
+            "No hosts yet. Import a scan with `meow add <file>`, or work in the session shell.",
+            DIM,
+        )],
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((model.inspector_scroll, 0))
+            .block(panel("Inspector: node, ports and sub-paths", false)),
+        inspector,
+    );
+    draw_advisories(frame, advisories, model, snapshot);
+    draw_activity(frame, activity, snapshot);
+}
+
+// ---------------------------------------------------------------------------
+// Running
+// ---------------------------------------------------------------------------
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect(info: &RuntimeInfo) -> Option<Socket> {
+    let url = format!("ws://127.0.0.1:{}/ws?token={}", info.port, info.token);
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await;
+    attempt.ok()?.ok().map(|(socket, _)| socket)
+}
+
+/// Forwards terminal events from a blocking thread.
+fn spawn_input() -> mpsc::UnboundedReceiver<Event> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || loop {
+        match event::poll(Duration::from_millis(200)) {
+            Ok(true) => {
+                let Ok(event) = event::read() else { break };
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+            Ok(false) if tx.is_closed() => break,
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    });
+    rx
+}
+
+async fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    model: &mut Model,
+    mut socket: Option<Socket>,
+) -> Result<()> {
+    let mut input = spawn_input();
+    loop {
+        terminal
+            .draw(|frame| draw(frame, model))
+            .context("cannot draw the panel")?;
+        tokio::select! {
+            event = input.recv() => {
+                let Some(event) = event else { break };
+                let Event::Key(key) = event else { continue };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match model.on_key(key) {
+                    Action::Quit => break,
+                    Action::None => {}
+                    Action::Send(command) => {
+                        let Some(live) = socket.as_mut() else { continue };
+                        let text = serde_json::to_string(&command)?;
+                        if live.send(Message::Text(text.into())).await.is_err() {
+                            socket = None;
+                            model.live = false;
+                            model.status = "the session has ended".to_owned();
+                        }
+                    }
+                }
+            }
+            message = async {
+                match socket.as_mut() {
+                    Some(live) => live.next().await,
+                    None => std::future::pending().await,
+                }
+            } => match message {
+                Some(Ok(Message::Text(text))) => model.apply_message(&text),
+                Some(Ok(_)) => {}
+                _ => {
+                    socket = None;
+                    model.live = false;
+                    model.status = "the session has ended; showing its last state".to_owned();
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Runs the panel until the operator quits.
+pub fn run(workspace: &Workspace) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?;
+    runtime.block_on(async {
+        let socket = match RuntimeInfo::read(&workspace.runtime_path()) {
+            Some(info) => connect(&info).await,
+            None => None,
+        };
+        let mut model = Model::new(socket.is_some());
+        if socket.is_none() {
+            model.snapshot = Some(Snapshot::offline(workspace)?);
+        }
+        let mut terminal =
+            ratatui::try_init().context("cannot take over the terminal (is this a TTY?)")?;
+        let result = event_loop(&mut terminal, &mut model, socket).await;
+        ratatui::restore();
+        result
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evidence::{Confidence, EvidenceRecord, Source};
+    use crate::graph::{Observation, Route};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use serde_json::json;
+
+    fn graph() -> Graph {
+        let mut graph = Graph::default();
+        for (address, port, product, version) in [
+            ("10.10.10.5", 80, "nginx", Some("1.18.0")),
+            ("10.10.10.5", 22, "OpenSSH", Some("8.2p1")),
+            ("10.10.10.9", 3306, "MySQL", None),
+        ] {
+            graph.apply(Observation::Port {
+                address: address.into(),
+                port,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("svc".into()),
+                product: Some(product.into()),
+                version: version.map(Into::into),
+                extra_info: None,
+                cpes: vec![],
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        for path in ["/portal/config/", "/portal/login.php"] {
+            graph.apply(Observation::Path {
+                address: "10.10.10.5".into(),
+                port: 80,
+                scheme: "http".into(),
+                path: path.into(),
+                status: Some(200),
+                record: EvidenceRecord::observed(Source::FeroxJson, Confidence::High, "x"),
+            });
+        }
+        graph.local.routes.push(Route {
+            destination: "10.10.10.0/23".into(),
+            gateway: Some("10.10.14.1".into()),
+            interface: "tun0".into(),
+        });
+        for (id, cvss, kev) in [
+            ("CVE-2019-0001", 5.0, false),
+            ("CVE-2021-23017", 7.7, false),
+            ("CVE-2020-0002", 4.0, true),
+        ] {
+            graph.add_advisory(
+                "10.10.10.5",
+                Advisory {
+                    id: id.into(),
+                    title: format!("title of {id}"),
+                    severity: Some("HIGH".into()),
+                    cvss: Some(cvss),
+                    kev,
+                    matched: "cpe:2.3:a:nginx:nginx:1.18.0".into(),
+                    port: Some("80/tcp".into()),
+                    references: vec![],
+                    record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
+                },
+            );
+        }
+        graph
+    }
+
+    fn state_message(graph: &Graph) -> String {
+        json!({
+            "type": "state",
+            "state": {
+                "session": "acme", "mode": "mild", "graph": graph,
+                "tasks": [ { "id": 1, "target": "10.10.10.0/23", "mode": "mild", "extra_flags": [], "created_utc": "",
+                    "stages": [
+                        { "stage": "ports", "status": "done", "detail": "2 hosts up" },
+                        { "stage": "services", "status": "running", "detail": "" },
+                        { "stage": "crawl", "status": "pending", "detail": "" },
+                        { "stage": "dirs", "status": "pending", "detail": "" } ] } ],
+                "notices": [ { "at": "2026-11-12T09:41:00Z", "text": "not running as root: -sS replaced with -sT (connect scan)" } ],
+                "checklists": {}, "topology": {}
+            }
+        })
+        .to_string()
+    }
+
+    fn model() -> Model {
+        let mut model = Model::new(true);
+        model.apply_message(&state_message(&graph()));
+        model
+    }
+
+    fn screen(model: &Model, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, model)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn every_panel_is_drawn_from_the_session_state() {
+        let model = model();
+        let text = screen(&model, 160, 46);
+        for expected in [
+            "meow hud",
+            "| acme | mode mild | 2 hosts | 3 advisories | live",
+            "Hosts",
+            "10.10.10.5  p:2 h:3 KEV [R]",
+            "10.10.10.9  p:1",
+            "Inspector: node, ports and sub-paths",
+            "80/tcp svc nginx 1.18.0 open",
+            "/portal/",
+            "/config  200",
+            "/login.php  200",
+            "Evidence (Observed)",
+            "[nmap_xml / High]",
+            "CVE feed: hypotheses and findings (3)",
+            "Evidence vs. hypothesis",
+            "Verification checklist (4/6)",
+            "[x] Service identified",
+            "[x] Route to the host  via 10.10.14.1 on tun0",
+            "[ ] Operator verdict",
+            "[R] Deep Research Ready",
+            "Background queue",
+            "recon 10.10.10.0/23 ports:done services:running crawl:pending dirs:pending",
+            "Notices",
+            "09:41:00 not running as root: -sS replaced with -sT (connect scan)",
+            "n note   c confirm   f false positive",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn advisories_are_ordered_known_exploited_then_by_score() {
+        let model = model();
+        let ids: Vec<&str> = model.advisories().iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["CVE-2020-0002", "CVE-2021-23017", "CVE-2019-0001"]);
+        assert_eq!(model.selected_advisory().unwrap().id, "CVE-2020-0002");
+    }
+
+    #[test]
+    fn keys_navigate_and_produce_commands() {
+        let mut model = model();
+        assert_eq!(model.on_key(key(KeyCode::Down)), Action::None);
+        assert_eq!(model.selected_host().unwrap().address, "10.10.10.9");
+        assert_eq!(
+            model.on_key(key(KeyCode::Down)),
+            Action::None,
+            "stays on the last host"
+        );
+        assert_eq!(model.selected_host().unwrap().address, "10.10.10.9");
+        // No advisory on this host: a verdict key explains instead of sending.
+        assert_eq!(model.on_key(key(KeyCode::Char('c'))), Action::None);
+        assert!(model.status.contains("select a host and an advisory"));
+
+        model.on_key(key(KeyCode::Up));
+        model.on_key(key(KeyCode::Tab));
+        assert_eq!(model.focus, Focus::Advisories);
+        model.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            model.on_key(key(KeyCode::Char('c'))),
+            Action::Send(Command::Verdict {
+                address: "10.10.10.5".into(),
+                advisory: "CVE-2021-23017".into(),
+                status: VerificationStatus::Confirmed,
+            })
+        );
+        assert!(matches!(
+            model.on_key(key(KeyCode::Char('f'))),
+            Action::Send(Command::Verdict {
+                status: VerificationStatus::FalsePositive,
+                ..
+            })
+        ));
+        assert_eq!(
+            model.on_key(key(KeyCode::Char('2'))),
+            Action::Send(Command::SetMode { mode: Mode::Mild })
+        );
+        assert_eq!(model.on_key(key(KeyCode::Char('q'))), Action::Quit);
+        assert_eq!(
+            model.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn catch_up_box_captures_typing_until_enter() {
+        let mut model = model();
+        model.on_key(key(KeyCode::Char('n')));
+        assert_eq!(model.note.as_deref(), Some(""));
+        // Keys that are commands elsewhere are plain text here.
+        for ch in "qc pkg:npm/lodash@4.17.20x".chars() {
+            assert_eq!(model.on_key(key(KeyCode::Char(ch))), Action::None);
+        }
+        model.on_key(key(KeyCode::Backspace));
+        assert!(screen(&model, 120, 40).contains("note for 10.10.10.5> qc pkg:npm/lodash@4.17.20_"));
+        assert_eq!(
+            model.on_key(key(KeyCode::Enter)),
+            Action::Send(Command::Note {
+                address: Some("10.10.10.5".into()),
+                text: "qc pkg:npm/lodash@4.17.20".into(),
+            })
+        );
+        assert_eq!(model.note, None);
+
+        // Esc cancels, and an empty note is not sent.
+        model.on_key(key(KeyCode::Char('n')));
+        model.on_key(key(KeyCode::Char('x')));
+        assert_eq!(model.on_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(model.note, None);
+        model.on_key(key(KeyCode::Char('n')));
+        assert_eq!(model.on_key(key(KeyCode::Enter)), Action::None);
+    }
+
+    #[test]
+    fn updates_keep_the_selection_and_show_results() {
+        let mut model = model();
+        model.on_key(key(KeyCode::Down));
+        let mut graph = graph();
+        graph.apply(Observation::Port {
+            address: "10.10.10.1".into(),
+            port: 53,
+            protocol: "udp".into(),
+            state: "open".into(),
+            service: None,
+            product: None,
+            version: None,
+            extra_info: None,
+            cpes: vec![],
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        model.apply_message(&state_message(&graph));
+        assert_eq!(model.hosts().len(), 3);
+        assert_eq!(
+            model.selected_host().unwrap().address,
+            "10.10.10.9",
+            "selection follows the host"
+        );
+
+        model.apply_message(
+            r#"{"type":"result","ok":false,"error":"light mode sends no packets\u001b[2J"}"#,
+        );
+        assert_eq!(model.status, "refused: light mode sends no packets[2J");
+        model.apply_message(r#"{"type":"result","ok":true,"result":{}}"#);
+        assert_eq!(model.status, "done");
+        model.apply_message("not json");
+        model.apply_message(r#"{"type":"state","state":{"session":5}}"#);
+        assert!(model.status.starts_with("unreadable state"));
+        assert_eq!(
+            model.hosts().len(),
+            3,
+            "a bad update keeps the last good state"
+        );
+    }
+
+    #[test]
+    fn read_only_mode_never_sends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::workspace::MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        graph().save(&workspace.graph_path()).unwrap();
+        {
+            let db = Db::open(&workspace.state_db_path()).unwrap();
+            queue::enqueue(&db, "10.10.10.0/23", Mode::Mild, &[]).unwrap();
+        }
+        let mut model = Model::new(false);
+        model.snapshot = Some(Snapshot::offline(&workspace).unwrap());
+        let text = screen(&model, 140, 40);
+        assert!(text.contains("read-only (no session running)"), "{text}");
+        assert!(text.contains("10.10.10.5"), "{text}");
+        assert!(text.contains("recon 10.10.10.0/23 ports:pending"), "{text}");
+
+        model.on_key(key(KeyCode::Tab));
+        assert_eq!(model.on_key(key(KeyCode::Char('c'))), Action::None);
+        assert!(model.status.starts_with("read-only"));
+        model.on_key(key(KeyCode::Char('n')));
+        model.on_key(key(KeyCode::Char('x')));
+        assert_eq!(model.on_key(key(KeyCode::Enter)), Action::None);
+    }
+
+    #[test]
+    fn small_and_empty_screens_do_not_panic() {
+        let mut empty = Model::new(true);
+        assert!(screen(&empty, 80, 24).contains("waiting for the session"));
+        empty.apply_message(&state_message(&Graph::default()));
+        let text = screen(&empty, 80, 24);
+        assert!(text.contains("No hosts yet."), "{text}");
+        for (width, height) in [(20, 5), (1, 1), (200, 60)] {
+            screen(&model(), width, height);
+        }
+    }
+}

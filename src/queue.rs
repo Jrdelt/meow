@@ -558,7 +558,7 @@ pub async fn run_tool(command: &ToolCommand, limits: RunLimits) -> RunOutcome {
 // Persistence
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageRow {
     pub stage: Stage,
     /// `pending`, `running`, `interrupted`, `done`, `skipped` or `failed`.
@@ -566,7 +566,7 @@ pub struct StageRow {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRow {
     pub id: i64,
     pub target: String,

@@ -9,6 +9,7 @@ pub mod db;
 pub mod endpoint;
 pub mod evidence;
 pub mod graph;
+pub mod hud;
 pub mod ipc;
 pub mod lock;
 pub mod mode;
