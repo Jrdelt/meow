@@ -267,7 +267,7 @@ pub struct Interface {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route {
-    /// CIDR destination, or `default`.
+    /// CIDR destination; the default route is `0.0.0.0/0` or `::/0`.
     pub destination: String,
     #[serde(default)]
     pub gateway: Option<String>,
@@ -806,6 +806,14 @@ impl Graph {
             .record
             .transition(status)
             .map_err(|e: IllegalTransition| anyhow::anyhow!(e))
+    }
+
+    /// IP addresses of all known hosts (name-only hosts are left out).
+    pub fn target_ips(&self) -> Vec<std::net::IpAddr> {
+        self.hosts
+            .keys()
+            .filter_map(|key| key.parse().ok())
+            .collect()
     }
 
     pub fn advisory_count(&self) -> usize {

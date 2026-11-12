@@ -128,6 +128,14 @@ fn opening_a_name_creates_then_resumes_the_workspace() {
 
     let output = sandbox.run(&["acme"], &[]);
     assert!(stdout(&output).contains("[+] Resumed workspace 'acme'"));
+    assert!(stdout(&output).contains("[+] Local network: "));
+    let graph: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("graph.json")).unwrap()).unwrap();
+    assert!(graph["local"]["observed_utc"]
+        .as_str()
+        .unwrap()
+        .ends_with('Z'));
+    assert!(graph["local"]["interfaces"].is_array());
 
     #[cfg(unix)]
     {

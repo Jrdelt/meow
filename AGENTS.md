@@ -53,22 +53,26 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 2, Step 3 complete (parsers + `meow add`).
-  Owner asked to build straight through Phases 2-4 without pausing;
+- **Active Phase & Step:** Phase 2, Step 4 complete (passive local network
+  observer). Owner asked to build straight through Phases 2-4 without pausing;
   checkpoint after every step.
-- **Last Verified Commit:** `feat(phase2-step3)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `feat(phase2-step4)` — see `git log -n 1
+  --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 so far: `db`, `timeutil`,
-  `evidence`, `endpoint`, `graph`, `cpe`, `parsers/{nmap,jsonl,text,diff}`.
-  Tests: unit tests in each module plus `tests/{cli,pty,shims}.rs`.
+  `evidence`, `endpoint`, `graph`, `cpe`, `parsers/{nmap,jsonl,text,diff}`,
+  `observer`. Tests: unit tests in each module plus
+  `tests/{cli,pty,shims}.rs`.
 - **In-Progress / Partial Work:** `recon`/`map`/`hud`/`report` report "not
-  built yet". `db.rs` tables are unused. Live PTY tap lines are not parsed
-  yet (wired with the coordinator in Phase 3).
-- **Next Exact Action:** Phase 2, Step 4 — `src/observer.rs`: passive local
-  network observer (interfaces, routes, ARP neighbours, listening sockets from
-  OS tools, no sudo, zero packets) filling `graph.local` plus one-line
-  subnet/interface route warnings; run once at session start. Then Step 5:
-  CVE grounding (NVD v2.0, OSV, CISA KEV) and the verification checklist.
+  built yet". `db.rs` tables are unused. The observer runs once at session
+  start (periodic polling and live PTY tap parsing come with the Phase 3
+  coordinator). macOS/Windows observer parsers are tested on fixtures only.
+- **Next Exact Action:** Phase 2, Step 5 — `src/cve.rs`: add `tokio` +
+  `reqwest`; rate-paced NVD v2.0 client (`cpeName=` + `keywordSearch=`, 6.5 s
+  / 0.7 s pacing, 2 s connect timeout), OSV `querybatch` with
+  `next_page_token`, 7-day cached CISA KEV, all attaching
+  `UnverifiedHypothesis` advisories; then the verification checklist
+  (`src/checklist.rs`).
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it (owner decision).
     Terminal control via `ratatui::crossterm` only.

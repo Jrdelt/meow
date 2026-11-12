@@ -11,6 +11,7 @@ use clap::Parser;
 use meow::cli::{Cli, Command};
 use meow::graph::Graph;
 use meow::lock::{LockError, SessionLock};
+use meow::observer;
 use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
 use meow::shims;
@@ -146,6 +147,16 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
             "[!] No replay hooks for this shell (only zsh, bash and PowerShell): \
              commands will not be logged to replay.sh"
         );
+    }
+
+    // Passive, zero-packet look at the local network tables.
+    let graph_path = workspace.graph_path();
+    let mut graph = Graph::load(&graph_path)?;
+    graph.local = observer::observe(&graph.target_ips());
+    graph.save(&graph_path)?;
+    println!("[+] Local network: {}", observer::summary(&graph.local));
+    for warning in &graph.local.warnings {
+        println!("[!] {warning}");
     }
 
     let outcome = pty::run_session(&spec, sink)?;

@@ -8,6 +8,7 @@ pub mod evidence;
 pub mod graph;
 pub mod lock;
 pub mod mode;
+pub mod observer;
 pub mod parsers;
 pub mod pty;
 pub mod shims;
