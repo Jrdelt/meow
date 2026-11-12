@@ -19,6 +19,7 @@ pub mod parsers;
 pub mod pty;
 pub mod queue;
 pub mod report;
+pub mod setup;
 pub mod shims;
 pub mod tap;
 pub mod timeutil;

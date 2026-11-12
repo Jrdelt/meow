@@ -55,6 +55,7 @@ cargo test                   # the full test suite
 | `meow hud` | Opens the terminal panel: this machine's connection and VPN, hosts, inspector, checklist, CVE feed, queue, notes, AI. |
 | `meow add <file>` | Imports an Nmap XML, JSON Lines, log or `git diff` file. `--no-cve` skips the vulnerability lookups. |
 | `meow report` | Writes `REPORT.md` into the workspace. No AI, no network. |
+| `meow setup` | Sets up your own AI: a model server on your machine or your own cloud API key. See [Your own AI](#your-own-ai-meow-setup). |
 
 Inside a session the helper commands find it by themselves. From another
 terminal, add `--session <name>` or `--local`.
@@ -161,17 +162,50 @@ one JSON field, never as instructions. Cloud use is capped per day
 (`max_daily_usd`, `max_daily_calls`); when the cap is reached, `C` answers
 locally. Identical questions are answered from a cache at no cost.
 
-Set the key in the environment before starting the session:
-`export OPENROUTER_API_KEY=...`, then `meow <name>`. The session reads it when
-it starts, so exporting it inside a running session has no effect. Without a
-key, `C` answers with the local model and `R` is unavailable; the map and the
-HUD say so.
+### Your own AI: `meow setup`
+
+Nothing about anyone's AI is built in. Each person who uses meow points it at
+their own model server or adds their own API key:
+
+```sh
+meow setup
+```
+
+It shows the current setup and asks what to change:
+
+- **A model on your machine**: it looks for LM Studio, Ollama and llama.cpp on
+  their usual ports, lists the models the server offers, and lets you pick one
+  or type another address.
+- **Your own cloud API key**: OpenRouter by default, or any OpenAI-compatible
+  service (`R` needs OpenRouter, for its web search). The key is hidden as you
+  type it.
+- **Remove the key**, or **check that it works**.
+
+Your setup is kept in `~/.meow/ai.toml`, which only you can read. It is not
+part of any workspace or repository, a key is never printed (only its last
+four characters), and a session that is already running uses the new setup for
+its next request.
+
+The same without questions, for scripts:
+
+```sh
+meow setup --local-url http://localhost:11434/v1 --local-model llama3.2
+meow setup --api-key-stdin < my-key.txt      # never as an argument
+meow setup --show                            # what is set, and where the key comes from
+meow setup --check                           # try both, exit 1 if one fails
+meow setup --forget-key
+```
+
+The `OPENROUTER_API_KEY` environment variable also works for the key and wins
+over the file; it is read when the session starts. Without any key, `C` answers
+with the local model and `R` is unavailable; the map and the HUD say so.
 
 ## Configuration
 
 `~/.meow/config.toml` is created on first use, with comments. Sections:
 `default_mode`, `shell`, `[cve]`, `[recon]`, `[ai]`. Per-workspace overrides
-live in `profile.toml`. `MEOW_HOME` moves the base directory.
+live in `profile.toml`. Your own AI setup is in `~/.meow/ai.toml` and overrides
+`[ai]`. `MEOW_HOME` moves the base directory.
 
 ## Workspace files
 

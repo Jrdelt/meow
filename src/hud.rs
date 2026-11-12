@@ -595,7 +595,7 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
                     snapshot.budget.max_calls
                 )
             } else {
-                " | cloud: no OpenRouter key in this session".to_owned()
+                " | cloud: no API key (run `meow setup`)".to_owned()
             },
             DIM,
         ),

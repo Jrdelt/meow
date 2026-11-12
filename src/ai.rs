@@ -87,8 +87,14 @@ pub struct AiSettings {
     /// Hard caps for the cloud tiers, per UTC day.
     pub max_daily_usd: f64,
     pub max_daily_calls: u32,
-    /// Prefer the `OPENROUTER_API_KEY` environment variable over this.
+    /// Prefer `meow setup` or the `OPENROUTER_API_KEY` environment variable
+    /// over this.
     pub openrouter_api_key: Option<String>,
+    /// The user's own setup file (`~/.meow/ai.toml`), written by
+    /// `meow setup`. Read again for every request, so a change applies to a
+    /// running session at once.
+    #[serde(skip)]
+    pub user_file: Option<PathBuf>,
 }
 
 impl Default for AiSettings {
@@ -102,14 +108,111 @@ impl Default for AiSettings {
             max_daily_usd: 1.0,
             max_daily_calls: 20,
             openrouter_api_key: None,
+            user_file: None,
         }
     }
 }
 
 impl Eq for AiSettings {}
 
+/// A user's own AI setup, kept in `~/.meow/ai.toml` (private to them, never
+/// part of the repository). Whatever is set here overrides `[ai]` in
+/// `config.toml`; the rest is left alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+const OVERRIDES_HEADER: &str = "\
+# Your own AI setup for meow, written by `meow setup`.
+# This file can hold an API key: keep it private, never commit or share it.
+";
+
+impl AiOverrides {
+    /// Reads the file; a missing file is an empty setup.
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+        }
+    }
+
+    /// Writes the file so that only its owner can read it.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let body = toml::to_string(self).context("cannot write the AI setup")?;
+        crate::workspace::write_private_atomic(path, format!("{OVERRIDES_HEADER}{body}").as_bytes())
+    }
+
+    fn apply(self, settings: &mut AiSettings) {
+        let set = |target: &mut String, value: Option<String>| {
+            if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
+                *target = value.trim().to_owned();
+            }
+        };
+        set(&mut settings.local_url, self.local_url);
+        set(&mut settings.cloud_url, self.cloud_url);
+        set(&mut settings.cloud_model, self.cloud_model);
+        set(&mut settings.research_model, self.research_model);
+        // An empty model is a choice: "let the server pick".
+        if let Some(model) = self.local_model {
+            settings.local_model = model.trim().to_owned();
+        }
+        if let Some(key) = self.api_key.filter(|k| !k.trim().is_empty()) {
+            settings.openrouter_api_key = Some(key);
+        }
+    }
+}
+
 impl AiSettings {
-    fn api_key(&self) -> Option<String> {
+    /// These settings with the user's own setup file applied on top. A file
+    /// that cannot be read changes nothing.
+    pub fn effective(&self) -> AiSettings {
+        let mut settings = self.clone();
+        if let Some(overrides) = self
+            .user_file
+            .as_deref()
+            .and_then(|p| AiOverrides::load(p).ok())
+        {
+            overrides.apply(&mut settings);
+        }
+        settings
+    }
+
+    /// Where the API key comes from, for `meow setup`: the environment wins
+    /// over the user's file, which wins over `config.toml`.
+    pub fn key_source(&self) -> Option<&'static str> {
+        let filled = |key: &Option<String>| key.as_deref().is_some_and(|k| !k.trim().is_empty());
+        let in_file = self
+            .user_file
+            .as_deref()
+            .and_then(|path| AiOverrides::load(path).ok())
+            .is_some_and(|overrides| filled(&overrides.api_key));
+        if std::env::var(API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
+            Some("the OPENROUTER_API_KEY environment variable")
+        } else if in_file {
+            Some("your setup file")
+        } else if filled(&self.openrouter_api_key) {
+            Some("config.toml")
+        } else {
+            None
+        }
+    }
+
+    pub fn api_key(&self) -> Option<String> {
         std::env::var(API_KEY_ENV)
             .ok()
             .or_else(|| self.openrouter_api_key.clone())
@@ -455,7 +558,7 @@ impl AiEngine {
     }
 
     pub fn budget(&self) -> Budget {
-        budget(&lock_db(&self.db), &self.settings).unwrap_or_default()
+        budget(&lock_db(&self.db), &self.settings.effective()).unwrap_or_default()
     }
 
     /// One streamed chat completion. `on_delta` receives each piece of the
@@ -480,8 +583,8 @@ impl AiEngine {
             Ok(response) => response,
             // Only the local tier is called without a key.
             Err(error) if error.is_connect() && api_key.is_none() => bail!(
-                "nothing is listening at {base} (start a local model server such as LM Studio \
-                 or Ollama, or change `local_url` under [ai] in config.toml)"
+                "nothing is listening at {base} (start your model server, or run `meow setup` \
+                 to choose another)"
             ),
             Err(error) if error.is_connect() => bail!("cannot connect to {base}"),
             Err(error) if error.is_timeout() => {
@@ -587,13 +690,12 @@ impl AiEngine {
             "stream": true,
             "temperature": 0.2,
         });
-        if !self.settings.local_model.is_empty() {
-            body["model"] = json!(self.settings.local_model);
+        let settings = self.settings.effective();
+        if !settings.local_model.is_empty() {
+            body["model"] = json!(settings.local_model);
         }
         let (text, usage) = self
-            .chat(&self.settings.local_url, None, &body, |piece| {
-                on_text(piece)
-            })
+            .chat(&settings.local_url, None, &body, |piece| on_text(piece))
             .await
             .with_context(|| match &fallback_reason {
                 // Say why the cloud was not used, or the real cause is lost.
@@ -603,10 +705,10 @@ impl AiEngine {
                 ),
                 None => "local tier [L] failed (is a model server running?)".to_owned(),
             })?;
-        let model = if self.settings.local_model.is_empty() {
+        let model = if settings.local_model.is_empty() {
             "local"
         } else {
-            &self.settings.local_model
+            &settings.local_model
         };
         record_usage(
             &lock_db(&self.db),
@@ -655,10 +757,11 @@ impl AiEngine {
                 _ => Ok(Some(reason.to_owned())),
             }
         };
-        let Some(api_key) = self.settings.api_key() else {
-            let reason = unavailable(&format!(
-                "no OpenRouter API key (export {API_KEY_ENV} before starting the session)"
-            ))?;
+        let settings = self.settings.effective();
+        let Some(api_key) = settings.api_key() else {
+            let reason = unavailable(
+                "no cloud API key yet (run `meow setup` to add yours, or to choose a local model)",
+            )?;
             return self.run_local(tier, &prompt, reason, on_text).await;
         };
 
@@ -679,8 +782,8 @@ impl AiEngine {
         };
 
         let model = match tier {
-            Tier::Research => self.settings.research_model.clone(),
-            _ => self.settings.cloud_model.clone(),
+            Tier::Research => settings.research_model.clone(),
+            _ => settings.cloud_model.clone(),
         };
         let key = cache_key(tier, &model, &prompt.system, &masked_user);
         let cached: Option<String> = lock_db(&self.db)
@@ -734,7 +837,7 @@ impl AiEngine {
         }
         let mut shown = String::new();
         let result = self
-            .chat(&self.settings.cloud_url, Some(&api_key), &body, |piece| {
+            .chat(&settings.cloud_url, Some(&api_key), &body, |piece| {
                 let ready = unmasker.push(piece);
                 if !ready.is_empty() {
                     on_text(&ready);
@@ -847,7 +950,7 @@ pub fn cloud_ready(settings: &AiSettings) -> Result<()> {
     settings
         .api_key()
         .map(|_| ())
-        .ok_or_else(|| anyhow!("no OpenRouter API key: set ${API_KEY_ENV}"))
+        .ok_or_else(|| anyhow!("no cloud API key yet: run `meow setup`"))
 }
 
 #[cfg(test)]
@@ -1334,7 +1437,7 @@ mod tests {
             .fallback_reason
             .as_deref()
             .unwrap()
-            .contains("no OpenRouter API key"));
+            .contains("no cloud API key yet (run `meow setup`"));
         assert!(mock.cloud.lock().unwrap().is_empty());
         let local_body = mock.local.lock().unwrap()[0].clone();
         assert!(local_body["messages"][1]["content"]
@@ -1449,13 +1552,90 @@ mod tests {
         let error = format!("{:#}", outcome.unwrap_err());
         assert!(
             error.starts_with(
-                "the cloud was not used: no OpenRouter API key \
-                 (export OPENROUTER_API_KEY before starting the session); \
-                 the local tier [L] it fell back to also failed"
+                "the cloud was not used: no cloud API key yet (run `meow setup` to add \
+                 yours, or to choose a local model); the local tier [L] it fell back to \
+                 also failed"
             ),
             "{error}"
         );
         assert!(error.contains("nothing is listening at"), "{error}");
+    }
+
+    /// `meow setup` writes each user's own file; a running session must
+    /// pick it up without a restart.
+    #[tokio::test]
+    async fn the_users_own_setup_file_applies_to_the_next_request() {
+        if std::env::var(API_KEY_ENV).is_ok() {
+            return; // the environment would win over the file under test
+        }
+        let (base, mock) = mock_models().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        let settings = AiSettings {
+            // Defaults that lead nowhere: only the user's file can fix them.
+            local_url: "http://127.0.0.1:1/v1".into(),
+            cloud_url: "http://127.0.0.1:1/v1".into(),
+            max_daily_usd: 0.01,
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(
+            settings.clone(),
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        assert!(!engine.budget().has_key);
+        assert_eq!(settings.key_source(), None);
+        assert_eq!(settings.effective(), settings, "no file, no change");
+
+        // The user points meow at their own model server ...
+        let mut own = AiOverrides {
+            local_url: Some(format!("{base}/local")),
+            local_model: Some("my-model".into()),
+            ..AiOverrides::default()
+        };
+        own.save(&file).unwrap();
+        let (outcome, _) = run(&engine, Tier::Local, &graph, &vault).await;
+        assert_eq!(outcome.unwrap().text, "local answer");
+        assert_eq!(mock.local.lock().unwrap()[0]["model"], "my-model");
+
+        // ... and later adds their own key and cloud service.
+        own.api_key = Some("sk-their-own-key".into());
+        own.cloud_url = Some(format!("{base}/cloud"));
+        own.cloud_model = Some("their/model".into());
+        own.save(&file).unwrap();
+        assert!(engine.budget().has_key);
+        assert_eq!(settings.key_source(), Some("your setup file"));
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert_eq!(
+            (outcome.tier, outcome.model.as_str()),
+            (Tier::Cloud, "their/model")
+        );
+        let (authorization, sent) = mock.cloud.lock().unwrap()[0].clone();
+        assert_eq!(sent["model"], "their/model");
+        assert_eq!(authorization.as_deref(), Some("Bearer sk-their-own-key"));
+
+        // The file is theirs alone, says so, and round-trips.
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("# Your own AI setup for meow"), "{text}");
+        assert!(text.contains("never commit or share it"), "{text}");
+        assert_eq!(AiOverrides::load(&file).unwrap(), own);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Unset fields are not written, and a missing file is an empty setup.
+        assert!(!text.contains("research_model"), "{text}");
+        let missing = dir.path().join("none.toml");
+        assert_eq!(AiOverrides::load(&missing).unwrap(), AiOverrides::default());
+        std::fs::write(&file, "not toml [").unwrap();
+        assert!(AiOverrides::load(&file).is_err());
+        assert!(!engine.budget().has_key, "a broken file changes nothing");
     }
 
     #[test]

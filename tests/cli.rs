@@ -252,6 +252,136 @@ fn delete_never_follows_a_link() {
     assert!(precious.join("profile.toml").is_file());
 }
 
+/// `meow setup` with flags: every user keeps their own model server and
+/// API key in their own private file, and the key is never printed.
+#[test]
+fn setup_keeps_each_users_own_ai_in_their_private_file() {
+    use std::io::Write;
+    use std::process::Stdio;
+    const KEY: &str = "sk-cli-their-own-key-4d2e";
+
+    let sandbox = Sandbox::new();
+    let file = sandbox.home().join("ai.toml");
+    let setup = |args: &[&str], stdin: &str, env: &[(&str, &str)]| -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_meow"));
+        command
+            .arg("setup")
+            .args(args)
+            .current_dir(sandbox.project())
+            .env("MEOW_HOME", sandbox.home())
+            .env_remove("OPENROUTER_API_KEY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // Nothing set up, and no terminal to ask on: the state and what to do.
+    let output = setup(&[], "", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("[L] local model    http://localhost:1234/v1"),
+        "{text}"
+    );
+    assert!(text.contains("API key            not set"), "{text}");
+    assert!(text.contains("Run `meow setup` in a terminal"), "{text}");
+    assert!(!file.exists(), "looking changes nothing");
+
+    // Their own model server.
+    let output = setup(
+        &[
+            "--local-url",
+            "http://127.0.0.1:9/v1/",
+            "--local-model",
+            "llama3.2",
+        ],
+        "",
+        &[],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("[+] local model server: http://127.0.0.1:9/v1"),
+        "{text}"
+    );
+    assert!(text.contains("model: llama3.2"), "{text}");
+
+    // Their own key, through standard input only.
+    let output = setup(&["--api-key-stdin"], &format!("{KEY}\n"), &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("[+] API key set, ends in 4d2e"), "{text}");
+    assert!(
+        text.contains("API key            set, ends in 4d2e (from your setup file)"),
+        "{text}"
+    );
+    assert!(!text.contains(KEY), "the key was printed: {text}");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains(&format!("api_key = \"{KEY}\"")), "{saved}");
+    assert!(saved.contains("local_model = \"llama3.2\""), "{saved}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    // There is no way to pass the key as an argument.
+    assert_eq!(setup(&["--api-key", KEY], "", &[]).status.code(), Some(2));
+
+    // The environment variable still wins, and is named as the source.
+    let output = setup(
+        &["--show"],
+        "",
+        &[("OPENROUTER_API_KEY", "sk-env-key-0000-zzzz")],
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("ends in zzzz (from the OPENROUTER_API_KEY environment variable)"),
+        "{text}"
+    );
+
+    // Checking says what happened in plain words, and fails if it does not work.
+    let output = setup(
+        &["--check", "--cloud-url", "http://127.0.0.1:9/v1"],
+        "",
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(
+        text.contains("[!] [L] nothing is listening at http://127.0.0.1:9/v1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[!] [C] nothing is listening at http://127.0.0.1:9/v1"),
+        "{text}"
+    );
+    assert!(!text.contains(KEY), "{text}");
+
+    // A mistyped address is refused and nothing is saved.
+    let before = std::fs::read_to_string(&file).unwrap();
+    let output = setup(&["--local-url", "localhost:1234"], "", &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("must start with http:// or https://"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+    // And the key can be removed again.
+    let output = setup(&["--forget-key"], "", &[]);
+    assert!(stdout(&output).contains("API key            not set"));
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("api_key"));
+}
+
 #[test]
 fn opening_a_name_creates_then_resumes_the_workspace() {
     let sandbox = Sandbox::new();

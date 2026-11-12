@@ -33,6 +33,7 @@ pub const HOME_ENV: &str = "MEOW_HOME";
 const LOCAL_DIR: &str = ".meow";
 const CONFIG_FILE: &str = "config.toml";
 const PROFILE_FILE: &str = "profile.toml";
+const AI_FILE: &str = "ai.toml";
 const LOCK_FILE: &str = "session.lock";
 /// Port and token of the running session; present only while one is open.
 pub const RUNTIME_FILE: &str = "runtime.json";
@@ -79,8 +80,10 @@ output_cap_mb = 50
 local_url = "http://localhost:1234/v1"
 # local_model = ""
 # [C] cloud triage and [R] grounded research go through OpenRouter. Private
-# values are replaced by placeholders first. The key is read from the
-# OPENROUTER_API_KEY environment variable.
+# values are replaced by placeholders first.
+# Run `meow setup` to add your own API key or to choose your own local model:
+# it keeps them in ai.toml next to this file and overrides what is set here.
+# The OPENROUTER_API_KEY environment variable also works for the key.
 cloud_model = "anthropic/claude-sonnet-5.5"
 research_model = "anthropic/claude-opus-5.5"
 # Hard daily caps for the cloud tiers; when reached, [C] answers locally.
@@ -177,6 +180,11 @@ impl MeowHome {
 
     pub fn config_path(&self) -> PathBuf {
         self.0.join(CONFIG_FILE)
+    }
+
+    /// The user's own AI setup, written by `meow setup`.
+    pub fn ai_path(&self) -> PathBuf {
+        self.0.join(AI_FILE)
     }
 
     pub fn workspaces_dir(&self) -> PathBuf {
@@ -374,7 +382,11 @@ impl Config {
         restrict_file(&path).with_context(|| format!("cannot restrict {}", path.display()))?;
         let text =
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+        let mut config: Config =
+            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        // Each user's own AI setup lives beside the config, not in it.
+        config.ai.user_file = Some(home.ai_path());
+        Ok(config)
     }
 }
 
@@ -1166,7 +1178,10 @@ mod tests {
             toml::from_str::<Config>(CONFIG_TEMPLATE).unwrap(),
             Config::default()
         );
-        assert_eq!(Config::load_or_create(&fx.home).unwrap(), Config::default());
+        // A loaded config also knows where this user's own AI setup lives.
+        let mut expected = Config::default();
+        expected.ai.user_file = Some(fx.home.root().join("ai.toml"));
+        assert_eq!(Config::load_or_create(&fx.home).unwrap(), expected);
         assert_eq!(
             fs::read_to_string(fx.home.config_path()).unwrap(),
             CONFIG_TEMPLATE
@@ -1184,7 +1199,7 @@ mod tests {
                 shell: Some("/bin/zsh".into()),
                 cve: CveSettings::default(),
                 recon: ReconSettings::default(),
-                ai: AiSettings::default(),
+                ai: expected.ai.clone(),
             }
         );
 

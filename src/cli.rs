@@ -39,6 +39,36 @@ pub enum Command {
     /// List every saved workspace and whether its session is running
     #[command(visible_alias = "ls")]
     List,
+    /// Set up your own AI: a local model server or your own cloud API key
+    Setup {
+        /// Show the current setup (a key is never printed)
+        #[arg(long)]
+        show: bool,
+        /// Try the local model server and the cloud key, and say what happened
+        #[arg(long)]
+        check: bool,
+        /// OpenAI-compatible model server on this machine, e.g. http://localhost:11434/v1
+        #[arg(long, value_name = "URL")]
+        local_url: Option<String>,
+        /// Model the local server should use ("" lets the server choose)
+        #[arg(long, value_name = "NAME")]
+        local_model: Option<String>,
+        /// Cloud service for [C] and [R] (default: OpenRouter)
+        #[arg(long, value_name = "URL")]
+        cloud_url: Option<String>,
+        /// Model for [C] cloud triage
+        #[arg(long, value_name = "NAME")]
+        cloud_model: Option<String>,
+        /// Model for [R] grounded research
+        #[arg(long, value_name = "NAME")]
+        research_model: Option<String>,
+        /// Read your API key from standard input (never from the command line)
+        #[arg(long, conflicts_with = "forget_key")]
+        api_key_stdin: bool,
+        /// Remove your stored API key
+        #[arg(long)]
+        forget_key: bool,
+    },
     /// Delete a saved workspace and everything in it
     #[command(visible_alias = "rm")]
     Delete {
@@ -122,6 +152,7 @@ impl Command {
         match self {
             Command::List => "list",
             Command::Delete { .. } => "delete",
+            Command::Setup { .. } => "setup",
             Command::Mode { .. } => "mode",
             Command::Recon { .. } => "recon",
             Command::Map { .. } => "map",
@@ -131,11 +162,11 @@ impl Command {
         }
     }
 
-    /// The workspace a helper targets. `None` for `list` and `delete`, which
-    /// are not helpers of a session.
+    /// The workspace a helper targets. `None` for `list`, `delete` and
+    /// `setup`, which are not helpers of a session.
     pub fn session_arg(&self) -> Option<&SessionArg> {
         match self {
-            Command::List | Command::Delete { .. } => None,
+            Command::List | Command::Delete { .. } | Command::Setup { .. } => None,
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
             | Command::Map { session, .. }

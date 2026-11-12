@@ -56,6 +56,7 @@ impl Hosted {
         command.env("PS1", "ready> ");
         command.env_remove("MEOW_SESSION");
         command.env_remove("MEOW_WORKSPACE");
+        command.env_remove("OPENROUTER_API_KEY");
         command.env_remove("ENV");
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
@@ -343,4 +344,87 @@ fn delete_asks_first_and_keeps_the_workspace_on_anything_but_yes() {
     assert_eq!(code, 0, "{}", text(&output));
     assert!(text(&output).contains("[+] Deleted workspace 'acme'"));
     assert!(!dir.exists());
+}
+
+/// `meow setup` on a terminal: the menu, and an API key that is typed
+/// without ever appearing on screen.
+#[test]
+fn setup_asks_on_the_terminal_and_never_shows_the_key() {
+    const KEY: &str = "sk-pty-their-secret-key-77";
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("meow-home").join("ai.toml");
+    let mut hosted = Hosted::spawn_args(&["setup"], tmp);
+    let expect = |hosted: &mut Hosted, needle: &str| {
+        assert!(
+            hosted.wait_for(needle.as_bytes(), PATIENCE),
+            "no {needle:?} in: {}",
+            hosted.dump()
+        );
+    };
+    expect(&mut hosted, "meow setup: your own AI for meow.");
+    expect(&mut hosted, "API key            not set");
+    expect(&mut hosted, "  q  Done");
+    expect(&mut hosted, "> ");
+
+    hosted.send("2\r");
+    expect(
+        &mut hosted,
+        "Service address [https://openrouter.ai/api/v1]: ",
+    );
+    hosted.send("\r");
+    expect(&mut hosted, "Your API key (hidden as you type");
+    // A typo, corrected with backspace, then Enter.
+    hosted.send(&format!("{KEY}x\x7f\r"));
+    expect(&mut hosted, "Triage model [anthropic/claude-sonnet-5.5]: ");
+    hosted.send("their/triage-model\r");
+    expect(&mut hosted, "Research model [");
+    hosted.send("\r");
+    expect(
+        &mut hosted,
+        "[+] Saved. A running session uses it for its next request.",
+    );
+    expect(
+        &mut hosted,
+        "API key            set, ends in y-77 (from your setup file)",
+    );
+    expect(&mut hosted, "model: their/triage-model");
+
+    // Anything else than a menu entry is explained, not acted on.
+    hosted.send("7\r");
+    expect(&mut hosted, "Type 1, 2, 3, 4 or q.");
+    hosted.send("q\r");
+    let (code, output, tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0, "{}", text(&output));
+    assert!(
+        !text(&output).contains(KEY) && !text(&output).contains("sk-pty"),
+        "the key was shown: {}",
+        text(&output)
+    );
+
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains(&format!("api_key = \"{KEY}\"")), "{saved}");
+    assert!(
+        saved.contains("cloud_model = \"their/triage-model\""),
+        "{saved}"
+    );
+    assert!(
+        !saved.contains("research_model"),
+        "Enter keeps the default: {saved}"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // Removing the key again, from the menu.
+    let mut hosted = Hosted::spawn_args(&["setup"], tmp);
+    expect(&mut hosted, "> ");
+    hosted.send("3\r");
+    expect(&mut hosted, "[+] Saved.");
+    expect(&mut hosted, "API key            not set");
+    hosted.send("q\r");
+    let (code, _, _tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0);
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("api_key"));
 }

@@ -23,6 +23,7 @@ use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
 use meow::queue;
 use meow::report;
+use meow::setup;
 use meow::shims;
 use meow::webui;
 use meow::workspace::{
@@ -130,6 +131,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Command::Delete { name, yes, .. } => {
                 delete_workspace(&home, &cwd, &env, name.as_deref(), *yes)
             }
+            Command::Setup {
+                show,
+                check,
+                local_url,
+                local_model,
+                cloud_url,
+                cloud_model,
+                research_model,
+                api_key_stdin,
+                forget_key,
+            } => setup::run(
+                &home,
+                &setup::SetupArgs {
+                    show: *show,
+                    check: *check,
+                    local_url: local_url.clone(),
+                    local_model: local_model.clone(),
+                    cloud_url: cloud_url.clone(),
+                    cloud_model: cloud_model.clone(),
+                    research_model: research_model.clone(),
+                    api_key_stdin: *api_key_stdin,
+                    forget_key: *forget_key,
+                },
+            ),
             _ => print_listing(&home, &cwd, &env),
         };
     };
@@ -137,8 +162,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     match command {
-        Command::List | Command::Delete { .. } => {
-            unreachable!("`list` and `delete` are not session helpers and returned above")
+        Command::List | Command::Delete { .. } | Command::Setup { .. } => {
+            unreachable!("`list`, `delete` and `setup` are not session helpers and returned above")
         }
         Command::Mode { mode, .. } => {
             // A live session applies the change itself; otherwise write the

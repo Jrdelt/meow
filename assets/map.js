@@ -503,8 +503,9 @@
       detail.appendChild(el('div', 'dim', 'Cloud today: $' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
         (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
     } else {
-      detail.appendChild(el('div', 'dim', 'No OpenRouter key in this session: [C] answers with the local model ' +
-        'and [R] is unavailable. Leave the session, run `export OPENROUTER_API_KEY=...`, then start it again.'));
+      detail.appendChild(el('div', 'dim', 'No cloud API key yet: [C] answers with the local model and [R] is ' +
+        'unavailable. Run `meow setup` in any terminal to add your own key or to choose your local model. ' +
+        'It applies to this session at once.'));
     }
     var ai = state.ai || {};
     if (ai.address === host.address && (ai.running || ai.text || ai.error)) {

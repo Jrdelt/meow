@@ -54,18 +54,17 @@ Before every push:
 ## Current Handoff State
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
-  list`, `meow delete`, the sketched map and fixes from real macOS runs.
-- **Last Verified Commit:** `chore(privacy)` — see `git log -n 1 --oneline`.
+  list`/`delete`/`setup`, the sketched map and macOS fixes.
+- **Last Verified Commit:** `feat(setup)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
   Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
-  `assets/`); Phase 4 (`vault`, `ai`, `report`); `install.sh`; `tests/*.rs`.
+  `assets/`); Phase 4 (`vault`, `ai`, `report`, `setup`); `install.sh`.
 - **In-Progress / Partial Work:** None.
 - **Next Exact Action:** Wait for the owner's macOS results: `cargo test
-  --no-fail-fast`, how the map looks, and the session banner (`not fully read`
-  names an OS tool that failed). Unverified: real `katana`/`feroxbuster`, a
-  real `[L]`/`[C]`/`[R]` request, Windows.
+  --no-fail-fast`, the map and HUD, `meow setup` with a real key or model.
+  Unverified: real `katana`/`feroxbuster`, Windows.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
@@ -79,7 +78,9 @@ Before every push:
     `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`; `meow delete`
     needs it free. `meow list` pings each session (`ipc::is_live`).
   - `$MEOW_HOME` overrides `~/.meow` (tests). Create files via
-    `private_open_options()` / `write_private_atomic()` only.
+    `private_open_options()` / `write_private_atomic()` only. `meow setup`
+    keeps each user's AI in `~/.meow/ai.toml`, re-read per request. Shared
+    repository: never print a key, never commit real addresses or keys.
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system
     files (Apple's pick the history location from it) and the user's
     `.zshrc` load natively. Never keep `ZDOTDIR` on the shim past `.zshenv`.
@@ -88,12 +89,11 @@ Before every push:
     and carries the reason; the cloud and neighbour-table clients are drawn
     only, never hosts. `observer::machine_report` words "this machine" once
     for the map and the HUD (`m`). Cytoscape 3.33.1 is vendored (MIT).
-  - Recon tests use stand-in tools; real `nmap` was smoke-tested on 127.0.0.1
-    only, `katana`/`feroxbuster` never. `init.ps1` has never been run.
+  - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
+    for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
     `gcc-mingw-w64-x86-64`). No CI: private repo, paid macOS runners.
-  - macOS (owner's machine): sessions, `meow report` and the listing work; no
-    full test run reported yet. Tests must not depend on the login name,
-    `/usr/bin/zsh`, bash >= 4.4 or unresolved temp paths. `install.sh` has
-    run for real on Linux only.
+  - macOS (owner's machine): install, sessions, map and `nmap` recon work;
+    no full test run reported. Tests must not depend on the login name,
+    `/usr/bin/zsh`, bash >= 4.4 or unresolved temp paths.
