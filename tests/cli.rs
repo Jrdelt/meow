@@ -113,6 +113,63 @@ fn bare_meow_lists_workspaces() {
 }
 
 #[test]
+fn list_and_ls_show_every_workspace_also_from_inside_a_session() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.run(&["list"], &[]);
+    assert!(empty.status.success());
+    assert!(stdout(&empty).contains("No workspaces yet"));
+    assert!(!sandbox.home().exists(), "listing must not create ~/.meow");
+
+    sandbox.run(&["acme"], &[]);
+    sandbox.run(&["beta"], &[]);
+    sandbox.run(&["webapp", "--local"], &[]);
+    let bare = stdout(&sandbox.run(&[], &[]));
+    let listing = stdout(&sandbox.run(&["list"], &[]));
+    assert_eq!(listing, bare);
+    assert_eq!(stdout(&sandbox.run(&["ls"], &[])), bare);
+    assert!(listing.starts_with("NAME"), "{listing}");
+    let row = |name: &str| -> Vec<String> {
+        let line = listing.lines().find(|l| l.starts_with(name)).unwrap();
+        line.split("  ")
+            .filter(|cell| !cell.is_empty())
+            .map(|cell| cell.trim().to_owned())
+            .collect()
+    };
+    // No session is open on any of them.
+    for name in ["acme", "beta", "webapp (local)"] {
+        assert_eq!(row(name)[1], "-", "{listing}");
+    }
+    // The words are commands now, not workspace names.
+    assert!(!sandbox.workspace("list").exists());
+    assert!(!sandbox.workspace("ls").exists());
+
+    // A bare `meow` is refused inside a session; `meow list` is not, and it
+    // marks the session it was asked from. A connection file left behind by
+    // a crashed session does not count as running.
+    let beta = sandbox.workspace("beta");
+    std::fs::write(
+        beta.join("runtime.json"),
+        r#"{"pid":1,"port":9,"token":"0000"}"#,
+    )
+    .unwrap();
+    let acme = sandbox.workspace("acme");
+    let inside = [
+        ("MEOW_SESSION", "acme"),
+        ("MEOW_WORKSPACE", acme.to_str().unwrap()),
+    ];
+    assert_eq!(sandbox.run(&[], &inside).status.code(), Some(1));
+    let output = sandbox.run(&["list"], &inside);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let listing = stdout(&output);
+    let state = |name: &str| {
+        let line = listing.lines().find(|l| l.starts_with(name)).unwrap();
+        line.contains("this session")
+    };
+    assert!(state("acme"), "{listing}");
+    assert!(!state("beta") && !listing.contains("running"), "{listing}");
+}
+
+#[test]
 fn opening_a_name_creates_then_resumes_the_workspace() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["acme"], &[]);
@@ -359,6 +416,8 @@ fn live_session_serves_helpers_and_mines_terminal_output() {
 "$MEOW_BIN" add scan.xml
 "$MEOW_BIN" mode mild
 "$MEOW_BIN" map --no-open
+"$MEOW_BIN" list | sed 's/^/inside: /'
+env -u MEOW_SESSION -u MEOW_WORKSPACE "$MEOW_BIN" list | sed 's/^/outside: /'
 echo "Discovered open port 8443/tcp on 10.0.0.77"
 exit
 "#;
@@ -400,6 +459,16 @@ exit
         text.contains("[+] Mode set to mild (session: acme)"),
         "{text}"
     );
+    // `meow list` asks the session itself: from its own shell it is "this
+    // session", from any other terminal it is "running".
+    let listed = |prefix: &str| {
+        text.lines()
+            .find(|l| l.starts_with(prefix) && l.contains("acme"))
+            .unwrap_or_else(|| panic!("no {prefix} row for acme: {text}"))
+            .to_owned()
+    };
+    assert!(listed("inside: ").contains("this session"), "{text}");
+    assert!(listed("outside: ").contains("running"), "{text}");
     let url_at = text
         .find("http://127.0.0.1:")
         .expect("map URL was not printed");

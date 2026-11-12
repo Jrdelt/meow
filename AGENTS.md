@@ -53,9 +53,9 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** All four phases complete, plus `install.sh` and the
-  first fixes from a real macOS run.
-- **Last Verified Commit:** `feat(install)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** All four phases complete. Since then: `install.sh`,
+  `meow list`, and fixes from real macOS runs.
+- **Last Verified Commit:** `feat(list)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -78,9 +78,13 @@ Before every push:
     `ipc::send` and fall back to the files on `None`. New requests go into
     `coordinator::Command` (HTTP `/api/command` and WebSocket share it).
   - Helper targeting: `--local`, `--session`, `$MEOW_WORKSPACE`,
-    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`.
+    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`. `meow list`
+    targets no workspace and pings each session (`ipc::is_live`).
   - `$MEOW_HOME` overrides `~/.meow` (tests). Create files via
     `private_open_options()` / `write_private_atomic()` only.
+  - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system
+    files (Apple's pick the history location from it) and the user's
+    `.zshrc` load natively. Never keep `ZDOTDIR` on the shim past `.zshenv`.
   - Map page: no inline scripts, no `innerHTML`; checked by hand in Chromium
     (Playwright), not in `cargo test`. Cytoscape 3.33.1 is vendored (MIT).
   - Recon tests use stand-in tools; real `nmap` was smoke-tested on 127.0.0.1
@@ -89,10 +93,7 @@ Before every push:
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
     `gcc-mingw-w64-x86-64`). No CI: the repo is private and macOS runners
     cost Actions minutes.
-  - macOS (owner's machine): builds and a zsh session starts. First test run
-    stopped at one lib test that depended on `$USER` (fixed), so the
-    integration tests have not run there yet. Tests must not depend on the
-    login name, on `/usr/bin/zsh`, on bash >= 4.4, or on unresolved temp paths.
-  - `install.sh` (macOS/Linux) installs a C compiler and Rust if missing,
-    then `cargo install --path . --locked`. Tested with stand-ins
-    (`tests/install.rs`) and for real on Linux; never run on macOS.
+  - macOS (owner's machine): sessions, `meow report` and the listing work;
+    the full test suite has not been reported from there yet. Tests must not
+    depend on the login name, `/usr/bin/zsh`, bash >= 4.4, or unresolved
+    temp paths. `install.sh` is tested with stand-ins and for real on Linux.

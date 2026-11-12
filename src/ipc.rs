@@ -4,16 +4,20 @@
 //! loopback HTTP). When there is none it gets `None` back and falls back to
 //! working on the workspace files directly.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use crate::coordinator::{Command, RuntimeInfo};
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, RUNTIME_FILE};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A session that does not answer a ping within this time is not listed as
+/// running.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Connection details of the session that owns `workspace`, if its
 /// `runtime.json` exists. The session may still be gone (stale file).
@@ -74,4 +78,25 @@ pub fn send(workspace: &Workspace, command: &Command) -> Result<Option<Value>> {
         .build()
         .context("cannot start the async runtime")?
         .block_on(send_to(&info, command))
+}
+
+/// True when a session is open on the workspace in `dir` and answers. Only
+/// reads: a `runtime.json` left behind by a crashed session counts as closed.
+pub fn is_live(dir: &Path) -> bool {
+    let Some(info) = RuntimeInfo::read(&dir.join(RUNTIME_FILE)) else {
+        return false;
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    runtime.block_on(async {
+        let ping = send_to(&info, &Command::Ping);
+        matches!(
+            tokio::time::timeout(PING_TIMEOUT, ping).await,
+            Ok(Ok(Some(_)))
+        )
+    })
 }

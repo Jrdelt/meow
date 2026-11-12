@@ -27,7 +27,7 @@ use meow::shims;
 use meow::webui;
 use meow::workspace::{
     format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config, MeowHome,
-    SessionEnv, Workspace,
+    SessionEnv, SessionState, Workspace,
 };
 
 /// Debug aid: when set to a file path, the clean lines produced by the
@@ -45,6 +45,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// `meow list` and a bare `meow`: every saved workspace, the `./.meow/` of
+/// this directory, and which of them have a session open right now.
+fn print_listing(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCode> {
+    let mut workspaces = list_workspaces(home, cwd)?;
+    for workspace in &mut workspaces {
+        workspace.state = if env.workspace.as_deref() == Some(workspace.dir.as_path()) {
+            SessionState::Current
+        } else if ipc::is_live(&workspace.dir) {
+            SessionState::Running
+        } else {
+            SessionState::Closed
+        };
+    }
+    print!("{}", format_listing(&workspaces, SystemTime::now()));
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
     // Must come first: a nested `meow` exits before any terminal state changes.
     let env = SessionEnv::from_process();
@@ -57,19 +74,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let Some(command) = &cli.command else {
         return match &cli.name {
-            None => {
-                let workspaces = list_workspaces(&home, &cwd)?;
-                print!("{}", format_listing(&workspaces, SystemTime::now()));
-                Ok(ExitCode::SUCCESS)
-            }
+            None => print_listing(&home, &cwd, &env),
             Some(name) => start_session(&home, &cwd, name, cli.local),
         };
     };
+    let Some(target) = command.session_arg() else {
+        return print_listing(&home, &cwd, &env);
+    };
 
-    let target = command.session_arg();
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     match command {
+        Command::List => unreachable!("`list` targets no workspace and returned above"),
         Command::Mode { mode, .. } => {
             // A live session applies the change itself; otherwise write the
             // profile directly.

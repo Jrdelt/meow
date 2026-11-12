@@ -33,6 +33,8 @@ pub const HOME_ENV: &str = "MEOW_HOME";
 const LOCAL_DIR: &str = ".meow";
 const CONFIG_FILE: &str = "config.toml";
 const PROFILE_FILE: &str = "profile.toml";
+/// Port and token of the running session; present only while one is open.
+pub const RUNTIME_FILE: &str = "runtime.json";
 const NAME_MAX: usize = 64;
 
 /// Device names Windows refuses as file or directory names.
@@ -529,7 +531,7 @@ impl Workspace {
     }
 
     pub fn runtime_path(&self) -> PathBuf {
-        self.dir.join("runtime.json")
+        self.dir.join(RUNTIME_FILE)
     }
 
     pub fn tmp_dir(&self) -> PathBuf {
@@ -604,11 +606,35 @@ pub fn resolve_helper_dir(
 // Listing
 // ---------------------------------------------------------------------------
 
+/// Whether a session is open on a listed workspace right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionState {
+    /// No session is open.
+    #[default]
+    Closed,
+    /// A session is open in another terminal.
+    Running,
+    /// The listing was asked for from inside this workspace's session.
+    Current,
+}
+
+impl SessionState {
+    fn label(self) -> &'static str {
+        match self {
+            SessionState::Closed => "-",
+            SessionState::Running => "running",
+            SessionState::Current => "this session",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     pub name: String,
     pub dir: PathBuf,
     pub local: bool,
+    /// `Closed` as read from disk; the caller asks the sessions themselves.
+    pub state: SessionState,
     /// `None` when `profile.toml` cannot be parsed.
     pub mode: Option<Mode>,
     /// Hosts in `graph.json`.
@@ -664,6 +690,7 @@ fn summarize(dir: &Path, name: Option<String>, local: bool) -> Option<WorkspaceS
         name,
         dir: dir.to_path_buf(),
         local,
+        state: SessionState::Closed,
         mode: profile.map(|p| p.mode),
         hosts: count_hosts(&dir.join("graph.json")),
         unfinished_tasks: crate::queue::count_unfinished(&dir.join("state.db")),
@@ -706,12 +733,12 @@ fn format_age(age: Duration) -> String {
     }
 }
 
-/// Renders the listing printed by a bare `meow`.
+/// Renders the listing printed by `meow list` and by a bare `meow`.
 pub fn format_listing(workspaces: &[WorkspaceSummary], now: SystemTime) -> String {
     if workspaces.is_empty() {
         return "No workspaces yet. Start one with `meow <name>`.\n".to_owned();
     }
-    let header = ["NAME", "MODE", "HOSTS", "TASKS", "LAST ACTIVE"].map(str::to_owned);
+    let header = ["NAME", "STATE", "MODE", "HOSTS", "TASKS", "LAST ACTIVE"].map(str::to_owned);
     let mut rows = vec![header];
     for w in workspaces {
         let name = if w.local {
@@ -729,13 +756,15 @@ pub fn format_listing(workspaces: &[WorkspaceSummary], now: SystemTime) -> Strin
         };
         rows.push([
             name,
+            w.state.label().to_owned(),
             w.mode.map_or("?", Mode::as_str).to_owned(),
             w.hosts.to_string(),
             tasks,
             age,
         ]);
     }
-    let widths: Vec<usize> = (0..4)
+    let last = rows[0].len() - 1;
+    let widths: Vec<usize> = (0..last)
         .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect();
     let mut out = String::new();
@@ -743,7 +772,7 @@ pub fn format_listing(workspaces: &[WorkspaceSummary], now: SystemTime) -> Strin
         for (col, width) in widths.iter().enumerate() {
             out.push_str(&format!("{:<width$}  ", row[col]));
         }
-        out.push_str(&row[4]);
+        out.push_str(&row[last]);
         out.push('\n');
     }
     out
@@ -1179,10 +1208,15 @@ mod tests {
     #[test]
     fn listing_is_rendered_as_an_aligned_table() {
         let now = SystemTime::now();
-        let row = |name: &str, local, mode, secs| WorkspaceSummary {
+        let row = |name: &str, local, mode: Option<Mode>, secs| WorkspaceSummary {
             name: name.into(),
             dir: PathBuf::new(),
             local,
+            state: match mode {
+                Some(Mode::Aggressive) => SessionState::Current,
+                Some(Mode::Light) => SessionState::Running,
+                _ => SessionState::Closed,
+            },
             mode,
             hosts: if local { 12 } else { 0 },
             unfinished_tasks: usize::from(mode.is_none()),
@@ -1198,10 +1232,10 @@ mod tests {
         );
         assert_eq!(
             text,
-            "NAME         MODE        HOSTS  TASKS         LAST ACTIVE\n\
-             acme-lab     aggressive  0      -             just now\n\
-             web (local)  light       12     -             2m ago\n\
-             old          ?           0      1 unfinished  3d ago\n"
+            "NAME         STATE         MODE        HOSTS  TASKS         LAST ACTIVE\n\
+             acme-lab     this session  aggressive  0      -             just now\n\
+             web (local)  running       light       12     -             2m ago\n\
+             old          -             ?           0      1 unfinished  3d ago\n"
         );
         assert!(format_listing(&[], now).contains("No workspaces yet"));
         assert_eq!(format_age(Duration::from_secs(7300)), "2h ago");

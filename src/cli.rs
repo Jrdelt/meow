@@ -1,8 +1,9 @@
 //! Command-line interface definitions (`clap` derive).
 //!
-//! `meow` and `meow <name>` start a session; every subcommand is a helper
-//! that targets an existing workspace: `--local`, `--session`, or the session
-//! of the current shell (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
+//! `meow` and `meow <name>` start a session; `meow list` shows every saved
+//! workspace; every other subcommand is a helper that targets an existing
+//! workspace: `--local`, `--session`, or the session of the current shell
+//! (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
 
 use std::path::PathBuf;
 
@@ -17,7 +18,7 @@ use crate::workspace::validate_name;
     version,
     about,
     args_conflicts_with_subcommands = true,
-    after_help = "Run `meow` with no arguments to list saved workspaces."
+    after_help = "Run `meow list` (or `meow` with no arguments) to list saved workspaces."
 )]
 pub struct Cli {
     /// Workspace to create or resume (~/.meow/workspaces/<NAME>/)
@@ -34,6 +35,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// List every saved workspace and whether its session is running
+    #[command(visible_alias = "ls")]
+    List,
     /// Switch the discovery load/rate profile of the session
     Mode {
         #[arg(value_enum)]
@@ -97,6 +101,7 @@ impl Command {
     /// The subcommand as the user typed it, for messages.
     pub fn name(&self) -> &'static str {
         match self {
+            Command::List => "list",
             Command::Mode { .. } => "mode",
             Command::Recon { .. } => "recon",
             Command::Map { .. } => "map",
@@ -106,14 +111,16 @@ impl Command {
         }
     }
 
-    pub fn session_arg(&self) -> &SessionArg {
+    /// The workspace a helper targets. `None` for `list`, which targets none.
+    pub fn session_arg(&self) -> Option<&SessionArg> {
         match self {
+            Command::List => None,
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
             | Command::Map { session, .. }
             | Command::Hud { session }
             | Command::Add { session, .. }
-            | Command::Report { session } => session,
+            | Command::Report { session } => Some(session),
         }
     }
 }
@@ -182,6 +189,22 @@ mod tests {
             assert_eq!(cli.command.as_ref().unwrap().name(), word);
             assert!(!cli.starts_session());
         }
+    }
+
+    #[test]
+    fn list_and_ls_show_the_listing_without_starting_a_session() {
+        for word in ["list", "ls"] {
+            let cli = parse(&[word]).unwrap();
+            assert!(cli.name.is_none(), "{word} parsed as a workspace name");
+            assert!(matches!(cli.command, Some(Command::List)));
+            let command = cli.command.as_ref().unwrap();
+            assert_eq!(command.name(), "list");
+            assert!(command.session_arg().is_none());
+            // Allowed inside a session, unlike a bare `meow`.
+            assert!(!cli.starts_session());
+            assert_eq!(cli.nesting_error(Some("acme")), None);
+        }
+        assert!(parse(&["list", "--session", "x"]).is_err());
     }
 
     #[test]
@@ -256,7 +279,10 @@ mod tests {
 
     #[test]
     fn helpers_accept_session_or_local_but_not_both() {
-        let arg = |args: &[&str]| parse(args).unwrap().command.unwrap().session_arg().clone();
+        let arg = |args: &[&str]| {
+            let command = parse(args).unwrap().command.unwrap();
+            command.session_arg().unwrap().clone()
+        };
 
         let named = arg(&["report", "--session", "acme"]);
         assert_eq!(
