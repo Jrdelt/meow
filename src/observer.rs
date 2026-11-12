@@ -715,6 +715,8 @@ pub struct ReportSection {
     pub lines: Vec<String>,
     /// Shown in full by the map; the other sections start folded.
     pub open: bool,
+    /// Something the operator should look at.
+    pub warn: bool,
 }
 
 /// Everything the passive observer read about this machine, worded once for
@@ -771,14 +773,16 @@ fn default_carriers(local: &LocalNet) -> Vec<(&str, Vec<&str>)> {
     carriers
 }
 
-/// This machine's own address on the network it reaches the rest through
-/// (without the prefix length), for the map's "You" caption.
+/// This machine's own address on its local network (without the prefix
+/// length), for the map's "You" caption. The local link comes before a VPN
+/// tunnel, and an interface with a default route before one without.
 pub fn primary_address(local: &LocalNet) -> Option<String> {
-    let by_name = |name: &str| local.interfaces.iter().find(|i| i.name == name);
-    default_carriers(local)
+    let carriers = default_carriers(local);
+    let carries = |i: &Interface| carriers.iter().any(|(name, _)| *name == i.name);
+    let mut candidates: Vec<&Interface> = local.interfaces.iter().filter(|i| in_use(i)).collect();
+    candidates.sort_by_key(|i| (i.kind == "vpn", !carries(i)));
+    candidates
         .into_iter()
-        .filter_map(|(name, _)| by_name(name))
-        .chain(local.interfaces.iter().filter(|i| in_use(i)))
         .find_map(routable_address)
         .map(|address| address.split('/').next().unwrap_or(address).to_owned())
 }
@@ -792,43 +796,41 @@ fn counted(title: &str, lines: Vec<String>, count: usize) -> ReportSection {
             lines
         },
         open: false,
+        warn: false,
     }
 }
 
 /// The report shown as "This machine" by `meow map` and `meow hud`: the
 /// local connection, any VPN, and every table the observer read.
 pub fn machine_report(local: &LocalNet) -> MachineReport {
-    let by_name = |name: &str| local.interfaces.iter().find(|i| i.name == name);
-    let described = |name: &str| {
-        let interface = by_name(name);
+    // The local links come first and are always listed, VPN or not: they
+    // are how this machine is physically connected. Those with a default
+    // route lead.
+    let carriers = default_carriers(local);
+    let gateways_of = |i: &Interface| carriers.iter().find(|(name, _)| *name == i.name);
+    let line = |interface: &Interface| {
+        let how = match gateways_of(interface).map(|(_, gateways)| gateways.as_slice()) {
+            Some([]) => "default route without a gateway".to_owned(),
+            Some(gateways) => format!("gateway {}", gateways.join(" and ")),
+            None => "local network only (no default route)".to_owned(),
+        };
         format!(
-            "{name} ({}) {}",
-            interface.map_or("unknown", |i| i.kind.as_str()),
-            interface
-                .and_then(routable_address)
-                .unwrap_or("no usable address")
+            "{} ({}) {}, {how}",
+            interface.name,
+            interface.kind,
+            routable_address(interface).unwrap_or("no usable address")
         )
     };
-
-    let mut connection: Vec<String> = default_carriers(local)
+    let mut links: Vec<&Interface> = local.interfaces.iter().filter(|i| in_use(i)).collect();
+    links.sort_by_key(|i| gateways_of(i).is_none());
+    let mut connection: Vec<String> = links
         .iter()
-        .map(|(name, gateways)| match gateways.as_slice() {
-            [] => format!("{}, default route without a gateway", described(name)),
-            gateways => format!("{}, gateway {}", described(name), gateways.join(" and ")),
-        })
+        .filter(|i| i.kind != "vpn")
+        .map(|i| line(i))
         .collect();
     if connection.is_empty() {
-        connection = local
-            .interfaces
-            .iter()
-            .filter(|i| in_use(i))
-            .map(|i| {
-                format!(
-                    "{}, local network only (no default route)",
-                    described(&i.name)
-                )
-            })
-            .collect();
+        // Nothing but a tunnel is in use.
+        connection = links.iter().map(|i| line(i)).collect();
     }
     if connection.is_empty() {
         connection.push(if local.interfaces.is_empty() {
@@ -851,8 +853,13 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
             };
             let mut networks: Vec<&str> = routes().map(|r| r.destination.as_str()).collect();
             networks.dedup();
+            let halves = ["0.0.0.0/1", "128.0.0.0/1"];
             let carries = if routes().any(is_default_route) {
                 "carries the default route".to_owned()
+            } else if halves.iter().all(|half| networks.contains(half)) {
+                // The usual way a VPN client takes everything without
+                // replacing the default route.
+                "carries all IPv4 traffic (0.0.0.0/1 and 128.0.0.0/1)".to_owned()
             } else if networks.is_empty() {
                 "no route uses it".to_owned()
             } else if networks.len() > 4 {
@@ -866,11 +873,13 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
         })
         .collect();
 
-    let open = |title: &str, lines: Vec<String>| ReportSection {
+    let section = |title: &str, lines: Vec<String>, warn: bool| ReportSection {
         title: title.to_owned(),
         lines,
         open: true,
+        warn,
     };
+    let open = |title: &str, lines: Vec<String>| section(title, lines, false);
     let mut sections = vec![
         open("Connection", connection.clone()),
         open(
@@ -883,7 +892,11 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
         ),
     ];
     if !local.warnings.is_empty() {
-        sections.push(open("Route warnings", local.warnings.clone()));
+        sections.push(section("Route warnings", local.warnings.clone(), true));
+    }
+    if !local.notes.is_empty() {
+        // An empty table below then means "not read", not "nothing there".
+        sections.push(section("Could not be read", local.notes.clone(), true));
     }
 
     // Interfaces: the ones with a usable address in full, the rest by name.
@@ -987,19 +1000,64 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
 // Running the OS tools
 // ---------------------------------------------------------------------------
 
-/// Runs a read-only OS tool and returns its stdout, or an empty string if
-/// it is missing.
-fn run(program: &str, args: &[&str]) -> String {
-    // The exit code is not checked: some of these tools print a usable table
-    // and still exit non-zero (for example when one entry cannot be read).
-    // The parsers ignore anything they do not recognise.
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
+/// Where system tools live when the PATH leaves them out (the `sbin`
+/// directories are not on every user's PATH).
+#[cfg(unix)]
+const SYSTEM_DIRS: &[&str] = &["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+#[cfg(not(unix))]
+const SYSTEM_DIRS: &[&str] = &[];
+
+/// Runs a read-only OS tool and returns its stdout. A tool that cannot be
+/// started, or that fails without printing anything, is recorded in `notes`:
+/// the table it feeds is then unread, which is not the same as empty.
+fn run(program: &str, args: &[&str], notes: &mut Vec<String>) -> String {
+    run_from(program, args, SYSTEM_DIRS, notes)
+}
+
+fn run_from(program: &str, args: &[&str], dirs: &[&str], notes: &mut Vec<String>) -> String {
+    let start = |program: &std::path::Path| {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+    };
+    let mut result = start(std::path::Path::new(program));
+    if matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        let elsewhere = dirs
+            .iter()
+            .map(|dir| std::path::Path::new(dir).join(program))
+            .find(|candidate| candidate.is_file());
+        if let Some(candidate) = elsewhere {
+            result = start(&candidate);
+        }
+    }
+    let command = format!("{program} {}", args.join(" "));
+    let command = command.trim();
+    match result {
+        // The exit code alone is not a failure: some of these tools print a
+        // usable table and still exit non-zero (for example when one entry
+        // cannot be read). The parsers ignore what they do not recognise.
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if text.trim().is_empty() && !output.status.success() {
+                let note = format!("`{command}` failed ({}) and printed nothing", output.status);
+                push_unique(notes, note);
+            }
+            text
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            push_unique(
+                notes,
+                format!("`{program}` is not installed or not on the PATH"),
+            );
+            String::new()
+        }
+        Err(error) => {
+            push_unique(notes, format!("`{command}` could not be run: {error}"));
+            String::new()
+        }
+    }
 }
 
 /// Reads the local tables once. `targets` are the known lab hosts, used for
@@ -1009,36 +1067,60 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
         observed_utc: now_rfc3339(),
         ..LocalNet::default()
     };
-    #[cfg(target_os = "linux")]
-    {
-        linux::links(&run("ip", &["-o", "link", "show"]), &mut local.interfaces);
-        linux::addresses(&run("ip", &["-o", "addr", "show"]), &mut local.interfaces);
-        linux::routes(&run("ip", &["route", "show"]), false, &mut local.routes);
+    // Plain `if`s rather than `#[cfg]` blocks: every platform's branch is
+    // type-checked on every platform, so a change cannot break a system it
+    // was not built on.
+    let notes = &mut local.notes;
+    if cfg!(target_os = "linux") {
+        linux::links(
+            &run("ip", &["-o", "link", "show"], notes),
+            &mut local.interfaces,
+        );
+        linux::addresses(
+            &run("ip", &["-o", "addr", "show"], notes),
+            &mut local.interfaces,
+        );
         linux::routes(
-            &run("ip", &["-6", "route", "show"]),
+            &run("ip", &["route", "show"], notes),
+            false,
+            &mut local.routes,
+        );
+        linux::routes(
+            &run("ip", &["-6", "route", "show"], notes),
             true,
             &mut local.routes,
         );
-        linux::neighbors(&run("ip", &["neigh", "show"]), &mut local.neighbors);
-        linux::listeners(&run("ss", &["-H", "-ltn"]), "tcp", &mut local.listeners);
-        linux::listeners(&run("ss", &["-H", "-lun"]), "udp", &mut local.listeners);
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        macos::ifconfig(&run("ifconfig", &[]), &mut local.interfaces);
-        macos::routes(&run("netstat", &["-rn"]), &mut local.routes);
-        macos::neighbors(&run("arp", &["-an"]), &mut local.neighbors);
-        macos::listeners(&run("netstat", &["-an", "-p", "tcp"]), &mut local.listeners);
-    }
-    #[cfg(windows)]
-    {
+        linux::neighbors(&run("ip", &["neigh", "show"], notes), &mut local.neighbors);
+        linux::listeners(
+            &run("ss", &["-H", "-ltn"], notes),
+            "tcp",
+            &mut local.listeners,
+        );
+        linux::listeners(
+            &run("ss", &["-H", "-lun"], notes),
+            "udp",
+            &mut local.listeners,
+        );
+    } else if cfg!(windows) {
         windows::routes(
-            &run("route", &["print", "-4"]),
+            &run("route", &["print", "-4"], notes),
             &mut local.interfaces,
             &mut local.routes,
         );
-        windows::neighbors(&run("arp", &["-a"]), &mut local.neighbors);
-        windows::listeners(&run("netstat", &["-an", "-p", "tcp"]), &mut local.listeners);
+        windows::neighbors(&run("arp", &["-a"], notes), &mut local.neighbors);
+        windows::listeners(
+            &run("netstat", &["-an", "-p", "tcp"], notes),
+            &mut local.listeners,
+        );
+    } else {
+        // macOS and the BSDs.
+        macos::ifconfig(&run("ifconfig", &[], notes), &mut local.interfaces);
+        macos::routes(&run("netstat", &["-rn"], notes), &mut local.routes);
+        macos::neighbors(&run("arp", &["-an"], notes), &mut local.neighbors);
+        macos::listeners(
+            &run("netstat", &["-an", "-p", "tcp"], notes),
+            &mut local.listeners,
+        );
     }
     local.warnings = route_warnings(&local, targets);
     local
@@ -1457,6 +1539,55 @@ mod tests {
         assert_eq!(route_warnings(&local, &[]).len(), 1);
     }
 
+    /// A table that could not be read must not look like an empty one.
+    #[cfg(unix)]
+    #[test]
+    fn tools_that_cannot_be_read_are_reported_not_hidden() {
+        let mut notes = Vec::new();
+        assert_eq!(run("meow-no-such-tool", &["-a"], &mut notes), "");
+        assert_eq!(run("meow-no-such-tool", &["-b"], &mut notes), "");
+        assert_eq!(
+            notes,
+            ["`meow-no-such-tool` is not installed or not on the PATH"],
+            "one note per missing tool, however often it is called"
+        );
+
+        // Fails without a word: reported. Fails after printing a table: the
+        // table is used. Succeeds with nothing to say: that is just empty.
+        let mut notes = Vec::new();
+        assert_eq!(run("sh", &["-c", "exit 3"], &mut notes), "");
+        assert_eq!(
+            notes,
+            ["`sh -c exit 3` failed (exit status: 3) and printed nothing"]
+        );
+        let mut notes = Vec::new();
+        assert_eq!(run("sh", &["-c", "echo row; exit 1"], &mut notes), "row\n");
+        assert_eq!(run("sh", &["-c", "true"], &mut notes), "");
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // A tool that is installed but not on the PATH is still found in
+        // the system directories.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("meow-sbin-tool");
+        std::fs::write(&tool, "#!/bin/sh\necho \"from sbin: $1\"\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dirs = ["/nonexistent", dir.path().to_str().unwrap()];
+        let mut notes = Vec::new();
+        assert_eq!(
+            run_from("meow-sbin-tool", &["-an"], &dirs, &mut notes),
+            "from sbin: -an\n"
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // The real observation never fails, whatever this machine has.
+        let local = observe(&[]);
+        assert!(!local.observed_utc.is_empty());
+        if local.interfaces.is_empty() {
+            assert!(!local.notes.is_empty(), "nothing read, and nothing said");
+        }
+    }
+
     #[test]
     fn machine_report_states_the_connection_and_the_vpn() {
         let local = linux_fixture();
@@ -1515,7 +1646,8 @@ mod tests {
         assert_eq!(neighbours[0], "192.168.1.1  00:11:22:33:44:55  eth0");
         assert_eq!(neighbours[1], "fe80::1  00:11:22:33:44:55  eth0");
 
-        // A VPN that takes the default route says so, and is the connection.
+        // A VPN that takes the default route says so, and the local link
+        // stays listed: it is still how this machine is connected.
         let mut full = local.clone();
         full.routes.retain(|r| !is_default_route(r));
         full.routes.push(Route {
@@ -1524,6 +1656,8 @@ mod tests {
             interface: "tun0".into(),
         });
         full.warnings.push("a warning".into());
+        full.notes
+            .push("`arp` is not installed or not on the PATH".into());
         full.neighbors.push(Neighbor {
             address: "192.168.1.77".into(),
             mac: None,
@@ -1534,14 +1668,61 @@ mod tests {
         assert_eq!(neighbours.last().unwrap(), "192.168.1.77  no answer  eth0");
         assert_eq!(
             report.connection,
-            ["tun0 (vpn) 10.10.14.3/23, default route without a gateway"]
+            ["eth0 (ethernet) 192.168.1.5/24, local network only (no default route)"]
         );
         assert_eq!(
             report.vpn,
             ["tun0 10.10.14.3/23: carries the default route"]
         );
-        assert_eq!(report.sections[2].title, "Route warnings");
-        assert_eq!(primary_address(&full).as_deref(), Some("10.10.14.3"));
+        // "You" is this machine's address on its own network, not the tunnel's.
+        assert_eq!(primary_address(&full).as_deref(), Some("192.168.1.5"));
+        // What needs a look comes right after the headline, marked as such.
+        let flagged: Vec<(&str, bool, bool)> = report.sections[2..4]
+            .iter()
+            .map(|s| (s.title.as_str(), s.open, s.warn))
+            .collect();
+        assert_eq!(
+            flagged,
+            [
+                ("Route warnings", true, true),
+                ("Could not be read", true, true)
+            ]
+        );
+        assert_eq!(
+            report.sections[3].lines,
+            ["`arp` is not installed or not on the PATH"]
+        );
+        assert!(report.sections.iter().filter(|s| s.warn).count() == 2);
+
+        // The other way a VPN client takes everything: two half-routes
+        // beside the untouched default route.
+        let mut halves = local.clone();
+        for destination in ["0.0.0.0/1", "128.0.0.0/1"] {
+            halves.routes.push(Route {
+                destination: destination.into(),
+                gateway: Some("10.10.14.1".into()),
+                interface: "tun0".into(),
+            });
+        }
+        let report = machine_report(&halves);
+        assert_eq!(
+            report.vpn,
+            ["tun0 10.10.14.3/23: carries all IPv4 traffic (0.0.0.0/1 and 128.0.0.0/1)"]
+        );
+        assert_eq!(
+            report.connection,
+            ["eth0 (ethernet) 192.168.1.5/24, gateway 192.168.1.1 and fe80::1"]
+        );
+
+        // Nothing but the tunnel in use: then the tunnel is the connection.
+        let mut tunnel = full.clone();
+        tunnel.interfaces.retain(|i| i.name == "tun0");
+        let report = machine_report(&tunnel);
+        assert_eq!(
+            report.connection,
+            ["tun0 (vpn) 10.10.14.3/23, default route without a gateway"]
+        );
+        assert_eq!(primary_address(&tunnel).as_deref(), Some("10.10.14.3"));
 
         // No VPN, no default route, and nothing at all.
         let mut island = local.clone();

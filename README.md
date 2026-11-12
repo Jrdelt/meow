@@ -83,7 +83,8 @@ the CISA known-exploited catalog.
 
 Both `meow map` and `meow hud` always show how this machine is connected (the
 interface, its address and the gateway) and whether a VPN is up, with the
-networks that VPN carries. The map has a badge for it in the header and a
+networks that VPN carries. The local link stays listed while a VPN is up, also
+when the VPN takes all traffic. The map has a badge for it in the header and a
 "This machine" panel; the HUD has a line under its header.
 
 Below that is everything meow read about the machine: interfaces, routes,
@@ -91,6 +92,11 @@ listening ports and the neighbour table. On the map these unfold on a click;
 in the HUD press `m`. The tables are read from the operating system every 30
 seconds, so a VPN that connects during a session shows up by itself. Nothing
 is sent to find any of it out.
+
+If one of the system tools behind these tables cannot be run, the session says
+so when it starts (`[!] Local network not fully read: ...`) and the panel lists
+it under "Could not be read". An empty table then means it was not read, not
+that there is nothing there.
 
 ## Modes
 

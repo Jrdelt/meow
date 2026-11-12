@@ -55,7 +55,7 @@ Before every push:
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
   list`, `meow delete`, the sketched map and fixes from real macOS runs.
-- **Last Verified Commit:** `feat(machine)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `fix(observer)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -63,9 +63,9 @@ Before every push:
   `assets/`); Phase 4 (`vault`, `ai`, `report`); `install.sh`; `tests/*.rs`.
 - **In-Progress / Partial Work:** None.
 - **Next Exact Action:** Wait for the owner's macOS results: `cargo test
-  --no-fail-fast`, how the map looks there, and (if the banner still shows 0
-  neighbours / 0 listeners) `arp -an` and `netstat -an -p tcp`. Unverified:
-  real `katana`/`feroxbuster`, a real `[L]`/`[C]`/`[R]` request, Windows.
+  --no-fail-fast`, how the map looks, and the session banner (`not fully read`
+  names an OS tool that failed). Unverified: real `katana`/`feroxbuster`, a
+  real `[L]`/`[C]`/`[R]` request, Windows.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY

@@ -309,6 +309,9 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
         // Passive, zero-packet look at the local network tables.
         let graph = state.graph();
         println!("[+] Local network: {}", observer::summary(&graph.local));
+        for note in &graph.local.notes {
+            println!("[!] Local network not fully read: {note}");
+        }
         for warning in &graph.local.warnings {
             println!("[!] {warning}");
         }

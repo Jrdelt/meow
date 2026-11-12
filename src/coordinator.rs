@@ -708,6 +708,7 @@ fn same_tables(a: &LocalNet, b: &LocalNet) -> bool {
         && a.neighbors == b.neighbors
         && a.listeners == b.listeners
         && a.warnings == b.warnings
+        && a.notes == b.notes
 }
 
 /// Re-reads the local network tables periodically (passive, zero packets).

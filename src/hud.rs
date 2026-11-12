@@ -511,11 +511,7 @@ fn machine_lines(report: &MachineReport) -> Vec<Line<'static>> {
             lines.push(Line::raw(""));
         }
         lines.push(Line::styled(section.title.clone(), TITLE));
-        let style = if section.title == "Route warnings" {
-            WARN
-        } else {
-            Style::default()
-        };
+        let style = if section.warn { WARN } else { Style::default() };
         for line in &section.lines {
             lines.push(Line::styled(format!("  {}", sanitize(line, 400)), style));
         }

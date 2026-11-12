@@ -306,6 +306,10 @@ pub struct LocalNet {
     /// One-line subnet / interface route warnings.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// OS tools that could not be run or failed without output. An empty
+    /// table above then means "could not be read", not "nothing there".
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// One parsed fact, ready to be merged into the graph.

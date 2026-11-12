@@ -341,7 +341,7 @@
     machine.sections.forEach(function (section) {
       var name = section.title.replace(/ \(\d+\)$/, '');
       var lines = section.lines.map(function (line) {
-        return el('div', name === 'Route warnings' ? 'warn-text' : 'mono', line);
+        return el('div', section.warn ? 'warn-text' : 'mono', line);
       });
       if (section.open) {
         box.appendChild(el('h3', null, section.title));
