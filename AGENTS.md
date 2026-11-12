@@ -45,29 +45,26 @@ Before every push:
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
-4. Update `## Current Handoff State` in place.
-5. Stage source/doc files only, then
-   `git commit -m "feat(phaseX-stepY): <summary>"` and `git push -u origin HEAD`.
-6. If the push needs a hardware key touch or `origin` is missing, print the
-   exact command and wait.
+4. Update `## Current Handoff State
 
-## Current Handoff State
-
-- **Active Phase & Step:** Phase 1, Step 1 complete (repo and handoff scaffold).
-- **Last Verified Commit:** `feat(phase1-step1)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** Phase 1, Step 2 complete (C tap filter + FFI tests).
+- **Last Verified Commit:** `feat(phase1-step2)` — see `git log -n 1 --oneline`.
 - **Completed Files:** `Cargo.toml`, `Cargo.lock`, `build.rs`, `.gitignore`,
-  `AGENTS.md`, `CLAUDE.md`, `SPEC.md`.
-- **In-Progress / Partial Work:** none.
-- **Next Exact Action:** Phase 1, Step 2 — write `src/c/tap_filter.h` and
-  `src/c/tap_filter.c` (stateful ECMA-48 filter: GROUND/ESCAPE/CSI/OSC + UTF-8
-  continuation state, `\r` rewind, `?1049h`/`?1049l` pause, binary and
-  password-prompt drop), then `src/tap.rs` FFI bindings with unit tests.
+  `AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `src/c/tap_filter.h`,
+  `src/c/tap_filter.c`, `src/tap.rs` (21 tests), `src/lib.rs`.
+- **In-Progress / Partial Work:** `src/main.rs` is a version-printing stub,
+  replaced in Step 3.
+- **Next Exact Action:** Phase 1, Step 3 — write `src/cli.rs` (clap derive:
+  bare `meow`, `meow <name> [--local]`, `mode`, `recon <target> [-- flags]`,
+  `map`, `hud`, `add <file>`, `report`) and wire `src/main.rs` to it with the
+  `MEOW_SESSION` anti-nesting check (exit code 1 before touching the terminal).
 - **Blockers / Notes:**
-  - No `src/` yet, so `cargo build`/`test`/`clippy` cannot run until
-    `src/main.rs` and `src/c/tap_filter.c` exist. Step 1 was verified with
-    `cargo tree --depth 1` (dependency resolution) only.
-  - `Cargo.toml` lists Phase 1 crates only; add each later-phase crate from
-    the SPEC §7 baseline in the step that first uses it.
+  - `Cargo.toml` lists Phase 1 crates only (owner decision); add each
+    later-phase crate from the SPEC §7 baseline in the step that first uses it.
   - Terminal control comes from `ratatui::crossterm`; do not add a direct
     `crossterm` dependency.
+  - Library modules are exposed through `src/lib.rs` so unused public APIs
+    pass `clippy -D warnings` before the binary wires them up.
+  - `TapFilter` allocates `tap_state_t` using `tap_state_size()` from C; never
+    mirror the struct layout in Rust.
   - Windows NTFS ACL crate is added with the workspace-permissions step.
