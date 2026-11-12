@@ -32,12 +32,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
+use crate::ai::{self, AiEngine, Tier};
 use crate::checklist;
 use crate::cve::CveClient;
 use crate::db::Db;
 use crate::endpoint::Target;
 use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
-use crate::graph::{Graph, LocalNet, Observation};
+use crate::graph::{Graph, Host, LocalNet, Observation};
 use crate::mode::Mode;
 use crate::observer;
 use crate::parsers::text::TextParser;
@@ -45,6 +46,7 @@ use crate::pty::LineSink;
 use crate::queue;
 use crate::timeutil::now_rfc3339;
 use crate::topology::Topology;
+use crate::vault::Vault;
 use crate::webui;
 use crate::workspace::{write_private_atomic, Config, Workspace};
 
@@ -142,6 +144,24 @@ pub enum Command {
     },
     /// Puts unfinished tasks back on the queue.
     Resume,
+    /// Starts an AI request for a host (`[L]`, `[C]` or `[R]`).
+    Ai {
+        tier: Tier,
+        address: String,
+    },
+}
+
+/// The AI request that is running, or the last one that finished.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AiStatus {
+    pub running: bool,
+    pub tier: Option<Tier>,
+    pub address: Option<String>,
+    /// The reply so far (it grows while the request streams in).
+    pub text: String,
+    pub error: Option<String>,
+    /// One line about the finished request: tier, model, cost, file.
+    pub summary: Option<String>,
 }
 
 /// Everything the coordinator owns, shared between its tasks.
@@ -160,6 +180,11 @@ pub struct State {
     ground_queue: mpsc::UnboundedSender<String>,
     recon_queue: mpsc::UnboundedSender<i64>,
     cve: Option<CveClient>,
+    vault: Mutex<Vault>,
+    ai: AiEngine,
+    ai_status: Mutex<AiStatus>,
+    /// The coordinator's runtime, for work started from any thread.
+    handle: tokio::runtime::Handle,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -280,6 +305,8 @@ impl State {
             "topology": Topology::build(&graph).cytoscape(&graph),
             "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
             "notices": &*lock(&self.notices),
+            "ai": &*lock(&self.ai_status),
+            "budget": self.ai.budget(),
         })
     }
 
@@ -392,7 +419,100 @@ impl State {
                 )
             }
             Command::Resume => Ok(json!({ "resumed": self.resume_unfinished()? })),
+            Command::Ai { tier, address } => {
+                let (graph, host) = {
+                    let graph = self.graph();
+                    let host = graph
+                        .host(&address)
+                        .cloned()
+                        .with_context(|| format!("unknown host '{address}'"))?;
+                    (graph.clone(), host)
+                };
+                if tier == Tier::Research && !checklist::host_research_ready(&graph, &host) {
+                    bail!(
+                        "[R] is not ready for {}: the stack and route evidence is incomplete \
+                         (see the verification checklist)",
+                        host.address
+                    );
+                }
+                {
+                    let mut status = lock(&self.ai_status);
+                    if status.running {
+                        bail!("an AI request is already running");
+                    }
+                    *status = AiStatus {
+                        running: true,
+                        tier: Some(tier),
+                        address: Some(host.address.clone()),
+                        ..AiStatus::default()
+                    };
+                }
+                self.notice(format!(
+                    "[{}] {} started for {}",
+                    tier.key(),
+                    tier.label(),
+                    host.address
+                ));
+                let state = Arc::clone(self);
+                self.handle
+                    .spawn(async move { state.run_ai(tier, graph, host).await });
+                Ok(json!({ "started": true, "tier": tier }))
+            }
         }
+    }
+}
+
+impl State {
+    /// Runs one AI request to the end, streaming the reply into the status
+    /// that the HUD and the map show, then saves it under `chats/`.
+    async fn run_ai(self: Arc<Self>, tier: Tier, graph: Graph, host: Host) {
+        let streamer = Arc::clone(&self);
+        let mut on_text = move |piece: &str| {
+            if !piece.is_empty() {
+                lock(&streamer.ai_status).text.push_str(piece);
+                streamer.touch();
+            }
+        };
+        let result = self
+            .ai
+            .run(tier, &graph, &host, &self.vault, &mut on_text)
+            .await;
+        let line = match result {
+            Ok(outcome) => {
+                let saved = ai::append_chat(&self.workspace_dir().join("chats"), &host, &outcome);
+                let file = match &saved {
+                    Ok(path) => format!(
+                        "saved to chats/{}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    Err(error) => format!("not saved: {error:#}"),
+                };
+                let how = match (&outcome.fallback_reason, outcome.cached) {
+                    (Some(reason), _) => format!("answered locally ({reason})"),
+                    (None, true) => "answered from the prompt cache".to_owned(),
+                    (None, false) => format!("answered by {}", outcome.model),
+                };
+                let line = format!(
+                    "[{}] for {} {how}, ${:.4}, {file}",
+                    tier.key(),
+                    host.address,
+                    outcome.cost_usd
+                );
+                let mut status = lock(&self.ai_status);
+                status.running = false;
+                status.text = outcome.text;
+                status.summary = Some(line.clone());
+                line
+            }
+            Err(error) => {
+                let line = format!("[{}] for {} failed: {error:#}", tier.key(), host.address);
+                let mut status = lock(&self.ai_status);
+                status.running = false;
+                status.error = Some(format!("{error:#}"));
+                line
+            }
+        };
+        self.notice(line);
     }
 }
 
@@ -740,6 +860,8 @@ impl Coordinator {
         let mut graph = Graph::load(&workspace.graph_path())?;
         graph.local = observer::observe(&graph.target_ips());
         let db = Arc::new(Mutex::new(Db::open(&workspace.state_db_path())?));
+        let vault = Vault::open(Arc::clone(&db))?;
+        let engine = AiEngine::new(config.ai.clone(), Arc::clone(&db))?;
         let cve = if config.cve.enabled {
             Some(CveClient::new(config.cve.clone(), Arc::clone(&db))?)
         } else {
@@ -775,6 +897,10 @@ impl Coordinator {
             ground_queue,
             recon_queue,
             cve,
+            vault: Mutex::new(vault),
+            ai: engine,
+            ai_status: Mutex::new(AiStatus::default()),
+            handle: runtime.handle().clone(),
         });
 
         let app = router(Arc::clone(&state));
@@ -854,6 +980,7 @@ mod tests {
     use super::*;
     use crate::ipc;
     use crate::workspace::MeowHome;
+    use axum::routing::post;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -1348,6 +1475,102 @@ mod tests {
             host.ports["22/tcp"].facts[0].record.verification_status,
             VerificationStatus::Observed
         );
+    }
+
+    /// A stand-in for a local OpenAI-compatible server, on its own thread.
+    fn local_model_server() -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            block_on(async {
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(|Json(body): Json<Value>| async move {
+                        let asked = body["messages"][1]["content"].as_str().unwrap_or("").to_owned();
+                        let host = if asked.contains("10.0.0.5") { "10.0.0.5" } else { "?" };
+                        Json(json!({ "choices": [ { "message": {
+                            "content": format!("## 1. Risk\nnginx on {host} is outdated.\n## 2. Fix\nUpgrade.\n## 3. Rule\nalert") } } ] }))
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(format!("http://{}/v1", listener.local_addr().unwrap()))
+                    .unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        rx.recv().unwrap()
+    }
+
+    #[test]
+    fn ai_requests_stream_into_the_status_and_are_saved_per_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        config.ai.local_url = local_model_server();
+        let coordinator = Coordinator::start(workspace.clone(), config).unwrap();
+        let state = coordinator.state();
+
+        let ask = |tier: Tier, address: &str| {
+            state.execute(Command::Ai {
+                tier,
+                address: address.to_owned(),
+            })
+        };
+        assert!(ask(Tier::Local, "10.0.0.5")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown host"));
+
+        let items = crate::parsers::nmap::parse(crate::parsers::nmap::SAMPLE).unwrap();
+        state
+            .execute(Command::Observations {
+                items,
+                ground: false,
+            })
+            .unwrap();
+        // Deep research needs stack and route evidence first.
+        let refused = ask(Tier::Research, "10.0.0.5").unwrap_err().to_string();
+        assert!(
+            refused.contains("[R] is not ready for 10.0.0.5"),
+            "{refused}"
+        );
+
+        assert_eq!(ask(Tier::Local, "10.0.0.5").unwrap()["started"], true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = state.snapshot()["ai"].clone();
+            if status["running"] == false && status["summary"].is_string() {
+                assert_eq!(status["tier"], "local");
+                assert_eq!(status["address"], "10.0.0.5");
+                assert!(status["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nginx on 10.0.0.5 is outdated."));
+                assert!(status["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("saved to chats/10.0.0.5.md"));
+                break;
+            }
+            assert!(status["error"].is_null(), "{status}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the AI request never finished: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let chat = std::fs::read_to_string(workspace.chats_dir().join("10.0.0.5.md")).unwrap();
+        assert!(chat.contains("[L] Local triage"), "{chat}");
+        assert!(chat.contains("nginx on 10.0.0.5 is outdated."), "{chat}");
+        assert!(chat.contains("_Cost: $0.0000_"), "{chat}");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot["budget"]["calls"], 0, "local calls are free");
+        assert_eq!(snapshot["budget"]["max_calls"], 20);
+        assert!(snapshot["notices"]
+            .to_string()
+            .contains("[L] for 10.0.0.5 answered by local"));
     }
 
     #[test]

@@ -241,6 +241,32 @@
       detail.appendChild(el('div', 'dim', (ordered.length - 60) + ' more not shown; see `meow hud` or the report.'));
     }
 
+    detail.appendChild(el('h3', null, 'Ask AI'));
+    var ready = Object.keys(state.checklists[host.address] || {}).some(function (id) {
+      return state.checklists[host.address][id].research_ready;
+    });
+    var ask = detail.appendChild(el('div', 'actions'));
+    [['local', '[L] Local'], ['cloud', '[C] Cloud triage'], ['research', '[R] Deep research']].forEach(function (tier) {
+      var button = ask.appendChild(el('button', null, tier[1]));
+      if (tier[0] === 'research' && !ready) {
+        button.disabled = true;
+        button.title = 'Needs stack and route evidence first (see the checklist).';
+      }
+      button.addEventListener('click', function () {
+        send({ cmd: 'ai', tier: tier[0], address: host.address });
+      });
+    });
+    var budget = state.budget || {};
+    detail.appendChild(el('div', 'dim', 'Cloud today: $' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
+      (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
+    var ai = state.ai || {};
+    if (ai.address === host.address && (ai.running || ai.text || ai.error)) {
+      var reply = detail.appendChild(el('div', 'card'));
+      reply.appendChild(el('div', 'dim', ai.running ? 'Running ...' : (ai.summary || '')));
+      reply.appendChild(el('pre', 'reply', ai.text || ''));
+      if (ai.error) { reply.appendChild(el('div', 'bad-text', ai.error)); }
+    }
+
     detail.appendChild(el('h3', null, 'Evidence'));
     var facts = detail.appendChild(el('ul'));
     (host.facts || []).forEach(function (fact) { facts.appendChild(factItem(fact)); });

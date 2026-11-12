@@ -53,27 +53,25 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 4, Step 1 complete (Privacy Vault). Owner
-  asked to build straight through Phase 4 without pausing; checkpoint after
-  every step.
-- **Last Verified Commit:** `feat(phase4-step1)` — see `git log -n 1
+- **Active Phase & Step:** Phase 4, Step 2 complete (AI tiers [L]/[C]/[R],
+  LLM01 sandboxing, budget lock, chats). Owner asked to build straight through
+  Phase 4 without pausing.
+- **Last Verified Commit:** `feat(phase4-step2)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
   Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
   `assets/`). Tests: per module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
-- **In-Progress / Partial Work:** `meow report` reports "not built yet". The
-  vault is not called by anything yet; `ai_usage` and `prompt_cache` tables
-  are unused. No AI tier exists; the HUD has no `[L]`/`[C]`/`[R]` keys yet.
-- **Next Exact Action:** Phase 4, Step 2 — `src/ai.rs`: `[ai]` config (local
-  URL/model, OpenRouter model, `max_daily_usd`, `max_daily_calls`; API key
-  from `$OPENROUTER_API_KEY`), OWASP LLM01 prompt builder (scraped text only
-  inside an untrusted JSON data field), `[L]` local OpenAI-compatible client,
-  `[C]` OpenRouter triage with SHA-256 prompt cache + daily budget and
-  fallback to `[L]`, `[R]` `openrouter:web_search` research on vaulted
-  identifiers only, exact `usage` cost into `ai_usage`; `Command::Ai`, HUD
-  keys, `chats/<host>.md`. Then Step 3: `meow report`.
+- **In-Progress / Partial Work:** `meow report` reports "not built yet"; it is
+  the only command left. AI tiers were tested against stand-in servers only:
+  no real OpenRouter or local-model request has ever been made.
+- **Next Exact Action:** Phase 4, Step 3 — `src/report.rs` + `meow report`:
+  compile `REPORT.md` in the workspace from `graph.json` (Mermaid topology via
+  `Topology::mermaid`), `Confirmed` findings separate from
+  `UnverifiedHypothesis` items (and false positives), route warnings, secrets
+  to rotate (`Vault::exposed_secrets`), task history, `replay.sh` and
+  `chats/*.md`; no AI, no network. Then finish: README, final handoff.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY

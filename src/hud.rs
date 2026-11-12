@@ -25,8 +25,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::ai::{Budget, Tier};
 use crate::checklist;
-use crate::coordinator::{Command, Notice, RuntimeInfo};
+use crate::coordinator::{AiStatus, Command, Notice, RuntimeInfo};
 use crate::db::Db;
 use crate::evidence::{sanitize, VerificationStatus};
 use crate::graph::{Advisory, Graph, Host, PathNode};
@@ -47,6 +48,10 @@ pub struct Snapshot {
     pub tasks: Vec<TaskRow>,
     #[serde(default)]
     pub notices: Vec<Notice>,
+    #[serde(default)]
+    pub ai: AiStatus,
+    #[serde(default)]
+    pub budget: Budget,
 }
 
 impl Snapshot {
@@ -63,6 +68,8 @@ impl Snapshot {
             graph: Graph::load(&workspace.graph_path())?,
             tasks,
             notices: Vec::new(),
+            ai: AiStatus::default(),
+            budget: Budget::default(),
         })
     }
 }
@@ -91,6 +98,8 @@ pub struct Model {
     /// The note being typed in the catch-up box, if it is open.
     pub note: Option<String>,
     pub status: String,
+    /// The upper-right panel shows the AI reply instead of the inspector.
+    pub show_ai: bool,
 }
 
 fn advisory_rank(advisory: &Advisory) -> (bool, i64) {
@@ -109,6 +118,7 @@ impl Model {
             inspector_scroll: 0,
             note: None,
             status: String::new(),
+            show_ai: false,
         }
     }
 
@@ -218,6 +228,22 @@ impl Model {
         })
     }
 
+    fn ask_ai(&mut self, tier: Tier) -> Action {
+        let Some(host) = self.selected_host() else {
+            self.status = "select a host first".to_owned();
+            return Action::None;
+        };
+        let command = Command::Ai {
+            tier,
+            address: host.address.clone(),
+        };
+        if self.live {
+            self.show_ai = true;
+            self.inspector_scroll = 0;
+        }
+        Action::Send(command)
+    }
+
     /// Handles one key press and says what, if anything, to do about it.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -283,6 +309,14 @@ impl Model {
             KeyCode::Char('c') => self.verdict(VerificationStatus::Confirmed),
             KeyCode::Char('f') => self.verdict(VerificationStatus::FalsePositive),
             KeyCode::Char('u') => self.verdict(VerificationStatus::UnverifiedHypothesis),
+            KeyCode::Char('L') => self.ask_ai(Tier::Local),
+            KeyCode::Char('C') => self.ask_ai(Tier::Cloud),
+            KeyCode::Char('R') => self.ask_ai(Tier::Research),
+            KeyCode::Char('a') => {
+                self.show_ai = !self.show_ai;
+                self.inspector_scroll = 0;
+                Action::None
+            }
             KeyCode::Char('1') => Action::Send(Command::SetMode { mode: Mode::Light }),
             KeyCode::Char('2') => Action::Send(Command::SetMode { mode: Mode::Mild }),
             KeyCode::Char('3') => Action::Send(Command::SetMode {
@@ -469,6 +503,16 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
             snapshot.graph.advisory_count()
         )),
         link,
+        Span::styled(
+            format!(
+                " | cloud ${:.2} of ${:.2}, {} of {} calls today",
+                snapshot.budget.spent_usd,
+                snapshot.budget.max_usd,
+                snapshot.budget.calls,
+                snapshot.budget.max_calls
+            ),
+            DIM,
+        ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -629,9 +673,56 @@ fn draw_footer(frame: &mut Frame, area: Rect, model: &Model) {
     let help = if model.note.is_some() {
         " Enter save   Esc cancel"
     } else {
-        " Up/Down select   Tab panel   n note   c confirm   f false positive   u reopen   1/2/3 mode   PgUp/PgDn scroll   q quit"
+        " Up/Down select  Tab panel  n note  c confirm  f false positive  u reopen  L/C/R ask AI  a AI view  1/2/3 mode  PgUp/PgDn scroll  q quit"
     };
     frame.render_widget(Paragraph::new(Line::styled(help, DIM)), help_area);
+}
+
+fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+    let ai = &snapshot.ai;
+    let title = match (ai.tier, &ai.address) {
+        (Some(tier), Some(address)) => format!(
+            "AI: [{}] {} for {address}{}",
+            tier.key(),
+            tier.label(),
+            if ai.running { " (running)" } else { "" }
+        ),
+        _ => "AI: press L (local), C (cloud) or R (research) on a host".to_owned(),
+    };
+    let mut lines: Vec<Line> = ai
+        .text
+        .lines()
+        .map(|line| {
+            let line = sanitize(line, 2000);
+            if line.starts_with('#') {
+                Line::styled(line, TITLE)
+            } else {
+                Line::raw(line)
+            }
+        })
+        .collect();
+    if let Some(error) = &ai.error {
+        lines.push(Line::styled(sanitize(error, 600), BAD));
+    }
+    if let Some(summary) = &ai.summary {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(sanitize(summary, 400), DIM));
+    }
+    if lines.is_empty() {
+        let hint = if ai.running {
+            "Waiting for the model ..."
+        } else {
+            "No AI reply yet."
+        };
+        lines.push(Line::styled(hint, DIM));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((model.inspector_scroll, 0))
+            .block(panel(&title, true)),
+        area,
+    );
 }
 
 /// Draws the whole panel. Pure: everything comes from `model`.
@@ -653,19 +744,23 @@ pub fn draw(frame: &mut Frame, model: &Model) {
     let [inspector, advisories] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
     draw_hosts(frame, hosts, model, snapshot);
-    let lines = match model.selected_host() {
-        Some(host) => inspector_lines(host),
-        None => vec![Line::styled(
-            "No hosts yet. Import a scan with `meow add <file>`, or work in the session shell.",
-            DIM,
-        )],
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((model.inspector_scroll, 0))
-            .block(panel("Inspector: node, ports and sub-paths", false)),
-        inspector,
-    );
+    if model.show_ai {
+        draw_ai(frame, inspector, model, snapshot);
+    } else {
+        let lines = match model.selected_host() {
+            Some(host) => inspector_lines(host),
+            None => vec![Line::styled(
+                "No hosts yet. Import a scan with `meow add <file>`, or work in the session shell.",
+                DIM,
+            )],
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((model.inspector_scroll, 0))
+                .block(panel("Inspector: node, ports and sub-paths", false)),
+            inspector,
+        );
+    }
     draw_advisories(frame, advisories, model, snapshot);
     draw_activity(frame, activity, snapshot);
 }
@@ -858,7 +953,8 @@ mod tests {
                         { "stage": "crawl", "status": "pending", "detail": "" },
                         { "stage": "dirs", "status": "pending", "detail": "" } ] } ],
                 "notices": [ { "at": "2026-11-12T09:41:00Z", "text": "not running as root: -sS replaced with -sT (connect scan)" } ],
-                "checklists": {}, "topology": {}
+                "checklists": {}, "topology": {},
+                "budget": { "spent_usd": 0.25, "calls": 3, "max_usd": 1.0, "max_calls": 20 }
             }
         })
         .to_string()
@@ -916,7 +1012,9 @@ mod tests {
             "recon 10.10.10.0/23 ports:done services:running crawl:pending dirs:pending",
             "Notices",
             "09:41:00 not running as root: -sS replaced with -sT (connect scan)",
-            "n note   c confirm   f false positive",
+            "n note  c confirm  f false positive",
+            "L/C/R ask AI",
+            "| cloud $0.25 of $1.00, 3 of 20 calls today",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
@@ -973,6 +1071,73 @@ mod tests {
             model.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Quit
         );
+    }
+
+    #[test]
+    fn ai_keys_ask_for_the_selected_host_and_show_the_reply() {
+        let mut model = model();
+        // Lower-case c is "confirm"; the AI tiers are the capital letters.
+        for (key_char, tier) in [
+            ('L', Tier::Local),
+            ('C', Tier::Cloud),
+            ('R', Tier::Research),
+        ] {
+            assert_eq!(
+                model.on_key(key(KeyCode::Char(key_char))),
+                Action::Send(Command::Ai {
+                    tier,
+                    address: "10.10.10.5".into(),
+                })
+            );
+        }
+        assert!(model.show_ai, "asking switches to the AI view");
+        let text = screen(&model, 160, 46);
+        assert!(
+            text.contains("AI: press L (local), C (cloud) or R (research) on a host"),
+            "{text}"
+        );
+        assert!(text.contains("No AI reply yet."), "{text}");
+
+        // The reply streams in through state updates.
+        let mut state: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        state["state"]["ai"] = json!({
+            "running": true, "tier": "cloud", "address": "10.10.10.5",
+            "text": "## 1. Evidence-Backed Risk\nUpgrade nginx\u{1b}[2J on 10.10.10.5", "error": null, "summary": null
+        });
+        model.apply_message(&state.to_string());
+        let text = screen(&model, 160, 46);
+        assert!(
+            text.contains("AI: [C] Cloud triage for 10.10.10.5 (running)"),
+            "{text}"
+        );
+        assert!(text.contains("## 1. Evidence-Backed Risk"), "{text}");
+        assert!(text.contains("Upgrade nginx[2J on 10.10.10.5"), "{text}");
+
+        state["state"]["ai"]["running"] = json!(false);
+        state["state"]["ai"]["error"] =
+            json!("the model server answered HTTP 402: Insufficient credits");
+        state["state"]["ai"]["summary"] = json!(
+            "[C] for 10.10.10.5 answered by test/triage, $0.0042, saved to chats/10.10.10.5.md"
+        );
+        model.apply_message(&state.to_string());
+        let text = screen(&model, 160, 46);
+        assert!(!text.contains("(running)"), "{text}");
+        assert!(text.contains("HTTP 402: Insufficient credits"), "{text}");
+        assert!(text.contains("saved to chats/10.10.10.5.md"), "{text}");
+
+        // `a` goes back to the inspector.
+        model.on_key(key(KeyCode::Char('a')));
+        assert!(screen(&model, 160, 46).contains("Inspector: node, ports and sub-paths"));
+
+        // Without a session nothing is sent, and without a host nothing is asked.
+        let mut offline = Model::new(false);
+        offline.apply_message(&state_message(&graph()));
+        assert_eq!(offline.on_key(key(KeyCode::Char('C'))), Action::None);
+        assert!(offline.status.starts_with("read-only"));
+        let mut empty = Model::new(true);
+        empty.apply_message(&state_message(&Graph::default()));
+        assert_eq!(empty.on_key(key(KeyCode::Char('L'))), Action::None);
+        assert_eq!(empty.status, "select a host first");
     }
 
     #[test]

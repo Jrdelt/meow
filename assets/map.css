@@ -36,3 +36,6 @@ button:hover { border-color: var(--accent); }
 textarea { width: 100%; min-height: 54px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 6px; font: inherit; }
 #warning-list li { color: var(--warn); }
 #flash { position: fixed; left: 14px; bottom: 14px; background: #5a2323; color: #fff; padding: 8px 12px; border-radius: 6px; max-width: 60%; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+pre.reply { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: 6px 0 0; }
+.bad-text { color: var(--bad); }

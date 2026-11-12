@@ -558,18 +558,18 @@ impl Vault {
             .into_owned()
     }
 
-    /// Sensitive values that are still present in `text` after masking.
-    /// Used as a last check before a request leaves the machine.
+    /// Kinds of sensitive values still present in `text` after masking
+    /// (`HOST`, `SEC`, ...). Used as a last check before a request leaves
+    /// the machine: anything found here means the request must not be sent.
     pub fn leaks(&self, text: &str) -> Vec<String> {
-        let lower = text.to_ascii_lowercase();
         let mut found: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.kind != Kind::Lit && entry.value.len() >= 4)
-            .filter(|(_, entry)| lower.contains(&entry.value.to_ascii_lowercase()))
-            .map(|(token, _)| token.clone())
+            .detect(text)
+            .into_iter()
+            .filter(|(_, _, kind)| *kind != Kind::Lit)
+            .map(|(_, _, kind)| kind.tag().to_owned())
             .collect();
         found.sort();
+        found.dedup();
         found
     }
 
@@ -598,10 +598,15 @@ impl Vault {
         self.entries.is_empty()
     }
 
-    /// An unmasker for a reply that arrives in pieces.
-    pub fn stream(&self) -> StreamUnmasker<'_> {
+    /// An unmasker for a reply that arrives in pieces. It owns a copy of
+    /// the placeholder table, so it can outlive a lock on the vault.
+    pub fn stream(&self) -> StreamUnmasker {
         StreamUnmasker {
-            vault: self,
+            values: self
+                .entries
+                .iter()
+                .map(|(token, entry)| (token.clone(), entry.value.clone()))
+                .collect(),
             held: String::new(),
         }
     }
@@ -610,12 +615,23 @@ impl Vault {
 /// Unmasks streamed text. A placeholder may be split across chunks, so text
 /// from a possible placeholder start (`<` or `<<...`) is held back until the
 /// placeholder is complete or it is clear that it is not one.
-pub struct StreamUnmasker<'a> {
-    vault: &'a Vault,
+pub struct StreamUnmasker {
+    values: HashMap<String, String>,
     held: String,
 }
 
-impl StreamUnmasker<'_> {
+impl StreamUnmasker {
+    fn unmask(&self, text: &str) -> String {
+        TOKEN
+            .replace_all(text, |found: &regex::Captures| {
+                match self.values.get(&found[0]) {
+                    Some(value) => value.clone(),
+                    None => found[0].to_owned(),
+                }
+            })
+            .into_owned()
+    }
+
     /// Adds a chunk and returns the text that is safe to show now.
     pub fn push(&mut self, chunk: &str) -> String {
         self.held.push_str(chunk);
@@ -632,12 +648,13 @@ impl StreamUnmasker<'_> {
             _ => self.held.len(),
         };
         let ready: String = self.held.drain(..cut).collect();
-        self.vault.unmask(&ready)
+        self.unmask(&ready)
     }
 
     /// Returns whatever is still held back, at the end of the stream.
     pub fn finish(&mut self) -> String {
-        self.vault.unmask(&std::mem::take(&mut self.held))
+        let rest = std::mem::take(&mut self.held);
+        self.unmask(&rest)
     }
 }
 
@@ -702,7 +719,10 @@ mod tests {
             text.replace("APP.corp-acme.com", "app.corp-acme.com")
         );
         assert!(vault.leaks(&masked).is_empty());
-        assert_eq!(vault.leaks("see 10.10.10.5"), ["<<HOST_01>>"]);
+        assert_eq!(
+            vault.leaks("see 10.10.10.5 as alice@corp-acme.com"),
+            ["DOM", "HOST", "USER"]
+        );
     }
 
     #[test]
@@ -841,7 +861,7 @@ mod tests {
         let text = serde_json::to_string(&masked).unwrap();
         assert!(serde_json::from_str::<Value>(&text).is_ok());
         // The leak check catches a sensitive value used as a key.
-        assert_eq!(vault.leaks(&text), ["<<HOST_01>>"]);
+        assert_eq!(vault.leaks(&text), ["HOST"]);
     }
 
     #[test]

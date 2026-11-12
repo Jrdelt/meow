@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::ai::AiSettings;
 use crate::cve::CveSettings;
 use crate::mode::Mode;
 use crate::queue::{PresetOverride, ReconSettings};
@@ -68,6 +69,20 @@ output_cap_mb = 50
 # Override the built-in nmap flags per mode, for example:
 # [recon.mild]
 # nmap_ports = ["-sS", "-T3", "--top-ports", "1000"]
+
+[ai]
+# On-demand AI help, started by hand from `meow hud` ([L], [C], [R]).
+# [L] local: an OpenAI-compatible server on this machine. Free, nothing leaves.
+local_url = "http://localhost:1234/v1"
+# local_model = ""
+# [C] cloud triage and [R] grounded research go through OpenRouter. Private
+# values are replaced by placeholders first. The key is read from the
+# OPENROUTER_API_KEY environment variable.
+cloud_model = "anthropic/claude-sonnet-5.5"
+research_model = "anthropic/claude-opus-5.5"
+# Hard daily caps for the cloud tiers; when reached, [C] answers locally.
+max_daily_usd = 1.0
+max_daily_calls = 20
 "#;
 
 /// Validates a workspace name so it is a safe single directory name on
@@ -334,6 +349,7 @@ pub struct Config {
     pub shell: Option<String>,
     pub cve: CveSettings,
     pub recon: ReconSettings,
+    pub ai: AiSettings,
 }
 
 impl Config {
@@ -1095,6 +1111,7 @@ mod tests {
                 shell: Some("/bin/zsh".into()),
                 cve: CveSettings::default(),
                 recon: ReconSettings::default(),
+                ai: AiSettings::default(),
             }
         );
 
