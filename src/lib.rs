@@ -2,12 +2,14 @@
 
 pub mod checklist;
 pub mod cli;
+pub mod coordinator;
 pub mod cpe;
 pub mod cve;
 pub mod db;
 pub mod endpoint;
 pub mod evidence;
 pub mod graph;
+pub mod ipc;
 pub mod lock;
 pub mod mode;
 pub mod observer;

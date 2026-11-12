@@ -53,31 +53,34 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 2 complete (Step 5: CVE grounding +
-  verification checklist). Owner asked to build straight through Phases 2-4
-  without pausing; checkpoint after every step.
-- **Last Verified Commit:** `feat(phase2-step5)` — see `git log -n 1
+- **Active Phase & Step:** Phase 3, Step 1 complete (session coordinator +
+  helper IPC). Owner asked to build straight through Phases 2-4 without
+  pausing; checkpoint after every step.
+- **Last Verified Commit:** `feat(phase3-step1)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
-  `pty`, `shims`, `main`, C filter); Phase 2: `db`, `timeutil`, `evidence`,
-  `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`.
-  Tests: unit tests per module plus `tests/{cli,pty,shims,cve}.rs`.
+  `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
+  `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
+  Phase 3 so far: `coordinator`, `ipc`. Tests: unit tests per module plus
+  `tests/{cli,pty,shims,cve}.rs`.
 - **In-Progress / Partial Work:** `recon`/`map`/`hud`/`report` report "not
-  built yet". `meow add` grounds CVEs synchronously (`--no-cve` skips).
-  Observer runs once at session start; live PTY tap lines are not parsed yet.
+  built yet". The coordinator's `/` route is a text stub until `meow map`.
   `tasks`/`vault`/`ai_usage`/`prompt_cache` tables are unused.
-- **Next Exact Action:** Phase 3, Step 1 — `src/coordinator.rs`: move `axum`
-  to dependencies (`ws`), run a tokio runtime inside `meow <name>` owning
-  `Graph` + `Db`; loopback server on 127.0.0.1:8765+ with a 256-bit token
-  (Bearer or `?token=`), strict `Origin` check on WebSocket upgrades,
-  `runtime.json` (0600, removed on Drop); JSON API for state/mode/notes/add;
-  feed PTY tap lines through `TextParser`; poll the observer; make helpers
-  (`mode`, `add`) use the API when a session is live.
+- **Next Exact Action:** Phase 3, Step 2 — `src/queue.rs`:
+  `tasks`/`task_stages` persistence, stage command builders (nmap ports ->
+  nmap -sV -> katana -> feroxbuster) with privilege fallback (`-sS`->`-sT`,
+  strip `-O`), wordlist check, mode presets from config/profile, one-at-a-time
+  `Semaphore`, process groups + `kill_on_drop`, stage timeout, 50 MB cap;
+  `Recon` command + `meow recon`; light mode refusal; `[Y/n]` resume of
+  interrupted tasks at session start.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it (owner decision).
     Terminal control via `ratatui::crossterm` only.
   - Parsers emit `graph::Observation`; only `Graph::apply` mutates hosts.
     Advisories enter via `Graph::add_advisory` as `UnverifiedHypothesis`.
+  - While a session is live the coordinator is the only writer of
+    `graph.json`; helpers call `ipc::send` and fall back to the files when
+    it returns `None`. New requests go into `coordinator::Command`.
   - Helper targeting: `--local`, `--session`, `$MEOW_WORKSPACE`,
     `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`.
   - `$MEOW_HOME` overrides `~/.meow` (tests). `$MEOW_TAP_LOG=<file>` dumps

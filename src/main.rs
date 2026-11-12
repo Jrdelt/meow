@@ -10,9 +10,11 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
+use meow::coordinator::{Command as Request, Coordinator};
 use meow::cve::{self, CveClient, CveSettings};
 use meow::db::Db;
 use meow::graph::Graph;
+use meow::ipc;
 use meow::lock::{LockError, SessionLock};
 use meow::observer;
 use meow::parsers;
@@ -64,25 +66,54 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let mut workspace = Workspace::load(&dir)?;
     match command {
         Command::Mode { mode, .. } => {
-            workspace.set_mode(*mode)?;
+            // A live session applies the change itself; otherwise write the
+            // profile directly.
+            if ipc::send(&workspace, &Request::SetMode { mode: *mode })?.is_none() {
+                workspace.set_mode(*mode)?;
+            }
             println!("[+] Mode set to {mode} (session: {})", workspace.name);
             Ok(ExitCode::SUCCESS)
         }
         Command::Add { file, no_cve, .. } => {
             let parsed = parsers::parse_file(file)?;
+            let skipped = match parsed.skipped {
+                0 => String::new(),
+                n => format!(", {n} lines skipped"),
+            };
+            let total = parsed.observations.len();
+            let live = ipc::send(
+                &workspace,
+                &Request::Observations {
+                    items: parsed.observations.clone(),
+                    ground: !no_cve,
+                },
+            )?;
+            if let Some(result) = live {
+                println!(
+                    "[+] {} ({}): {total} facts parsed, {} new or updated{skipped}",
+                    file.display(),
+                    parsed.format,
+                    result["changed"]
+                );
+                println!(
+                    "[+] Session '{}' now has {} hosts",
+                    workspace.name, result["hosts"]
+                );
+                if result["grounding"] == true {
+                    println!("[+] CVE lookups are running in the session (see `meow hud`)");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            // No live session: work on the files directly.
             let path = workspace.graph_path();
             let mut graph = Graph::load(&path)?;
-            let total = parsed.observations.len();
             let changed = graph.apply_all(parsed.observations);
             graph.save(&path)?;
             println!(
-                "[+] {} ({}): {total} facts parsed, {changed} new or updated{}",
+                "[+] {} ({}): {total} facts parsed, {changed} new or updated{skipped}",
                 file.display(),
                 parsed.format,
-                match parsed.skipped {
-                    0 => String::new(),
-                    n => format!(", {n} lines skipped"),
-                }
             );
             println!(
                 "[+] Session '{}' now has {} hosts",
@@ -137,8 +168,6 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
             .unwrap_or_else(|| cwd.to_path_buf()),
         env,
     };
-    let sink = tap_sink()?;
-
     println!(
         "[+] {} workspace '{}' at {} (mode: {})",
         if created { "Created" } else { "Resumed" },
@@ -146,6 +175,23 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
         workspace.dir.display(),
         workspace.profile.mode
     );
+
+    // The coordinator owns the graph, the database and the loopback server
+    // for as long as the shell runs.
+    let coordinator = Coordinator::start(workspace.clone(), config)?;
+    let state = coordinator.state();
+    println!(
+        "[+] Coordinator on 127.0.0.1:{} (`meow map`, `meow hud`)",
+        state.port
+    );
+    {
+        // Passive, zero-packet look at the local network tables.
+        let graph = state.graph();
+        println!("[+] Local network: {}", observer::summary(&graph.local));
+        for warning in &graph.local.warnings {
+            println!("[!] {warning}");
+        }
+    }
     println!(
         "[+] Session shell: {} (exit the shell to leave)",
         spec.program
@@ -157,17 +203,10 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
         );
     }
 
-    // Passive, zero-packet look at the local network tables.
-    let graph_path = workspace.graph_path();
-    let mut graph = Graph::load(&graph_path)?;
-    graph.local = observer::observe(&graph.target_ips());
-    graph.save(&graph_path)?;
-    println!("[+] Local network: {}", observer::summary(&graph.local));
-    for warning in &graph.local.warnings {
-        println!("[!] {warning}");
-    }
-
-    let outcome = pty::run_session(&spec, sink)?;
+    let sink = tee_sink(coordinator.tap_sink(), debug_tap_log()?);
+    let outcome = pty::run_session(&spec, sink);
+    coordinator.shutdown();
+    let outcome = outcome?;
 
     println!("[+] Session '{}' closed", workspace.name);
     Ok(ExitCode::from(u8::try_from(outcome.exit_code).unwrap_or(1)))
@@ -204,9 +243,21 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
     Ok(())
 }
 
-fn tap_sink() -> Result<LineSink> {
+/// Sends every tap line to both sinks.
+fn tee_sink(mut first: LineSink, second: Option<LineSink>) -> LineSink {
+    match second {
+        None => first,
+        Some(mut second) => Box::new(move |line| {
+            first(line);
+            second(line);
+        }),
+    }
+}
+
+/// `$MEOW_TAP_LOG`: a file that receives the tap's clean lines.
+fn debug_tap_log() -> Result<Option<LineSink>> {
     let Some(path) = std::env::var_os(TAP_LOG_ENV).filter(|value| !value.is_empty()) else {
-        return Ok(Box::new(|_line| {}));
+        return Ok(None);
     };
     let mut file = private_open_options()
         .append(true)
@@ -218,7 +269,7 @@ fn tap_sink() -> Result<LineSink> {
                 Path::new(&path).display()
             )
         })?;
-    Ok(Box::new(move |line| {
+    Ok(Some(Box::new(move |line| {
         let _ = writeln!(file, "{line}");
-    }))
+    })))
 }

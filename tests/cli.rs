@@ -332,6 +332,88 @@ exit 7
     assert!(!tap.contains('\x1b'), "{tap:?}");
 }
 
+/// Inside a live session, helpers go through the coordinator and terminal
+/// output is mined for facts.
+#[cfg(unix)]
+#[test]
+fn live_session_serves_helpers_and_mines_terminal_output() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home()).unwrap();
+    std::fs::write(
+        sandbox.home().join("config.toml"),
+        "[cve]\nenabled = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox.project().join("scan.xml"),
+        r#"<?xml version="1.0"?><nmaprun><host><status state="up"/><address addr="10.0.0.5" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="open"/><service name="http"/></port></ports></host></nmaprun>"#,
+    )
+    .unwrap();
+    let script = r#"cat "$MEOW_WORKSPACE/runtime.json"; echo
+"$MEOW_BIN" add scan.xml
+"$MEOW_BIN" mode mild
+echo "Discovered open port 8443/tcp on 10.0.0.77"
+exit
+"#;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meow"))
+        .arg("acme")
+        .current_dir(sandbox.project())
+        .env("MEOW_HOME", sandbox.home())
+        .env("SHELL", "/bin/sh")
+        .env("MEOW_BIN", env!("CARGO_BIN_EXE_meow"))
+        .env_remove("MEOW_SESSION")
+        .env_remove("MEOW_WORKSPACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let text = stdout(&output);
+    let workspace = sandbox.workspace("acme");
+
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("[+] Coordinator on 127.0.0.1:"), "{text}");
+    assert!(
+        text.contains("\"pid\":"),
+        "runtime.json was not readable in the session: {text}"
+    );
+    assert!(text.contains("\"token\":\""), "{text}");
+    assert!(
+        text.contains("scan.xml (Nmap XML): 2 facts parsed, 2 new or updated"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[+] Mode set to mild (session: acme)"),
+        "{text}"
+    );
+
+    // The session is over: its connection details are gone, its data is not.
+    assert!(!workspace.join("runtime.json").exists());
+    assert!(profile(&workspace).contains("mode = \"mild\""));
+    let graph: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workspace.join("graph.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        graph["hosts"]["10.0.0.5"]["ports"]["80/tcp"]["facts"][0]["source"],
+        "nmap_xml"
+    );
+    let mined = &graph["hosts"]["10.0.0.77"]["ports"]["8443/tcp"];
+    assert_eq!(mined["state"], "open", "{graph:#}");
+    assert_eq!(mined["facts"][0]["source"], "pty_regex");
+    assert_eq!(mined["facts"][0]["verification_status"], "Observed");
+}
+
 /// Shells with line editing ignore an EOF that arrives while they start up;
 /// the session must still end when its input does.
 #[cfg(unix)]
