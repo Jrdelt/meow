@@ -1,13 +1,19 @@
 //! Non-invasive per-session shell shims.
 //!
 //! The user's own startup files are never modified. Instead, each session
-//! generates small startup files under `<workspace>/tmp/shell/` that first
-//! load the user's real rc file and then attach hooks which:
+//! generates small startup files under `<workspace>/tmp/shell/` that load
+//! the user's real startup files and attach hooks which:
 //!
 //! * append every command to `replay.sh` in two stages: `# [CWD] <dir>` and
 //!   the command before it runs, `# [EXIT] <code>` once it has finished;
 //! * record the current directory in `last_cwd` for the next session;
 //! * refresh `$MEOW_MODE` from `profile.toml` at each prompt.
+//!
+//! zsh is pointed at the shim directory through `ZDOTDIR` only until its first
+//! startup file has run. That file restores the user's `ZDOTDIR` at once, so
+//! the system-wide files that follow (on macOS they decide where Terminal
+//! keeps the shell history) and the user's own `.zshrc` see the same
+//! environment as in a shell started without meow.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -53,36 +59,22 @@ Run \`meow mode mild\` (or aggressive) first if that is intended." >&2
 "##;
 
 const ZSH_ENV: &str = r##"# meow session shim (generated, rewritten at every session start).
-# Loads your own .zshenv, then keeps meow's ZDOTDIR until .zshrc has run.
-_meow_shim_dir=$ZDOTDIR
+# zsh reads this file because meow starts it with ZDOTDIR pointing here. The
+# first thing it does is hand ZDOTDIR back, so every later startup file (the
+# system's and your own) loads exactly as it does without meow. Then it loads
+# your own .zshenv and, in an interactive shell, attaches the meow hooks.
 if [[ -n ${MEOW_ORIG_ZDOTDIR-} ]]; then
-  ZDOTDIR=$MEOW_ORIG_ZDOTDIR
+  export ZDOTDIR=$MEOW_ORIG_ZDOTDIR
 else
   unset ZDOTDIR
 fi
+unset MEOW_ORIG_ZDOTDIR
 if [[ -f ${ZDOTDIR:-$HOME}/.zshenv ]]; then
   source "${ZDOTDIR:-$HOME}/.zshenv"
 fi
-# Your .zshenv may have chosen its own ZDOTDIR; remember it for .zshrc.
-_meow_user_zdotdir=${ZDOTDIR-}
-ZDOTDIR=$_meow_shim_dir
-"##;
-
-const ZSH_RC: &str = r##"# meow session shim (generated, rewritten at every session start).
-# Loads your own .zshrc with your own ZDOTDIR, then attaches the meow hooks.
-if [[ ${HISTFILE-} == "$ZDOTDIR/.zsh_history" ]]; then
-  HISTFILE=${${_meow_user_zdotdir:-$HOME}}/.zsh_history
+if [[ -o interactive ]]; then
+  source @HOOKS@
 fi
-if [[ -n ${_meow_user_zdotdir-} ]]; then
-  ZDOTDIR=$_meow_user_zdotdir
-else
-  unset ZDOTDIR
-fi
-unset _meow_shim_dir _meow_user_zdotdir MEOW_ORIG_ZDOTDIR
-if [[ -f ${ZDOTDIR:-$HOME}/.zshrc ]]; then
-  source "${ZDOTDIR:-$HOME}/.zshrc"
-fi
-source @HOOKS@
 "##;
 
 const ZSH_HOOKS: &str = r##"# meow session hooks for zsh (generated).
@@ -395,8 +387,15 @@ pub fn prepare(
     match kind {
         ShellKind::Zsh => {
             write(".zshenv", ZSH_ENV)?;
-            write(".zshrc", ZSH_RC)?;
             write("hooks.zsh", ZSH_HOOKS)?;
+            // Earlier versions kept ZDOTDIR here until a `.zshrc` shim had
+            // run; zsh now reads the user's own `.zshrc` directly.
+            match std::fs::remove_file(dir.join(".zshrc")) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    return Err(e).context("cannot remove the old .zshrc shim");
+                }
+                _ => {}
+            }
             launch.env.push(("ZDOTDIR".to_owned(), dir.into()));
             // Always set, so a stale inherited value can never be used.
             launch.env.push((
@@ -541,14 +540,26 @@ mod tests {
         let launch = prepare(&ws, "zsh", None).unwrap();
         assert_eq!(launch.env[1], ("MEOW_ORIG_ZDOTDIR".to_owned(), "".into()));
 
-        assert!(read(dir.join(".zshenv")).contains(".zshenv"));
-        let rc = read(dir.join(".zshrc"));
-        assert!(rc.find("/.zshrc").unwrap() < rc.find("hooks.zsh").unwrap());
+        // ZDOTDIR is handed back before anything else is loaded, and never
+        // pointed at the shim directory again.
+        let env = read(dir.join(".zshenv"));
+        let restore = env.find("unset ZDOTDIR").unwrap();
+        assert!(restore < env.find("/.zshenv").unwrap(), "{env}");
+        assert!(restore < env.find("hooks.zsh").unwrap(), "{env}");
+        assert_eq!(env.matches("ZDOTDIR=").count(), 1, "{env}");
+        assert!(env.contains("export ZDOTDIR=$MEOW_ORIG_ZDOTDIR"), "{env}");
+        assert_filled(&env);
         let hooks = read(dir.join("hooks.zsh"));
         assert!(hooks.contains("add-zsh-hook preexec _meow_preexec"));
         assert!(hooks.contains("add-zsh-hook precmd _meow_precmd"));
         assert_filled(&hooks);
-        assert_filled(&rc);
+
+        // zsh reads the user's own .zshrc; a shim left by an older version
+        // is removed.
+        assert!(!dir.join(".zshrc").exists());
+        fs::write(dir.join(".zshrc"), "stale").unwrap();
+        prepare(&ws, "zsh", None).unwrap();
+        assert!(!dir.join(".zshrc").exists());
     }
 
     #[test]

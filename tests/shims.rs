@@ -257,6 +257,50 @@ fn zsh_keeps_the_users_own_zdotdir() {
     assert_eq!(logged.iter().filter(|l| l.contains("nested=")).count(), 1);
 }
 
+/// zsh must read the user's `.zshrc` itself, with the user's own `ZDOTDIR`
+/// back in place. System-wide startup files run just before it and derive
+/// paths from `ZDOTDIR` (on macOS: where Terminal keeps the shell history),
+/// so nothing of the user's may end up in the shim directory.
+#[test]
+fn zsh_reads_the_users_startup_files_itself() {
+    let Some(zsh) = find_shell("zsh") else {
+        return;
+    };
+    let sandbox = Sandbox::new();
+    let home = sandbox.path("user-home");
+    std::fs::write(
+        home.join(".zshrc"),
+        "print -r -- \"context=$ZSH_EVAL_CONTEXT zdotdir=${ZDOTDIR-unset}\" > $HOME/seen\n\
+         HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history\n\
+         HISTSIZE=100\n\
+         SAVEHIST=100\n\
+         PS1='%% '\n",
+    )
+    .unwrap();
+
+    let output = sandbox.session(&zsh, "echo kept-in-my-history\nexit\n", &[]);
+    let out = text(&output);
+
+    // `file` alone: loaded by zsh, not sourced from inside a meow file.
+    let seen = std::fs::read_to_string(home.join("seen")).unwrap();
+    assert_eq!(seen.trim(), "context=file zdotdir=unset", "{out}");
+    let history = std::fs::read_to_string(home.join(".zsh_history")).unwrap();
+    assert!(history.contains("echo kept-in-my-history"), "{history}");
+
+    let mut shim: Vec<String> = std::fs::read_dir(sandbox.workspace().join("tmp/shell"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    shim.sort();
+    assert_eq!(shim, [".zshenv", "hooks.zsh"]);
+
+    // The hooks are attached all the same.
+    let project = sandbox.path("project");
+    let mut expected = entry(&project, "echo kept-in-my-history", Some(0));
+    expected.extend(entry(&project, "exit", None));
+    assert_eq!(sandbox.replay(), expected, "{out}");
+}
+
 #[test]
 fn bash_without_ps0_logs_each_command_when_it_finishes() {
     // Any bash will do: the variable forces the path that old versions take.
