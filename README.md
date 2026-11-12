@@ -126,7 +126,11 @@ one JSON field, never as instructions. Cloud use is capped per day
 (`max_daily_usd`, `max_daily_calls`); when the cap is reached, `C` answers
 locally. Identical questions are answered from a cache at no cost.
 
-Set the key in the environment: `export OPENROUTER_API_KEY=...`
+Set the key in the environment before starting the session:
+`export OPENROUTER_API_KEY=...`, then `meow <name>`. The session reads it when
+it starts, so exporting it inside a running session has no effect. Without a
+key, `C` answers with the local model and `R` is unavailable; the map and the
+HUD say so.
 
 ## Configuration
 

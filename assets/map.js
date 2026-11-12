@@ -258,7 +258,7 @@
       var lines = [d.caption || d.label];
       if (d.confirmed) { lines.push(d.confirmed + ' confirmed'); }
       if (d.hypotheses) { lines.push(d.hypotheses + ' to verify'); }
-      if (d.kind === 'host' && !d.reachable) { lines.push('no route known'); }
+      if (d.kind === 'host' && !d.reachable) { lines.push(d.by_name ? 'address not known' : 'no route known'); }
       d.text = lines.join('\n');
       return { group: 'nodes', data: d, classes: above[d.id] ? 'above' : '' };
     });
@@ -456,8 +456,13 @@
       });
     });
     var budget = state.budget || {};
-    detail.appendChild(el('div', 'dim', 'Cloud today: $' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
-      (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
+    if (budget.has_key) {
+      detail.appendChild(el('div', 'dim', 'Cloud today: $' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
+        (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
+    } else {
+      detail.appendChild(el('div', 'dim', 'No OpenRouter key in this session: [C] answers with the local model ' +
+        'and [R] is unavailable. Leave the session, run `export OPENROUTER_API_KEY=...`, then start it again.'));
+    }
     var ai = state.ai || {};
     if (ai.address === host.address && (ai.running || ai.text || ai.error)) {
       var reply = detail.appendChild(el('div', 'card'));

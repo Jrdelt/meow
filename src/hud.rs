@@ -504,13 +504,17 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         )),
         link,
         Span::styled(
-            format!(
-                " | cloud ${:.2} of ${:.2}, {} of {} calls today",
-                snapshot.budget.spent_usd,
-                snapshot.budget.max_usd,
-                snapshot.budget.calls,
-                snapshot.budget.max_calls
-            ),
+            if snapshot.budget.has_key {
+                format!(
+                    " | cloud ${:.2} of ${:.2}, {} of {} calls today",
+                    snapshot.budget.spent_usd,
+                    snapshot.budget.max_usd,
+                    snapshot.budget.calls,
+                    snapshot.budget.max_calls
+                )
+            } else {
+                " | cloud: no OpenRouter key in this session".to_owned()
+            },
             DIM,
         ),
     ]);
@@ -954,7 +958,7 @@ mod tests {
                         { "stage": "dirs", "status": "pending", "detail": "" } ] } ],
                 "notices": [ { "at": "2026-11-12T09:41:00Z", "text": "not running as root: -sS replaced with -sT (connect scan)" } ],
                 "checklists": {}, "topology": {},
-                "budget": { "spent_usd": 0.25, "calls": 3, "max_usd": 1.0, "max_calls": 20 }
+                "budget": { "spent_usd": 0.25, "calls": 3, "max_usd": 1.0, "max_calls": 20, "has_key": true }
             }
         })
         .to_string()

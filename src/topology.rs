@@ -213,13 +213,16 @@ impl Topology {
     }
 
     fn interface(&mut self, graph: &Graph, name: &str) -> NodeIndex {
+        // The address the interface is used with, not its link-local one
+        // (macOS lists `fe80::` first).
         let address = graph
             .local
             .interfaces
             .iter()
             .find(|i| i.name == name)
-            .and_then(|i| i.addresses.first().cloned())
-            .unwrap_or_default();
+            .and_then(|i| routable_address(i).or(i.addresses.first().map(String::as_str)))
+            .unwrap_or_default()
+            .to_owned();
         let label = format!("{name} {address}").trim().to_owned();
         let local = self.index[LOCAL_ID];
         let index = self.node(format!("if:{name}"), NodeKind::Interface, label);
@@ -439,6 +442,8 @@ impl Topology {
                     data["kev"] = json!(host.advisories.iter().any(|a| a.kev));
                     data["ready"] = json!(checklist::host_research_ready(graph, host));
                     data["reachable"] = json!(self.reachable(&host.address));
+                    // Known by name only: no address, so no route to derive.
+                    data["by_name"] = json!(host.address.parse::<IpAddr>().is_err());
                 }
                 json!({ "data": data })
             })
@@ -701,6 +706,21 @@ mod tests {
             (tun.kind, tun.label.as_str()),
             (NodeKind::Interface, "tun0 10.10.14.3/23")
         );
+
+        // macOS lists the link-local address first; the label and the
+        // segment use the address the interface is really used with.
+        let mut mac = graph.clone();
+        mac.local.interfaces[1].addresses = vec![
+            "fe80::1c71:9b2d:2156:23ce/64".into(),
+            "192.168.1.5/24".into(),
+        ];
+        let topology = Topology::build(&mac);
+        let eth = topology.nodes().find(|n| n.id == "if:eth0").unwrap();
+        assert_eq!(eth.label, "eth0 192.168.1.5/24");
+        let elements = topology.cytoscape(&mac);
+        let nodes = elements["nodes"].as_array().unwrap();
+        let segment = nodes.iter().find(|n| n["data"]["id"] == "if:eth0").unwrap();
+        assert_eq!(segment["data"]["network"], "192.168.1.0/24");
     }
 
     #[test]
@@ -769,6 +789,13 @@ mod tests {
         assert_eq!(web["data"]["kev"], true);
         assert_eq!(web["data"]["ready"], true);
         assert_eq!(web["data"]["reachable"], true);
+        assert_eq!(web["data"]["by_name"], false);
+        let named = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "host:app.lab.local")
+            .unwrap();
+        assert_eq!(named["data"]["reachable"], false);
+        assert_eq!(named["data"]["by_name"], true);
         // Every edge joins two existing nodes.
         let ids: Vec<&str> = nodes
             .iter()

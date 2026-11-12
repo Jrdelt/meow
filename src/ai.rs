@@ -343,6 +343,10 @@ pub struct Budget {
     pub calls: u32,
     pub max_usd: f64,
     pub max_calls: u32,
+    /// Whether this session has an OpenRouter key at all. Without one `[C]`
+    /// answers with the local model and `[R]` is unavailable.
+    #[serde(default)]
+    pub has_key: bool,
 }
 
 impl Budget {
@@ -383,6 +387,7 @@ pub fn budget(db: &Db, settings: &AiSettings) -> Result<Budget> {
         calls: calls.max(0) as u32,
         max_usd: settings.max_daily_usd,
         max_calls: settings.max_daily_calls,
+        has_key: settings.api_key().is_some(),
     })
 }
 
@@ -473,7 +478,12 @@ impl AiEngine {
         }
         let mut response = match request.send().await {
             Ok(response) => response,
-            Err(error) if error.is_connect() => bail!("nothing is listening at {base}"),
+            // Only the local tier is called without a key.
+            Err(error) if error.is_connect() && api_key.is_none() => bail!(
+                "nothing is listening at {base} (start a local model server such as LM Studio \
+                 or Ollama, or change `local_url` under [ai] in config.toml)"
+            ),
+            Err(error) if error.is_connect() => bail!("cannot connect to {base}"),
             Err(error) if error.is_timeout() => {
                 bail!("the model server at {base} did not answer in time")
             }
@@ -585,7 +595,14 @@ impl AiEngine {
                 on_text(piece)
             })
             .await
-            .context("local tier [L] failed (is a model server running?)")?;
+            .with_context(|| match &fallback_reason {
+                // Say why the cloud was not used, or the real cause is lost.
+                Some(reason) => format!(
+                    "the cloud was not used: {reason}; the local tier [L] it fell back to \
+                     also failed (is a model server running?)"
+                ),
+                None => "local tier [L] failed (is a model server running?)".to_owned(),
+            })?;
         let model = if self.settings.local_model.is_empty() {
             "local"
         } else {
@@ -639,7 +656,9 @@ impl AiEngine {
             }
         };
         let Some(api_key) = self.settings.api_key() else {
-            let reason = unavailable(&format!("no OpenRouter API key (set ${API_KEY_ENV})"))?;
+            let reason = unavailable(&format!(
+                "no OpenRouter API key (export {API_KEY_ENV} before starting the session)"
+            ))?;
             return self.run_local(tier, &prompt, reason, on_text).await;
         };
 
@@ -1418,7 +1437,25 @@ mod tests {
         )
         .unwrap();
         let (outcome, _) = run(&offline, Tier::Local, &graph, &vault).await;
-        assert!(format!("{:#}", outcome.unwrap_err()).contains("is a model server running?"));
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(error.starts_with("local tier [L] failed"), "{error}");
+        assert!(error.contains("is a model server running?"), "{error}");
+        assert!(error.contains("nothing is listening at http://127.0.0.1:"));
+
+        // [C] without a key falls back to that dead local server: the error
+        // must still name the missing key, which is what the operator can fix.
+        assert!(!offline.budget().has_key);
+        let (outcome, _) = run(&offline, Tier::Cloud, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with(
+                "the cloud was not used: no OpenRouter API key \
+                 (export OPENROUTER_API_KEY before starting the session); \
+                 the local tier [L] it fell back to also failed"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("nothing is listening at"), "{error}");
     }
 
     #[test]
