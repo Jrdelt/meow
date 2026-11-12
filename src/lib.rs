@@ -1,7 +1,9 @@
 //! `meow` library crate: modules shared by the binary and the test suite.
 
+pub mod checklist;
 pub mod cli;
 pub mod cpe;
+pub mod cve;
 pub mod db;
 pub mod endpoint;
 pub mod evidence;

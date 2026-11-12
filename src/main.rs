@@ -4,11 +4,14 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
+use meow::cve::{self, CveClient, CveSettings};
+use meow::db::Db;
 use meow::graph::Graph;
 use meow::lock::{LockError, SessionLock};
 use meow::observer;
@@ -65,7 +68,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("[+] Mode set to {mode} (session: {})", workspace.name);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Add { file, .. } => {
+        Command::Add { file, no_cve, .. } => {
             let parsed = parsers::parse_file(file)?;
             let path = workspace.graph_path();
             let mut graph = Graph::load(&path)?;
@@ -86,6 +89,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 workspace.name,
                 graph.hosts.len()
             );
+            let config = Config::load_or_create(&home)?;
+            if config.cve.enabled && !no_cve {
+                ground_cves(&workspace, &mut graph, config.cve)?;
+                graph.save(&path)?;
+            }
             Ok(ExitCode::SUCCESS)
         }
         other => {
@@ -163,6 +171,37 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
 
     println!("[+] Session '{}' closed", workspace.name);
     Ok(ExitCode::from(u8::try_from(outcome.exit_code).unwrap_or(1)))
+}
+
+/// Looks up CVEs for every host with versioned software and merges the
+/// matches into the graph as unverified hypotheses.
+fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) -> Result<()> {
+    let lookups: Vec<cve::Lookup> = graph.hosts.values().flat_map(cve::plan).collect();
+    if lookups.is_empty() {
+        return Ok(());
+    }
+    let db = Arc::new(Mutex::new(Db::open(&workspace.state_db_path())?));
+    let client = CveClient::new(settings, db)?;
+    println!(
+        "[+] CVE lookups: {} to run, at most {} s (cached answers are instant; --no-cve skips this)",
+        lookups.len(),
+        client.estimate(&lookups).as_secs()
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?;
+    let summary = runtime.block_on(cve::ground_graph(&client, graph));
+    for error in &summary.errors {
+        println!("[!] CVE lookup failed: {error}");
+    }
+    println!(
+        "[+] CVE lookups: {} new advisories ({} in CISA KEV), all stored as UnverifiedHypothesis; {} in total",
+        summary.new_advisories,
+        summary.kev,
+        graph.advisory_count()
+    );
+    Ok(())
 }
 
 fn tap_sink() -> Result<LineSink> {

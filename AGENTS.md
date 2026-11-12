@@ -53,26 +53,26 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 2, Step 4 complete (passive local network
-  observer). Owner asked to build straight through Phases 2-4 without pausing;
-  checkpoint after every step.
-- **Last Verified Commit:** `feat(phase2-step4)` — see `git log -n 1
+- **Active Phase & Step:** Phase 2 complete (Step 5: CVE grounding +
+  verification checklist). Owner asked to build straight through Phases 2-4
+  without pausing; checkpoint after every step.
+- **Last Verified Commit:** `feat(phase2-step5)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
-  `pty`, `shims`, `main`, C filter); Phase 2 so far: `db`, `timeutil`,
-  `evidence`, `endpoint`, `graph`, `cpe`, `parsers/{nmap,jsonl,text,diff}`,
-  `observer`. Tests: unit tests in each module plus
-  `tests/{cli,pty,shims}.rs`.
+  `pty`, `shims`, `main`, C filter); Phase 2: `db`, `timeutil`, `evidence`,
+  `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`.
+  Tests: unit tests per module plus `tests/{cli,pty,shims,cve}.rs`.
 - **In-Progress / Partial Work:** `recon`/`map`/`hud`/`report` report "not
-  built yet". `db.rs` tables are unused. The observer runs once at session
-  start (periodic polling and live PTY tap parsing come with the Phase 3
-  coordinator). macOS/Windows observer parsers are tested on fixtures only.
-- **Next Exact Action:** Phase 2, Step 5 — `src/cve.rs`: add `tokio` +
-  `reqwest`; rate-paced NVD v2.0 client (`cpeName=` + `keywordSearch=`, 6.5 s
-  / 0.7 s pacing, 2 s connect timeout), OSV `querybatch` with
-  `next_page_token`, 7-day cached CISA KEV, all attaching
-  `UnverifiedHypothesis` advisories; then the verification checklist
-  (`src/checklist.rs`).
+  built yet". `meow add` grounds CVEs synchronously (`--no-cve` skips).
+  Observer runs once at session start; live PTY tap lines are not parsed yet.
+  `tasks`/`vault`/`ai_usage`/`prompt_cache` tables are unused.
+- **Next Exact Action:** Phase 3, Step 1 — `src/coordinator.rs`: move `axum`
+  to dependencies (`ws`), run a tokio runtime inside `meow <name>` owning
+  `Graph` + `Db`; loopback server on 127.0.0.1:8765+ with a 256-bit token
+  (Bearer or `?token=`), strict `Origin` check on WebSocket upgrades,
+  `runtime.json` (0600, removed on Drop); JSON API for state/mode/notes/add;
+  feed PTY tap lines through `TextParser`; poll the observer; make helpers
+  (`mode`, `add`) use the API when a session is live.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it (owner decision).
     Terminal control via `ratatui::crossterm` only.

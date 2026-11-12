@@ -144,6 +144,38 @@ impl Db {
         &mut self.conn
     }
 
+    /// Cached body for `key`. With `max_age`, only an entry younger than
+    /// that is returned; without, any entry (a stale fallback).
+    pub fn cache_get(&self, key: &str, max_age: Option<Duration>) -> Result<Option<String>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT fetched_utc, body FROM cve_cache WHERE key = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((fetched, body)) = row else {
+            return Ok(None);
+        };
+        let fresh = match max_age {
+            None => true,
+            Some(max_age) => crate::timeutil::parse_rfc3339(&fetched)
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age <= max_age),
+        };
+        Ok(fresh.then_some(body))
+    }
+
+    pub fn cache_put(&self, key: &str, body: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cve_cache (key, fetched_utc, body) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET fetched_utc = excluded.fetched_utc, body = excluded.body",
+            [key, &crate::timeutil::now_rfc3339(), body],
+        )?;
+        Ok(())
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -219,6 +251,24 @@ mod tests {
             coordinator.get_meta("mode").unwrap().as_deref(),
             Some("light")
         );
+    }
+
+    #[test]
+    fn cache_entries_expire_but_stay_available_as_stale() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.cache_get("k", None).unwrap(), None);
+        db.cache_put("k", "one").unwrap();
+        db.cache_put("k", "two").unwrap();
+        let hour = Some(Duration::from_secs(3600));
+        assert_eq!(db.cache_get("k", hour).unwrap().as_deref(), Some("two"));
+        db.conn()
+            .execute(
+                "UPDATE cve_cache SET fetched_utc = '2020-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.cache_get("k", hour).unwrap(), None);
+        assert_eq!(db.cache_get("k", None).unwrap().as_deref(), Some("two"));
     }
 
     #[test]

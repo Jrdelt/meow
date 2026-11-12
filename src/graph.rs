@@ -786,6 +786,15 @@ impl Graph {
         }
     }
 
+    /// Adds a host-level fact that did not come from a parser (for example
+    /// a CISA KEV listing found during CVE grounding).
+    pub fn add_host_fact(&mut self, address: &str, fact: Fact) -> bool {
+        match self.host_entry(address) {
+            Some(host) => push_fact(&mut host.facts, fact),
+            None => false,
+        }
+    }
+
     /// Operator verdict on an advisory (`Confirmed`, `FalsePositive`, or
     /// back to `UnverifiedHypothesis`).
     pub fn set_advisory_status(

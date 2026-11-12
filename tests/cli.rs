@@ -411,7 +411,7 @@ fn add_imports_files_into_the_graph() {
 <port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.18.0" method="probed" conf="10"><cpe>cpe:/a:nginx:nginx:1.18.0</cpe></service></port>
 </ports></host></nmaprun>"#,
     );
-    let output = sandbox.run(&["add", "scan.xml"], &env);
+    let output = sandbox.run(&["add", "scan.xml", "--no-cve"], &env);
     assert!(output.status.success(), "{}", stderr(&output));
     let out = stdout(&output);
     assert!(
@@ -429,14 +429,14 @@ fn add_imports_files_into_the_graph() {
     assert_eq!(port["facts"][0]["verification_status"], "Observed");
 
     // Importing the same file again changes nothing.
-    let out = stdout(&sandbox.run(&["add", "scan.xml"], &env));
+    let out = stdout(&sandbox.run(&["add", "scan.xml", "--no-cve"], &env));
     assert!(out.contains("2 facts parsed, 0 new"), "{out}");
 
     write(
         "ferox.jsonl",
         "{\"type\":\"response\",\"url\":\"http://10.0.0.5/admin/\",\"status\":401}\n{\"type\":\"statistics\"}\n",
     );
-    let out = stdout(&sandbox.run(&["add", "ferox.jsonl"], &env));
+    let out = stdout(&sandbox.run(&["add", "ferox.jsonl", "--no-cve"], &env));
     assert!(
         out.contains("(JSON Lines): 1 facts parsed, 1 new or updated, 1 lines skipped"),
         "{out}"
@@ -451,8 +451,8 @@ fn add_imports_files_into_the_graph() {
         "fix.diff",
         "--- a/x.conf\n+++ b/x.conf\n@@ -1 +1 @@\n-tokens on\n+tokens off\n",
     );
-    assert!(stdout(&sandbox.run(&["add", "notes.log"], &env)).contains("(text log)"));
-    assert!(stdout(&sandbox.run(&["add", "fix.diff"], &env)).contains("(git diff)"));
+    assert!(stdout(&sandbox.run(&["add", "notes.log", "--no-cve"], &env)).contains("(text log)"));
+    assert!(stdout(&sandbox.run(&["add", "fix.diff", "--no-cve"], &env)).contains("(git diff)"));
     let graph = graph();
     assert_eq!(graph["hosts"].as_object().unwrap().len(), 2);
     assert_eq!(graph["notes"][0]["claim"], "git diff: x.conf (+1 -1)");

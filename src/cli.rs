@@ -64,6 +64,9 @@ pub enum Command {
     /// Import an Nmap XML, JSONL, log or git-diff file into the workspace
     Add {
         file: PathBuf,
+        /// Skip the CVE lookups (NVD, OSV.dev, CISA KEV) after importing
+        #[arg(long)]
+        no_cve: bool,
         #[command(flatten)]
         session: SessionArg,
     },

@@ -12,7 +12,7 @@ name = "meow"
 path = "src/main.rs"
 
 # Phase 1 dependencies only. Later phases add their crates when their code lands
-# (tokio, axum, petgraph, reqwest).
+# (axum, petgraph).
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -23,11 +23,13 @@ portable-pty = "0.9"
 # Terminal control is used through the `ratatui::crossterm` re-export.
 ratatui = "0.30"
 regex = "1"
+reqwest = { version = "0.13", features = ["json", "query"] }
 roxmltree = "0.20"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 url = "2"
 
@@ -38,6 +40,10 @@ signal-hook = "0.3"
 [target.'cfg(windows)'.dependencies]
 # Console-mode access for VT input/output; same crate crossterm uses.
 crossterm_winapi = "0.9"
+
+[dev-dependencies]
+# Mock HTTP servers in tests; becomes a normal dependency in Phase 3.
+axum = "0.8"
 
 [build-dependencies]
 cc = "1.2"

@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cve::CveSettings;
 use crate::mode::Mode;
 
 /// Name of the active session, exported inside a session shell.
@@ -47,6 +48,13 @@ default_mode = "light"
 # Shell to launch inside a session. Leave commented out to use the platform
 # default (zsh on macOS, bash on Linux, PowerShell on Windows).
 # shell = "/bin/zsh"
+
+[cve]
+# Look up known vulnerabilities for discovered software (NIST NVD, OSV.dev,
+# CISA KEV). Free, no AI involved; only software names and versions are sent.
+enabled = true
+# Optional NVD API key: lookups are paced at 0.7 s instead of 6.5 s each.
+# nvd_api_key = "..."
 "#;
 
 /// Validates a workspace name so it is a safe single directory name on
@@ -311,6 +319,7 @@ pub struct Config {
     pub default_mode: Mode,
     /// Shell program to launch instead of the platform default.
     pub shell: Option<String>,
+    pub cve: CveSettings,
 }
 
 impl Config {
@@ -1040,8 +1049,20 @@ mod tests {
             Config {
                 default_mode: Mode::Mild,
                 shell: Some("/bin/zsh".into()),
+                cve: CveSettings::default(),
             }
         );
+
+        fs::write(
+            fx.home.config_path(),
+            "[cve]\nenabled = false\nnvd_api_key = \"k\"\nnvd_url = \"http://127.0.0.1:9/nvd\"\n",
+        )
+        .unwrap();
+        let config = Config::load_or_create(&fx.home).unwrap();
+        assert!(!config.cve.enabled);
+        assert_eq!(config.cve.nvd_api_key.as_deref(), Some("k"));
+        assert_eq!(config.cve.nvd_url, "http://127.0.0.1:9/nvd");
+        assert_eq!(config.cve.osv_url, crate::cve::OSV_URL);
 
         fs::write(fx.home.config_path(), "default_mode = \"warp\"\n").unwrap();
         let err = Config::load_or_create(&fx.home).unwrap_err();
