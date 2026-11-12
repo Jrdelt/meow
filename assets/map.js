@@ -9,30 +9,89 @@
   var selected = null;
   var drawn = '';
 
+  // Layout distances, in map units (one unit is one pixel at zoom 1).
+  var NODE_W = 84, NODE_H = 63;
+  var COLUMN = 172;     // between a node and the tier it fans out to
+  var SELF_UP = 46;     // room a node needs above its centre ...
+  var SELF_DOWN = 96;   // ... and below it, caption included
+  var BUS_PITCH = 124;  // between neighbours along a bus line
+  var BUS_DROP = 88;    // from the bus line to the first row above and below it
+  var ROW_PITCH = 130;  // between rows on the same side of a crowded bus
+  // A riser leaves the bus line in the middle of the gap between two devices.
+  var BUS_STUB = (BUS_PITCH - NODE_W) / 2;
+
+  // Rows on each side of a bus line: more as the segment gets crowded, so
+  // the drawing grows in both directions instead of into one long line.
+  function busRows(devices) {
+    return devices <= 10 ? 1 : (devices <= 28 ? 2 : 3);
+  }
+
+  // The map is drawn like a hand-sketched network diagram: an Internet cloud
+  // on the left, then routers, firewalls, servers, network segments and
+  // clients in tiers to the right. Which picture a node gets ("role") is
+  // decided by the session, together with the reason for it.
+  var INK = '#2e2e2e';
+  var HAND = '"Chalkboard SE", "Bradley Hand", "Segoe Print", "Comic Sans MS", cursive';
+  // role, how the legend names it, how the detail panel names it
+  var ROLES = [
+    ['internet', 'Internet (default route)', 'the Internet'],
+    ['router', 'Router or gateway', 'a router'],
+    ['firewall', 'Firewall', 'a firewall'],
+    ['server', 'Server (offers a service)', 'a server'],
+    ['segment', 'Network segment', 'a network segment'],
+    ['switch', '', 'a switch'],
+    ['client', 'Client (no service seen)', 'a client'],
+    ['you', 'You (this machine)', 'you']
+  ];
+  // Order among siblings: this machine first, clients last.
+  var RANK = { internet: -1, you: 0, router: 1, firewall: 2, segment: 3, 'switch': 4, server: 5, client: 6 };
+
+  function icon(role) {
+    return '/assets/icon-' + role + '.svg?token=' + encodeURIComponent(token);
+  }
+
   var cy = cytoscape({
     container: document.getElementById('cy'),
-    maxZoom: 1.8,
+    maxZoom: 1.6,
+    minZoom: 0.15,
     style: [
       { selector: 'node', style: {
-        'label': 'data(label)', 'color': '#d7dde8', 'font-size': 11, 'text-valign': 'bottom',
-        'text-margin-y': 6, 'text-wrap': 'wrap', 'text-max-width': 150,
-        'background-color': '#4a5568', 'width': 34, 'height': 34, 'border-width': 2, 'border-color': '#2c3545' } },
-      { selector: 'node[kind = "local"]', style: { 'shape': 'round-rectangle', 'background-color': '#6cb6ff', 'width': 46, 'height': 30 } },
-      { selector: 'node[kind = "interface"]', style: { 'shape': 'diamond', 'background-color': '#7f8ea3' } },
-      { selector: 'node[kind = "gateway"]', style: { 'shape': 'hexagon', 'background-color': '#9f7aea' } },
-      { selector: 'node[kind = "host"]', style: { 'background-color': '#3b8f6b' } },
-      { selector: 'node[kind = "host"][hypotheses > 0]', style: { 'background-color': '#c9972c' } },
-      { selector: 'node[kind = "host"][confirmed > 0]', style: { 'background-color': '#c0392b' } },
-      { selector: 'node[?kev]', style: { 'border-color': '#ff6b6b', 'border-width': 4 } },
-      { selector: 'node[kind = "host"][!reachable]', style: { 'border-style': 'dashed', 'border-color': '#f2c14e' } },
-      { selector: 'node:selected', style: { 'border-color': '#ffffff', 'border-width': 4 } },
+        'shape': 'round-rectangle', 'width': NODE_W, 'height': NODE_H,
+        'background-opacity': 0, 'background-fit': 'contain', 'background-clip': 'none',
+        'border-width': 0, 'border-color': INK,
+        'label': 'data(text)', 'font-family': HAND, 'font-size': 14, 'color': INK, 'line-height': 1.1,
+        'text-wrap': 'wrap', 'text-max-width': BUS_PITCH - 8, 'text-valign': 'bottom', 'text-margin-y': 2,
+        'underlay-shape': 'ellipse', 'underlay-padding': 10, 'underlay-opacity': 0,
+        'overlay-shape': 'round-rectangle', 'overlay-padding': 7, 'overlay-opacity': 0 } }
+    ].concat(ROLES.map(function (role) {
+      return { selector: 'node[role = "' + role[0] + '"]', style: { 'background-image': icon(role[0]) } };
+    })).concat([
+      { selector: 'node[role = "internet"]', style: {
+        'width': 156, 'height': 104, 'font-size': 18, 'text-valign': 'center', 'text-margin-y': 2 } },
+      { selector: 'node[role = "you"]', style: { 'font-size': 16 } },
+      // Devices above a bus line carry their caption on top, clear of the line.
+      { selector: 'node.above', style: { 'text-valign': 'top', 'text-margin-y': -3 } },
+      // A marker-pen blot behind a host that has something to look at.
+      { selector: 'node[hypotheses > 0]', style: { 'underlay-color': '#f2c14e', 'underlay-opacity': 0.6 } },
+      { selector: 'node[confirmed > 0]', style: { 'underlay-color': '#e2574c', 'underlay-opacity': 0.55 } },
+      { selector: 'node[?kev]', style: { 'border-width': 3, 'border-style': 'dashed', 'border-color': '#b83227' } },
+      { selector: 'node[kind = "host"][!reachable]', style: { 'background-image-opacity': 0.5, 'color': '#8f6200' } },
+      { selector: 'node:selected', style: { 'overlay-color': '#1f6fb2', 'overlay-opacity': 0.16 } },
       { selector: 'edge', style: {
-        'width': 1.5, 'line-color': '#3b475c', 'target-arrow-color': '#3b475c',
-        'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } },
-      { selector: 'edge[kind = "routed"]', style: { 'line-style': 'dashed' } },
-      { selector: 'edge[kind = "unknown"]', style: {
-        'line-style': 'dotted', 'line-color': '#f2c14e', 'target-arrow-shape': 'none', 'opacity': 0.5 } }
-    ]
+        'width': 1.9, 'line-color': '#454545', 'line-cap': 'round',
+        'curve-style': 'straight', 'target-arrow-shape': 'none' } },
+      // A fan-out line is drawn freehand: very slightly S-shaped.
+      { selector: 'edge.fan', style: {
+        'curve-style': 'unbundled-bezier', 'control-point-distances': '5 -5', 'control-point-weights': '0.3 0.7' } },
+      // Out of a bus: along the line, then a short riser into the device.
+      { selector: 'edge.bus', style: {
+        'curve-style': 'taxi', 'taxi-direction': 'rightward', 'taxi-turn': -BUS_STUB, 'taxi-turn-min-distance': 2 } },
+      // The link to the Internet is the classic lightning bolt.
+      { selector: 'edge[kind = "internet"]', style: {
+        'curve-style': 'segments', 'segment-distances': '-13 13', 'segment-weights': '0.44 0.56', 'width': 2.1 } },
+      { selector: 'edge.extra', style: { 'line-style': 'dashed', 'width': 1.2, 'line-color': '#8c8c8c' } },
+      { selector: 'edge[kind = "unknown"]', style: { 'line-style': 'dotted', 'line-color': '#c9972c' } }
+    ])
   });
 
   function byId(id) { return document.getElementById(id); }
@@ -99,19 +158,159 @@
     document.title = 'meow map: ' + state.session;
   }
 
+  // Natural order for addresses: 10.0.0.9 before 10.0.0.10.
+  function sortKey(data) {
+    return String(data.address || data.label || data.id).replace(/\d+/g, function (digits) {
+      return ('00000' + digits).slice(-6);
+    });
+  }
+
+  // Turns the session's nodes and links into a drawing: a tree that grows
+  // to the right from the Internet cloud (or from this machine when there is
+  // no default route). A node with a few children fans out to the next tier;
+  // a network segment lines its devices up above and below a bus line, the
+  // way a hub is drawn, and whatever leads further sits at the end of it.
+  function plan(nodes, edges) {
+    var data = {}, links = {}, parent = {}, kids = {}, box = {}, pos = {}, above = {};
+    nodes.forEach(function (node) { data[node.data.id] = node.data; links[node.data.id] = []; });
+    edges.forEach(function (edge) {
+      var link = edge.data;
+      if (links[link.source] && links[link.target]) {
+        links[link.source].push(link.target);
+        links[link.target].push(link.source);
+      }
+    });
+    function before(a, b) {
+      var byRank = (RANK[data[a].role] || 0) - (RANK[data[b].role] || 0);
+      if (byRank) { return byRank; }
+      var ka = sortKey(data[a]), kb = sortKey(data[b]);
+      return ka < kb ? -1 : (ka > kb ? 1 : 0);
+    }
+
+    // Breadth first, so every node sits as close to the root as its links allow.
+    var root = data.internet ? 'internet' : 'local';
+    var order = [root];
+    parent[root] = null;
+    for (var i = 0; i < order.length; i++) {
+      var id = order[i];
+      kids[id] = [];
+      links[id].slice().sort(before).forEach(function (next) {
+        if (!(next in parent)) {
+          parent[next] = order[i];
+          kids[order[i]].push(next);
+          order.push(next);
+        }
+      });
+    }
+    nodes.forEach(function (node) {  // nothing links it to the rest
+      if (!(node.data.id in parent)) {
+        parent[node.data.id] = root;
+        kids[root].push(node.data.id);
+        kids[node.data.id] = [];
+      }
+    });
+
+    // How much room each subtree needs above and below its own axis.
+    function measure(id) {
+      var leaves = [], branches = [];
+      kids[id].forEach(function (kid) {
+        measure(kid);
+        (kids[kid].length ? branches : leaves).push(kid);
+      });
+      var bus = leaves.length >= 2 && (data[id].role === 'segment' || leaves.length > 3);
+      var rows = busRows(leaves.length);
+      var reach = BUS_DROP + (rows - 1) * ROW_PITCH + SELF_DOWN;
+      var stack = bus ? branches : kids[id];
+      var offsets = [], total = 0;
+      stack.forEach(function (kid) {
+        offsets.push(total + box[kid].up);
+        total += box[kid].up + box[kid].down;
+      });
+      var axis = stack.length ? (offsets[0] + offsets[offsets.length - 1]) / 2 : 0;
+      var big = data[id].role === 'internet';
+      box[id] = {
+        bus: bus, rows: rows, leaves: leaves, stack: stack, offsets: offsets, axis: axis,
+        up: Math.max(bus ? reach : (big ? 70 : SELF_UP), axis),
+        down: Math.max(bus ? reach : (big ? 70 : SELF_DOWN), total - axis)
+      };
+    }
+    function place(id, x, y) {
+      var b = box[id], next = x + COLUMN;
+      pos[id] = { x: x, y: y };
+      if (b.bus) {
+        // Column by column, nearest row first, alternating above and below.
+        var perColumn = b.rows * 2;
+        b.leaves.forEach(function (leaf, n) {
+          var slot = n % perColumn;
+          var drop = BUS_DROP + Math.floor(slot / 2) * ROW_PITCH;
+          above[leaf] = slot % 2 === 0;
+          pos[leaf] = { x: x + BUS_PITCH * (Math.floor(n / perColumn) + 1), y: y + (above[leaf] ? -drop : drop) };
+        });
+        next = x + BUS_PITCH * (Math.ceil(b.leaves.length / perColumn) + 1);
+      }
+      b.stack.forEach(function (kid, n) { place(kid, next, y - b.axis + b.offsets[n]); });
+    }
+    measure(root);
+    place(root, 0, 0);
+
+    var elements = nodes.map(function (node) {
+      var d = Object.assign({}, node.data);
+      var lines = [d.caption || d.label];
+      if (d.confirmed) { lines.push(d.confirmed + ' confirmed'); }
+      if (d.hypotheses) { lines.push(d.hypotheses + ' to verify'); }
+      if (d.kind === 'host' && !d.reachable) { lines.push('no route known'); }
+      d.text = lines.join('\n');
+      return { group: 'nodes', data: d, classes: above[d.id] ? 'above' : '' };
+    });
+    edges.forEach(function (edge) {
+      var d = Object.assign({}, edge.data), kind = 'extra';
+      if (parent[d.source] === d.target) {  // always drawn from parent to child
+        var swap = d.source;
+        d.source = d.target;
+        d.target = swap;
+      }
+      if (parent[d.target] === d.source) { kind = box[d.source].bus ? 'bus' : 'fan'; }
+      elements.push({ group: 'edges', data: d, classes: kind });
+    });
+    return { elements: elements, positions: pos };
+  }
+
   function renderGraph() {
-    var elements = state.topology.nodes.concat(state.topology.edges);
-    var key = JSON.stringify(elements);
+    var key = JSON.stringify(state.topology);
     if (key === drawn) { return; }
-    var firstDraw = drawn === '';
     drawn = key;
+    var picture = plan(state.topology.nodes, state.topology.edges);
     cy.elements().remove();
-    cy.add(elements);
+    cy.add(picture.elements);
     cy.layout({
-      name: 'breadthfirst', directed: true, roots: cy.$id('local'),
-      padding: 40, spacingFactor: 1.15, animate: !firstDraw, animationDuration: 250
+      name: 'preset', fit: true, padding: 30,
+      positions: function (node) { return picture.positions[node.id()]; }
     }).run();
     if (selected) { cy.$id(selected).select(); }
+  }
+
+  function renderLegend() {
+    var legend = byId('legend');
+    ROLES.forEach(function (role) {
+      if (!role[1]) { return; }
+      var item = legend.appendChild(el('span', 'item'));
+      var picture = item.appendChild(el('img'));
+      picture.src = icon(role[0]);
+      picture.alt = '';
+      item.appendChild(el('span', null, role[1]));
+    });
+    [['verify', 'to verify'], ['confirmed', 'confirmed'], ['kev', 'known exploited']].forEach(function (key) {
+      var item = legend.appendChild(el('span', 'item'));
+      item.appendChild(el('span', 'swatch ' + key[0]));
+      item.appendChild(el('span', null, key[1]));
+    });
+  }
+
+  // Why a node is drawn the way it is. A hint, not a finding.
+  function drawnAs(data) {
+    var name = '';
+    ROLES.forEach(function (role) { if (role[0] === data.role) { name = role[2]; } });
+    return el('div', 'dim drawn', name ? 'Shown as ' + name + ': ' + data.why + '.' : '');
   }
 
   function renderList(target, items, empty, build) {
@@ -303,21 +502,31 @@
     var host = data.address ? state.graph.hosts[data.address] : null;
     if (host) {
       renderHost(detail, host);
+      detail.insertBefore(drawnAs(data), detail.firstChild);
       var box = detail.querySelector('textarea');
       if (box && draftText) { box.value = draftText; }
       if (box && hadFocus) { box.focus(); }
       return;
     }
     byId('detail-title').textContent = data.label;
+    detail.appendChild(drawnAs(data));
     if (data.kind === 'interface') {
       var name = data.id.slice(3);
+      if (data.network) { detail.appendChild(el('div', 'mono', 'network ' + data.network)); }
       (state.graph.local.interfaces || []).forEach(function (iface) {
         if (iface.name !== name) { return; }
         detail.appendChild(el('div', 'mono', iface.kind + (iface.up ? ', up' : ', down')));
-        iface.addresses.forEach(function (address) { detail.appendChild(el('div', 'mono', address)); });
+        iface.addresses.forEach(function (address) { detail.appendChild(el('div', 'mono', 'this machine: ' + address)); });
       });
-    } else {
-      detail.appendChild(el('div', 'dim', data.kind));
+      if (data.hidden_neighbours) {
+        detail.appendChild(el('div', 'dim', data.hidden_neighbours + ' more devices in the neighbour table are not drawn.'));
+      }
+    } else if (data.kind === 'neighbour') {
+      detail.appendChild(el('div', 'mono', 'hardware address ' + data.mac));
+      detail.appendChild(el('div', 'mono', 'seen on ' + data.interface));
+      detail.appendChild(el('div', 'dim', 'It becomes a host once a scan, an imported file or the terminal output mentions it.'));
+    } else if (data.kind === 'internet') {
+      detail.appendChild(el('div', 'dim', 'meow has sent nothing there to find this out.'));
     }
   }
 
@@ -339,5 +548,6 @@
     }
   });
 
+  renderLegend();
   connect();
 })();

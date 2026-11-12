@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90" viewBox="0 0 120 90">
+<!-- meow map icon: a laptop: the machine meow runs on. Original artwork, same licence as the project. -->
+<defs>
+<filter id="a" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.045" numOctaves="2" seed="5" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="3" xChannelSelector="R" yChannelSelector="G"/></filter>
+<filter id="b" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.03" numOctaves="2" seed="14" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="4.5" xChannelSelector="G" yChannelSelector="R"/></filter>
+<pattern id="h" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(-35)"><rect width="5" height="5" fill="#e3f2f9"/><line x1="0" y1="2.5" x2="5" y2="2.5" stroke="#58a6c8" stroke-width="1.6"/></pattern>
+<g id="ink" stroke-linecap="round" stroke-linejoin="round">
+<path d="M30 12 L92 12 L94 54 L28 54 Z"/>
+<path d="M28 54 L94 54 L108 74 L14 74 Z"/>
+<path d="M14 74 L14 79 L108 79 L108 74"/>
+</g>
+</defs>
+<g filter="url(#a)">
+<use href="#ink" fill="#ffffff" stroke="#2e2e2e" stroke-width="2.3"/>
+<g fill="url(#h)" stroke="#2e2e2e" stroke-width="1.1" stroke-linejoin="round">
+<path d="M35 17 L87 17 L89 49 L33 49 Z"/>
+</g>
+<g fill="none" stroke="#2e2e2e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+<path d="M31 60 H91 M27 65 H95 M45 70 H77"/>
+</g>
+</g>
+<use href="#ink" fill="none" stroke="#2e2e2e" stroke-width="1" opacity="0.45" filter="url(#b)"/>
+</svg>

@@ -1,6 +1,6 @@
-//! The browser map (`meow map`): one HTML page plus its script, style sheet
-//! and the vendored Cytoscape.js, all embedded in the binary so the map
-//! works offline.
+//! The browser map (`meow map`): one HTML page plus its script, style sheet,
+//! device icons and the vendored Cytoscape.js, all embedded in the binary so
+//! the map works offline.
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -9,6 +9,19 @@ const PAGE: &str = include_str!("../assets/map.html");
 const SCRIPT: &str = include_str!("../assets/map.js");
 const STYLE: &str = include_str!("../assets/map.css");
 const CYTOSCAPE: &str = include_str!("../assets/cytoscape.min.js");
+
+/// One drawing per `topology::Role`, served as `icon-<role>.svg`. A switch
+/// is drawn like a network segment: both are the box everything plugs into.
+const ICONS: &[(&str, &str)] = &[
+    ("internet", include_str!("../assets/icons/internet.svg")),
+    ("you", include_str!("../assets/icons/you.svg")),
+    ("segment", include_str!("../assets/icons/segment.svg")),
+    ("switch", include_str!("../assets/icons/segment.svg")),
+    ("router", include_str!("../assets/icons/router.svg")),
+    ("firewall", include_str!("../assets/icons/firewall.svg")),
+    ("server", include_str!("../assets/icons/server.svg")),
+    ("client", include_str!("../assets/icons/client.svg")),
+];
 
 fn with_type(content_type: &'static str, body: String) -> Response {
     (
@@ -30,7 +43,15 @@ pub fn asset(name: &str) -> Response {
         "map.js" => with_type("text/javascript; charset=utf-8", SCRIPT.to_owned()),
         "map.css" => with_type("text/css; charset=utf-8", STYLE.to_owned()),
         "cytoscape.min.js" => with_type("text/javascript; charset=utf-8", CYTOSCAPE.to_owned()),
-        _ => StatusCode::NOT_FOUND.into_response(),
+        _ => {
+            let role = name
+                .strip_prefix("icon-")
+                .and_then(|rest| rest.strip_suffix(".svg"));
+            match ICONS.iter().find(|(known, _)| Some(*known) == role) {
+                Some((_, svg)) => with_type("image/svg+xml", (*svg).to_owned()),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
     }
 }
 
@@ -135,6 +156,39 @@ mod tests {
         assert!(CYTOSCAPE.starts_with("/**\n * Copyright (c) 2016-"));
         let license = include_str!("../assets/cytoscape.LICENSE");
         assert!(license.contains("Permission is hereby granted, free of charge"));
+    }
+
+    #[test]
+    fn every_role_has_a_self_contained_icon() {
+        use crate::topology::Role;
+        for role in [
+            Role::Internet,
+            Role::You,
+            Role::Segment,
+            Role::Router,
+            Role::Firewall,
+            Role::Switch,
+            Role::Server,
+            Role::Client,
+        ] {
+            let name = serde_json::to_value(role).unwrap();
+            let name = name.as_str().unwrap();
+            let response = asset(&format!("icon-{name}.svg"));
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+            // The map script draws the same roles.
+            assert!(SCRIPT.contains(&format!("'{name}'")), "map.js lacks {name}");
+        }
+        for (name, svg) in ICONS {
+            assert!(svg.starts_with("<svg xmlns="), "{name}");
+            // Nothing is fetched from anywhere and nothing can run.
+            for forbidden in ["http://", "https://", "<script", "<image", "onload"] {
+                let rest = svg.replace("http://www.w3.org/2000/svg", "");
+                assert!(!rest.contains(forbidden), "{name} contains {forbidden}");
+            }
+        }
+        assert_eq!(asset("icon-.svg").status(), StatusCode::NOT_FOUND);
+        assert_eq!(asset("icon-nope.svg").status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

@@ -648,7 +648,7 @@ pub fn has_routable_address(interface: &Interface) -> bool {
 
 /// The first address of the interface that is neither loopback nor
 /// link-local, in CIDR form.
-fn routable_address(interface: &Interface) -> Option<&str> {
+pub fn routable_address(interface: &Interface) -> Option<&str> {
     interface
         .addresses
         .iter()

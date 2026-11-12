@@ -58,6 +58,26 @@ cargo test                   # the full test suite
 Inside a session the helper commands find it by themselves. From another
 terminal, add `--session <name>` or `--local`.
 
+## The map
+
+`meow map` draws the network the way it is sketched on a whiteboard, left to
+right: the Internet cloud, routers, firewalls, servers, network segments and
+clients, with this machine marked as "You".
+
+| Drawn as | Because |
+|---|---|
+| Internet cloud | The routing table has a default route. Nothing is sent there. |
+| Router | It is a gateway in the routing table, or its OS guess or a service banner says so. |
+| Firewall, switch | Its OS guess or a service banner names one. |
+| Server | A port on it was seen open, or a service on it was mentioned. |
+| Client | Nothing is known to listen on it. Devices in the neighbour table (ARP, NDP) are drawn as clients without becoming hosts: reading that table sends nothing. |
+| Network segment | One per active interface: the LAN, Wi-Fi or VPN this machine is attached to. Crowded segments stack their devices in rows above and below the line. |
+
+The picture is a drawing hint, not a finding. Click any node to read what it
+was derived from. A host with hypotheses to verify gets an amber marker, one
+with a confirmed finding a red one, and a dashed red frame means a match is in
+the CISA known-exploited catalog.
+
 ## Modes
 
 - **light** (default): sends no packets to targets. Reads the local interface,

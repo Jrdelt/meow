@@ -53,21 +53,19 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** All four phases complete. Since then: `install.sh`,
-  `meow list`, and fixes from real macOS runs.
-- **Last Verified Commit:** `feat(list)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
+  list`, the sketched-diagram map and fixes from real macOS runs.
+- **Last Verified Commit:** `feat(map)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
   Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
-  `assets/`); Phase 4 (`vault`, `ai`, `report`); `README.md`. Tests: per
-  module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
+  `assets/`); Phase 4 (`vault`, `ai`, `report`); `install.sh`; `tests/*.rs`.
 - **In-Progress / Partial Work:** None.
 - **Next Exact Action:** Wait for the owner's macOS results: `cargo test
-  --no-fail-fast` output, and (if the banner still says 0 neighbours / 0
-  listeners) the output of `arp -an` and `netstat -an -p tcp`, then fix what
-  they show. Other open verification: real `katana`/`feroxbuster` runs, one
-  real `[L]`/`[C]`/`[R]` request, Windows.
+  --no-fail-fast`, how the map looks there, and (if the banner still shows 0
+  neighbours / 0 listeners) `arp -an` and `netstat -an -p tcp`. Unverified:
+  real `katana`/`feroxbuster`, a real `[L]`/`[C]`/`[R]` request, Windows.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
@@ -85,15 +83,17 @@ Before every push:
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system
     files (Apple's pick the history location from it) and the user's
     `.zshrc` load natively. Never keep `ZDOTDIR` on the shim past `.zshenv`.
-  - Map page: no inline scripts, no `innerHTML`; checked by hand in Chromium
-    (Playwright), not in `cargo test`. Cytoscape 3.33.1 is vendored (MIT).
+  - Map page: no inline scripts, no `innerHTML`; its look and layout are
+    checked by hand in Chromium (Playwright), not in `cargo test`.
+    `topology::Role` picks a node's icon (`assets/icons/`) and always carries
+    the reason; the Internet cloud and neighbour-table clients are drawn
+    only, never hosts. Cytoscape 3.33.1 is vendored (MIT).
   - Recon tests use stand-in tools; real `nmap` was smoke-tested on 127.0.0.1
     only, `katana`/`feroxbuster` never. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
-    `gcc-mingw-w64-x86-64`). No CI: the repo is private and macOS runners
-    cost Actions minutes.
-  - macOS (owner's machine): sessions, `meow report` and the listing work;
-    the full test suite has not been reported from there yet. Tests must not
-    depend on the login name, `/usr/bin/zsh`, bash >= 4.4, or unresolved
-    temp paths. `install.sh` is tested with stand-ins and for real on Linux.
+    `gcc-mingw-w64-x86-64`). No CI: private repo, paid macOS runners.
+  - macOS (owner's machine): sessions, `meow report` and the listing work; no
+    full test run reported yet. Tests must not depend on the login name,
+    `/usr/bin/zsh`, bash >= 4.4 or unresolved temp paths. `install.sh` has
+    run for real on Linux only.

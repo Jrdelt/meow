@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90" viewBox="0 0 120 90">
+<!-- meow map icon: two server towers. Original artwork, same licence as the project. -->
+<defs>
+<filter id="a" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.045" numOctaves="2" seed="8" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="3" xChannelSelector="R" yChannelSelector="G"/></filter>
+<filter id="b" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.03" numOctaves="2" seed="2" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="4.5" xChannelSelector="G" yChannelSelector="R"/></filter>
+<pattern id="h" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(-35)"><rect width="5" height="5" fill="#e3f2f9"/><line x1="0" y1="2.5" x2="5" y2="2.5" stroke="#58a6c8" stroke-width="1.6"/></pattern>
+<g id="ink" stroke-linecap="round" stroke-linejoin="round">
+<rect x="20" y="8" width="34" height="72" rx="2"/>
+<rect x="64" y="8" width="34" height="72" rx="2"/>
+</g>
+</defs>
+<g filter="url(#a)">
+<use href="#ink" fill="#ffffff" stroke="#2e2e2e" stroke-width="2.3"/>
+<g fill="url(#h)" stroke="#2e2e2e" stroke-width="1.1" stroke-linejoin="round">
+<rect x="25" y="42" width="24" height="28"/>
+<rect x="69" y="42" width="24" height="28"/>
+</g>
+<g fill="none" stroke="#2e2e2e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+<path d="M25 16 H49 M25 22 H49 M25 28 H49 M25 34 H49"/>
+<path d="M69 16 H93 M69 22 H93 M69 28 H93 M69 34 H93"/>
+<circle cx="29" cy="75" r="1.7"/><circle cx="73" cy="75" r="1.7"/>
+</g>
+</g>
+<use href="#ink" fill="none" stroke="#2e2e2e" stroke-width="1" opacity="0.45" filter="url(#b)"/>
+</svg>

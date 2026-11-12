@@ -1166,6 +1166,7 @@ mod tests {
             ("map.js", "text/javascript"),
             ("map.css", "text/css"),
             ("cytoscape.min.js", "text/javascript"),
+            ("icon-router.svg", "image/svg+xml"),
         ] {
             let (status, headers, body) = fetch(&format!("/assets/{asset}?token={}", info.token));
             assert_eq!(status, 200, "{asset}");
