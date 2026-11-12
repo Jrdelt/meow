@@ -303,6 +303,7 @@ impl State {
             "graph": &*graph,
             "checklists": checklists,
             "topology": Topology::build(&graph).cytoscape(&graph),
+            "machine": observer::machine_report(&graph.local),
             "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
             "notices": &*lock(&self.notices),
             "ai": &*lock(&self.ai_status),
@@ -1186,6 +1187,10 @@ mod tests {
         // The snapshot carries ready-made Cytoscape elements.
         let snapshot = fx.coordinator.state().snapshot();
         assert_eq!(snapshot["topology"]["nodes"][0]["data"]["id"], "local");
+        // And the report on this machine that the map shows beside it.
+        assert_eq!(snapshot["machine"]["sections"][0]["title"], "Connection");
+        assert_eq!(snapshot["machine"]["sections"][1]["title"], "VPN");
+        assert!(snapshot["machine"]["vpn"].is_array());
         assert!(snapshot["topology"]["edges"].is_array());
     }
 

@@ -319,10 +319,49 @@
     items.forEach(function (item) { target.appendChild(build(item)); });
   }
 
+  // "This machine": the local connection, any VPN, and every table the
+  // session read from the operating system. The first sections are always
+  // in view; the long tables unfold on a click and stay as they were left.
+  var machineDrawn = '';
+  var unfolded = {};
+
+  function renderMachine() {
+    var machine = state.machine || { vpn: [], sections: [] };
+    var vpn = byId('vpn');
+    vpn.textContent = machine.vpn.length ? 'VPN ' + machine.vpn.map(function (line) {
+      return line.split(':')[0];
+    }).join(', ') : 'no VPN';
+    vpn.className = machine.vpn.length ? 'badge ok' : 'badge';
+    vpn.title = machine.vpn.join('\n') || 'No VPN interface with an address was found.';
+
+    var key = JSON.stringify(machine);
+    if (key === machineDrawn) { return; }
+    machineDrawn = key;
+    var box = clear(byId('machine'));
+    machine.sections.forEach(function (section) {
+      var name = section.title.replace(/ \(\d+\)$/, '');
+      var lines = section.lines.map(function (line) {
+        return el('div', name === 'Route warnings' ? 'warn-text' : 'mono', line);
+      });
+      if (section.open) {
+        box.appendChild(el('h3', null, section.title));
+        lines.forEach(function (line) { box.appendChild(line); });
+        return;
+      }
+      var fold = box.appendChild(el('details'));
+      fold.open = !!unfolded[name];
+      fold.appendChild(el('summary', null, section.title));
+      lines.forEach(function (line) { fold.appendChild(line); });
+      fold.addEventListener('toggle', function () { unfolded[name] = fold.open; });
+    });
+    if (machine.observed_utc) {
+      box.appendChild(el('div', 'dim', 'Read from this machine at ' + machine.observed_utc.slice(11, 19) +
+        ' UTC. Nothing was sent to find this out.'));
+    }
+  }
+
   function renderSide() {
-    var warnings = state.graph.local.warnings || [];
-    byId('warnings').hidden = warnings.length === 0;
-    renderList(byId('warning-list'), warnings, '', function (text) { return el('li', null, text); });
+    renderMachine();
 
     renderList(byId('tasks'), state.tasks || [], 'No recon tasks yet.', function (task) {
       var item = el('li');

@@ -55,7 +55,7 @@ Before every push:
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
   list`, `meow delete`, the sketched map and fixes from real macOS runs.
-- **Last Verified Commit:** `feat(delete)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `feat(machine)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -83,11 +83,11 @@ Before every push:
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system
     files (Apple's pick the history location from it) and the user's
     `.zshrc` load natively. Never keep `ZDOTDIR` on the shim past `.zshenv`.
-  - Map page: no inline scripts, no `innerHTML`; its look and layout are
-    checked by hand in Chromium (Playwright), not in `cargo test`.
-    `topology::Role` picks a node's icon (`assets/icons/`) and always carries
-    the reason; the Internet cloud and neighbour-table clients are drawn
-    only, never hosts. Cytoscape 3.33.1 is vendored (MIT).
+  - Map page: no inline scripts, no `innerHTML`; look and layout are checked
+    by hand in Chromium (Playwright). `topology::Role` picks a node's icon
+    and carries the reason; the cloud and neighbour-table clients are drawn
+    only, never hosts. `observer::machine_report` words "this machine" once
+    for the map and the HUD (`m`). Cytoscape 3.33.1 is vendored (MIT).
   - Recon tests use stand-in tools; real `nmap` was smoke-tested on 127.0.0.1
     only, `katana`/`feroxbuster` never. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target

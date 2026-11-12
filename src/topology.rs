@@ -23,8 +23,10 @@ use serde_json::{json, Value};
 
 use crate::checklist;
 use crate::evidence::VerificationStatus;
-use crate::graph::{Graph, Host, Route};
-use crate::observer::{has_routable_address, routable_address, route_for};
+use crate::graph::{Graph, Host};
+use crate::observer::{
+    has_routable_address, is_default_route, primary_address, routable_address, route_for,
+};
 
 pub const LOCAL_ID: &str = "local";
 /// Drawing only: what lies beyond a default route.
@@ -111,10 +113,6 @@ fn is_single_device(address: &str, mac: &str) -> bool {
         Err(_) => false,
     };
     !group_mac && single_address
-}
-
-fn is_default(route: &Route) -> bool {
-    matches!(route.destination.as_str(), "0.0.0.0/0" | "::/0")
 }
 
 /// The role of a host and what it was derived from. Text evidence wins over
@@ -268,7 +266,7 @@ impl Topology {
             topology.interface(graph, name);
         }
         for route in &graph.local.routes {
-            if !is_default(route) || !visible.contains(&route.interface) {
+            if !is_default_route(route) || !visible.contains(&route.interface) {
                 continue;
             }
             if let Some(gateway) = &route.gateway {
@@ -338,12 +336,16 @@ impl Topology {
     fn drawing(&self, graph: &Graph, node: &Node) -> (Role, String, String, Option<String>) {
         let routed = "it is a gateway in this machine's routing table";
         match node.kind {
-            NodeKind::Local => (
-                Role::You,
-                "the machine meow runs on".to_owned(),
-                Role::You.title().to_owned(),
-                None,
-            ),
+            NodeKind::Local => {
+                // Its own address on the network it reaches the rest through.
+                let mut caption = Role::You.title().to_owned();
+                if let Some(address) = primary_address(&graph.local) {
+                    caption.push('\n');
+                    caption.push_str(&address);
+                }
+                let why = "the machine meow runs on".to_owned();
+                (Role::You, why, caption, None)
+            }
             NodeKind::Interface => {
                 let name = node.id.strip_prefix("if:").unwrap_or(&node.id);
                 let interface = graph.local.interfaces.iter().find(|i| i.name == name);
@@ -391,7 +393,7 @@ impl Topology {
     /// interface itself for a route without one) and a description.
     fn default_routes(&self, graph: &Graph) -> Vec<(String, String)> {
         let mut found: Vec<(String, String)> = Vec::new();
-        for route in graph.local.routes.iter().filter(|r| is_default(r)) {
+        for route in graph.local.routes.iter().filter(|r| is_default_route(r)) {
             let (id, via) = match &route.gateway {
                 Some(gateway) if graph.hosts.contains_key(gateway) => {
                     (host_id(gateway), format!("{gateway} ({})", route.interface))
@@ -774,7 +776,8 @@ mod tests {
             nodes[0]["data"],
             json!({
                 "id": "local", "label": "this machine", "kind": "local",
-                "role": "you", "why": "the machine meow runs on", "caption": "You",
+                "role": "you", "why": "the machine meow runs on",
+                "caption": "You\n192.168.1.5",
             })
         );
         let web = nodes
@@ -852,7 +855,7 @@ mod tests {
         };
         let pair = |role: &str, caption: &str| (role.to_owned(), caption.to_owned());
 
-        assert_eq!(drawn("local"), pair("you", "You"));
+        assert_eq!(drawn("local"), pair("you", "You\n192.168.1.5"));
         assert_eq!(drawn("internet"), pair("internet", "Internet"));
         assert_eq!(
             drawn("if:eth0"),

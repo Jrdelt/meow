@@ -52,7 +52,7 @@ cargo test                   # the full test suite
 | `meow mode <light\|mild\|aggressive>` | Switches the discovery profile. |
 | `meow recon <target> [-- <nmap flags>]` | Queues a four-stage inventory of a host or CIDR range. Runs in the background of the session, one tool at a time. |
 | `meow map` | Opens the live topology map in your browser. `--no-open` prints the URL. |
-| `meow hud` | Opens the terminal panel: hosts, inspector, checklist, CVE feed, queue, notes, AI. |
+| `meow hud` | Opens the terminal panel: this machine's connection and VPN, hosts, inspector, checklist, CVE feed, queue, notes, AI. |
 | `meow add <file>` | Imports an Nmap XML, JSON Lines, log or `git diff` file. `--no-cve` skips the vulnerability lookups. |
 | `meow report` | Writes `REPORT.md` into the workspace. No AI, no network. |
 
@@ -78,6 +78,19 @@ The picture is a drawing hint, not a finding. Click any node to read what it
 was derived from. A host with hypotheses to verify gets an amber marker, one
 with a confirmed finding a red one, and a dashed red frame means a match is in
 the CISA known-exploited catalog.
+
+## This machine
+
+Both `meow map` and `meow hud` always show how this machine is connected (the
+interface, its address and the gateway) and whether a VPN is up, with the
+networks that VPN carries. The map has a badge for it in the header and a
+"This machine" panel; the HUD has a line under its header.
+
+Below that is everything meow read about the machine: interfaces, routes,
+listening ports and the neighbour table. On the map these unfold on a click;
+in the HUD press `m`. The tables are read from the operating system every 30
+seconds, so a VPN that connects during a session shows up by itself. Nothing
+is sent to find any of it out.
 
 ## Modes
 

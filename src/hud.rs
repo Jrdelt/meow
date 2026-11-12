@@ -32,6 +32,7 @@ use crate::db::Db;
 use crate::evidence::{sanitize, VerificationStatus};
 use crate::graph::{Advisory, Graph, Host, PathNode};
 use crate::mode::Mode;
+use crate::observer::{machine_report, MachineReport};
 use crate::queue::{self, TaskRow};
 use crate::workspace::Workspace;
 
@@ -100,6 +101,8 @@ pub struct Model {
     pub status: String,
     /// The upper-right panel shows the AI reply instead of the inspector.
     pub show_ai: bool,
+    /// The upper-right panel shows everything known about this machine.
+    pub show_machine: bool,
 }
 
 fn advisory_rank(advisory: &Advisory) -> (bool, i64) {
@@ -119,6 +122,7 @@ impl Model {
             note: None,
             status: String::new(),
             show_ai: false,
+            show_machine: false,
         }
     }
 
@@ -314,6 +318,13 @@ impl Model {
             KeyCode::Char('R') => self.ask_ai(Tier::Research),
             KeyCode::Char('a') => {
                 self.show_ai = !self.show_ai;
+                self.show_machine = false;
+                self.inspector_scroll = 0;
+                Action::None
+            }
+            KeyCode::Char('m') => {
+                self.show_machine = !self.show_machine;
+                self.show_ai = false;
                 self.inspector_scroll = 0;
                 Action::None
             }
@@ -475,6 +486,50 @@ fn advisory_detail(snapshot: &Snapshot, host: &Host, advisory: &Advisory) -> Vec
     lines
 }
 
+/// The second header line: how this machine is connected, and whether a
+/// VPN is up. Always in view; `m` shows the rest.
+fn machine_line(report: &MachineReport) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" this machine ", TITLE),
+        Span::raw(sanitize(&report.connection.join("; "), 300)),
+        Span::raw(" | "),
+    ];
+    if report.vpn.is_empty() {
+        spans.push(Span::styled("no VPN", DIM));
+    } else {
+        let text = format!("VPN {}", report.vpn.join("; "));
+        spans.push(Span::styled(sanitize(&text, 300), GOOD));
+    }
+    Line::from(spans)
+}
+
+/// Everything the observer read about this machine, section by section.
+fn machine_lines(report: &MachineReport) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for section in &report.sections {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(section.title.clone(), TITLE));
+        let style = if section.title == "Route warnings" {
+            WARN
+        } else {
+            Style::default()
+        };
+        for line in &section.lines {
+            lines.push(Line::styled(format!("  {}", sanitize(line, 400)), style));
+        }
+    }
+    if let Some(time) = report.observed_utc.get(11..19) {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("Read from this machine at {time} UTC. Nothing was sent to find this out."),
+            DIM,
+        ));
+    }
+    lines
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     let Some(snapshot) = &model.snapshot else {
         frame.render_widget(
@@ -483,6 +538,10 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         );
         return;
     };
+    let [area, machine_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let report = machine_report(&snapshot.graph.local);
+    frame.render_widget(Paragraph::new(machine_line(&report)), machine_area);
     let mode_style = match snapshot.mode {
         Mode::Light => GOOD,
         Mode::Mild => WARN,
@@ -677,7 +736,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, model: &Model) {
     let help = if model.note.is_some() {
         " Enter save   Esc cancel"
     } else {
-        " Up/Down select  Tab panel  n note  c confirm  f false positive  u reopen  L/C/R ask AI  a AI view  1/2/3 mode  PgUp/PgDn scroll  q quit"
+        " Up/Down select  Tab panel  n note  c confirm  f false positive  u reopen  L/C/R ask AI  a AI view  m this machine  1/2/3 mode  PgUp/PgDn scroll  q quit"
     };
     frame.render_widget(Paragraph::new(Line::styled(help, DIM)), help_area);
 }
@@ -732,7 +791,7 @@ fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
 /// Draws the whole panel. Pure: everything comes from `model`.
 pub fn draw(frame: &mut Frame, model: &Model) {
     let [header, body, activity, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Min(8),
         Constraint::Length(8),
         Constraint::Length(2),
@@ -750,6 +809,18 @@ pub fn draw(frame: &mut Frame, model: &Model) {
     draw_hosts(frame, hosts, model, snapshot);
     if model.show_ai {
         draw_ai(frame, inspector, model, snapshot);
+    } else if model.show_machine {
+        let report = machine_report(&snapshot.graph.local);
+        frame.render_widget(
+            Paragraph::new(machine_lines(&report))
+                .wrap(Wrap { trim: false })
+                .scroll((model.inspector_scroll, 0))
+                .block(panel(
+                    "This machine: connection, VPN, interfaces, routes, listeners, neighbours",
+                    true,
+                )),
+            inspector,
+        );
     } else {
         let lines = match model.selected_host() {
             Some(host) => inspector_lines(host),
@@ -882,7 +953,7 @@ pub fn run(workspace: &Workspace) -> Result<()> {
 mod tests {
     use super::*;
     use crate::evidence::{Confidence, EvidenceRecord, Source};
-    use crate::graph::{Observation, Route};
+    use crate::graph::{Interface, Listener, Observation, Route};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;
@@ -1238,6 +1309,108 @@ mod tests {
         model.on_key(key(KeyCode::Char('n')));
         model.on_key(key(KeyCode::Char('x')));
         assert_eq!(model.on_key(key(KeyCode::Enter)), Action::None);
+    }
+
+    #[test]
+    fn this_machine_is_always_in_the_header_and_in_full_behind_m() {
+        // Nothing read yet: say so instead of showing nothing.
+        let text = screen(&model(), 160, 46);
+        assert!(
+            text.contains(" this machine unknown: the network tables could not be read | no VPN"),
+            "{text}"
+        );
+
+        let mut graph = graph();
+        let interface = |name: &str, kind: &str, addresses: &[&str]| Interface {
+            name: name.into(),
+            kind: kind.into(),
+            up: true,
+            addresses: addresses.iter().map(|a| (*a).to_owned()).collect(),
+        };
+        graph.local.observed_utc = "2026-11-12T09:40:00Z".into();
+        graph.local.interfaces = vec![
+            interface("en0", "wifi", &["fe80::1c71/64", "10.104.168.20/22"]),
+            interface("utun0", "vpn", &["fe80::2/64"]),
+        ];
+        graph.local.routes.insert(
+            0,
+            Route {
+                destination: "0.0.0.0/0".into(),
+                gateway: Some("10.104.168.1".into()),
+                interface: "en0".into(),
+            },
+        );
+        graph.local.listeners.push(Listener {
+            protocol: "tcp".into(),
+            address: "127.0.0.1".into(),
+            port: 631,
+        });
+        let mut model = Model::new(true);
+        model.apply_message(&state_message(&graph));
+        let text = screen(&model, 160, 46);
+        // An idle tunnel with only a link-local address is not a VPN.
+        assert!(
+            text.contains(
+                " this machine en0 (wifi) 10.104.168.20/22, gateway 10.104.168.1 | no VPN"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("m this machine"), "{text}");
+        assert!(!text.contains("Listening on this machine"), "{text}");
+
+        // `m` swaps the inspector for the full report; `m` again swaps back.
+        assert_eq!(model.on_key(key(KeyCode::Char('m'))), Action::None);
+        let text = screen(&model, 160, 46);
+        for expected in [
+            "This machine: connection, VPN, interfaces, routes, listeners, neighbours",
+            "Connection",
+            "  en0 (wifi) 10.104.168.20/22, gateway 10.104.168.1",
+            "VPN",
+            "  none detected",
+            "Interfaces (2)",
+            "  en0 wifi up fe80::1c71/64 10.104.168.20/22",
+            "  1 more without a usable address: utun0",
+            "Routes (2)",
+            "  default via 10.104.168.1 on en0",
+            "Listening on this machine (1)",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(!text.contains("Inspector: node, ports and sub-paths"));
+        // The report is long: it scrolls like the inspector does.
+        model.on_key(key(KeyCode::PageDown));
+        let scrolled = screen(&model, 160, 46);
+        assert!(
+            scrolled.contains("  tcp 127.0.0.1:631 (this machine only)"),
+            "{scrolled}"
+        );
+        assert!(
+            scrolled.contains("Neighbours seen by this machine (0)"),
+            "{scrolled}"
+        );
+        assert!(
+            scrolled.contains("Read from this machine at 09:40:00 UTC"),
+            "{scrolled}"
+        );
+        model.on_key(key(KeyCode::Char('m')));
+        assert!(screen(&model, 160, 46).contains("Inspector: node, ports and sub-paths"));
+
+        // A tunnel with a real address is reported as the VPN it is.
+        graph.local.interfaces[1]
+            .addresses
+            .push("10.10.14.3/23".into());
+        model.apply_message(&state_message(&graph));
+        let text = screen(&model, 160, 46);
+        assert!(
+            text.contains("| VPN utun0 10.10.14.3/23: no route uses it"),
+            "{text}"
+        );
+        // The AI view and the machine view replace each other.
+        model.on_key(key(KeyCode::Char('m')));
+        model.on_key(key(KeyCode::Char('a')));
+        assert!(model.show_ai && !model.show_machine);
+        model.on_key(key(KeyCode::Char('m')));
+        assert!(model.show_machine && !model.show_ai);
     }
 
     #[test]
