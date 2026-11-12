@@ -99,6 +99,139 @@ impl Role {
     }
 }
 
+/// What is known about a host's operating system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsGuess {
+    pub name: String,
+    /// Empty when not known.
+    pub version: String,
+    /// Read off a service banner instead of reported by an OS scan.
+    pub guessed: bool,
+}
+
+/// Distribution names as they appear in service banners.
+const BANNER_SYSTEMS: &[(&str, &str)] = &[
+    ("ubuntu", "Ubuntu"),
+    ("debian", "Debian"),
+    ("raspbian", "Raspbian"),
+    ("red hat", "Red Hat"),
+    ("rhel", "Red Hat"),
+    ("centos", "CentOS"),
+    ("fedora", "Fedora"),
+    ("alpine", "Alpine Linux"),
+    ("freebsd", "FreeBSD"),
+    ("microsoft", "Windows"),
+    ("windows", "Windows"),
+];
+
+/// The OpenSSH version each Ubuntu long-term release ships. The package
+/// revision in the banner changes with every update; this part does not.
+const UBUNTU_BY_OPENSSH: &[(&str, &str)] = &[
+    ("6.6.1p1", "14.04"),
+    ("7.2p2", "16.04"),
+    ("7.6p1", "18.04"),
+    ("8.2p1", "20.04"),
+    ("8.9p1", "22.04"),
+    ("9.6p1", "24.04"),
+];
+
+/// The operating system of a host: what an OS scan reported, or else what
+/// its service banners give away (`OpenSSH 9.6p1 Ubuntu 3ubuntu13.20`).
+pub fn host_os(host: &Host) -> Option<OsGuess> {
+    if let Some(os) = host
+        .os
+        .as_deref()
+        .map(str::trim)
+        .filter(|os| !os.is_empty())
+    {
+        // "Linux 5.4", "Microsoft Windows 10 1809": the version starts at
+        // the first word that begins with a digit.
+        let words: Vec<&str> = os.split_whitespace().collect();
+        let at = words
+            .iter()
+            .position(|word| word.starts_with(|c: char| c.is_ascii_digit()))
+            .filter(|at| *at > 0)
+            .unwrap_or(words.len());
+        return Some(OsGuess {
+            name: words[..at].join(" "),
+            version: words[at..].join(" "),
+            guessed: false,
+        });
+    }
+    for port in host.ports.values() {
+        let banner = [&port.product, &port.version, &port.extra_info]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lower = banner.to_lowercase();
+        let Some((_, name)) = BANNER_SYSTEMS.iter().find(|(word, _)| lower.contains(word)) else {
+            continue;
+        };
+        let upstream = port
+            .version
+            .as_deref()
+            .and_then(|v| v.split_whitespace().next());
+        let version = match *name {
+            "Ubuntu" if lower.contains("openssh") => UBUNTU_BY_OPENSSH
+                .iter()
+                .find(|(openssh, _)| Some(*openssh) == upstream)
+                .map(|(_, release)| (*release).to_owned()),
+            // Debian package revisions name the release: `5+deb11u3`.
+            "Debian" | "Raspbian" => lower.split("deb").skip(1).find_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                (!digits.is_empty()).then_some(digits)
+            }),
+            _ => None,
+        };
+        return Some(OsGuess {
+            name: (*name).to_owned(),
+            version: version.unwrap_or_default(),
+            guessed: true,
+        });
+    }
+    None
+}
+
+/// `address -> machine type -> OS -> version`, the one-line answer to "what
+/// is this?". Unknown parts say so; a guess is marked as one.
+pub fn host_headline(graph: &Graph, host: &Host) -> String {
+    let (role, _) = host_role(graph, host);
+    let os = host_os(host);
+    let known = |text: Option<&str>, otherwise: &str| match text {
+        Some(text) if !text.is_empty() => text.to_owned(),
+        _ => otherwise.to_owned(),
+    };
+    let mut line = [
+        host.address.clone(),
+        role.title().to_owned(),
+        known(os.as_ref().map(|o| o.name.as_str()), "OS not known"),
+        known(os.as_ref().map(|o| o.version.as_str()), "version not known"),
+    ]
+    .join(" -> ");
+    if os.is_some_and(|o| o.guessed) {
+        line.push_str(" (OS read off a service banner)");
+    }
+    line
+}
+
+/// `22/tcp ssh, 443/tcp https`: the ports seen open on a host.
+pub fn host_open_ports(host: &Host) -> String {
+    let ports: Vec<String> = host
+        .open_ports()
+        .map(|port| match &port.service {
+            Some(service) => format!("{} {service}", port.key()),
+            None => port.key(),
+        })
+        .collect();
+    match ports.len() {
+        0 => "none seen open".to_owned(),
+        1..=12 => ports.join(", "),
+        n => format!("{} and {} more", ports[..12].join(", "), n - 12),
+    }
+}
+
 /// True for a neighbour-table entry that stands for one device: a resolved,
 /// individual hardware address and an address that is not a group.
 fn is_single_device(address: &str, mac: &str) -> bool {
@@ -438,6 +571,8 @@ impl Topology {
                             .count()
                     };
                     data["address"] = json!(host.address);
+                    data["headline"] = json!(host_headline(graph, host));
+                    data["ports_line"] = json!(host_open_ports(host));
                     data["open_ports"] = json!(host.open_ports().count());
                     data["hypotheses"] = json!(open(VerificationStatus::UnverifiedHypothesis));
                     data["confirmed"] = json!(open(VerificationStatus::Confirmed));
@@ -1011,6 +1146,130 @@ mod tests {
         let edges = elements["edges"].as_array().unwrap();
         let link = edges.iter().find(|e| e["data"]["kind"] == "internet");
         assert_eq!(link.unwrap()["data"]["target"], "if:tun0");
+    }
+
+    #[test]
+    fn a_host_is_summed_up_as_address_type_os_version() {
+        let mut graph = Graph::default();
+        fn port(
+            graph: &mut Graph,
+            address: &str,
+            number: u16,
+            service: &str,
+            product: &str,
+            version: &str,
+        ) {
+            graph.apply(Observation::Port {
+                address: address.into(),
+                port: number,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some(service.into()),
+                product: Some(product.into()),
+                version: Some(version.into()),
+                extra_info: None,
+                cpes: vec![],
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        // As scanned from the owner's Mac: no OS scan, but the SSH banner
+        // names the distribution and its OpenSSH version names the release.
+        port(
+            &mut graph,
+            "10.202.12.41",
+            22,
+            "ssh",
+            "OpenSSH",
+            "9.6p1 Ubuntu 3ubuntu13.20",
+        );
+        port(
+            &mut graph,
+            "10.0.0.2",
+            22,
+            "ssh",
+            "OpenSSH",
+            "8.4p1 Debian 5+deb11u3",
+        );
+        port(&mut graph, "10.0.0.2", 80, "http", "nginx", "1.18.0");
+        // A release this table does not know: the name, not a made-up version.
+        port(
+            &mut graph,
+            "10.0.0.3",
+            22,
+            "ssh",
+            "OpenSSH",
+            "9.7p1 Ubuntu 7ubuntu4",
+        );
+        port(&mut graph, "10.0.0.4", 80, "http", "nginx", "1.24.0");
+        let os = |address: &str, os: &str| Observation::Host {
+            address: address.into(),
+            os: Some(os.into()),
+            mac: None,
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::Medium, "x"),
+        };
+        graph.apply(os("10.0.0.5", "Linux 5.4"));
+        graph.apply(os("10.0.0.6", "Microsoft Windows 10 1809"));
+        // An OS scan result wins over a banner.
+        port(
+            &mut graph,
+            "10.0.0.5",
+            22,
+            "ssh",
+            "OpenSSH",
+            "8.2p1 Ubuntu 4ubuntu0.11",
+        );
+
+        let host = |address: &str| &graph.hosts[address];
+        let guess = |address: &str| host_os(host(address)).unwrap();
+        assert_eq!(
+            guess("10.202.12.41"),
+            OsGuess {
+                name: "Ubuntu".into(),
+                version: "24.04".into(),
+                guessed: true
+            }
+        );
+        assert_eq!(
+            host_headline(&graph, host("10.202.12.41")),
+            "10.202.12.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)"
+        );
+        assert_eq!(host_open_ports(host("10.202.12.41")), "22/tcp ssh");
+        assert_eq!(
+            host_headline(&graph, host("10.0.0.2")),
+            "10.0.0.2 -> Server -> Debian -> 11 (OS read off a service banner)"
+        );
+        assert_eq!(host_open_ports(host("10.0.0.2")), "22/tcp ssh, 80/tcp http");
+        assert_eq!(
+            host_headline(&graph, host("10.0.0.3")),
+            "10.0.0.3 -> Server -> Ubuntu -> version not known (OS read off a service banner)"
+        );
+        assert_eq!(host_os(host("10.0.0.4")), None);
+        assert_eq!(
+            host_headline(&graph, host("10.0.0.4")),
+            "10.0.0.4 -> Server -> OS not known -> version not known"
+        );
+        assert_eq!(
+            host_headline(&graph, host("10.0.0.5")),
+            "10.0.0.5 -> Server -> Linux -> 5.4"
+        );
+        assert_eq!(
+            host_headline(&graph, host("10.0.0.6")),
+            "10.0.0.6 -> Client -> Microsoft Windows -> 10 1809"
+        );
+        assert_eq!(host_open_ports(host("10.0.0.6")), "none seen open");
+
+        // The map gets the same two lines.
+        let elements = Topology::build(&graph).cytoscape(&graph);
+        let nodes = elements["nodes"].as_array().unwrap();
+        let node = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "host:10.202.12.41")
+            .unwrap();
+        assert_eq!(
+            node["data"]["headline"],
+            "10.202.12.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)"
+        );
+        assert_eq!(node["data"]["ports_line"], "22/tcp ssh");
     }
 
     #[test]

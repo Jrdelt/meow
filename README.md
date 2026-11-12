@@ -81,23 +81,37 @@ the CISA known-exploited catalog.
 
 ## This machine
 
-Both `meow map` and `meow hud` always show how this machine is connected (the
-interface, its address and the gateway) and whether a VPN is up, with the
-networks that VPN carries. The local link stays listed while a VPN is up, also
-when the VPN takes all traffic. An interface is shown by its IPv4 address, with
-its IPv6 address beside it if it has one. The map has a badge for it in the header and a
-"This machine" panel; the HUD has a line under its header.
+The top right of both `meow map` and `meow hud` sums up the machine meow runs
+on in a few lines:
 
-Below that is everything meow read about the machine: interfaces, routes,
-listening ports and the neighbour table. On the map these unfold on a click;
-in the HUD press `m`. The tables are read from the operating system every 30
-seconds, so a VPN that connects during a session shows up by itself. Nothing
-is sent to find any of it out.
+```
+172.20.10.5 -> MacBook Pro -> macOS -> 15.1
+Open ports  none listening
+Interfaces  en0  172.20.10.5/28  gateway 172.20.10.1
+            utun5  172.16.2.24/32  VPN, carries 10.0.0.0/8, 172.16.0.0/12 and 5 single hosts
+```
+
+That is its address, what kind of machine it is, its operating system and
+version, the ports open on it (those only this machine can reach are listed
+apart) and one line per interface in use, saying what each is for. An interface
+is shown by its IPv4 address. A VPN also gets a badge in the map header, and
+the local link stays listed while one is up.
+
+The tables behind this are folded away: on the map they unfold on a click, in
+the HUD press `m`. Routes are cut down to the ones that say where traffic goes;
+single hosts, multicast, link-local and idle interfaces are left out and
+counted. Everything is read from the operating system every 30 seconds, and
+nothing is sent to find it out.
+
+A selected host gets the same one-line answer, for example
+`10.202.12.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)`,
+followed by its open ports. Without an OS scan the system is read off service
+banners where they give it away, and marked as such.
 
 If one of the system tools behind these tables cannot be run, the session says
-so when it starts (`[!] Local network not fully read: ...`) and the panel lists
-it under "Could not be read". An empty table then means it was not read, not
-that there is nothing there.
+so when it starts (`[!] Local network not fully read: ...`) and the summary
+lists it under "Could not be read". An empty table then means it was not read,
+not that there is nothing there.
 
 ## Modes
 

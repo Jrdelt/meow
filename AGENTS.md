@@ -55,7 +55,7 @@ Before every push:
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
   list`, `meow delete`, the sketched map and fixes from real macOS runs.
-- **Last Verified Commit:** `fix(observer)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `feat(summary)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);

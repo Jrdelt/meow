@@ -15,7 +15,7 @@ use ipnetwork::IpNetwork;
 use serde::Serialize;
 
 use crate::endpoint::Endpoint;
-use crate::graph::{Interface, Listener, LocalNet, Neighbor, Route};
+use crate::graph::{Interface, Listener, LocalNet, Neighbor, Route, SystemInfo};
 use crate::timeutil::now_rfc3339;
 
 /// Classifies an interface by its conventional name.
@@ -341,6 +341,13 @@ pub mod macos {
             if fields.len() < 4 || fields[0] == "Destination" {
                 continue;
             }
+            // Flag `I` on a default route: it is scoped to its interface and
+            // only applies to sockets bound to it, so it says nothing about
+            // where this machine's traffic goes. macOS keeps one such
+            // "default" per interface, VPN tunnels and idle ones included.
+            if fields[0] == "default" && fields[2].contains('I') {
+                continue;
+            }
             let destination = if ipv6 {
                 canonical_destination(fields[0], true)
                     .or_else(|| canonical_ip(fields[0]).map(|ip| format!("{ip}/128")))
@@ -401,7 +408,10 @@ pub mod macos {
     pub fn listeners(text: &str, out: &mut Vec<Listener>) {
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 6 || !fields[0].starts_with("tcp") || fields[5] != "LISTEN" {
+            // Proto Recv-Q Send-Q Local-Address Foreign-Address (state) ...
+            // The state is looked for by name: some versions add columns.
+            let listening = fields.iter().skip(4).any(|field| *field == "LISTEN");
+            if fields.len() < 6 || !fields[0].starts_with("tcp") || !listening {
                 continue;
             }
             let Some((address, port)) = fields[3].rsplit_once('.') else {
@@ -736,12 +746,12 @@ pub struct ReportSection {
 }
 
 /// Everything the passive observer read about this machine, worded once for
-/// both the map and the HUD.
+/// both the map and the HUD. Short by design: the address, what the machine
+/// is, its open ports and its interfaces; the long tables are folded away.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct MachineReport {
-    /// How this machine is connected: one line per interface that carries a
-    /// default route.
-    pub connection: Vec<String>,
+    /// `address -> machine type -> OS -> version`.
+    pub headline: String,
     /// One line per active VPN; empty when none is detected.
     pub vpn: Vec<String>,
     pub sections: Vec<ReportSection>,
@@ -757,6 +767,12 @@ fn in_use(interface: &Interface) -> bool {
     interface.up
         && has_routable_address(interface)
         && !matches!(interface.kind.as_str(), "loopback" | "virtual")
+}
+
+/// Up and addressed, internal networks (bridges, containers) included:
+/// what the short interface list shows.
+fn addressed(interface: &Interface) -> bool {
+    interface.up && has_routable_address(interface) && interface.kind != "loopback"
 }
 
 /// The interfaces that carry a default route (IPv4's first), each with the
@@ -803,123 +819,266 @@ pub fn primary_address(local: &LocalNet) -> Option<String> {
         .map(|address| address.split('/').next().unwrap_or(address).to_owned())
 }
 
-fn counted(title: &str, lines: Vec<String>, count: usize) -> ReportSection {
-    ReportSection {
-        title: format!("{title} ({count})"),
-        lines: if lines.is_empty() {
-            vec!["none".to_owned()]
-        } else {
-            lines
-        },
-        open: false,
-        warn: false,
+/// A route to one single address.
+fn is_host_route(network: &IpNetwork) -> bool {
+    match network {
+        IpNetwork::V4(n) => n.prefix() == 32,
+        IpNetwork::V6(n) => n.prefix() == 128,
     }
 }
 
-/// The report shown as "This machine" by `meow map` and `meow hud`: the
-/// local connection, any VPN, and every table the observer read.
-pub fn machine_report(local: &LocalNet) -> MachineReport {
-    // The local links come first and are always listed, VPN or not: they
-    // are how this machine is physically connected. Those with a default
-    // route lead.
-    let carriers = default_carriers(local);
-    let gateways_of = |i: &Interface| carriers.iter().find(|(name, _)| *name == i.name);
-    let line = |interface: &Interface| {
-        let how = match gateways_of(interface).map(|(_, gateways)| gateways.as_slice()) {
-            Some([]) => "default route without a gateway".to_owned(),
-            Some(gateways) => format!("gateway {}", gateways.join(" and ")),
-            None => "local network only (no default route)".to_owned(),
-        };
-        let ipv4 = usable_address(interface, true);
-        let ipv6 = usable_address(interface, false);
-        let address = match (ipv4, ipv6) {
-            (Some(ipv4), Some(ipv6)) => format!("{ipv4} (IPv6 {ipv6})"),
-            (Some(only), None) | (None, Some(only)) => only.to_owned(),
-            (None, None) => "no usable address".to_owned(),
-        };
-        format!("{} ({}) {address}, {how}", interface.name, interface.kind)
-    };
-    let mut links: Vec<&Interface> = local.interfaces.iter().filter(|i| in_use(i)).collect();
-    links.sort_by_key(|i| gateways_of(i).is_none());
-    let mut connection: Vec<String> = links
+/// Multicast, broadcast, link-local and loopback destinations: bookkeeping
+/// of the operating system, not somewhere traffic to other machines goes.
+fn is_bookkeeping(network: &IpNetwork) -> bool {
+    match network.ip() {
+        IpAddr::V4(ip) => {
+            ip.is_multicast() || ip.is_broadcast() || ip.is_link_local() || ip.is_loopback()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_multicast() || ip.is_loopback() || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// True for a route worth reading: a default route or a real network.
+fn is_meaningful(route: &Route) -> bool {
+    is_default_route(route)
+        || IpNetwork::from_str(&route.destination)
+            .is_ok_and(|network| !is_host_route(&network) && !is_bookkeeping(&network))
+}
+
+/// What a VPN interface is used for, from the routes that go through it.
+fn vpn_carries(local: &LocalNet, interface: &Interface) -> String {
+    let routes: Vec<&Route> = local
+        .routes
         .iter()
-        .filter(|i| i.kind != "vpn")
-        .map(|i| line(i))
+        .filter(|r| r.interface == interface.name)
         .collect();
-    if connection.is_empty() {
-        // Nothing but a tunnel is in use.
-        connection = links.iter().map(|i| line(i)).collect();
+    let mut networks: Vec<&str> = routes
+        .iter()
+        .filter(|r| is_meaningful(r))
+        .map(|r| r.destination.as_str())
+        .collect();
+    networks.dedup();
+    let hosts = routes
+        .iter()
+        .filter_map(|r| IpNetwork::from_str(&r.destination).ok())
+        .filter(|network| is_host_route(network) && !is_bookkeeping(network))
+        .count();
+    let halves = ["0.0.0.0/1", "128.0.0.0/1"];
+    if routes.iter().any(|r| is_default_route(r)) {
+        return "carries the default route".to_owned();
     }
-    if connection.is_empty() {
-        connection.push(if local.interfaces.is_empty() {
-            "unknown: the network tables could not be read".to_owned()
-        } else {
-            "not connected: no interface has a usable address".to_owned()
-        });
+    if halves.iter().all(|half| networks.contains(half)) {
+        // The usual way a VPN client takes everything without replacing
+        // the default route.
+        return "carries all IPv4 traffic (0.0.0.0/1 and 128.0.0.0/1)".to_owned();
     }
+    let mut parts: Vec<String> = Vec::new();
+    if !networks.is_empty() {
+        parts.push(networks[..networks.len().min(4)].join(", "));
+    }
+    if networks.len() > 4 {
+        parts.push(format!("{} more networks", networks.len() - 4));
+    }
+    match hosts {
+        0 => {}
+        1 => parts.push("1 single host".to_owned()),
+        n => parts.push(format!("{n} single hosts")),
+    }
+    match parts.as_slice() {
+        [] => "no route uses it".to_owned(),
+        [only] => format!("carries {only}"),
+        [first @ .., last] => format!("carries {} and {last}", first.join(", ")),
+    }
+}
+
+/// `22/tcp, 80/tcp, ...`, shortened after sixteen.
+fn port_list(ports: &std::collections::BTreeSet<(u16, &str)>) -> String {
+    let mut shown: Vec<String> = ports
+        .iter()
+        .take(16)
+        .map(|(port, protocol)| format!("{port}/{protocol}"))
+        .collect();
+    if ports.len() > 16 {
+        shown.push(format!("and {} more", ports.len() - 16));
+    }
+    shown.join(", ")
+}
+
+/// The report shown as "This machine" by `meow map` and `meow hud`.
+pub fn machine_report(local: &LocalNet) -> MachineReport {
+    let known = |text: &str, otherwise: &str| match text.trim() {
+        "" => otherwise.to_owned(),
+        text => text.to_owned(),
+    };
+    let headline = [
+        primary_address(local).unwrap_or_else(|| "no address".to_owned()),
+        known(&local.system.kind, "computer"),
+        known(&local.system.os, "OS not known"),
+        known(&local.system.version, "version not known"),
+    ]
+    .join(" -> ");
 
     let vpn: Vec<String> = local
         .interfaces
         .iter()
         .filter(|i| is_active_vpn(i))
         .map(|interface| {
-            let routes = || {
-                local
-                    .routes
-                    .iter()
-                    .filter(|r| r.interface == interface.name)
-            };
-            let mut networks: Vec<&str> = routes().map(|r| r.destination.as_str()).collect();
-            networks.dedup();
-            let halves = ["0.0.0.0/1", "128.0.0.0/1"];
-            let carries = if routes().any(is_default_route) {
-                "carries the default route".to_owned()
-            } else if halves.iter().all(|half| networks.contains(half)) {
-                // The usual way a VPN client takes everything without
-                // replacing the default route.
-                "carries all IPv4 traffic (0.0.0.0/1 and 128.0.0.0/1)".to_owned()
-            } else if networks.is_empty() {
-                "no route uses it".to_owned()
-            } else if networks.len() > 4 {
-                let more = networks.len() - 4;
-                format!("carries {} and {more} more", networks[..4].join(", "))
-            } else {
-                format!("carries {}", networks.join(", "))
-            };
-            let address = routable_address(interface).unwrap_or_default();
-            format!("{} {address}: {carries}", interface.name)
+            format!(
+                "{} {}: {}",
+                interface.name,
+                routable_address(interface).unwrap_or_default(),
+                vpn_carries(local, interface)
+            )
         })
         .collect();
 
-    let section = |title: &str, lines: Vec<String>, warn: bool| ReportSection {
-        title: title.to_owned(),
+    let section = |title: String, lines: Vec<String>, open: bool, warn: bool| ReportSection {
+        title,
         lines,
-        open: true,
+        open,
         warn,
     };
-    let open = |title: &str, lines: Vec<String>| section(title, lines, false);
-    let mut sections = vec![
-        open("Connection", connection.clone()),
-        open(
-            "VPN",
-            if vpn.is_empty() {
-                vec!["none detected".to_owned()]
-            } else {
-                vpn.clone()
-            },
-        ),
-    ];
+    let mut sections = Vec::new();
+
+    // Open ports: what other machines can reach, then what only this one can.
+    let mut reachable = std::collections::BTreeSet::new();
+    let mut local_only = std::collections::BTreeSet::new();
+    for listener in &local.listeners {
+        let port = (listener.port, listener.protocol.as_str());
+        let loopback = listener
+            .address
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            local_only.insert(port);
+        } else {
+            reachable.insert(port);
+        }
+    }
+    local_only.retain(|port| !reachable.contains(port));
+    let mut ports = Vec::new();
+    if !reachable.is_empty() {
+        ports.push(port_list(&reachable));
+    }
+    if !local_only.is_empty() {
+        ports.push(format!("this machine only: {}", port_list(&local_only)));
+    }
+    if ports.is_empty() {
+        ports.push("none listening".to_owned());
+    }
+    sections.push(section("Open ports".to_owned(), ports, true, false));
+
+    // Interfaces: the ones in use, one line each, saying what each is for.
+    let carriers = default_carriers(local);
+    let gateways_of = |i: &Interface| carriers.iter().find(|(name, _)| *name == i.name);
+    let rank = |i: &Interface| match i.kind.as_str() {
+        _ if gateways_of(i).is_some() && i.kind != "vpn" => 0,
+        "vpn" => 2,
+        "virtual" => 3,
+        _ => 1,
+    };
+    let mut links: Vec<&Interface> = local.interfaces.iter().filter(|i| addressed(i)).collect();
+    links.sort_by_key(|i| rank(i));
+    let mut interfaces: Vec<String> = links
+        .iter()
+        .map(|interface| {
+            let what = match (interface.kind.as_str(), gateways_of(interface)) {
+                ("vpn", _) => format!("VPN, {}", vpn_carries(local, interface)),
+                ("virtual", _) => "virtual network on this machine".to_owned(),
+                (_, Some((_, gateways))) => {
+                    // The IPv4 gateway is the one people know; the IPv6
+                    // one is a link-local address that says little.
+                    let ipv4: Vec<&str> = gateways
+                        .iter()
+                        .copied()
+                        .filter(|g| !g.contains(':'))
+                        .collect();
+                    match (ipv4.as_slice(), gateways.as_slice()) {
+                        ([], []) => "default route without a gateway".to_owned(),
+                        ([], all) => format!("gateway {}", all.join(" and ")),
+                        (ipv4, _) => format!("gateway {}", ipv4.join(" and ")),
+                    }
+                }
+                _ => "local network only".to_owned(),
+            };
+            format!(
+                "{}  {}  {what}",
+                interface.name,
+                routable_address(interface).unwrap_or_default()
+            )
+        })
+        .collect();
+    if interfaces.is_empty() {
+        interfaces.push(if local.interfaces.is_empty() {
+            "unknown: the network tables could not be read".to_owned()
+        } else {
+            "not connected: no interface has a usable address".to_owned()
+        });
+    }
+    sections.push(section("Interfaces".to_owned(), interfaces, true, false));
+
     if !local.warnings.is_empty() {
-        sections.push(section("Route warnings", local.warnings.clone(), true));
+        let title = "Route warnings".to_owned();
+        sections.push(section(title, local.warnings.clone(), true, true));
     }
     if !local.notes.is_empty() {
-        // An empty table below then means "not read", not "nothing there".
-        sections.push(section("Could not be read", local.notes.clone(), true));
+        // An empty table then means "not read", not "nothing there".
+        let title = "Could not be read".to_owned();
+        sections.push(section(title, local.notes.clone(), true, true));
     }
 
-    // Interfaces: the ones with a usable address in full, the rest by name.
+    // Folded away: the routes that matter, the neighbours, every interface.
+    let shown_on = |name: &str| links.iter().any(|i| i.name == name);
+    let mut routes: Vec<String> = local
+        .routes
+        .iter()
+        .filter(|route| is_meaningful(route) && shown_on(&route.interface))
+        .map(|route| {
+            let to = match route.destination.as_str() {
+                "0.0.0.0/0" => "default",
+                "::/0" => "default (IPv6)",
+                other => other,
+            };
+            match &route.gateway {
+                Some(gateway) => format!("{to} via {gateway} on {}", route.interface),
+                None => format!("{to} on {} (directly attached)", route.interface),
+            }
+        })
+        .collect();
+    let kept = routes.len();
+    let left_out = local.routes.len() - kept;
+    if left_out > 0 {
+        routes.push(format!(
+            "{left_out} more left out: single hosts, multicast, link-local and idle interfaces"
+        ));
+    }
+    if routes.is_empty() {
+        routes.push("none".to_owned());
+    }
+    let title = match left_out {
+        0 => format!("Routes ({kept})"),
+        _ => format!("Routes ({kept} of {})", local.routes.len()),
+    };
+    sections.push(section(title, routes, false, false));
+
+    let mut neighbours: Vec<String> = local
+        .neighbors
+        .iter()
+        .map(|n| {
+            let mac = n.mac.as_deref().unwrap_or("no answer");
+            format!("{}  {mac}  {}", n.address, n.interface)
+        })
+        .collect();
+    if neighbours.is_empty() {
+        neighbours.push("none".to_owned());
+    }
+    let title = format!("Neighbours ({})", local.neighbors.len());
+    sections.push(section(title, neighbours, false, false));
+
     let listed = |i: &&Interface| has_routable_address(i) || i.kind == "loopback";
-    let mut interfaces: Vec<String> = local
+    let mut all: Vec<String> = local
         .interfaces
         .iter()
         .filter(listed)
@@ -940,74 +1099,20 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
         .map(|i| i.name.as_str())
         .collect();
     if !idle.is_empty() {
-        interfaces.push(format!(
-            "{} more without a usable address: {}",
+        all.push(format!(
+            "{} without a usable address: {}",
             idle.len(),
             idle.join(", ")
         ));
     }
-    sections.push(counted("Interfaces", interfaces, local.interfaces.len()));
-
-    let routes = local
-        .routes
-        .iter()
-        .map(|route| {
-            let to = if is_default_route(route) {
-                match route.destination.as_str() {
-                    "::/0" => "default (IPv6)",
-                    _ => "default",
-                }
-            } else {
-                route.destination.as_str()
-            };
-            match &route.gateway {
-                Some(gateway) => format!("{to} via {gateway} on {}", route.interface),
-                None => format!("{to} on {} (directly attached)", route.interface),
-            }
-        })
-        .collect();
-    sections.push(counted("Routes", routes, local.routes.len()));
-
-    let listeners = local
-        .listeners
-        .iter()
-        .map(|listener| {
-            let scope = match listener.address.parse::<IpAddr>() {
-                Ok(ip) if ip.is_unspecified() => " (every interface)",
-                Ok(ip) if ip.is_loopback() => " (this machine only)",
-                _ if listener.address == "*" => " (every interface)",
-                _ => "",
-            };
-            let address = if listener.address.contains(':') {
-                format!("[{}]", listener.address)
-            } else {
-                listener.address.clone()
-            };
-            format!("{} {address}:{}{scope}", listener.protocol, listener.port)
-        })
-        .collect();
-    sections.push(counted(
-        "Listening on this machine",
-        listeners,
-        local.listeners.len(),
-    ));
-
-    let neighbours = local
-        .neighbors
-        .iter()
-        .map(|n| {
-            let mac = n.mac.as_deref().unwrap_or("no answer");
-            format!("{}  {mac}  {}", n.address, n.interface)
-        })
-        .collect();
-    sections.push(counted(
-        "Neighbours seen by this machine",
-        neighbours,
-        local.neighbors.len(),
-    ));
+    if all.is_empty() {
+        all.push("none".to_owned());
+    }
+    let title = format!("All interfaces ({})", local.interfaces.len());
+    sections.push(section(title, all, false, false));
 
     MachineReport {
-        connection,
+        headline,
         vpn,
         sections,
         observed_utc: local.observed_utc.clone(),
@@ -1078,11 +1183,145 @@ fn run_from(program: &str, args: &[&str], dirs: &[&str], notes: &mut Vec<String>
     }
 }
 
+// ---------------------------------------------------------------------------
+// What this machine is: type, operating system, version
+// ---------------------------------------------------------------------------
+
+/// Parsers for what each platform says about itself. Pure, so every
+/// platform's parser is tested on every platform.
+pub mod system {
+    /// macOS `sysctl -n hw.model`: `MacBookPro18,3`, `Macmini9,1`, `Mac14,7`.
+    /// Recent models are only called `MacNN,N`, which does not say which.
+    pub fn mac_kind(model: &str) -> &'static str {
+        let model = model.trim();
+        let names = [
+            ("MacBookPro", "MacBook Pro"),
+            ("MacBookAir", "MacBook Air"),
+            ("MacBook", "MacBook"),
+            ("Macmini", "Mac mini"),
+            ("iMacPro", "iMac Pro"),
+            ("iMac", "iMac"),
+            ("MacPro", "Mac Pro"),
+            ("VirtualMac", "Mac (virtual machine)"),
+            ("Mac", "Mac"),
+        ];
+        names
+            .iter()
+            .find(|(prefix, _)| model.starts_with(prefix))
+            .map_or("", |(_, name)| name)
+    }
+
+    /// The value of `Key:   value` or `KEY="value"` lines.
+    fn field(text: &str, key: &str, separator: char) -> String {
+        text.lines()
+            .filter_map(|line| line.split_once(separator))
+            .find(|(name, _)| name.trim() == key)
+            .map(|(_, value)| value.trim().trim_matches('"').to_owned())
+            .unwrap_or_default()
+    }
+
+    /// macOS `sw_vers`: `ProductName: macOS`, `ProductVersion: 15.1`.
+    pub fn sw_vers(text: &str) -> (String, String) {
+        (
+            field(text, "ProductName", ':'),
+            field(text, "ProductVersion", ':'),
+        )
+    }
+
+    /// Linux `/etc/os-release`: `NAME="Ubuntu"`, `VERSION_ID="24.04"`.
+    pub fn os_release(text: &str) -> (String, String) {
+        let version = match field(text, "VERSION_ID", '=') {
+            id if id.is_empty() => field(text, "VERSION", '='),
+            id => id,
+        };
+        (field(text, "NAME", '='), version)
+    }
+
+    /// Linux DMI: the SMBIOS chassis type number and the product name.
+    pub fn chassis_kind(chassis_type: &str, product: &str) -> &'static str {
+        let product = product.to_ascii_lowercase();
+        let virtual_words = [
+            "virtual",
+            "kvm",
+            "qemu",
+            "vmware",
+            "hvm",
+            "bochs",
+            "parallels",
+        ];
+        if virtual_words.iter().any(|word| product.contains(word)) {
+            return "Virtual machine";
+        }
+        match chassis_type.trim().parse::<u8>().unwrap_or(0) {
+            8..=10 | 14 | 31 | 32 => "Laptop",
+            3..=7 | 13 | 15 | 16 | 35 | 36 => "Desktop",
+            17 | 23 | 28 | 29 => "Server",
+            _ => "",
+        }
+    }
+
+    /// Windows `ver`: `Microsoft Windows [Version 10.0.22631.4460]`.
+    pub fn windows_ver(text: &str) -> (String, String) {
+        let version = text
+            .split_once("[Version ")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(version, _)| version.trim().to_owned())
+            .unwrap_or_default();
+        ("Windows".to_owned(), version)
+    }
+}
+
+/// Asks this machine what it is. Cheap local lookups only; anything that
+/// cannot be read is left empty and shown as "not known".
+fn read_system() -> SystemInfo {
+    // These are extras: a tool that is missing here is not worth a warning.
+    let mut unused = Vec::new();
+    let mut ask = |program: &str, args: &[&str]| run(program, args, &mut unused);
+    let file = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let (kind, (os, version)) = if cfg!(target_os = "macos") {
+        (
+            system::mac_kind(&ask("sysctl", &["-n", "hw.model"])).to_owned(),
+            system::sw_vers(&ask("sw_vers", &[])),
+        )
+    } else if cfg!(windows) {
+        (
+            String::new(),
+            system::windows_ver(&ask("cmd", &["/C", "ver"])),
+        )
+    } else {
+        let kind = system::chassis_kind(
+            &file("/sys/class/dmi/id/chassis_type"),
+            &file("/sys/class/dmi/id/product_name"),
+        );
+        (
+            kind.to_owned(),
+            system::os_release(&file("/etc/os-release")),
+        )
+    };
+    SystemInfo {
+        kind,
+        // The platform name is always known, whatever the tools say.
+        os: match os.is_empty() {
+            true => std::env::consts::OS.to_owned(),
+            false => os,
+        },
+        version,
+    }
+}
+
+/// What this machine is. It does not change while meow runs, so it is read
+/// once.
+pub fn system_info() -> SystemInfo {
+    static SYSTEM: std::sync::OnceLock<SystemInfo> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(read_system).clone()
+}
+
 /// Reads the local tables once. `targets` are the known lab hosts, used for
 /// the route warnings.
 pub fn observe(targets: &[IpAddr]) -> LocalNet {
     let mut local = LocalNet {
         observed_utc: now_rfc3339(),
+        system: system_info(),
         ..LocalNet::default()
     };
     // Plain `if`s rather than `#[cfg]` blocks: every platform's branch is
@@ -1366,20 +1605,27 @@ mod tests {
         assert_eq!(routable_address(en0), Some("10.104.168.20/22"));
         assert_eq!(primary_address(&local).as_deref(), Some("10.104.168.20"));
         let report = machine_report(&local);
-        assert_eq!(
-            report.connection[0],
-            "en0 (ethernet) 10.104.168.20/22 (IPv6 2607:f8b0:4005:80a::200e/64), \
-             gateway 10.104.168.1"
+        assert!(
+            report.headline.starts_with("10.104.168.20 -> "),
+            "{}",
+            report.headline
         );
         // A dotted mask is read too, and an unreadable one does not cost
-        // the address.
+        // the address. Without any IPv4 address the IPv6 one is shown.
         assert_eq!(by_name("en7").addresses, ["192.168.50.2/24"]);
         assert_eq!(by_name("en8").addresses, ["192.168.60.2/32"]);
-        // No IPv4 address at all: then the IPv6 one is what it is known by.
         assert_eq!(routable_address(by_name("en9")), Some("fd00::9/64"));
-        assert!(report
-            .connection
-            .contains(&"en9 (ethernet) fd00::9/64, local network only (no default route)".into()));
+        let interfaces = &report.sections[1];
+        assert_eq!(interfaces.title, "Interfaces");
+        assert_eq!(
+            interfaces.lines,
+            [
+                "en0  10.104.168.20/22  gateway 10.104.168.1",
+                "en7  192.168.50.2/24  local network only",
+                "en8  192.168.60.2/32  local network only",
+                "en9  fd00::9/64  local network only",
+            ]
+        );
     }
 
     #[test]
@@ -1429,6 +1675,8 @@ mod tests {
             "Routing tables\n\nInternet:\n\
              Destination        Gateway            Flags           Netif Expire\n\
              default            192.168.1.1        UGScg             en0\n\
+             default            link#25            UCSIg       bridge100      !\n\
+             default            link#27            UCSIg           utun3\n\
              10.10.10/23        10.10.14.1         UGSc            utun3\n\
              127                127.0.0.1          UCS               lo0\n\
              192.168.1          link#6             UCS               en0      !\n\
@@ -1459,9 +1707,9 @@ mod tests {
                 "127.0.0.0/8 127.0.0.1 lo0",
                 "192.168.1.0/24 - en0",
                 "192.168.1.1/32 - en0",
-                "::/0 fe80:: utun0",
                 "fe80::/64 - en0",
-            ]
+            ],
+            "interface-scoped defaults (flag I) are not where traffic goes"
         );
 
         macos::neighbors(
@@ -1478,6 +1726,7 @@ mod tests {
              tcp46      0      0  *.8080                 *.*                    LISTEN\n\
              tcp4       0      0  *.22                   *.*                    LISTEN\n\
              tcp6       0      0  ::1.631                *.*                    LISTEN\n\
+             tcp4       0      0  *.7000                 *.*                    LISTEN  131072 131072\n\
              tcp4       0      0  192.168.1.5.52100      17.1.2.3.443           ESTABLISHED\n",
             &mut local.listeners,
         );
@@ -1488,7 +1737,14 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            ["192.168.1.5:8000", ":::8080", "0.0.0.0:22", "::1:631"]
+            [
+                "192.168.1.5:8000",
+                ":::8080",
+                "0.0.0.0:22",
+                "::1:631",
+                "0.0.0.0:7000"
+            ],
+            "the state is found by name, extra columns or not"
         );
 
         let warnings = route_warnings(&local, &[ip("10.10.10.5")]);
@@ -1669,13 +1925,13 @@ mod tests {
     }
 
     #[test]
-    fn machine_report_states_the_connection_and_the_vpn() {
+    fn machine_report_is_short_and_says_what_matters() {
         let local = linux_fixture();
         let report = machine_report(&local);
-        // Both default routes leave through eth0: one line, both gateways.
+        // Nothing is known about the machine itself here: it says so.
         assert_eq!(
-            report.connection,
-            ["eth0 (ethernet) 192.168.1.5/24, gateway 192.168.1.1 and fe80::1"]
+            report.headline,
+            "192.168.1.5 -> computer -> OS not known -> version not known"
         );
         assert_eq!(
             report.vpn,
@@ -1683,51 +1939,74 @@ mod tests {
         );
         assert_eq!(primary_address(&local).as_deref(), Some("192.168.1.5"));
 
-        let titles: Vec<(&str, bool)> = report
+        let shape: Vec<(&str, bool)> = report
             .sections
             .iter()
             .map(|s| (s.title.as_str(), s.open))
             .collect();
         assert_eq!(
-            titles,
+            shape,
             [
-                ("Connection", true),
-                ("VPN", true),
-                ("Interfaces (5)", false),
-                ("Routes (6)", false),
-                ("Listening on this machine (8)", false),
-                ("Neighbours seen by this machine (2)", false),
+                ("Open ports", true),
+                ("Interfaces", true),
+                ("Routes (5 of 6)", false),
+                ("Neighbours (2)", false),
+                ("All interfaces (5)", false),
+            ],
+            "two short blocks in view, the tables folded away"
+        );
+        let lines = |title: &str| -> Vec<String> {
+            let found = report.sections.iter().find(|s| s.title.starts_with(title));
+            found.unwrap().lines.clone()
+        };
+        // Ports other machines can reach first, each once (IPv4 and IPv6
+        // sockets of one port are one port), then the local-only ones.
+        assert_eq!(
+            lines("Open ports"),
+            [
+                "22/tcp, 68/udp, 8000/tcp, 9001/tcp, 9090/tcp",
+                "this machine only: 53/tcp, 631/tcp",
             ]
         );
-        let section = |title: &str| -> &[String] {
-            let found = report.sections.iter().find(|s| s.title.starts_with(title));
-            &found.unwrap().lines
-        };
-        assert_eq!(section("Connection"), report.connection);
-        let interfaces = section("Interfaces");
-        assert!(interfaces.contains(&"lo  loopback  up  127.0.0.1/8  ::1/128".to_owned()));
-        assert!(interfaces.contains(
-            &"eth0  ethernet  up  192.168.1.5/24  fe80::a00:27ff:fe4e:66a1/64".to_owned()
-        ));
+        // One line per interface in use, saying what it is for. The IPv6
+        // gateway (a link-local address) is left out beside the IPv4 one.
         assert_eq!(
-            interfaces.last().unwrap(),
-            "2 more without a usable address: wlan0, veth12ab"
+            lines("Interfaces"),
+            [
+                "eth0  192.168.1.5/24  gateway 192.168.1.1",
+                "tun0  10.10.14.3/23  VPN, carries 10.10.10.0/23, 10.10.14.0/23",
+            ]
         );
-        let routes = section("Routes");
-        assert!(routes.contains(&"default via 192.168.1.1 on eth0".to_owned()));
-        assert!(routes.contains(&"default (IPv6) via fe80::1 on eth0".to_owned()));
-        assert!(routes.contains(&"10.10.10.0/23 via 10.10.14.1 on tun0".to_owned()));
-        assert!(routes.contains(&"192.168.1.0/24 on eth0 (directly attached)".to_owned()));
-        let listening = section("Listening");
-        assert!(listening.contains(&"tcp 0.0.0.0:22 (every interface)".to_owned()));
-        assert!(listening.contains(&"tcp [::1]:631 (this machine only)".to_owned()));
-        assert!(listening.contains(&"tcp 192.168.1.5:8000".to_owned()));
-        let neighbours = section("Neighbours");
-        assert_eq!(neighbours[0], "192.168.1.1  00:11:22:33:44:55  eth0");
-        assert_eq!(neighbours[1], "fe80::1  00:11:22:33:44:55  eth0");
+        assert_eq!(
+            lines("Routes"),
+            [
+                "default via 192.168.1.1 on eth0",
+                "10.10.10.0/23 via 10.10.14.1 on tun0",
+                "10.10.14.0/23 on tun0 (directly attached)",
+                "192.168.1.0/24 on eth0 (directly attached)",
+                "default (IPv6) via fe80::1 on eth0",
+                "1 more left out: single hosts, multicast, link-local and idle interfaces",
+            ]
+        );
+        assert_eq!(
+            lines("Neighbours"),
+            [
+                "192.168.1.1  00:11:22:33:44:55  eth0",
+                "fe80::1  00:11:22:33:44:55  eth0",
+            ]
+        );
+        assert_eq!(
+            lines("All interfaces"),
+            [
+                "lo  loopback  up  127.0.0.1/8  ::1/128",
+                "eth0  ethernet  up  192.168.1.5/24  fe80::a00:27ff:fe4e:66a1/64",
+                "tun0  vpn  up  10.10.14.3/23",
+                "2 without a usable address: wlan0, veth12ab",
+            ]
+        );
 
-        // A VPN that takes the default route says so, and the local link
-        // stays listed: it is still how this machine is connected.
+        // A VPN that takes the default route says so; the local link stays
+        // listed and stays the address "You" is known by.
         let mut full = local.clone();
         full.routes.retain(|r| !is_default_route(r));
         full.routes.push(Route {
@@ -1744,19 +2023,19 @@ mod tests {
             interface: "eth0".into(),
         });
         let report = machine_report(&full);
-        let neighbours = &report.sections.last().unwrap().lines;
-        assert_eq!(neighbours.last().unwrap(), "192.168.1.77  no answer  eth0");
-        assert_eq!(
-            report.connection,
-            ["eth0 (ethernet) 192.168.1.5/24, local network only (no default route)"]
-        );
         assert_eq!(
             report.vpn,
             ["tun0 10.10.14.3/23: carries the default route"]
         );
-        // "You" is this machine's address on its own network, not the tunnel's.
+        assert_eq!(
+            report.sections[1].lines,
+            [
+                "eth0  192.168.1.5/24  local network only",
+                "tun0  10.10.14.3/23  VPN, carries the default route",
+            ]
+        );
         assert_eq!(primary_address(&full).as_deref(), Some("192.168.1.5"));
-        // What needs a look comes right after the headline, marked as such.
+        // What needs a look comes right after, in view and marked.
         let flagged: Vec<(&str, bool, bool)> = report.sections[2..4]
             .iter()
             .map(|s| (s.title.as_str(), s.open, s.warn))
@@ -1768,14 +2047,14 @@ mod tests {
                 ("Could not be read", true, true)
             ]
         );
+        assert_eq!(report.sections.iter().filter(|s| s.warn).count(), 2);
+        let neighbours = report.sections.iter().find(|s| s.title == "Neighbours (3)");
         assert_eq!(
-            report.sections[3].lines,
-            ["`arp` is not installed or not on the PATH"]
+            neighbours.unwrap().lines.last().unwrap(),
+            "192.168.1.77  no answer  eth0"
         );
-        assert!(report.sections.iter().filter(|s| s.warn).count() == 2);
 
-        // The other way a VPN client takes everything: two half-routes
-        // beside the untouched default route.
+        // The other way a VPN client takes everything: two half-routes.
         let mut halves = local.clone();
         for destination in ["0.0.0.0/1", "128.0.0.0/1"] {
             halves.routes.push(Route {
@@ -1784,46 +2063,202 @@ mod tests {
                 interface: "tun0".into(),
             });
         }
-        let report = machine_report(&halves);
         assert_eq!(
-            report.vpn,
+            machine_report(&halves).vpn,
             ["tun0 10.10.14.3/23: carries all IPv4 traffic (0.0.0.0/1 and 128.0.0.0/1)"]
         );
-        assert_eq!(
-            report.connection,
-            ["eth0 (ethernet) 192.168.1.5/24, gateway 192.168.1.1 and fe80::1"]
-        );
 
-        // Nothing but the tunnel in use: then the tunnel is the connection.
-        let mut tunnel = full.clone();
-        tunnel.interfaces.retain(|i| i.name == "tun0");
-        let report = machine_report(&tunnel);
-        assert_eq!(
-            report.connection,
-            ["tun0 (vpn) 10.10.14.3/23, default route without a gateway"]
-        );
-        assert_eq!(primary_address(&tunnel).as_deref(), Some("10.10.14.3"));
-
-        // No VPN, no default route, and nothing at all.
-        let mut island = local.clone();
-        island.interfaces.retain(|i| i.name != "tun0");
-        island
-            .routes
-            .retain(|r| !is_default_route(r) && r.interface != "tun0");
-        let report = machine_report(&island);
-        assert!(report.vpn.is_empty());
-        assert_eq!(report.sections[1].lines, ["none detected"]);
-        assert_eq!(
-            report.connection,
-            ["eth0 (ethernet) 192.168.1.5/24, local network only (no default route)"]
-        );
+        // Nothing read at all.
         let nothing = machine_report(&LocalNet::default());
         assert_eq!(
-            nothing.connection,
+            nothing.headline,
+            "no address -> computer -> OS not known -> version not known"
+        );
+        assert_eq!(nothing.sections[0].lines, ["none listening"]);
+        assert_eq!(
+            nothing.sections[1].lines,
             ["unknown: the network tables could not be read"]
         );
-        assert_eq!(nothing.sections.last().unwrap().lines, ["none"]);
+        assert_eq!(nothing.sections[2].title, "Routes (0)");
+        assert_eq!(nothing.sections[2].lines, ["none"]);
         assert_eq!(primary_address(&LocalNet::default()), None);
+    }
+
+    /// The tables of a real Mac on a phone hotspot with a split-tunnel
+    /// corporate VPN: 31 interfaces and 113 routes, of which a handful say
+    /// anything. Rebuilt from what the owner's machine reported.
+    #[test]
+    fn a_real_macs_tables_come_out_as_a_few_lines() {
+        let mut local = LocalNet::default();
+        macos::ifconfig(
+            "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+             \tinet 127.0.0.1 netmask 0xff000000\n\
+             \tinet6 ::1 prefixlen 128\n\
+             \tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1\n\
+             gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280\n\
+             en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet6 fe80::100d:54ed:adfe:7db1%en0 prefixlen 64 secured scopeid 0xe\n\
+             \tinet 172.20.10.5 netmask 0xfffffff0 broadcast 172.20.10.15\n\
+             \tinet6 2600:100f:b027:de15:3e:7e78:d565:25b6 prefixlen 64 autoconf secured\n\
+             utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\
+             \tinet6 fe80::ad3c:36a1:b46f:220c%utun0 prefixlen 64 scopeid 0x10\n\
+             utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400\n\
+             \tinet 172.16.2.24 --> 172.16.2.24 netmask 0xffffffff\n\
+             bridge100: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet 192.168.2.1 netmask 0xffffff00 broadcast 192.168.2.255\n\
+             \tinet6 fe80::fcb2:14ff:feea:9664%bridge100 prefixlen 64 scopeid 0x19\n\
+             \tinet6 fd4a:ddce:4da7:f339:109c:8607:daf2:1b3a prefixlen 64 autoconf secured\n",
+            &mut local.interfaces,
+        );
+        macos::routes(
+            "Routing tables\n\nInternet:\n\
+             Destination        Gateway            Flags               Netif Expire\n\
+             default            172.20.10.1        UGScg                 en0\n\
+             default            link#25            UCSIg           bridge100      !\n\
+             default            link#27            UCSIg               utun5\n\
+             10                 172.16.2.24        UGSc                utun5\n\
+             10.201.16.11/32    172.16.2.24        UGSc                utun5\n\
+             10.212.101.42/32   172.16.2.24        UGSc                utun5\n\
+             34.208/12          172.16.2.24        UGSc                utun5\n\
+             35.162.3.57/32     172.16.2.24        UGSc                utun5\n\
+             40.77.25.47/32     172.16.2.24        UGSc                utun5\n\
+             52.36.14.156/32    172.16.2.24        UGSc                utun5\n\
+             127                127.0.0.1          UCS                   lo0\n\
+             127.0.0.1          127.0.0.1          UH                    lo0\n\
+             146.187            172.16.2.24        UGSc                utun5\n\
+             146.187.0.4/32     172.20.10.1        UGHS                  en0\n\
+             169.254            link#14            UCS                   en0      !\n\
+             172.16/12          172.16.2.24        UGSc                utun5\n\
+             172.16.2.24        127.0.0.1          UH                    lo0\n\
+             172.20.10/28       link#14            UCS                   en0      !\n\
+             172.20.10.1/32     link#14            UCS                   en0      !\n\
+             172.20.10.5/32     link#14            UCS                   en0      !\n\
+             192.168.2          link#25            UC              bridge100      !\n\
+             224.0.0/4          link#14            UmCS                  en0      !\n\
+             255.255.255.255/32 link#14            UCS                   en0      !\n\n\
+             Internet6:\n\
+             Destination                             Gateway                         Flags   Netif Expire\n\
+             default                                 fe80::4409:daff:fe81:5964%en0   UGcg      en0\n\
+             default                                 fe80::%utun0                    UGcIg   utun0\n\
+             ::1                                     ::1                             UHL       lo0\n\
+             2600:100f:b027:de15::/64                link#14                         UC        en0\n\
+             fd4a:ddce:4da7:f339::/64                link#25                         UC  bridge100\n\
+             fe80::%en0/64                           link#14                         UCI       en0\n\
+             fe80::%utun0/64                         fe80::ad3c:36a1:b46f:220c%utun0 UcI     utun0\n\
+             ff00::/8                                ::1                             UmCI      lo0\n\
+             ff00::/8                                link#14                         UmCI      en0\n\
+             ff02::/32                               fe80::ad3c:36a1:b46f:220c%utun0 UmCI    utun0\n",
+            &mut local.routes,
+        );
+        macos::neighbors(
+            "? (172.20.10.1) at 46:9:da:81:59:64 on en0 ifscope [ethernet]\n",
+            &mut local.neighbors,
+        );
+        local.system = SystemInfo {
+            kind: system::mac_kind("MacBookPro18,3\n").to_owned(),
+            os: "macOS".into(),
+            version: "15.1".into(),
+        };
+
+        let report = machine_report(&local);
+        assert_eq!(
+            report.headline,
+            "172.20.10.5 -> MacBook Pro -> macOS -> 15.1"
+        );
+        // A split tunnel: the VPN carries the company's networks. Its
+        // interface-scoped "default" entry is not a default route.
+        let carries = "carries 10.0.0.0/8, 34.208.0.0/12, 146.187.0.0/16, 172.16.0.0/12 \
+                       and 5 single hosts";
+        assert_eq!(report.vpn, [format!("utun5 172.16.2.24/32: {carries}")]);
+        assert_eq!(report.sections[0].lines, ["none listening"]);
+        assert_eq!(
+            report.sections[1].lines,
+            [
+                "en0  172.20.10.5/28  gateway 172.20.10.1".to_owned(),
+                format!("utun5  172.16.2.24/32  VPN, {carries}"),
+                "bridge100  192.168.2.1/24  virtual network on this machine".to_owned(),
+            ]
+        );
+        let routes = &report.sections[2];
+        assert_eq!(routes.title, "Routes (10 of 30)");
+        assert_eq!(
+            routes.lines,
+            [
+                "default via 172.20.10.1 on en0",
+                "10.0.0.0/8 via 172.16.2.24 on utun5",
+                "34.208.0.0/12 via 172.16.2.24 on utun5",
+                "146.187.0.0/16 via 172.16.2.24 on utun5",
+                "172.16.0.0/12 via 172.16.2.24 on utun5",
+                "172.20.10.0/28 on en0 (directly attached)",
+                "192.168.2.0/24 on bridge100 (directly attached)",
+                "default (IPv6) via fe80::4409:daff:fe81:5964 on en0",
+                "2600:100f:b027:de15::/64 on en0 (directly attached)",
+                "fd4a:ddce:4da7:f339::/64 on bridge100 (directly attached)",
+                "20 more left out: single hosts, multicast, link-local and idle interfaces",
+            ]
+        );
+        assert_eq!(report.sections[3].title, "Neighbours (1)");
+        let all = &report.sections[4];
+        assert_eq!(all.title, "All interfaces (6)");
+        assert_eq!(
+            all.lines.last().unwrap(),
+            "2 without a usable address: gif0, utun0"
+        );
+        // The whole thing in view: a headline and five lines.
+        let in_view: usize = report
+            .sections
+            .iter()
+            .filter(|s| s.open)
+            .map(|s| s.lines.len())
+            .sum();
+        assert_eq!(in_view, 4);
+    }
+
+    #[test]
+    fn each_platform_says_what_kind_of_machine_it_is() {
+        for (model, kind) in [
+            ("MacBookPro18,3", "MacBook Pro"),
+            ("MacBookAir10,1\n", "MacBook Air"),
+            ("Macmini9,1", "Mac mini"),
+            ("iMac21,1", "iMac"),
+            ("Mac14,7", "Mac"),
+            ("VirtualMac2,1", "Mac (virtual machine)"),
+            ("", ""),
+        ] {
+            assert_eq!(system::mac_kind(model), kind, "{model}");
+        }
+        assert_eq!(
+            system::sw_vers(
+                "ProductName:\t\tmacOS\nProductVersion:\t\t15.1\nBuildVersion:\t\t24B83\n"
+            ),
+            ("macOS".to_owned(), "15.1".to_owned())
+        );
+        assert_eq!(
+            system::os_release(
+                "PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\n\
+                 VERSION=\"24.04.1 LTS (Noble Numbat)\"\nID=ubuntu\n"
+            ),
+            ("Ubuntu".to_owned(), "24.04".to_owned())
+        );
+        // A rolling release has no VERSION_ID.
+        assert_eq!(
+            system::os_release("NAME=\"Arch Linux\"\nID=arch\n"),
+            ("Arch Linux".to_owned(), String::new())
+        );
+        assert_eq!(
+            system::windows_ver("\r\nMicrosoft Windows [Version 10.0.22631.4460]\r\n"),
+            ("Windows".to_owned(), "10.0.22631.4460".to_owned())
+        );
+        assert_eq!(system::chassis_kind("10\n", "ThinkPad X1 Carbon"), "Laptop");
+        assert_eq!(system::chassis_kind("3", "OptiPlex 7090"), "Desktop");
+        assert_eq!(system::chassis_kind("23", "PowerEdge R650"), "Server");
+        assert_eq!(system::chassis_kind("1", "KVM"), "Virtual machine");
+        assert_eq!(system::chassis_kind("", ""), "");
+
+        // The real thing never fails, and always knows at least the platform.
+        let system = system_info();
+        assert!(!system.os.is_empty());
+        assert_eq!(observe(&[]).system, system);
     }
 
     #[test]

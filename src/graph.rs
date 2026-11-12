@@ -290,6 +290,19 @@ pub struct Listener {
     pub port: u16,
 }
 
+/// What kind of machine meow runs on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemInfo {
+    /// `MacBook Pro`, `Laptop`, `Virtual machine`; empty when not known.
+    #[serde(default)]
+    pub kind: String,
+    /// `macOS`, `Ubuntu`, `Windows`.
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub version: String,
+}
+
 /// What the passive observer read from the local OS network tables.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalNet {
@@ -306,6 +319,9 @@ pub struct LocalNet {
     /// One-line subnet / interface route warnings.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Machine type and operating system, read once per session.
+    #[serde(default)]
+    pub system: SystemInfo,
     /// OS tools that could not be run or failed without output. An empty
     /// table above then means "could not be read", not "nothing there".
     #[serde(default)]

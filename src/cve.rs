@@ -9,8 +9,9 @@
 //!
 //! Requests carry only public software identifiers (CPE names, product and
 //! package names, versions), never hosts or paths. Every match is stored as
-//! an `UnverifiedHypothesis`. Connecting has a 2 s timeout, so an offline
-//! machine fails fast; NVD requests are paced to respect its rate limit.
+//! an `UnverifiedHypothesis`. Connecting has a 5 s timeout, so an offline
+//! machine fails fast, while a reply may take as long as it keeps arriving;
+//! NVD requests are paced to respect its rate limit.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -35,8 +36,12 @@ pub const KEV_URL: &str =
 /// NVD allows 5 requests per 30 s without a key and 50 with one.
 pub const NVD_PACE_ANONYMOUS: Duration = Duration::from_millis(6500);
 pub const NVD_PACE_WITH_KEY: Duration = Duration::from_millis(700);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Short, so an offline machine is not kept waiting.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A reply may arrive slowly (a phone hotspot, a VPN) as long as it keeps
+/// arriving: the databases answer with megabytes of JSON.
+const STALL_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const DAY: Duration = Duration::from_secs(24 * 3600);
 const KEV_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const OSV_MAX_PAGES: usize = 5;
@@ -583,6 +588,7 @@ impl CveClient {
     pub fn new(settings: CveSettings, db: Arc<Mutex<Db>>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(STALL_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .user_agent("security-audit-client")
             .build()
@@ -707,7 +713,9 @@ impl CveClient {
             }
             Err(error) => match self.stale(KEY).as_deref().and_then(parse) {
                 Some(found) => Ok(found),
-                None => Err(error.context("cannot download the CISA KEV catalog")),
+                None => Err(error.context(
+                    "cannot download the CISA KEV catalog, so known-exploited flags are missing",
+                )),
             },
         }
     }

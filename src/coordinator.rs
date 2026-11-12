@@ -805,8 +805,19 @@ async fn grounding_loop(state: Shared, mut queue: mpsc::UnboundedReceiver<String
                 graph.add_host_fact(&address, fact);
             }
         }
-        for error in grounding.errors.iter().take(1) {
-            state.notice(format!("CVE lookup failed for {address}: {error}"));
+        // Every source that failed, not only the first: a missing catalog
+        // and an unanswered database are different problems.
+        if !grounding.errors.is_empty() {
+            let shown: Vec<&str> = grounding
+                .errors
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect();
+            state.notice(format!(
+                "CVE lookup for {address} is incomplete: {}",
+                shown.join("; ")
+            ));
         }
         if added > 0 {
             state.mark_dirty();
@@ -1189,8 +1200,9 @@ mod tests {
         let snapshot = fx.coordinator.state().snapshot();
         assert_eq!(snapshot["topology"]["nodes"][0]["data"]["id"], "local");
         // And the report on this machine that the map shows beside it.
-        assert_eq!(snapshot["machine"]["sections"][0]["title"], "Connection");
-        assert_eq!(snapshot["machine"]["sections"][1]["title"], "VPN");
+        assert!(snapshot["machine"]["headline"].is_string());
+        assert_eq!(snapshot["machine"]["sections"][0]["title"], "Open ports");
+        assert_eq!(snapshot["machine"]["sections"][1]["title"], "Interfaces");
         assert!(snapshot["machine"]["vpn"].is_array());
         assert!(snapshot["topology"]["edges"].is_array());
     }

@@ -46,7 +46,10 @@ button { background: #eef3f7; color: var(--text); border: 1px solid #b9c7d3; bor
 button:hover { border-color: var(--accent); }
 .actions { display: flex; gap: 6px; margin-top: 8px; }
 textarea { width: 100%; min-height: 54px; background: #fbfdfe; color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 6px; font: inherit; }
-#machine h3 { margin-top: 8px; }
+.headline { font-weight: 600; margin: 2px 0 6px; overflow-wrap: anywhere; }
+.row { display: flex; gap: 10px; margin: 3px 0; }
+.row .label { color: var(--dim); flex: 0 0 76px; }
+.row .mono { white-space: pre-wrap; }
 #machine .warn-text { color: var(--warn); }
 #machine details { margin-top: 6px; }
 #machine summary { cursor: pointer; color: var(--accent); font-size: 13px; font-weight: 600; }

@@ -34,6 +34,7 @@ use crate::graph::{Advisory, Graph, Host, PathNode};
 use crate::mode::Mode;
 use crate::observer::{machine_report, MachineReport};
 use crate::queue::{self, TaskRow};
+use crate::topology::{host_headline, host_open_ports};
 use crate::workspace::Workspace;
 
 const MAX_PATH_LINES: usize = 40;
@@ -382,10 +383,21 @@ fn path_lines(node: &PathNode, depth: usize, out: &mut Vec<Line<'static>>) {
     }
 }
 
-fn inspector_lines(host: &Host) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::styled(host.label(), TITLE)];
-    if let Some(os) = &host.os {
-        lines.push(Line::styled(format!("OS: {os}"), DIM));
+fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
+    // What it is in one line, then what is open on it.
+    let mut lines = vec![
+        Line::styled(sanitize(&host_headline(graph, host), 300), TITLE),
+        Line::from(vec![
+            Span::styled("Open ports  ", DIM),
+            Span::raw(sanitize(&host_open_ports(host), 300)),
+        ]),
+    ];
+    let names: Vec<&str> = host.hostnames.iter().map(String::as_str).collect();
+    if !names.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Names       ", DIM),
+            Span::raw(sanitize(&names.join(", "), 300)),
+        ]));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled("Ports", TITLE));
@@ -486,21 +498,39 @@ fn advisory_detail(snapshot: &Snapshot, host: &Host, advisory: &Advisory) -> Vec
     lines
 }
 
-/// The second header line: how this machine is connected, and whether a
-/// VPN is up. Always in view; `m` shows the rest.
-fn machine_line(report: &MachineReport) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(" this machine ", TITLE),
-        Span::raw(sanitize(&report.connection.join("; "), 300)),
-        Span::raw(" | "),
-    ];
-    if report.vpn.is_empty() {
-        spans.push(Span::styled("no VPN", DIM));
+/// The box at the top right: what this machine is, its open ports and its
+/// interfaces. Always in view; `m` shows the routes and neighbours too.
+fn machine_box_lines(report: &MachineReport) -> Vec<Line<'static>> {
+    let vpn = if report.vpn.is_empty() {
+        Span::styled("   no VPN", DIM)
     } else {
-        let text = format!("VPN {}", report.vpn.join("; "));
-        spans.push(Span::styled(sanitize(&text, 300), GOOD));
+        let names: Vec<&str> = report
+            .vpn
+            .iter()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        Span::styled(format!("   VPN {}", sanitize(&names.join(", "), 80)), GOOD)
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(sanitize(&report.headline, 200), TITLE),
+        vpn,
+    ])];
+    for section in report.sections.iter().filter(|section| section.open) {
+        let style = if section.warn { WARN } else { Style::default() };
+        let label = format!("{:<12}", section.title);
+        for (index, line) in section.lines.iter().enumerate() {
+            let label = if index == 0 {
+                label.clone()
+            } else {
+                " ".repeat(12)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(label, DIM),
+                Span::styled(sanitize(line, 300), style),
+            ]));
+        }
     }
-    Line::from(spans)
+    lines
 }
 
 /// Everything the observer read about this machine, section by section.
@@ -534,10 +564,7 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         );
         return;
     };
-    let [area, machine_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let report = machine_report(&snapshot.graph.local);
-    frame.render_widget(Paragraph::new(machine_line(&report)), machine_area);
+
     let mode_style = match snapshot.mode {
         Mode::Light => GOOD,
         Mode::Mild => WARN,
@@ -787,7 +814,7 @@ fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
 /// Draws the whole panel. Pure: everything comes from `model`.
 pub fn draw(frame: &mut Frame, model: &Model) {
     let [header, body, activity, footer] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(8),
         Constraint::Length(8),
         Constraint::Length(2),
@@ -800,26 +827,41 @@ pub fn draw(frame: &mut Frame, model: &Model) {
     };
     let [hosts, right] =
         Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(body);
+    // Top right: this machine, as tall as it needs but never crowding out
+    // the host panels below it.
+    let report = machine_report(&snapshot.graph.local);
+    let machine_lines_top = machine_box_lines(&report);
+    let wanted = (machine_lines_top.len() as u16 + 2)
+        .min(right.height / 3)
+        .max(3);
+    let [machine, right] =
+        Layout::vertical([Constraint::Length(wanted), Constraint::Min(0)]).areas(right);
+    frame.render_widget(
+        Paragraph::new(machine_lines_top).block(panel(
+            "This machine: address -> type -> OS -> version (m for routes and neighbours)",
+            false,
+        )),
+        machine,
+    );
     let [inspector, advisories] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
     draw_hosts(frame, hosts, model, snapshot);
     if model.show_ai {
         draw_ai(frame, inspector, model, snapshot);
     } else if model.show_machine {
-        let report = machine_report(&snapshot.graph.local);
         frame.render_widget(
             Paragraph::new(machine_lines(&report))
                 .wrap(Wrap { trim: false })
                 .scroll((model.inspector_scroll, 0))
                 .block(panel(
-                    "This machine: connection, VPN, interfaces, routes, listeners, neighbours",
+                    "This machine in full: ports, interfaces, routes, neighbours",
                     true,
                 )),
             inspector,
         );
     } else {
         let lines = match model.selected_host() {
-            Some(host) => inspector_lines(host),
+            Some(host) => inspector_lines(&snapshot.graph, host),
             None => vec![Line::styled(
                 "No hosts yet. Import a scan with `meow add <file>`, or work in the session shell.",
                 DIM,
@@ -949,7 +991,7 @@ pub fn run(workspace: &Workspace) -> Result<()> {
 mod tests {
     use super::*;
     use crate::evidence::{Confidence, EvidenceRecord, Source};
-    use crate::graph::{Interface, Listener, Observation, Route};
+    use crate::graph::{Interface, Listener, Observation, Route, SystemInfo};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;
@@ -1058,7 +1100,7 @@ mod tests {
     #[test]
     fn every_panel_is_drawn_from_the_session_state() {
         let model = model();
-        let text = screen(&model, 160, 46);
+        let text = screen(&model, 160, 54);
         for expected in [
             "meow hud",
             "| acme | mode mild | 2 hosts | 3 advisories | live",
@@ -1308,14 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_is_always_in_the_header_and_in_full_behind_m() {
-        // Nothing read yet: say so instead of showing nothing.
-        let text = screen(&model(), 160, 46);
-        assert!(
-            text.contains(" this machine unknown: the network tables could not be read | no VPN"),
-            "{text}"
-        );
-
+    fn this_machine_sits_at_the_top_right_and_in_full_behind_m() {
         let mut graph = graph();
         let interface = |name: &str, kind: &str, addresses: &[&str]| Interface {
             name: name.into(),
@@ -1324,6 +1359,11 @@ mod tests {
             addresses: addresses.iter().map(|a| (*a).to_owned()).collect(),
         };
         graph.local.observed_utc = "2026-11-12T09:40:00Z".into();
+        graph.local.system = SystemInfo {
+            kind: "MacBook Pro".into(),
+            os: "macOS".into(),
+            version: "15.1".into(),
+        };
         graph.local.interfaces = vec![
             interface("en0", "wifi", &["fe80::1c71/64", "10.104.168.20/22"]),
             interface("utun0", "vpn", &["fe80::2/64"]),
@@ -1341,64 +1381,68 @@ mod tests {
             address: "127.0.0.1".into(),
             port: 631,
         });
+        // Nothing read yet: the box says so instead of showing nothing.
+        let text = screen(&model(), 160, 50);
+        for expected in [
+            "This machine: address -> type -> OS -> version",
+            "no address -> computer -> OS not known -> version not known   no VPN",
+            "Open ports  none listening",
+            "Interfaces  unknown: the network tables could not be read",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+
         let mut model = Model::new(true);
         model.apply_message(&state_message(&graph));
-        let text = screen(&model, 160, 46);
-        // An idle tunnel with only a link-local address is not a VPN.
-        assert!(
-            text.contains(
-                " this machine en0 (wifi) 10.104.168.20/22, gateway 10.104.168.1 | no VPN"
-            ),
-            "{text}"
-        );
-        assert!(text.contains("m this machine"), "{text}");
-        assert!(!text.contains("Listening on this machine"), "{text}");
+        let text = screen(&model, 160, 50);
+        // An idle tunnel with only a link-local address is not a VPN, and
+        // is not listed as an interface in use.
+        for expected in [
+            "10.104.168.20 -> MacBook Pro -> macOS -> 15.1   no VPN",
+            "Open ports  this machine only: 631/tcp",
+            "Interfaces  en0 10.104.168.20/22 gateway 10.104.168.1",
+            "m this machine",
+            // The selected host gets the same one-line answer.
+            "10.10.10.5 -> Server -> OS not known -> version not known",
+            "Open ports  22/tcp svc, 80/tcp svc",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(!text.contains("utun0"), "{text}");
+        assert!(!text.contains("Routes ("), "the tables stay out of the way");
 
         // `m` swaps the inspector for the full report; `m` again swaps back.
         assert_eq!(model.on_key(key(KeyCode::Char('m'))), Action::None);
-        let text = screen(&model, 160, 46);
+        let text = screen(&model, 160, 50);
         for expected in [
-            "This machine: connection, VPN, interfaces, routes, listeners, neighbours",
-            "Connection",
-            "  en0 (wifi) 10.104.168.20/22, gateway 10.104.168.1",
-            "VPN",
-            "  none detected",
-            "Interfaces (2)",
-            "  en0 wifi up fe80::1c71/64 10.104.168.20/22",
-            "  1 more without a usable address: utun0",
-            "Routes (2)",
+            "This machine in full: ports, interfaces, routes, neighbours",
+            "Routes (1 of 2)",
             "  default via 10.104.168.1 on en0",
-            "Listening on this machine (1)",
+            "Neighbours (0)",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
         assert!(!text.contains("Inspector: node, ports and sub-paths"));
-        // The report is long: it scrolls like the inspector does.
+        // The report scrolls like the inspector does.
         model.on_key(key(KeyCode::PageDown));
-        let scrolled = screen(&model, 160, 46);
-        assert!(
-            scrolled.contains("  tcp 127.0.0.1:631 (this machine only)"),
-            "{scrolled}"
-        );
-        assert!(
-            scrolled.contains("Neighbours seen by this machine (0)"),
-            "{scrolled}"
-        );
+        let scrolled = screen(&model, 160, 50);
+        assert!(scrolled.contains("All interfaces (2)"), "{scrolled}");
         assert!(
             scrolled.contains("Read from this machine at 09:40:00 UTC"),
             "{scrolled}"
         );
         model.on_key(key(KeyCode::Char('m')));
-        assert!(screen(&model, 160, 46).contains("Inspector: node, ports and sub-paths"));
+        assert!(screen(&model, 160, 50).contains("Inspector: node, ports and sub-paths"));
 
         // A tunnel with a real address is reported as the VPN it is.
         graph.local.interfaces[1]
             .addresses
             .push("10.10.14.3/23".into());
         model.apply_message(&state_message(&graph));
-        let text = screen(&model, 160, 46);
+        let text = screen(&model, 160, 50);
+        assert!(text.contains("-> macOS -> 15.1   VPN utun0"), "{text}");
         assert!(
-            text.contains("| VPN utun0 10.10.14.3/23: no route uses it"),
+            text.contains("utun0 10.10.14.3/23 VPN, no route uses it"),
             "{text}"
         );
         // The AI view and the machine view replace each other.

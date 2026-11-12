@@ -319,9 +319,10 @@
     items.forEach(function (item) { target.appendChild(build(item)); });
   }
 
-  // "This machine": the local connection, any VPN, and every table the
-  // session read from the operating system. The first sections are always
-  // in view; the long tables unfold on a click and stay as they were left.
+  // "This machine", top right: address -> type -> OS -> version, then its
+  // open ports and its interfaces, one line each. The tables behind that
+  // (routes, neighbours, every interface) unfold on a click and stay as
+  // they were left.
   var machineDrawn = '';
   var unfolded = {};
 
@@ -338,14 +339,17 @@
     if (key === machineDrawn) { return; }
     machineDrawn = key;
     var box = clear(byId('machine'));
+    box.appendChild(el('div', 'headline', machine.headline));
     machine.sections.forEach(function (section) {
-      var name = section.title.replace(/ \(\d+\)$/, '');
+      var name = section.title.replace(/ \(.*\)$/, '');
       var lines = section.lines.map(function (line) {
         return el('div', section.warn ? 'warn-text' : 'mono', line);
       });
       if (section.open) {
-        box.appendChild(el('h3', null, section.title));
-        lines.forEach(function (line) { box.appendChild(line); });
+        var row = box.appendChild(el('div', 'row'));
+        row.appendChild(el('span', 'label', section.title));
+        var values = row.appendChild(el('div'));
+        lines.forEach(function (line) { values.appendChild(line); });
         return;
       }
       var fold = box.appendChild(el('details'));
@@ -546,7 +550,14 @@
     var host = data.address ? state.graph.hosts[data.address] : null;
     if (host) {
       renderHost(detail, host);
-      detail.insertBefore(drawnAs(data), detail.firstChild);
+      // What it is in one line, what is open on it, and why it is drawn so.
+      var summary = el('div');
+      summary.appendChild(el('div', 'headline', data.headline));
+      var open = summary.appendChild(el('div', 'row'));
+      open.appendChild(el('span', 'label', 'Open ports'));
+      open.appendChild(el('div', 'mono', data.ports_line));
+      summary.appendChild(drawnAs(data));
+      detail.insertBefore(summary, detail.firstChild);
       var box = detail.querySelector('textarea');
       if (box && draftText) { box.value = draftText; }
       if (box && hadFocus) { box.focus(); }
