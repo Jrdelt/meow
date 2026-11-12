@@ -18,7 +18,21 @@ use crate::workspace::private_open_options;
 #[derive(Debug)]
 pub struct SessionLock {
     /// The kernel lock belongs to this open file and ends when it closes.
-    _file: RwLock<File>,
+    file: RwLock<File>,
+}
+
+impl Drop for SessionLock {
+    /// Unlocks explicitly instead of relying on the file closing: a child
+    /// process forked while the lock was held briefly shares the open file,
+    /// which would otherwise keep the lock alive until that child execs.
+    fn drop(&mut self) {
+        // Re-taking a lock this file already holds succeeds on Unix, and
+        // dropping the guard unlocks. On Windows the attempt fails and the
+        // lock is released when the handle closes.
+        if let Ok(guard) = self.file.try_write() {
+            drop(guard);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -85,7 +99,7 @@ impl SessionLock {
             }
             Err(error) => return Err(LockError::Io(error)),
         }
-        Ok(Self { _file: lock })
+        Ok(Self { file: lock })
     }
 }
 

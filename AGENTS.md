@@ -53,39 +53,41 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 1, Step 5 complete (session lock).
-- **Last Verified Commit:** `feat(phase1-step5)` — see `git log -n 1 --oneline`.
-- **Completed Files:** scaffold, `src/c/tap_filter.{h,c}`, `src/tap.rs`,
-  `src/cli.rs`, `src/mode.rs`, `src/workspace.rs`, `src/lock.rs`,
-  `src/lib.rs`, `src/main.rs`, `tests/cli.rs` (66 tests + 1 ignored helper).
-- **In-Progress / Partial Work:** `main.rs::run` for `meow <name>` opens the
-  workspace, takes the lock, calls `record_open()`, then stops with "session
-  shell is not built yet". `recon`/`map`/`hud`/`add`/`report` report "not
-  built yet" (exit 1). Bare `meow` and `meow mode` are complete for Phase 1.
-- **Next Exact Action:** Phase 1, Step 6 — write `src/pty.rs`: spawn the
-  platform shell (`Config::shell` override) in a `portable-pty` PTY started in
-  the workspace's restored cwd, export `MEOW_SESSION` / `MEOW_WORKSPACE` /
-  `MEOW_MODE` and forward `TERM` / `COLORTERM`; raw mode with a `Drop` guard
-  that also writes `\x1b[?1049l\x1b[?1000l\x1b[?2004l\x1b[?25h`; stdin
-  thread -> pty writer; pty reader -> stdout untouched plus `try_send` copies
-  to a `TapFilter` worker; `SIGWINCH` via `signal-hook` (250 ms size poll on
-  Windows). Wire into `main.rs` while `_lock` is held. Shims are Step 7.
+- **Active Phase & Step:** Phase 1, Step 6 complete (dual-stream PTY shell).
+- **Last Verified Commit:** `feat(phase1-step6)` — see `git log -n 1 --oneline`.
+- **Completed Files:** scaffold, `src/c/tap_filter.{h,c}`, `src/{tap,cli,mode,
+  workspace,lock,pty,lib,main}.rs`, `tests/{cli,pty}.rs` (81 tests + 1
+  ignored helper).
+- **In-Progress / Partial Work:** `meow <name>` runs a full session, but
+  nothing writes `replay.sh` or `last_cwd` yet (`restored_cwd()` already
+  reads it) and `$MEOW_MODE` is fixed at shell start. `recon`/`map`/`hud`/
+  `add`/`report` report "not built yet" (exit 1).
+- **Next Exact Action:** Phase 1, Step 7 — write `src/shims.rs`: generate
+  `<workspace>/tmp/shell/` startup shims that source the user's real rc file
+  first, then hook each command to append `# [CWD]`, the command and its exit
+  code to `replay.sh`, write `last_cwd`, and refresh `$MEOW_MODE` from
+  `profile.toml`. Zsh: `ZDOTDIR` + `add-zsh-hook preexec/precmd`. Bash:
+  `--rcfile` + `PS0`/`PROMPT_COMMAND`. PowerShell: `-NoExit -File init.ps1`
+  wrapping `prompt`. Return program args/env for `pty::SessionSpec`; other
+  shells run unhooked with a notice. That completes Phase 1.
 - **Blockers / Notes:**
-  - `Cargo.toml` lists only crates in use (owner decision); add each
-    later-phase crate from the SPEC §7 baseline in the step that first uses it.
-  - Terminal control comes from `ratatui::crossterm`; do not add a direct
-    `crossterm` dependency.
-  - Library modules are exposed through `src/lib.rs` so unused public APIs
-    pass `clippy -D warnings` before the binary wires them up.
-  - `TapFilter` allocates `tap_state_t` using `tap_state_size()` from C; never
-    mirror the struct layout in Rust.
+  - `Cargo.toml` lists only crates in use (owner decision); add later-phase
+    crates from SPEC §7 in the step that first uses them.
+  - Terminal control comes from `ratatui::crossterm`; never add a direct
+    `crossterm` dependency. Library modules are exposed via `src/lib.rs`.
+  - `TapFilter` sizes `tap_state_t` via `tap_state_size()`; never mirror it.
   - Helper targeting order: `--local`, `--session`, `$MEOW_WORKSPACE`,
-    `$MEOW_SESSION`. `Workspace::dir` is already absolute.
-  - Only `meow <name>` takes `SessionLock`; helpers never do. Mutate the
-    workspace as a session only after the lock (`record_open`).
-  - `$MEOW_HOME` overrides `~/.meow`; tests rely on it. Create files with
-    `private_open_options()` / `write_private_atomic()` only.
-  - Windows paths (`icacls` ACL, `LockFileEx`) have never been compiled or run.
-  - Listing shows name/mode/last-active; host count and unfinished tasks join
-    when `graph.json` (Phase 2) and `state.db` tasks (Phase 3) exist.
-  - Exit codes: 1 = runtime refusal/failure, 2 = usage error (clap).
+    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`; mutate the
+    workspace as a session only after it (`record_open`).
+  - `$MEOW_HOME` overrides `~/.meow` (tests rely on it). `$MEOW_TAP_LOG=<file>`
+    appends the tap's clean lines to a file (debug aid; nothing else consumes
+    tap lines until Phase 2). Create files with `private_open_options()` /
+    `write_private_atomic()` only.
+  - Non-tty stdin: no raw mode, no reset sequence; at input EOF Ctrl-D is
+    retyped every 250 ms until the shell exits.
+  - Windows code is compile-checked only, never run: `rustup target add
+    x86_64-pc-windows-gnu`, install `gcc-mingw-w64-x86-64`, then
+    `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`.
+  - Listing lacks host count / unfinished tasks until Phases 2 and 3.
+  - Exit codes: `meow <name>` returns the shell's; otherwise 1 = failure,
+    2 = usage error.

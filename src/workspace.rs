@@ -22,6 +22,8 @@ use crate::mode::Mode;
 pub const SESSION_ENV: &str = "MEOW_SESSION";
 /// Absolute workspace directory of the active session.
 pub const WORKSPACE_ENV: &str = "MEOW_WORKSPACE";
+/// Discovery mode of the active session.
+pub const MODE_ENV: &str = "MEOW_MODE";
 /// Overrides the `~/.meow` base directory.
 pub const HOME_ENV: &str = "MEOW_HOME";
 
@@ -482,6 +484,28 @@ impl Workspace {
     pub fn chats_dir(&self) -> PathBuf {
         self.dir.join("chats")
     }
+
+    pub fn last_cwd_path(&self) -> PathBuf {
+        self.dir.join("last_cwd")
+    }
+
+    /// The directory the previous session ended in, if it was recorded and
+    /// still exists.
+    pub fn restored_cwd(&self) -> Option<PathBuf> {
+        let text = fs::read_to_string(self.last_cwd_path()).ok()?;
+        let dir = PathBuf::from(text.trim_end_matches(['\r', '\n']));
+        (dir.is_absolute() && dir.is_dir()).then_some(dir)
+    }
+
+    /// Variables exported into the session shell so helper subcommands can
+    /// find the session from any directory.
+    pub fn session_env(&self) -> Vec<(String, OsString)> {
+        vec![
+            (SESSION_ENV.to_owned(), self.name.clone().into()),
+            (WORKSPACE_ENV.to_owned(), self.dir.clone().into()),
+            (MODE_ENV.to_owned(), self.profile.mode.as_str().into()),
+        ]
+    }
 }
 
 fn dir_name(dir: &Path) -> String {
@@ -858,6 +882,38 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         let err = Workspace::open_or_create(&fx.home, &parent, "x", true, Mode::Light).unwrap_err();
         assert!(err.to_string().contains("own data directory"), "{err:#}");
+    }
+
+    #[test]
+    fn session_env_names_the_workspace_by_absolute_path() {
+        let fx = fixture();
+        let (mut ws, _) = open(&fx, "webapp", true);
+        ws.set_mode(Mode::Mild).unwrap();
+        let env = ws.session_env();
+        assert_eq!(env[0], ("MEOW_SESSION".to_owned(), "webapp".into()));
+        assert_eq!(env[1].0, "MEOW_WORKSPACE");
+        assert!(Path::new(&env[1].1).is_absolute());
+        assert_eq!(Path::new(&env[1].1), ws.dir);
+        assert_eq!(env[2], ("MEOW_MODE".to_owned(), "mild".into()));
+    }
+
+    #[test]
+    fn restored_cwd_requires_a_recorded_existing_directory() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", false);
+        assert_eq!(ws.restored_cwd(), None);
+
+        fs::write(ws.last_cwd_path(), format!("{}\n", fx.cwd.display())).unwrap();
+        assert_eq!(ws.restored_cwd(), Some(fx.cwd.clone()));
+
+        fs::write(
+            ws.last_cwd_path(),
+            fx.cwd.join("gone").display().to_string(),
+        )
+        .unwrap();
+        assert_eq!(ws.restored_cwd(), None);
+        fs::write(ws.last_cwd_path(), "relative/dir\n").unwrap();
+        assert_eq!(ws.restored_cwd(), None);
     }
 
     #[test]

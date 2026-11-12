@@ -36,6 +36,7 @@ impl Sandbox {
             .args(args)
             .current_dir(cwd)
             .env("MEOW_HOME", self.home())
+            .env("SHELL", "/bin/sh")
             .env_remove("MEOW_SESSION")
             .env_remove("MEOW_WORKSPACE");
         for (key, value) in env {
@@ -246,6 +247,138 @@ fn helpers_need_an_existing_workspace() {
     let text = stderr(&output);
     assert!(!text.contains("Nested"), "{text}");
     assert!(text.contains("session: acme"), "{text}");
+}
+
+/// Drives a whole session through a pipe: the shell runs inside the PTY,
+/// stdin is not a terminal, so no raw mode is involved.
+#[cfg(unix)]
+#[test]
+fn piped_session_runs_the_shell_with_session_variables() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let sandbox = Sandbox::new();
+    let tap_log = sandbox.tmp.path().join("tap.log");
+    let script = r#"echo "S=$MEOW_SESSION M=$MEOW_MODE"
+echo "W=$MEOW_WORKSPACE"
+cd / && "$MEOW_BIN" other; echo "nested-rc=$?"
+"$MEOW_BIN" mode mild
+printf 'tap-\033[31mmark\033[0m-%s\n' "$((40+2))"
+exit 7
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meow"))
+        .arg("acme")
+        .current_dir(sandbox.project())
+        .env("MEOW_HOME", sandbox.home())
+        .env("SHELL", "/bin/sh")
+        .env("MEOW_BIN", env!("CARGO_BIN_EXE_meow"))
+        .env("MEOW_TAP_LOG", &tap_log)
+        .env_remove("MEOW_SESSION")
+        .env_remove("MEOW_WORKSPACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let text = stdout(&output);
+    let workspace = sandbox.workspace("acme");
+
+    assert_eq!(output.status.code(), Some(7), "{text}");
+    assert!(text.contains("S=acme M=light"), "{text}");
+    assert!(
+        text.contains(&format!("W={}", workspace.display())),
+        "{text}"
+    );
+    // Inside the session a second shell is refused, from any directory...
+    assert!(
+        text.contains("Nested meow sessions are disabled (active: acme)"),
+        "{text}"
+    );
+    assert!(text.contains("nested-rc=1"), "{text}");
+    // ...while helpers find the workspace through $MEOW_WORKSPACE.
+    assert!(
+        text.contains("[+] Mode set to mild (session: acme)"),
+        "{text}"
+    );
+    assert!(profile(&workspace).contains("mode = \"mild\""));
+    // Display path: escape sequences reach stdout untouched.
+    assert!(text.contains("tap-\x1b[31mmark\x1b[0m-42"), "{text:?}");
+    assert!(text.contains("[+] Session 'acme' closed"), "{text}");
+    // No terminal was involved, so no reset sequence is emitted.
+    assert!(!text.contains("\x1b[?1049l"), "{text:?}");
+
+    // Analysis tap: the same line arrives without escape sequences.
+    let tap = std::fs::read_to_string(&tap_log).unwrap();
+    assert!(
+        tap.lines().any(|line| line.ends_with("tap-mark-42")),
+        "{tap}"
+    );
+    assert!(!tap.contains('\x1b'), "{tap:?}");
+}
+
+/// Shells with line editing ignore an EOF that arrives while they start up;
+/// the session must still end when its input does.
+#[cfg(unix)]
+#[test]
+fn session_ends_when_input_ends_even_with_a_line_editing_shell() {
+    if !Path::new("/bin/bash").exists() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["acme"], &[("SHELL", "/bin/bash")]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("[+] Session 'acme' closed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn session_starts_in_the_restored_directory() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["acme"], &[]);
+    let remembered = sandbox.tmp.path().join("remembered");
+    std::fs::create_dir(&remembered).unwrap();
+    std::fs::write(
+        sandbox.workspace("acme").join("last_cwd"),
+        format!("{}\n", remembered.display()),
+    )
+    .unwrap();
+
+    let marker = remembered.join("was-here");
+    assert!(!marker.exists());
+    // With stdin at EOF the shell exits at once; its startup directory is
+    // observed through $ENV, which POSIX sh runs when interactive.
+    let rc = sandbox.tmp.path().join("rc");
+    std::fs::write(&rc, "touch was-here\n").unwrap();
+    let output = sandbox.run(&["acme"], &[("ENV", rc.to_str().unwrap())]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(marker.exists(), "shell did not start in the restored cwd");
+}
+
+#[test]
+fn unknown_shell_is_reported_and_releases_the_workspace() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["acme"], &[("SHELL", "/no/such/shell")]);
+    // Windows ignores $SHELL, so only Unix can observe the failure.
+    #[cfg(unix)]
+    {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains("/no/such/shell"),
+            "{}",
+            stderr(&output)
+        );
+        let retry = sandbox.run(&["acme"], &[]);
+        assert!(retry.status.success(), "{}", stderr(&retry));
+    }
+    let _ = output;
 }
 
 #[test]

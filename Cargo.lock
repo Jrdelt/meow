@@ -824,6 +824,7 @@ dependencies = [
  "anyhow",
  "cc",
  "clap",
+ "crossterm_winapi",
  "dirs",
  "fd-lock",
  "libc",

@@ -29,6 +29,10 @@ toml = "0.8"
 libc = "0.2"
 signal-hook = "0.3"
 
+[target.'cfg(windows)'.dependencies]
+# Console-mode access for VT input/output; same crate crossterm uses.
+crossterm_winapi = "0.9"
+
 [build-dependencies]
 cc = "1.2"
 

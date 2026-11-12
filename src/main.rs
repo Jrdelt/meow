@@ -1,6 +1,8 @@
 //! `meow` entry point: parse the command line, refuse nested sessions, then
 //! dispatch.
 
+use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::SystemTime;
 
@@ -8,14 +10,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
 use meow::lock::{LockError, SessionLock};
+use meow::pty::{self, LineSink, SessionSpec};
 use meow::workspace::{
-    format_listing, list_workspaces, resolve_helper_dir, Config, MeowHome, SessionEnv, Workspace,
+    format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config, MeowHome,
+    SessionEnv, Workspace,
 };
+
+/// Debug aid: when set to a file path, the clean lines produced by the
+/// analysis tap are appended to that file.
+const TAP_LOG_ENV: &str = "MEOW_TAP_LOG";
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("[!] {error:#}");
             ExitCode::from(1)
@@ -23,7 +31,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
     // Must come first: a nested `meow` exits before any terminal state changes.
     let env = SessionEnv::from_process();
     if let Some(message) = cli.nesting_error(env.active_label().as_deref()) {
@@ -38,33 +46,9 @@ fn run(cli: Cli) -> Result<()> {
             None => {
                 let workspaces = list_workspaces(&home, &cwd)?;
                 print!("{}", format_listing(&workspaces, SystemTime::now()));
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
-            Some(name) => {
-                let config = Config::load_or_create(&home)?;
-                let (mut workspace, created) =
-                    Workspace::open_or_create(&home, &cwd, name, cli.local, config.default_mode)?;
-                let _lock =
-                    SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
-                        LockError::Held { .. } => {
-                            anyhow!("Workspace '{}' is {error}", workspace.name)
-                        }
-                        LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
-                    })?;
-                workspace.record_open()?;
-                println!(
-                    "[+] {} workspace '{}' at {} (mode: {})",
-                    if created { "Created" } else { "Resumed" },
-                    workspace.name,
-                    workspace.dir.display(),
-                    workspace.profile.mode
-                );
-                Err(unavailable(
-                    &format!("meow {name}"),
-                    "the session shell",
-                    "Phase 1, Steps 6-7",
-                ))
-            }
+            Some(name) => start_session(&home, &cwd, name, cli.local),
         };
     };
 
@@ -75,7 +59,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Mode { mode, .. } => {
             workspace.set_mode(*mode)?;
             println!("[+] Mode set to {mode} (session: {})", workspace.name);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         other => {
             let planned = match other {
@@ -83,15 +67,73 @@ fn run(cli: Cli) -> Result<()> {
                 Command::Report { .. } => "Phase 4",
                 _ => "Phase 3",
             };
-            Err(unavailable(
-                &format!("meow {}", other.name()),
-                &format!("this command (session: {})", workspace.name),
-                planned,
+            Err(anyhow!(
+                "`meow {}`: this command (session: {}) is not built yet (planned: {planned})",
+                other.name(),
+                workspace.name
             ))
         }
     }
 }
 
-fn unavailable(invocation: &str, what: &str, planned: &str) -> anyhow::Error {
-    anyhow!("`{invocation}`: {what} is not built yet (planned: {planned})")
+/// `meow <name>`: open the workspace, take its lock and run the shell until
+/// it exits. The process exit code is the shell's.
+fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result<ExitCode> {
+    let config = Config::load_or_create(home)?;
+    let (mut workspace, created) =
+        Workspace::open_or_create(home, cwd, name, local, config.default_mode)?;
+    let _lock = SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
+        LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
+        LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
+    })?;
+    workspace.record_open()?;
+
+    let spec = SessionSpec {
+        program: pty::resolve_shell(
+            config.shell.as_deref(),
+            std::env::var("SHELL").ok().as_deref(),
+        ),
+        args: Vec::new(),
+        cwd: workspace
+            .restored_cwd()
+            .unwrap_or_else(|| cwd.to_path_buf()),
+        env: workspace.session_env(),
+    };
+    let sink = tap_sink()?;
+
+    println!(
+        "[+] {} workspace '{}' at {} (mode: {})",
+        if created { "Created" } else { "Resumed" },
+        workspace.name,
+        workspace.dir.display(),
+        workspace.profile.mode
+    );
+    println!(
+        "[+] Session shell: {} (exit the shell to leave)",
+        spec.program
+    );
+
+    let outcome = pty::run_session(&spec, sink)?;
+
+    println!("[+] Session '{}' closed", workspace.name);
+    Ok(ExitCode::from(u8::try_from(outcome.exit_code).unwrap_or(1)))
+}
+
+fn tap_sink() -> Result<LineSink> {
+    let Some(path) = std::env::var_os(TAP_LOG_ENV).filter(|value| !value.is_empty()) else {
+        return Ok(Box::new(|_line| {}));
+    };
+    let mut file = private_open_options()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "cannot open ${TAP_LOG_ENV} ({})",
+                Path::new(&path).display()
+            )
+        })?;
+    Ok(Box::new(move |line| {
+        let _ = writeln!(file, "{line}");
+    }))
 }

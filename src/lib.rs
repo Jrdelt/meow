@@ -3,5 +3,6 @@
 pub mod cli;
 pub mod lock;
 pub mod mode;
+pub mod pty;
 pub mod tap;
 pub mod workspace;
