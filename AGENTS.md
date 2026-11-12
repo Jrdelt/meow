@@ -53,27 +53,27 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 3 complete (Step 4, `meow hud`, was last).
-  Owner asked to build straight through Phase 4 without pausing; checkpoint
-  after every step.
-- **Last Verified Commit:** `feat(phase3-step4)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** Phase 4, Step 1 complete (Privacy Vault). Owner
+  asked to build straight through Phase 4 without pausing; checkpoint after
+  every step.
+- **Last Verified Commit:** `feat(phase4-step1)` — see `git log -n 1
+  --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
   Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
   `assets/`). Tests: per module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
-- **In-Progress / Partial Work:** `meow report` reports "not built yet".
-  `vault`, `ai_usage`, `prompt_cache` tables are unused. No AI tier exists;
-  the HUD has no `[L]`/`[C]`/`[R]` keys yet (it shows the "[R] Deep Research
-  Ready" indicator only).
-- **Next Exact Action:** Phase 4, Step 1 — `src/vault.rs`: deterministic
-  two-way Privacy Vault in `state.db` (`<<HOST_01>>`, `<<DOM_01>>`,
-  `<<PATH_01>>`, `<<SEC_01>>`; IPs, domains/SANs, paths, usernames, auth
-  headers, JWTs, Base64/URL-encoded credentials, SSH keys, high-entropy
-  strings), longest-match-first, inside JSON string values only, plus a
-  streaming unmasker with a `<<...>>` hold-back buffer. Then Step 2: LLM01
-  sandboxed prompts + `[L]`/`[C]`/`[R]` clients with budget lock; Step 3:
-  `chats/<host>.md` and `meow report`.
+- **In-Progress / Partial Work:** `meow report` reports "not built yet". The
+  vault is not called by anything yet; `ai_usage` and `prompt_cache` tables
+  are unused. No AI tier exists; the HUD has no `[L]`/`[C]`/`[R]` keys yet.
+- **Next Exact Action:** Phase 4, Step 2 — `src/ai.rs`: `[ai]` config (local
+  URL/model, OpenRouter model, `max_daily_usd`, `max_daily_calls`; API key
+  from `$OPENROUTER_API_KEY`), OWASP LLM01 prompt builder (scraped text only
+  inside an untrusted JSON data field), `[L]` local OpenAI-compatible client,
+  `[C]` OpenRouter triage with SHA-256 prompt cache + daily budget and
+  fallback to `[L]`, `[R]` `openrouter:web_search` research on vaulted
+  identifiers only, exact `usage` cost into `ai_usage`; `Command::Ai`, HUD
+  keys, `chats/<host>.md`. Then Step 3: `meow report`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
