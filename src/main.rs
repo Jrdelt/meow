@@ -11,6 +11,7 @@ use clap::Parser;
 use meow::cli::{Cli, Command};
 use meow::lock::{LockError, SessionLock};
 use meow::pty::{self, LineSink, SessionSpec};
+use meow::shims;
 use meow::workspace::{
     format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config, MeowHome,
     SessionEnv, Workspace,
@@ -88,16 +89,20 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
     })?;
     workspace.record_open()?;
 
+    let program = pty::resolve_shell(
+        config.shell.as_deref(),
+        std::env::var("SHELL").ok().as_deref(),
+    );
+    let launch = shims::prepare(&workspace, &program, std::env::var_os("ZDOTDIR"))?;
+    let mut env = workspace.session_env();
+    env.extend(launch.env.iter().cloned());
     let spec = SessionSpec {
-        program: pty::resolve_shell(
-            config.shell.as_deref(),
-            std::env::var("SHELL").ok().as_deref(),
-        ),
-        args: Vec::new(),
+        program,
+        args: launch.args.clone(),
         cwd: workspace
             .restored_cwd()
             .unwrap_or_else(|| cwd.to_path_buf()),
-        env: workspace.session_env(),
+        env,
     };
     let sink = tap_sink()?;
 
@@ -112,6 +117,12 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
         "[+] Session shell: {} (exit the shell to leave)",
         spec.program
     );
+    if !launch.hooked() {
+        println!(
+            "[!] No replay hooks for this shell (only zsh, bash and PowerShell): \
+             commands will not be logged to replay.sh"
+        );
+    }
 
     let outcome = pty::run_session(&spec, sink)?;
 

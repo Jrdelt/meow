@@ -53,23 +53,19 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 1, Step 6 complete (dual-stream PTY shell).
-- **Last Verified Commit:** `feat(phase1-step6)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** Phase 1 complete (Step 7, shell shims, was last).
+- **Last Verified Commit:** `feat(phase1-step7)` — see `git log -n 1 --oneline`.
 - **Completed Files:** scaffold, `src/c/tap_filter.{h,c}`, `src/{tap,cli,mode,
-  workspace,lock,pty,lib,main}.rs`, `tests/{cli,pty}.rs` (81 tests + 1
-  ignored helper).
-- **In-Progress / Partial Work:** `meow <name>` runs a full session, but
-  nothing writes `replay.sh` or `last_cwd` yet (`restored_cwd()` already
-  reads it) and `$MEOW_MODE` is fixed at shell start. `recon`/`map`/`hud`/
-  `add`/`report` report "not built yet" (exit 1).
-- **Next Exact Action:** Phase 1, Step 7 — write `src/shims.rs`: generate
-  `<workspace>/tmp/shell/` startup shims that source the user's real rc file
-  first, then hook each command to append `# [CWD]`, the command and its exit
-  code to `replay.sh`, write `last_cwd`, and refresh `$MEOW_MODE` from
-  `profile.toml`. Zsh: `ZDOTDIR` + `add-zsh-hook preexec/precmd`. Bash:
-  `--rcfile` + `PS0`/`PROMPT_COMMAND`. PowerShell: `-NoExit -File init.ps1`
-  wrapping `prompt`. Return program args/env for `pty::SessionSpec`; other
-  shells run unhooked with a notice. That completes Phase 1.
+  workspace,lock,pty,shims,lib,main}.rs`, `tests/{cli,pty,shims}.rs`
+  (95 tests + 1 ignored helper).
+- **In-Progress / Partial Work:** none in Phase 1. `recon`/`map`/`hud`/
+  `add`/`report` report "not built yet" (exit 1) until their phases.
+- **Next Exact Action:** Ask the owner which comes first: (a) a GitHub
+  Actions CI workflow running the three gates on Linux, macOS and Windows
+  (offered, not yet approved), or (b) Phase 2, Step 1 — add `rusqlite`
+  (`bundled`) and write `src/db.rs`: open `<workspace>/state.db` with
+  `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, a
+  `schema_version` table and migrations, file created `0600`.
 - **Blockers / Notes:**
   - `Cargo.toml` lists only crates in use (owner decision); add later-phase
     crates from SPEC §7 in the step that first uses them.
@@ -83,6 +79,11 @@ Before every push:
     appends the tap's clean lines to a file (debug aid; nothing else consumes
     tap lines until Phase 2). Create files with `private_open_options()` /
     `write_private_atomic()` only.
+  - Shims: zsh and bash are tested end to end; `init.ps1` has never been run.
+    Bash strips `ignoredups`/`erasedups` from `HISTCONTROL` in-session (a new
+    history number identifies a command); history-excluded commands are
+    logged as `# [UNRECORDED]`. `MEOW_BASH_LEGACY=1` forces the no-`PS0` path.
+    Other shells (sh, fish, wsl) run unhooked with a notice.
   - Non-tty stdin: no raw mode, no reset sequence; at input EOF Ctrl-D is
     retyped every 250 ms until the shell exits.
   - Windows code is compile-checked only, never run: `rustup target add

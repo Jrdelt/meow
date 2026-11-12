@@ -493,6 +493,8 @@ impl Workspace {
     /// still exists.
     pub fn restored_cwd(&self) -> Option<PathBuf> {
         let text = fs::read_to_string(self.last_cwd_path()).ok()?;
+        // Windows PowerShell may prepend a byte-order mark.
+        let text = text.trim_start_matches('\u{feff}');
         let dir = PathBuf::from(text.trim_end_matches(['\r', '\n']));
         (dir.is_absolute() && dir.is_dir()).then_some(dir)
     }
