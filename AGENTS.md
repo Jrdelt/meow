@@ -45,7 +45,13 @@ Before every push:
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
-4. Update `## Current Handoff State
+4. Update `## Current Handoff State` in place.
+5. Stage source/doc files only, then
+   `git commit -m "feat(phaseX-stepY): <summary>"` and `git push -u origin HEAD`.
+6. If the push needs a hardware key touch or `origin` is missing, print the
+   exact command and wait.
+
+## Current Handoff State
 
 - **Active Phase & Step:** Phase 1, Step 2 complete (C tap filter + FFI tests).
 - **Last Verified Commit:** `feat(phase1-step2)` — see `git log -n 1 --oneline`.
