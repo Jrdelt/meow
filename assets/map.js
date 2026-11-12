@@ -108,6 +108,22 @@
     return node;
   }
 
+  // The page is a dashboard of cards. Inside a card a fact is one row: its
+  // label on the left, its value (text or a node) on the right.
+  function row(label, value, valueClass) {
+    var line = el('div', 'row');
+    line.appendChild(typeof label === 'string' ? el('span', 'label', label) : label);
+    var holder = line.appendChild(el('div', 'value' + (valueClass ? ' ' + valueClass : '')));
+    if (typeof value === 'string') { holder.textContent = value; } else if (value) { holder.appendChild(value); }
+    return line;
+  }
+
+  function card(title) {
+    var box = el('section', 'card');
+    box.appendChild(el('h2', null, title));
+    return box;
+  }
+
   function flash(message) {
     var box = byId('flash') || document.body.appendChild(el('div'));
     box.id = 'flash';
@@ -149,13 +165,23 @@
 
   function renderHeader() {
     byId('session').textContent = state.session;
-    byId('mode').textContent = state.mode;
+    byId('avatar').textContent = state.session.slice(0, 1).toUpperCase();
+    byId('mode').textContent = 'mode ' + state.mode;
     byId('mode').className = 'badge mode-' + state.mode;
+    // One line of status, like a finished lookup: what there is, what to do.
     var hosts = Object.keys(state.graph.hosts);
-    var advisories = 0;
-    hosts.forEach(function (key) { advisories += state.graph.hosts[key].advisories.length; });
-    byId('counts').textContent = hosts.length + ' hosts, ' + advisories + ' advisories';
-    document.title = 'meow map: ' + state.session;
+    var confirmed = 0, open = 0;
+    hosts.forEach(function (key) {
+      state.graph.hosts[key].advisories.forEach(function (advisory) {
+        if (advisory.verification_status === 'Confirmed') { confirmed += 1; }
+        if (advisory.verification_status === 'UnverifiedHypothesis') { open += 1; }
+      });
+    });
+    var parts = [hosts.length + (hosts.length === 1 ? ' host' : ' hosts')];
+    parts.push(open + ' to verify');
+    parts.push(confirmed + ' confirmed');
+    byId('counts').textContent = parts.join(' · ');
+    document.title = 'meow: ' + state.session;
   }
 
   // Natural order for addresses: 10.0.0.9 before 10.0.0.10.
@@ -319,12 +345,31 @@
     items.forEach(function (item) { target.appendChild(build(item)); });
   }
 
-  // "This machine", top right: address -> type -> OS -> version, then its
-  // open ports and its interfaces, one line each. The tables behind that
-  // (routes, neighbours, every interface) unfold on a click and stay as
-  // they were left.
-  var machineDrawn = '';
+  // A small round mark beside a value: ok, warn, bad or info.
+  function mark(kind) {
+    return el('span', 'mark ' + kind, { ok: '✓', warn: '!', bad: '✕', info: 'i' }[kind]);
+  }
+
+  // A value with a mark after it, for the right-hand side of a row.
+  function marked(text, kind) {
+    var holder = el('span', null, text + ' ');
+    holder.appendChild(mark(kind));
+    return holder;
+  }
+
+  // <details> keep the state the reader left them in across refreshes.
   var unfolded = {};
+  function fold(key, className, openByDefault) {
+    var box = el('details', className);
+    box.open = key in unfolded ? unfolded[key] : !!openByDefault;
+    box.addEventListener('toggle', function () { unfolded[key] = box.open; });
+    return box;
+  }
+
+  // "This machine": address -> type -> OS -> version, then a row per
+  // subject. The long tables (routes, neighbours, every interface) are
+  // cards of their own further down the page.
+  var machineDrawn = '';
 
   function renderMachine() {
     var machine = state.machine || { vpn: [], sections: [] };
@@ -339,43 +384,72 @@
     if (key === machineDrawn) { return; }
     machineDrawn = key;
     var box = clear(byId('machine'));
-    box.appendChild(el('div', 'headline', machine.headline));
+    var parts = (machine.headline || '').split(' -> ');
+    ['Address', 'Machine', 'System', 'Version'].forEach(function (label, index) {
+      box.appendChild(row(label, parts[index] || 'not known'));
+    });
+    var tables = clear(byId('machine-cards'));
     machine.sections.forEach(function (section) {
-      var name = section.title.replace(/ \(.*\)$/, '');
-      var lines = section.lines.map(function (line) {
-        return el('div', section.warn ? 'warn-text' : 'mono', line);
+      var lines = el('div');
+      section.lines.forEach(function (line) {
+        lines.appendChild(el('div', section.warn ? 'warn-text' : null, line));
       });
       if (section.open) {
-        var row = box.appendChild(el('div', 'row'));
-        row.appendChild(el('span', 'label', section.title));
-        var values = row.appendChild(el('div'));
-        lines.forEach(function (line) { values.appendChild(line); });
+        box.appendChild(row(section.title, lines));
         return;
       }
-      var fold = box.appendChild(el('details'));
-      fold.open = !!unfolded[name];
-      fold.appendChild(el('summary', null, section.title));
-      lines.forEach(function (line) { fold.appendChild(line); });
-      fold.addEventListener('toggle', function () { unfolded[name] = fold.open; });
+      var table = tables.appendChild(card(section.title));
+      lines.className = 'lines';
+      table.appendChild(lines);
     });
     if (machine.observed_utc) {
-      box.appendChild(el('div', 'dim', 'Read from this machine at ' + machine.observed_utc.slice(11, 19) +
+      box.appendChild(el('p', 'note', 'Read from this machine at ' + machine.observed_utc.slice(11, 19) +
         ' UTC. Nothing was sent to find this out.'));
     }
   }
 
+  function select(id) {
+    selected = id;
+    cy.elements().unselect();
+    if (id) { cy.$id(id).select(); }
+    renderDetail();
+    renderHosts();
+    renderAdvisory();
+  }
+
+  // Every host as one row: what it is, and what there is to look at.
+  function renderHosts() {
+    var list = clear(byId('hosts'));
+    var hosts = state.topology.nodes.filter(function (node) { return node.data.kind === 'host'; });
+    hosts.sort(function (a, b) { return sortKey(a.data) < sortKey(b.data) ? -1 : 1; });
+    if (!hosts.length) {
+      list.appendChild(el('p', 'note', 'None yet. Work in the session shell, or import a scan with `meow add <file>`.'));
+    }
+    hosts.forEach(function (node) {
+      var data = node.data;
+      var name = el('button', 'link', data.address);
+      name.addEventListener('click', function () { select(data.id); });
+      var facts = [data.caption.split('\n')[0], data.open_ports + (data.open_ports === 1 ? ' port' : ' ports')];
+      var kind = 'ok';
+      if (data.hypotheses) { facts.push(data.hypotheses + ' to verify'); kind = 'warn'; }
+      if (data.confirmed) { facts.push(data.confirmed + ' confirmed'); kind = 'bad'; }
+      var line = list.appendChild(row(name, marked(facts.join(' · '), kind)));
+      if (data.id === selected) { line.className += ' current'; }
+    });
+  }
+
   function renderSide() {
     renderMachine();
+    renderHosts();
+    renderAdvisory();
 
     renderList(byId('tasks'), state.tasks || [], 'No recon tasks yet.', function (task) {
       var item = el('li');
-      item.appendChild(el('span', 'mono', 'recon ' + task.target + ' '));
+      item.appendChild(el('div', 'label', 'recon ' + task.target));
       task.stages.forEach(function (stage) {
-        var kind = { done: 'ok', running: 'warn', failed: 'bad', interrupted: 'bad' }[stage.status] || '';
-        var badge = el('span', 'badge ' + kind, stage.stage + ': ' + stage.status);
-        badge.title = stage.detail || '';
-        item.appendChild(badge);
-        item.appendChild(document.createTextNode(' '));
+        var kind = { done: 'ok', running: 'warn', failed: 'bad', interrupted: 'bad' }[stage.status] || 'info';
+        var line = item.appendChild(row(stage.stage, marked(stage.status, kind)));
+        line.title = stage.detail || '';
       });
       return item;
     });
@@ -383,14 +457,14 @@
     var notices = (state.notices || []).slice(-25).reverse();
     renderList(byId('notices'), notices, 'Nothing yet.', function (notice) {
       var item = el('li');
-      item.appendChild(el('span', 'dim mono', notice.at.slice(11, 19) + ' '));
+      item.appendChild(el('span', 'dim', notice.at.slice(11, 19) + ' '));
       item.appendChild(document.createTextNode(notice.text));
       return item;
     });
   }
 
   function pathTree(node, budget) {
-    var list = el('ul', 'tree mono');
+    var list = el('ul', 'tree');
     Object.keys(node.children || {}).forEach(function (name) {
       if (budget.left <= 0) { return; }
       budget.left -= 1;
@@ -404,30 +478,32 @@
     return list;
   }
 
-  function advisoryCard(address, advisory) {
-    var card = el('div', 'card');
-    var head = card.appendChild(el('div', 'head'));
-    head.appendChild(el('strong', 'mono', advisory.id));
-    if (advisory.severity) { head.appendChild(el('span', 'badge', advisory.severity)); }
-    if (advisory.kev) { head.appendChild(el('span', 'badge bad', 'CISA KEV')); }
-    var status = advisory.verification_status;
-    var kind = status === 'Confirmed' ? 'bad' : (status === 'FalsePositive' ? 'ok' : 'warn');
-    head.appendChild(el('span', 'badge ' + kind, status));
-    card.appendChild(el('div', null, advisory.title));
-    card.appendChild(el('div', 'dim mono', (advisory.port ? advisory.port + '  ' : '') + advisory.matched));
+  // One advisory: a line that unfolds into its checklist and the verdict.
+  function advisoryItem(address, advisory, kind, withHost) {
+    var item = fold('advisory:' + address + ':' + advisory.id, 'item', false);
+    var summary = item.appendChild(el('summary'));
+    summary.appendChild(mark(kind));
+    var text = summary.appendChild(el('span', 'what'));
+    var title = text.appendChild(el('span', 'title', advisory.id + '  ' + advisory.title));
+    title.title = advisory.title;
+    var where = [];
+    if (withHost) { where.push(address); }
+    if (advisory.port) { where.push(advisory.port); }
+    if (advisory.severity) { where.push(advisory.severity + (advisory.cvss ? ' ' + advisory.cvss : '')); }
+    if (advisory.kev) { where.push('in the CISA known-exploited catalog'); }
+    where.push(advisory.matched);
+    text.appendChild(el('span', 'dim', where.join(' · ')));
 
+    var status = advisory.verification_status;
     var checks = ((state.checklists[address] || {})[advisory.id] || {});
-    var list = card.appendChild(el('ul'));
     (checks.items || []).forEach(function (check) {
-      var item = el('li', check.done ? 'done' : 'todo', (check.done ? '[x] ' : '[ ] ') + check.label);
-      item.appendChild(el('span', 'dim', ' ' + check.detail));
-      list.appendChild(item);
+      var label = el('span', 'label', check.label);
+      item.appendChild(row(label, marked(check.detail, check.done ? 'ok' : 'warn')));
     });
     if (checks.research_ready && status === 'UnverifiedHypothesis') {
-      card.appendChild(el('div', 'badge ok', '[R] Deep Research Ready'));
+      item.appendChild(el('div', 'badge ok', '[R] Deep Research Ready'));
     }
-
-    var actions = card.appendChild(el('div', 'actions'));
+    var actions = item.appendChild(el('div', 'actions'));
     function verdict(label, value) {
       var button = actions.appendChild(el('button', null, label));
       button.addEventListener('click', function () {
@@ -440,54 +516,107 @@
     } else {
       verdict('Reopen', 'UnverifiedHypothesis');
     }
-    return card;
-  }
-
-  function factItem(fact) {
-    var item = el('li');
-    item.appendChild(document.createTextNode(fact.claim + ' '));
-    item.appendChild(el('span', 'dim mono', fact.source + ' / ' + fact.confidence + ' / ' + fact.verification_status));
+    var look = actions.appendChild(el('button', null, 'Show host'));
+    look.addEventListener('click', function () { select('host:' + address); });
     return item;
   }
 
-  function renderHost(detail, host) {
-    byId('detail-title').textContent = host.address;
-    var names = (host.hostnames || []).join(', ');
-    if (names) { detail.appendChild(el('div', 'mono', names)); }
-    if (host.os) { detail.appendChild(el('div', 'dim', host.os)); }
-
-    detail.appendChild(el('h3', null, 'Ports'));
-    var ports = detail.appendChild(el('ul', 'mono'));
-    Object.keys(host.ports).forEach(function (key) {
-      var port = host.ports[key];
-      var text = [key, port.state, port.service, port.product, port.version].filter(Boolean).join(' ');
-      var item = ports.appendChild(el('li', port.state === 'open' ? null : 'dim', text));
-      if (port.http && port.http.server) { item.appendChild(el('div', 'dim', 'Server: ' + port.http.server)); }
-      if ((port.tls_sans || []).length) { item.appendChild(el('div', 'dim', 'SAN: ' + port.tls_sans.join(', '))); }
-      if (port.paths && port.paths.children && Object.keys(port.paths.children).length) {
-        item.appendChild(pathTree(port.paths, { left: 300 }));
+  // The Advisory card: everything that needs a decision, most urgent first.
+  // For the selected host, or for every host when none is selected.
+  function renderAdvisory() {
+    var box = clear(byId('advisory'));
+    var node = selected ? cy.$id(selected) : null;
+    var only = node && !node.empty() && node.data('address') ? node.data('address') : null;
+    byId('advisory-title').textContent = only ? 'Advisory for ' + only : 'Advisory';
+    var groups = [
+      { name: 'Confirmed', kind: 'bad', open: true, items: [] },
+      { name: 'Known exploited, to verify', kind: 'issue', open: true, items: [] },
+      { name: 'To verify', kind: 'warn', open: false, items: [] },
+      { name: 'Informational', kind: 'info', open: false, items: [] },
+      { name: 'False positives', kind: 'ok', open: false, items: [] }
+    ];
+    Object.keys(state.graph.hosts).forEach(function (address) {
+      if (only && address !== only) { return; }
+      // Known-exploited first, then by severity score.
+      var ordered = state.graph.hosts[address].advisories.slice().sort(function (a, b) {
+        return (b.kev ? 1 : 0) - (a.kev ? 1 : 0) || (b.cvss || 0) - (a.cvss || 0);
+      });
+      ordered.forEach(function (advisory) {
+        var status = advisory.verification_status;
+        var group = status === 'Confirmed' ? 0 : (status === 'FalsePositive' ? 4 : (advisory.kev ? 1 : 2));
+        groups[group].items.push({ address: address, advisory: advisory });
+      });
+    });
+    var notes = (state.graph.local.warnings || []).concat(state.graph.local.notes || []);
+    var shown = 0;
+    groups.forEach(function (group) {
+      var count = group.name === 'Informational' ? notes.length : group.items.length;
+      if (!count) { return; }
+      // The most urgent group that has anything in it starts unfolded.
+      var open = group.open || shown === 0;
+      shown += count;
+      var section = box.appendChild(fold('group:' + group.name, 'group ' + group.kind, open));
+      var summary = section.appendChild(el('summary'));
+      summary.appendChild(el('span', 'name', group.name));
+      summary.appendChild(el('span', 'dim', ' (' + count + ')'));
+      if (group.name === 'Informational') {
+        notes.forEach(function (text) {
+          var line = section.appendChild(el('div', 'plain'));
+          line.appendChild(mark('info'));
+          line.appendChild(el('span', null, text));
+        });
+        return;
+      }
+      group.items.slice(0, 80).forEach(function (entry) {
+        section.appendChild(advisoryItem(entry.address, entry.advisory, group.kind === 'issue' ? 'bad' : group.kind, !only));
+      });
+      if (group.items.length > 80) {
+        section.appendChild(el('p', 'note', (group.items.length - 80) + ' more not shown; see `meow hud` or the report.'));
       }
     });
-    if (!Object.keys(host.ports).length) { ports.appendChild(el('li', 'dim', 'none seen')); }
-
-    detail.appendChild(el('h3', null, 'Hypotheses and findings'));
-    if (!host.advisories.length) { detail.appendChild(el('div', 'dim', 'No advisories matched.')); }
-    // Known-exploited first, then by severity score.
-    var ordered = host.advisories.slice().sort(function (a, b) {
-      return (b.kev ? 1 : 0) - (a.kev ? 1 : 0) || (b.cvss || 0) - (a.cvss || 0);
-    });
-    ordered.slice(0, 60).forEach(function (advisory) {
-      detail.appendChild(advisoryCard(host.address, advisory));
-    });
-    if (ordered.length > 60) {
-      detail.appendChild(el('div', 'dim', (ordered.length - 60) + ' more not shown; see `meow hud` or the report.'));
+    if (!shown) {
+      box.appendChild(el('p', 'note', only
+        ? 'Nothing matched for this host. Matches from the vulnerability databases appear here as hypotheses to verify.'
+        : 'Nothing to decide yet. When the software meow sees matches a known vulnerability, it appears here as a hypothesis to verify, never as a finding.'));
     }
+  }
 
-    detail.appendChild(el('h3', null, 'Ask AI'));
+  // The cards of a selected host: only the ones there is something to say in.
+  function hostCards(host, data) {
+    var cards = [];
+
+    var ports = card('Open Ports');
+    var closed = [];
+    Object.keys(host.ports).forEach(function (key) {
+      var port = host.ports[key];
+      if (port.state !== 'open') { closed.push(key + ' (' + port.state + ')'); return; }
+      var what = [port.service, port.product, port.version].filter(Boolean).join(' ');
+      ports.appendChild(row(key, marked(what || 'open', 'ok')));
+    });
+    if (!data.open_ports) { ports.appendChild(el('p', 'note', 'None seen open.')); }
+    if (closed.length) { ports.appendChild(el('p', 'note', 'Not seen open: ' + closed.join(', '))); }
+    cards.push(ports);
+
+    // What the web ports gave away: server headers, certificate names, paths.
+    var web = card('Web');
+    Object.keys(host.ports).forEach(function (key) {
+      var port = host.ports[key];
+      var paths = port.paths && port.paths.children && Object.keys(port.paths.children).length;
+      var sans = port.tls_sans || [];
+      if (!port.http && !sans.length && !paths) { return; }
+      web.appendChild(el('h3', null, key));
+      if (port.http && port.http.server) { web.appendChild(row('Server', port.http.server)); }
+      if (port.http && port.http.location) { web.appendChild(row('Redirects to', port.http.location)); }
+      sans.forEach(function (name) { web.appendChild(row('Certificate name', name)); });
+      if (paths) { web.appendChild(pathTree(port.paths, { left: 300 })); }
+    });
+    if (web.childNodes.length > 1) { cards.push(web); }
+
+    var ai = card('Ask AI');
     var ready = Object.keys(state.checklists[host.address] || {}).some(function (id) {
       return state.checklists[host.address][id].research_ready;
     });
-    var ask = detail.appendChild(el('div', 'actions'));
+    var ask = ai.appendChild(el('div', 'actions'));
     [['local', '[L] Local'], ['cloud', '[C] Cloud triage'], ['research', '[R] Deep research']].forEach(function (tier) {
       var button = ask.appendChild(el('button', null, tier[1]));
       if (tier[0] === 'research' && !ready) {
@@ -500,90 +629,117 @@
     });
     var budget = state.budget || {};
     if (budget.has_key) {
-      detail.appendChild(el('div', 'dim', 'Cloud today: $' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
+      ai.appendChild(row('Cloud today', '$' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
         (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
     } else {
-      detail.appendChild(el('div', 'dim', 'No cloud API key yet: [C] answers with the local model and [R] is ' +
+      ai.appendChild(el('p', 'note', 'No cloud API key yet: [C] answers with the local model and [R] is ' +
         'unavailable. Run `meow setup` in any terminal to add your own key or to choose your local model. ' +
         'It applies to this session at once.'));
     }
-    var ai = state.ai || {};
-    if (ai.address === host.address && (ai.running || ai.text || ai.error)) {
-      var reply = detail.appendChild(el('div', 'card'));
-      reply.appendChild(el('div', 'dim', ai.running ? 'Running ...' : (ai.summary || '')));
-      reply.appendChild(el('pre', 'reply', ai.text || ''));
-      if (ai.error) { reply.appendChild(el('div', 'bad-text', ai.error)); }
+    var reply = state.ai || {};
+    if (reply.address === host.address && (reply.running || reply.text || reply.error)) {
+      var answer = ai.appendChild(el('div', 'box'));
+      answer.appendChild(el('div', 'dim', reply.running ? 'Running ...' : (reply.summary || '')));
+      answer.appendChild(el('pre', 'reply', reply.text || ''));
+      if (reply.error) { answer.appendChild(el('div', 'bad-text', reply.error)); }
     }
+    cards.push(ai);
 
-    detail.appendChild(el('h3', null, 'Evidence'));
-    var facts = detail.appendChild(el('ul'));
-    (host.facts || []).forEach(function (fact) { facts.appendChild(factItem(fact)); });
+    var evidence = card('Evidence');
+    var facts = (host.facts || []).slice();
     Object.keys(host.ports).forEach(function (key) {
-      (host.ports[key].facts || []).forEach(function (fact) { facts.appendChild(factItem(fact)); });
+      (host.ports[key].facts || []).forEach(function (fact) { facts.push(fact); });
     });
+    facts.forEach(function (fact) {
+      var line = evidence.appendChild(el('div', 'fact'));
+      line.appendChild(el('div', null, fact.claim));
+      line.appendChild(el('div', 'dim', fact.source + ' · ' + fact.confidence + ' · ' + fact.verification_status));
+    });
+    if (!facts.length) { evidence.appendChild(el('p', 'note', 'Nothing recorded yet.')); }
+    cards.push(evidence);
 
-    detail.appendChild(el('h3', null, 'Add a note'));
-    var box = detail.appendChild(el('textarea'));
+    var note = card('Add a note');
+    var box = note.appendChild(el('textarea'));
     box.placeholder = 'What you found by hand: credentials tried, versions seen, pkg:npm/name@1.2.3 ...';
-    var save = detail.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Save note'));
+    var save = note.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Save note'));
     save.addEventListener('click', function () {
       if (box.value.trim()) {
         send({ cmd: 'note', address: host.address, text: box.value });
         box.value = '';
       }
     });
+    cards.push(note);
+    return cards;
   }
 
+  // The selected node: its facts in the card beside the map, and for a host
+  // one card per subject at the head of the cards below.
   function renderDetail() {
     var detail = byId('detail');
+    var cards = byId('host-cards');
     // Keep a half-written note when the state refreshes.
-    var draft = detail.querySelector('textarea');
+    var draft = cards.querySelector('textarea');
     var draftText = draft ? draft.value : '';
     var hadFocus = draft && document.activeElement === draft;
     clear(detail);
+    clear(cards);
     var node = selected ? cy.$id(selected) : null;
     if (!node || node.empty()) {
-      byId('detail-title').textContent = 'Select a node';
-      detail.appendChild(el('div', 'dim', 'Click a host to see its ports, paths, evidence and hypotheses.'));
+      byId('detail-title').textContent = 'Selected';
+      detail.appendChild(el('p', 'note', 'Click a node on the map, or a host in the list below, to see what is ' +
+        'known about it.'));
       return;
     }
     var data = node.data();
     var host = data.address ? state.graph.hosts[data.address] : null;
     if (host) {
-      renderHost(detail, host);
-      // What it is in one line, what is open on it, and why it is drawn so.
-      var summary = el('div');
-      summary.appendChild(el('div', 'headline', data.headline));
-      var open = summary.appendChild(el('div', 'row'));
-      open.appendChild(el('span', 'label', 'Open ports'));
-      open.appendChild(el('div', 'mono', data.ports_line));
-      summary.appendChild(drawnAs(data));
-      detail.insertBefore(summary, detail.firstChild);
-      var box = detail.querySelector('textarea');
+      byId('detail-title').textContent = 'Host Info';
+      // address -> type -> OS -> version, one row each.
+      var parts = data.headline.split(' -> ');
+      var guessed = / \(OS read off a service banner\)$/;
+      var version = (parts[3] || '').replace(guessed, '');
+      detail.appendChild(row('Address', parts[0]));
+      detail.appendChild(row('Type', parts[1]));
+      detail.appendChild(row('System', guessed.test(parts[3] || '') ? marked(parts[2], 'info') : parts[2]));
+      detail.appendChild(row('Version', version));
+      (host.hostnames || []).forEach(function (name) { detail.appendChild(row('Name', name)); });
+      if (host.mac) { detail.appendChild(row('Hardware address', host.mac)); }
+      detail.appendChild(row('Route', data.reachable ? marked('known', 'ok')
+        : marked(data.by_name ? 'address not known' : 'none known', 'warn')));
+      detail.appendChild(row('Open ports', data.ports_line));
+      if (guessed.test(parts[3] || '')) {
+        detail.appendChild(el('p', 'note', 'The system was read off a service banner, not reported by an OS scan.'));
+      }
+      detail.appendChild(drawnAs(data));
+      hostCards(host, data).forEach(function (one) { cards.appendChild(one); });
+      var box = cards.querySelector('textarea');
       if (box && draftText) { box.value = draftText; }
       if (box && hadFocus) { box.focus(); }
       return;
     }
-    byId('detail-title').textContent = data.label;
-    detail.appendChild(drawnAs(data));
+    byId('detail-title').textContent = data.caption.split('\n')[0];
     if (data.kind === 'interface') {
       var name = data.id.slice(3);
-      if (data.network) { detail.appendChild(el('div', 'mono', 'network ' + data.network)); }
+      if (data.network) { detail.appendChild(row('Network', data.network)); }
       (state.graph.local.interfaces || []).forEach(function (iface) {
         if (iface.name !== name) { return; }
-        detail.appendChild(el('div', 'mono', iface.kind + (iface.up ? ', up' : ', down')));
-        iface.addresses.forEach(function (address) { detail.appendChild(el('div', 'mono', 'this machine: ' + address)); });
+        detail.appendChild(row('Interface', name + ' (' + iface.kind + (iface.up ? ', up' : ', down') + ')'));
+        iface.addresses.forEach(function (address) { detail.appendChild(row('This machine', address)); });
       });
       if (data.hidden_neighbours) {
-        detail.appendChild(el('div', 'dim', data.hidden_neighbours + ' more devices in the neighbour table are not drawn.'));
+        detail.appendChild(el('p', 'note', data.hidden_neighbours + ' more devices in the neighbour table are not drawn.'));
       }
     } else if (data.kind === 'neighbour') {
-      detail.appendChild(el('div', 'mono', 'hardware address ' + data.mac));
-      detail.appendChild(el('div', 'mono', 'seen on ' + data.interface));
-      detail.appendChild(el('div', 'dim', 'It becomes a host once a scan, an imported file or the terminal output mentions it.'));
+      detail.appendChild(row('Address', data.label));
+      detail.appendChild(row('Hardware address', data.mac));
+      detail.appendChild(row('Seen on', data.interface));
+      detail.appendChild(el('p', 'note', 'It becomes a host once a scan, an imported file or the terminal output mentions it.'));
     } else if (data.kind === 'internet') {
-      detail.appendChild(el('div', 'dim', 'meow has sent nothing there to find this out.'));
+      detail.appendChild(el('p', 'note', 'meow has sent nothing there to find this out.'));
+    } else {
+      detail.appendChild(row('Name', data.label));
     }
+    detail.appendChild(drawnAs(data));
   }
 
   function render() {
@@ -593,15 +749,9 @@
     renderDetail();
   }
 
-  cy.on('tap', 'node', function (event) {
-    selected = event.target.id();
-    renderDetail();
-  });
+  cy.on('tap', 'node', function (event) { select(event.target.id()); });
   cy.on('tap', function (event) {
-    if (event.target === cy) {
-      selected = null;
-      renderDetail();
-    }
+    if (event.target === cy) { select(null); }
   });
 
   renderLegend();

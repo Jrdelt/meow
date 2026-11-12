@@ -75,6 +75,22 @@ clients, with this machine marked as "You".
 | Client | Nothing is known to listen on it. Devices in the neighbour table (ARP, NDP) are drawn as clients without becoming hosts: reading that table sends nothing. |
 | Network segment | One per active interface: the LAN, Wi-Fi or VPN this machine is attached to. Crowded segments stack their devices in rows above and below the line. |
 
+The page around the drawing is a dashboard of cards, each with a heading and
+rows of label and value:
+
+- **Topology**, **This Machine** and the selected node side by side at the top.
+- **Advisory**, across the page: what needs a decision, most urgent first.
+  Confirmed findings, known-exploited matches to verify, other matches to
+  verify, informational notes and false positives each fold open. An entry
+  unfolds into its verification checklist and the buttons to confirm it, mark
+  it a false positive or reopen it. Without a selection it covers every host.
+- For a selected host: **Open Ports**, **Web** (server headers, certificate
+  names and paths, when there are any), **Ask AI**, **Evidence**, **Add a note**.
+- **Hosts** (click one to select it), **Routes**, **Neighbours**,
+  **All interfaces**, **Background Tasks** and **Notices**.
+
+Only cards that have something to say are shown.
+
 The picture is a drawing hint, not a finding. Click any node to read what it
 was derived from. A host with hypotheses to verify gets an amber marker, one
 with a confirmed finding a red one, and a dashed red frame means a match is in

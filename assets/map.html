@@ -8,36 +8,56 @@
 </head>
 <body>
 <header>
-  <strong>meow</strong>
-  <span id="session"></span>
+  <span class="logo">meow</span>
+  <span class="target"><span id="avatar" class="avatar"></span><span id="session"></span></span>
+</header>
+<div id="status">
+  <span id="counts"></span>
+  <span class="spacer"></span>
   <span id="mode" class="badge"></span>
   <span id="vpn" class="badge"></span>
-  <span id="counts"></span>
   <span id="conn" class="badge off">connecting</span>
-</header>
+</div>
 <main>
-  <div id="stage">
-    <div id="cy"></div>
-    <div id="legend"></div>
+  <div id="top">
+    <section class="card" id="card-map">
+      <h2>Topology</h2>
+      <div id="stage">
+        <div id="cy"></div>
+        <div id="legend"></div>
+      </div>
+    </section>
+    <div class="side">
+      <section class="card">
+        <h2>This Machine</h2>
+        <div id="machine"></div>
+      </section>
+      <section class="card">
+        <h2 id="detail-title">Selected</h2>
+        <div id="detail"></div>
+      </section>
+    </div>
   </div>
-  <aside>
-    <section>
-      <h2>This machine</h2>
-      <div id="machine"></div>
+  <section class="card" id="card-advisory">
+    <h2 id="advisory-title">Advisory</h2>
+    <div id="advisory"></div>
+  </section>
+  <div id="cards">
+    <div id="host-cards" class="group-of-cards"></div>
+    <section class="card">
+      <h2>Hosts</h2>
+      <div id="hosts"></div>
     </section>
-    <section>
-      <h2 id="detail-title">Select a node</h2>
-      <div id="detail"></div>
-    </section>
-    <section>
-      <h2>Background tasks</h2>
+    <div id="machine-cards" class="group-of-cards"></div>
+    <section class="card">
+      <h2>Background Tasks</h2>
       <ul id="tasks"></ul>
     </section>
-    <section>
+    <section class="card">
       <h2>Notices</h2>
       <ul id="notices"></ul>
     </section>
-  </aside>
+  </div>
 </main>
 <script src="/assets/cytoscape.min.js?token={{TOKEN}}"></script>
 <script src="/assets/map.js?token={{TOKEN}}"></script>

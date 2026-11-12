@@ -38,9 +38,11 @@ pub const NVD_PACE_ANONYMOUS: Duration = Duration::from_millis(6500);
 pub const NVD_PACE_WITH_KEY: Duration = Duration::from_millis(700);
 /// Short, so an offline machine is not kept waiting.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A reply may arrive slowly (a phone hotspot, a VPN) as long as it keeps
-/// arriving: the databases answer with megabytes of JSON.
-const STALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a database may stay silent, before its first byte or between
+/// two parts of a reply. NVD often takes half a minute to start answering a
+/// keyword search, and a reply of megabytes may arrive slowly (a phone
+/// hotspot, a VPN) as long as it keeps arriving.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const DAY: Duration = Duration::from_secs(24 * 3600);
 const KEV_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -837,6 +839,9 @@ impl CveClient {
         };
 
         let mut packages: Vec<(Package, Option<String>)> = Vec::new();
+        // One slow answer is not an outage: the next lookup is still tried.
+        // After a second failure the rest is skipped.
+        let mut failures = 0;
         let mut offline = false;
         for lookup in &lookups {
             let (query, product, version, port) = match lookup {
@@ -868,7 +873,8 @@ impl CveClient {
                 Ok(found) => found,
                 Err(error) => {
                     grounding.errors.push(format!("{query}: {error:#}"));
-                    offline = true;
+                    failures += 1;
+                    offline = failures >= 2;
                     continue;
                 }
             };
@@ -1525,7 +1531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_fails_fast_and_reports_once() {
+    async fn offline_fails_fast_and_gives_up_after_two_lookups() {
         // A port nothing listens on: connection refused immediately.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1533,11 +1539,14 @@ mod tests {
         let client = client(&base, None);
         let started = Instant::now();
         let grounding = client.ground(&sample_host()).await;
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(8));
         assert!(grounding.advisories.is_empty());
-        assert_eq!(grounding.errors.len(), 2, "{:?}", grounding.errors);
+        // The catalog, then two lookups: one slow answer is not an outage,
+        // two failures in a row are, and the rest is not tried.
+        assert_eq!(grounding.errors.len(), 3, "{:?}", grounding.errors);
         assert!(grounding.errors[0].contains("CISA KEV"));
         assert!(grounding.errors[1].starts_with("cpeName="));
+        assert!(grounding.lookups > 2, "there was more to try");
     }
 
     #[tokio::test]
