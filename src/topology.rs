@@ -849,8 +849,8 @@ mod tests {
         // "You" caption use the IPv4 address all the same.
         let mut mac = graph.clone();
         mac.local.interfaces[1].addresses = vec![
-            "fe80::1c71:9b2d:2156:23ce/64".into(),
-            "2607:f8b0:4005:80a::200e/64".into(),
+            "fe80::aa:bb:cc:dd/64".into(),
+            "2001:db8:4005:80a::200e/64".into(),
             "192.168.1.5/24".into(),
         ];
         let topology = Topology::build(&mac);
@@ -1172,11 +1172,11 @@ mod tests {
                 record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
             });
         }
-        // As scanned from the owner's Mac: no OS scan, but the SSH banner
+        // A real scan result: no OS scan, but the SSH banner
         // names the distribution and its OpenSSH version names the release.
         port(
             &mut graph,
-            "10.202.12.41",
+            "10.20.30.41",
             22,
             "ssh",
             "OpenSSH",
@@ -1222,7 +1222,7 @@ mod tests {
         let host = |address: &str| &graph.hosts[address];
         let guess = |address: &str| host_os(host(address)).unwrap();
         assert_eq!(
-            guess("10.202.12.41"),
+            guess("10.20.30.41"),
             OsGuess {
                 name: "Ubuntu".into(),
                 version: "24.04".into(),
@@ -1230,10 +1230,10 @@ mod tests {
             }
         );
         assert_eq!(
-            host_headline(&graph, host("10.202.12.41")),
-            "10.202.12.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)"
+            host_headline(&graph, host("10.20.30.41")),
+            "10.20.30.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)"
         );
-        assert_eq!(host_open_ports(host("10.202.12.41")), "22/tcp ssh");
+        assert_eq!(host_open_ports(host("10.20.30.41")), "22/tcp ssh");
         assert_eq!(
             host_headline(&graph, host("10.0.0.2")),
             "10.0.0.2 -> Server -> Debian -> 11 (OS read off a service banner)"
@@ -1263,11 +1263,11 @@ mod tests {
         let nodes = elements["nodes"].as_array().unwrap();
         let node = nodes
             .iter()
-            .find(|n| n["data"]["id"] == "host:10.202.12.41")
+            .find(|n| n["data"]["id"] == "host:10.20.30.41")
             .unwrap();
         assert_eq!(
             node["data"]["headline"],
-            "10.202.12.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)"
+            "10.20.30.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)"
         );
         assert_eq!(node["data"]["ports_line"], "22/tcp ssh");
     }

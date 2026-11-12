@@ -1569,10 +1569,10 @@ mod tests {
             "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
              \toptions=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>\n\
              \tether a4:83:e7:11:22:33\n\
-             \tinet6 fe80::1c71:9b2d:2156:23ce%en0 prefixlen 64 secured scopeid 0xb\n\
-             \tinet6 2607:f8b0:4005:80a::200e prefixlen 64 autoconf secured\n\
-             \tinet6 2607:f8b0:4005:80a:d5f:1:2:3 prefixlen 64 autoconf temporary\n\
-             \tinet 10.104.168.20 netmask 0xfffffc00 broadcast 10.104.171.255\n\
+             \tinet6 fe80::aa:bb:cc:dd%en0 prefixlen 64 secured scopeid 0xb\n\
+             \tinet6 2001:db8:4005:80a::200e prefixlen 64 autoconf secured\n\
+             \tinet6 2001:db8:4005:80a:d5f:1:2:3 prefixlen 64 autoconf temporary\n\
+             \tinet 10.44.8.20 netmask 0xfffffc00 broadcast 10.44.11.255\n\
              \tnat64 prefix 64:ff9b:: prefixlen 96\n\
              \tnd6 options=201<PERFORMNUD,DAD>\n\
              \tmedia: autoselect\n\
@@ -1588,7 +1588,7 @@ mod tests {
         );
         macos::routes(
             "Internet:\nDestination        Gateway            Flags           Netif Expire\n\
-             default            10.104.168.1       UGScg             en0\n",
+             default            10.44.8.1       UGScg             en0\n",
             &mut local.routes,
         );
         let by_name = |name: &str| local.interfaces.iter().find(|i| i.name == name).unwrap();
@@ -1596,17 +1596,17 @@ mod tests {
         assert_eq!(
             en0.addresses,
             [
-                "fe80::1c71:9b2d:2156:23ce/64",
-                "2607:f8b0:4005:80a::200e/64",
-                "2607:f8b0:4005:80a:d5f:1:2:3/64",
-                "10.104.168.20/22",
+                "fe80::aa:bb:cc:dd/64",
+                "2001:db8:4005:80a::200e/64",
+                "2001:db8:4005:80a:d5f:1:2:3/64",
+                "10.44.8.20/22",
             ]
         );
-        assert_eq!(routable_address(en0), Some("10.104.168.20/22"));
-        assert_eq!(primary_address(&local).as_deref(), Some("10.104.168.20"));
+        assert_eq!(routable_address(en0), Some("10.44.8.20/22"));
+        assert_eq!(primary_address(&local).as_deref(), Some("10.44.8.20"));
         let report = machine_report(&local);
         assert!(
-            report.headline.starts_with("10.104.168.20 -> "),
+            report.headline.starts_with("10.44.8.20 -> "),
             "{}",
             report.headline
         );
@@ -1620,7 +1620,7 @@ mod tests {
         assert_eq!(
             interfaces.lines,
             [
-                "en0  10.104.168.20/22  gateway 10.104.168.1",
+                "en0  10.44.8.20/22  gateway 10.44.8.1",
                 "en7  192.168.50.2/24  local network only",
                 "en8  192.168.60.2/32  local network only",
                 "en9  fd00::9/64  local network only",
@@ -1834,7 +1834,7 @@ mod tests {
             "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\
              en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
              \tinet6 fe80::1c2a:3b4c:5d6e:7f80%en0 prefixlen 64 secured scopeid 0xb\n\
-             \tinet 172.26.147.20 netmask 0xfffff800 broadcast 172.26.151.255\n\
+             \tinet 172.30.47.20 netmask 0xfffff800 broadcast 172.26.151.255\n\
              awdl0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
              \tinet6 fe80::8c1f:64ff:fe01:2345%awdl0 prefixlen 64 scopeid 0xd\n",
         );
@@ -1847,18 +1847,18 @@ mod tests {
         macos::ifconfig(&text, &mut local.interfaces);
         macos::routes(
             "Internet:\nDestination        Gateway            Flags           Netif Expire\n\
-             default            172.26.147.1       UGScg             en0\n",
+             default            172.30.47.1       UGScg             en0\n",
             &mut local.routes,
         );
         assert_eq!(local.interfaces.len(), 11);
         assert_eq!(
             summary(&local),
-            "1 interfaces up, gateway 172.26.147.1 via en0, 0 neighbours, 0 listeners"
+            "1 interfaces up, gateway 172.30.47.1 via en0, 0 neighbours, 0 listeners"
         );
         // Idle tunnels are not mistaken for the lab, so nothing is flagged.
         local.listeners.push(Listener {
             protocol: "tcp".into(),
-            address: "172.26.147.20".into(),
+            address: "172.30.47.20".into(),
             port: 8000,
         });
         assert!(route_warnings(&local, &[]).is_empty());
@@ -2086,7 +2086,8 @@ mod tests {
 
     /// The tables of a real Mac on a phone hotspot with a split-tunnel
     /// corporate VPN: 31 interfaces and 113 routes, of which a handful say
-    /// anything. Rebuilt from what the owner's machine reported.
+    /// anything. Modelled on a real machine; every address is a documentation or
+    /// made-up one.
     #[test]
     fn a_real_macs_tables_come_out_as_a_few_lines() {
         let mut local = LocalNet::default();
@@ -2097,61 +2098,61 @@ mod tests {
              \tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1\n\
              gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280\n\
              en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
-             \tinet6 fe80::100d:54ed:adfe:7db1%en0 prefixlen 64 secured scopeid 0xe\n\
-             \tinet 172.20.10.5 netmask 0xfffffff0 broadcast 172.20.10.15\n\
-             \tinet6 2600:100f:b027:de15:3e:7e78:d565:25b6 prefixlen 64 autoconf secured\n\
+             \tinet6 fe80::1:2:3:4%en0 prefixlen 64 secured scopeid 0xe\n\
+             \tinet 192.168.50.5 netmask 0xfffffff0 broadcast 192.168.50.15\n\
+             \tinet6 2001:db8:b027:de15:3e:7e78:d565:25b6 prefixlen 64 autoconf secured\n\
              utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\
-             \tinet6 fe80::ad3c:36a1:b46f:220c%utun0 prefixlen 64 scopeid 0x10\n\
+             \tinet6 fe80::9:a:b:c%utun0 prefixlen 64 scopeid 0x10\n\
              utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400\n\
-             \tinet 172.16.2.24 --> 172.16.2.24 netmask 0xffffffff\n\
+             \tinet 10.99.2.24 --> 10.99.2.24 netmask 0xffffffff\n\
              bridge100: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500\n\
              \tinet 192.168.2.1 netmask 0xffffff00 broadcast 192.168.2.255\n\
-             \tinet6 fe80::fcb2:14ff:feea:9664%bridge100 prefixlen 64 scopeid 0x19\n\
-             \tinet6 fd4a:ddce:4da7:f339:109c:8607:daf2:1b3a prefixlen 64 autoconf secured\n",
+             \tinet6 fe80::d:e:f:1%bridge100 prefixlen 64 scopeid 0x19\n\
+             \tinet6 fd00:1234:5678:9abc:109c:8607:daf2:1b3a prefixlen 64 autoconf secured\n",
             &mut local.interfaces,
         );
         macos::routes(
             "Routing tables\n\nInternet:\n\
              Destination        Gateway            Flags               Netif Expire\n\
-             default            172.20.10.1        UGScg                 en0\n\
+             default            192.168.50.1        UGScg                 en0\n\
              default            link#25            UCSIg           bridge100      !\n\
              default            link#27            UCSIg               utun5\n\
-             10                 172.16.2.24        UGSc                utun5\n\
-             10.201.16.11/32    172.16.2.24        UGSc                utun5\n\
-             10.212.101.42/32   172.16.2.24        UGSc                utun5\n\
-             34.208/12          172.16.2.24        UGSc                utun5\n\
-             35.162.3.57/32     172.16.2.24        UGSc                utun5\n\
-             40.77.25.47/32     172.16.2.24        UGSc                utun5\n\
-             52.36.14.156/32    172.16.2.24        UGSc                utun5\n\
+             10                 10.99.2.24        UGSc                utun5\n\
+             10.1.16.11/32    10.99.2.24        UGSc                utun5\n\
+             10.2.101.42/32   10.99.2.24        UGSc                utun5\n\
+             198.51.100/24          10.99.2.24        UGSc                utun5\n\
+             192.0.2.57/32     10.99.2.24        UGSc                utun5\n\
+             192.0.2.47/32     10.99.2.24        UGSc                utun5\n\
+             192.0.2.156/32    10.99.2.24        UGSc                utun5\n\
              127                127.0.0.1          UCS                   lo0\n\
              127.0.0.1          127.0.0.1          UH                    lo0\n\
-             146.187            172.16.2.24        UGSc                utun5\n\
-             146.187.0.4/32     172.20.10.1        UGHS                  en0\n\
+             203.0.113            10.99.2.24        UGSc                utun5\n\
+             203.0.113.4/32     192.168.50.1        UGHS                  en0\n\
              169.254            link#14            UCS                   en0      !\n\
-             172.16/12          172.16.2.24        UGSc                utun5\n\
-             172.16.2.24        127.0.0.1          UH                    lo0\n\
-             172.20.10/28       link#14            UCS                   en0      !\n\
-             172.20.10.1/32     link#14            UCS                   en0      !\n\
-             172.20.10.5/32     link#14            UCS                   en0      !\n\
+             172.16/12          10.99.2.24        UGSc                utun5\n\
+             10.99.2.24        127.0.0.1          UH                    lo0\n\
+             192.168.50/28       link#14            UCS                   en0      !\n\
+             192.168.50.1/32     link#14            UCS                   en0      !\n\
+             192.168.50.5/32     link#14            UCS                   en0      !\n\
              192.168.2          link#25            UC              bridge100      !\n\
              224.0.0/4          link#14            UmCS                  en0      !\n\
              255.255.255.255/32 link#14            UCS                   en0      !\n\n\
              Internet6:\n\
              Destination                             Gateway                         Flags   Netif Expire\n\
-             default                                 fe80::4409:daff:fe81:5964%en0   UGcg      en0\n\
+             default                                 fe80::5:6:7:8%en0   UGcg      en0\n\
              default                                 fe80::%utun0                    UGcIg   utun0\n\
              ::1                                     ::1                             UHL       lo0\n\
-             2600:100f:b027:de15::/64                link#14                         UC        en0\n\
-             fd4a:ddce:4da7:f339::/64                link#25                         UC  bridge100\n\
+             2001:db8:b027:de15::/64                link#14                         UC        en0\n\
+             fd00:1234:5678:9abc::/64                link#25                         UC  bridge100\n\
              fe80::%en0/64                           link#14                         UCI       en0\n\
-             fe80::%utun0/64                         fe80::ad3c:36a1:b46f:220c%utun0 UcI     utun0\n\
+             fe80::%utun0/64                         fe80::9:a:b:c%utun0 UcI     utun0\n\
              ff00::/8                                ::1                             UmCI      lo0\n\
              ff00::/8                                link#14                         UmCI      en0\n\
-             ff02::/32                               fe80::ad3c:36a1:b46f:220c%utun0 UmCI    utun0\n",
+             ff02::/32                               fe80::9:a:b:c%utun0 UmCI    utun0\n",
             &mut local.routes,
         );
         macos::neighbors(
-            "? (172.20.10.1) at 46:9:da:81:59:64 on en0 ifscope [ethernet]\n",
+            "? (192.168.50.1) at 2:0:5e:10:0:1 on en0 ifscope [ethernet]\n",
             &mut local.neighbors,
         );
         local.system = SystemInfo {
@@ -2163,19 +2164,19 @@ mod tests {
         let report = machine_report(&local);
         assert_eq!(
             report.headline,
-            "172.20.10.5 -> MacBook Pro -> macOS -> 15.1"
+            "192.168.50.5 -> MacBook Pro -> macOS -> 15.1"
         );
         // A split tunnel: the VPN carries the company's networks. Its
         // interface-scoped "default" entry is not a default route.
-        let carries = "carries 10.0.0.0/8, 34.208.0.0/12, 146.187.0.0/16, 172.16.0.0/12 \
+        let carries = "carries 10.0.0.0/8, 198.51.100.0/24, 203.0.113.0/24, 172.16.0.0/12 \
                        and 5 single hosts";
-        assert_eq!(report.vpn, [format!("utun5 172.16.2.24/32: {carries}")]);
+        assert_eq!(report.vpn, [format!("utun5 10.99.2.24/32: {carries}")]);
         assert_eq!(report.sections[0].lines, ["none listening"]);
         assert_eq!(
             report.sections[1].lines,
             [
-                "en0  172.20.10.5/28  gateway 172.20.10.1".to_owned(),
-                format!("utun5  172.16.2.24/32  VPN, {carries}"),
+                "en0  192.168.50.5/28  gateway 192.168.50.1".to_owned(),
+                format!("utun5  10.99.2.24/32  VPN, {carries}"),
                 "bridge100  192.168.2.1/24  virtual network on this machine".to_owned(),
             ]
         );
@@ -2184,16 +2185,16 @@ mod tests {
         assert_eq!(
             routes.lines,
             [
-                "default via 172.20.10.1 on en0",
-                "10.0.0.0/8 via 172.16.2.24 on utun5",
-                "34.208.0.0/12 via 172.16.2.24 on utun5",
-                "146.187.0.0/16 via 172.16.2.24 on utun5",
-                "172.16.0.0/12 via 172.16.2.24 on utun5",
-                "172.20.10.0/28 on en0 (directly attached)",
+                "default via 192.168.50.1 on en0",
+                "10.0.0.0/8 via 10.99.2.24 on utun5",
+                "198.51.100.0/24 via 10.99.2.24 on utun5",
+                "203.0.113.0/24 via 10.99.2.24 on utun5",
+                "172.16.0.0/12 via 10.99.2.24 on utun5",
+                "192.168.50.0/28 on en0 (directly attached)",
                 "192.168.2.0/24 on bridge100 (directly attached)",
-                "default (IPv6) via fe80::4409:daff:fe81:5964 on en0",
-                "2600:100f:b027:de15::/64 on en0 (directly attached)",
-                "fd4a:ddce:4da7:f339::/64 on bridge100 (directly attached)",
+                "default (IPv6) via fe80::5:6:7:8 on en0",
+                "2001:db8:b027:de15::/64 on en0 (directly attached)",
+                "fd00:1234:5678:9abc::/64 on bridge100 (directly attached)",
                 "20 more left out: single hosts, multicast, link-local and idle interfaces",
             ]
         );

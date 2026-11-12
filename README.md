@@ -85,10 +85,10 @@ The top right of both `meow map` and `meow hud` sums up the machine meow runs
 on in a few lines:
 
 ```
-172.20.10.5 -> MacBook Pro -> macOS -> 15.1
+192.168.50.5 -> MacBook Pro -> macOS -> 15.1
 Open ports  none listening
-Interfaces  en0  172.20.10.5/28  gateway 172.20.10.1
-            utun5  172.16.2.24/32  VPN, carries 10.0.0.0/8, 172.16.0.0/12 and 5 single hosts
+Interfaces  en0  192.168.50.5/28  gateway 192.168.50.1
+            utun5  10.99.2.24/32  VPN, carries 10.0.0.0/8, 172.16.0.0/12 and 5 single hosts
 ```
 
 That is its address, what kind of machine it is, its operating system and
@@ -104,7 +104,7 @@ counted. Everything is read from the operating system every 30 seconds, and
 nothing is sent to find it out.
 
 A selected host gets the same one-line answer, for example
-`10.202.12.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)`,
+`10.20.30.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)`,
 followed by its open ports. Without an OS scan the system is read off service
 banners where they give it away, and marked as such.
 

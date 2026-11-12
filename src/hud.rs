@@ -1365,14 +1365,14 @@ mod tests {
             version: "15.1".into(),
         };
         graph.local.interfaces = vec![
-            interface("en0", "wifi", &["fe80::1c71/64", "10.104.168.20/22"]),
+            interface("en0", "wifi", &["fe80::aa/64", "10.44.8.20/22"]),
             interface("utun0", "vpn", &["fe80::2/64"]),
         ];
         graph.local.routes.insert(
             0,
             Route {
                 destination: "0.0.0.0/0".into(),
-                gateway: Some("10.104.168.1".into()),
+                gateway: Some("10.44.8.1".into()),
                 interface: "en0".into(),
             },
         );
@@ -1398,9 +1398,9 @@ mod tests {
         // An idle tunnel with only a link-local address is not a VPN, and
         // is not listed as an interface in use.
         for expected in [
-            "10.104.168.20 -> MacBook Pro -> macOS -> 15.1   no VPN",
+            "10.44.8.20 -> MacBook Pro -> macOS -> 15.1   no VPN",
             "Open ports  this machine only: 631/tcp",
-            "Interfaces  en0 10.104.168.20/22 gateway 10.104.168.1",
+            "Interfaces  en0 10.44.8.20/22 gateway 10.44.8.1",
             "m this machine",
             // The selected host gets the same one-line answer.
             "10.10.10.5 -> Server -> OS not known -> version not known",
@@ -1417,7 +1417,7 @@ mod tests {
         for expected in [
             "This machine in full: ports, interfaces, routes, neighbours",
             "Routes (1 of 2)",
-            "  default via 10.104.168.1 on en0",
+            "  default via 10.44.8.1 on en0",
             "Neighbours (0)",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
