@@ -366,7 +366,8 @@ pub struct Workspace {
 
 impl Workspace {
     /// Creates or resumes a workspace for `meow <name>` and re-applies its
-    /// permissions. Returns `true` when it was newly created.
+    /// permissions. Returns `true` when it was newly created. An existing
+    /// `profile.toml` is read but not rewritten; see [`Workspace::record_open`].
     pub fn open_or_create(
         home: &MeowHome,
         cwd: &Path,
@@ -408,9 +409,22 @@ impl Workspace {
             local,
             profile,
         };
-        // Rewritten on every open: refreshes the name and marks activity.
-        workspace.save_profile()?;
+        if !existed {
+            workspace.save_profile()?;
+        }
         Ok((workspace, !existed))
+    }
+
+    /// Records that a session now owns this workspace: stores the name it was
+    /// opened as and marks activity. Call only while holding the session
+    /// lock, so a refused second `meow <name>` never alters a live session.
+    pub fn record_open(&mut self) -> Result<()> {
+        // Re-read under the lock: a helper may have changed the profile
+        // since `open_or_create` loaded it.
+        let name = self.name.clone();
+        self.profile = Profile::read(&self.profile_path())?;
+        self.profile.name = name;
+        self.save_profile()
     }
 
     /// Loads an existing workspace for a helper subcommand and re-applies
@@ -822,10 +836,16 @@ mod tests {
         assert!(ws.dir.is_absolute());
         assert!(!fx.home.root().exists(), "--local must not create ~/.meow");
 
-        // Reopening under another name relabels the same directory.
-        let (again, created) = open(&fx, "renamed", true);
+        // Reopening under another name relabels the same directory, but only
+        // once the new session records itself (after taking the lock).
+        let (mut again, created) = open(&fx, "renamed", true);
         assert!(!created);
         assert_eq!(again.dir, ws.dir);
+        assert_eq!(Workspace::load(&ws.dir).unwrap().name, "webapp");
+        let mut helper = Workspace::load(&ws.dir).unwrap();
+        helper.set_mode(Mode::Mild).unwrap();
+        again.record_open().unwrap();
+        assert_eq!(again.profile.mode, Mode::Mild, "helper change was lost");
         let loaded = Workspace::load(&ws.dir).unwrap();
         assert_eq!(loaded.name, "renamed");
         assert!(loaded.local);

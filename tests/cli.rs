@@ -139,6 +139,42 @@ fn opening_a_name_creates_then_resumes_the_workspace() {
 }
 
 #[test]
+fn second_session_on_a_locked_workspace_is_refused() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["webapp", "--local"], &[]);
+    let local = sandbox.project().join(".meow");
+    assert!(local.join("session.lock").is_file());
+
+    // This test process plays the live session that owns the workspace.
+    let held = meow::lock::SessionLock::acquire(&local.join("session.lock")).unwrap();
+    let output = sandbox.run(&["renamed", "--local"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stderr(&output);
+    assert!(
+        text.contains("[!] Workspace 'renamed' is already open in another meow session"),
+        "{text}"
+    );
+    #[cfg(unix)]
+    assert!(
+        text.contains(&format!("(pid {})", std::process::id())),
+        "{text}"
+    );
+    assert!(output.stdout.is_empty(), "{}", stdout(&output));
+    // The refused run must not relabel the live session's workspace.
+    assert!(profile(&local).contains("name = \"webapp\""));
+
+    // Helpers do not take the session lock.
+    let output = sandbox.run(&["mode", "mild", "--local"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    drop(held);
+    let output = sandbox.run(&["renamed", "--local"], &[]);
+    assert!(stdout(&output).contains("[+] Resumed workspace 'renamed'"));
+    assert!(profile(&local).contains("name = \"renamed\""));
+    assert!(profile(&local).contains("mode = \"mild\""));
+}
+
+#[test]
 fn local_workspace_is_created_in_the_current_directory() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["webapp", "--local"], &[]);

@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
+use meow::lock::{LockError, SessionLock};
 use meow::workspace::{
     format_listing, list_workspaces, resolve_helper_dir, Config, MeowHome, SessionEnv, Workspace,
 };
@@ -41,8 +42,16 @@ fn run(cli: Cli) -> Result<()> {
             }
             Some(name) => {
                 let config = Config::load_or_create(&home)?;
-                let (workspace, created) =
+                let (mut workspace, created) =
                     Workspace::open_or_create(&home, &cwd, name, cli.local, config.default_mode)?;
+                let _lock =
+                    SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
+                        LockError::Held { .. } => {
+                            anyhow!("Workspace '{}' is {error}", workspace.name)
+                        }
+                        LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
+                    })?;
+                workspace.record_open()?;
                 println!(
                     "[+] {} workspace '{}' at {} (mode: {})",
                     if created { "Created" } else { "Resumed" },
@@ -53,7 +62,7 @@ fn run(cli: Cli) -> Result<()> {
                 Err(unavailable(
                     &format!("meow {name}"),
                     "the session shell",
-                    "Phase 1, Steps 5-7",
+                    "Phase 1, Steps 6-7",
                 ))
             }
         };

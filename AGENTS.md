@@ -53,20 +53,23 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 1, Step 4 complete (workspace + config).
-- **Last Verified Commit:** `feat(phase1-step4)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** Phase 1, Step 5 complete (session lock).
+- **Last Verified Commit:** `feat(phase1-step5)` — see `git log -n 1 --oneline`.
 - **Completed Files:** scaffold, `src/c/tap_filter.{h,c}`, `src/tap.rs`,
-  `src/cli.rs`, `src/mode.rs`, `src/workspace.rs`, `src/lib.rs`,
-  `src/main.rs`, `tests/cli.rs` (59 tests total).
-- **In-Progress / Partial Work:** `main.rs::run` implements bare `meow`
-  (listing), workspace create/resume, and `meow mode` (direct `profile.toml`
-  write). `meow <name>` then stops with "session shell is not built yet";
-  `recon`/`map`/`hud`/`add`/`report` report "not built yet" (exit 1).
-- **Next Exact Action:** Phase 1, Step 5 — write `src/lock.rs`: hold an
-  `fd-lock` write lock on `Workspace::lock_path()` (file opened with
-  `workspace::private_open_options()`) for the life of the session; a second
-  `meow <name>` on the same workspace must fail fast with a clear message.
-  Wire it into `main.rs` right after `Workspace::open_or_create`.
+  `src/cli.rs`, `src/mode.rs`, `src/workspace.rs`, `src/lock.rs`,
+  `src/lib.rs`, `src/main.rs`, `tests/cli.rs` (66 tests + 1 ignored helper).
+- **In-Progress / Partial Work:** `main.rs::run` for `meow <name>` opens the
+  workspace, takes the lock, calls `record_open()`, then stops with "session
+  shell is not built yet". `recon`/`map`/`hud`/`add`/`report` report "not
+  built yet" (exit 1). Bare `meow` and `meow mode` are complete for Phase 1.
+- **Next Exact Action:** Phase 1, Step 6 — write `src/pty.rs`: spawn the
+  platform shell (`Config::shell` override) in a `portable-pty` PTY started in
+  the workspace's restored cwd, export `MEOW_SESSION` / `MEOW_WORKSPACE` /
+  `MEOW_MODE` and forward `TERM` / `COLORTERM`; raw mode with a `Drop` guard
+  that also writes `\x1b[?1049l\x1b[?1000l\x1b[?2004l\x1b[?25h`; stdin
+  thread -> pty writer; pty reader -> stdout untouched plus `try_send` copies
+  to a `TapFilter` worker; `SIGWINCH` via `signal-hook` (250 ms size poll on
+  Windows). Wire into `main.rs` while `_lock` is held. Shims are Step 7.
 - **Blockers / Notes:**
   - `Cargo.toml` lists only crates in use (owner decision); add each
     later-phase crate from the SPEC §7 baseline in the step that first uses it.
@@ -77,11 +80,12 @@ Before every push:
   - `TapFilter` allocates `tap_state_t` using `tap_state_size()` from C; never
     mirror the struct layout in Rust.
   - Helper targeting order: `--local`, `--session`, `$MEOW_WORKSPACE`,
-    `$MEOW_SESSION`. The PTY step must export `MEOW_SESSION`,
-    `MEOW_WORKSPACE` (= `Workspace::dir`, already absolute) and `MEOW_MODE`.
+    `$MEOW_SESSION`. `Workspace::dir` is already absolute.
+  - Only `meow <name>` takes `SessionLock`; helpers never do. Mutate the
+    workspace as a session only after the lock (`record_open`).
   - `$MEOW_HOME` overrides `~/.meow`; tests rely on it. Create files with
     `private_open_options()` / `write_private_atomic()` only.
-  - Windows ACL (`icacls` in `workspace.rs`) has never been compiled or run.
+  - Windows paths (`icacls` ACL, `LockFileEx`) have never been compiled or run.
   - Listing shows name/mode/last-active; host count and unfinished tasks join
     when `graph.json` (Phase 2) and `state.db` tasks (Phase 3) exist.
   - Exit codes: 1 = runtime refusal/failure, 2 = usage error (clap).
