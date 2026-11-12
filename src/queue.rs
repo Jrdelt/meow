@@ -1,0 +1,1406 @@
+//! The background recon queue.
+//!
+//! `meow recon <target>` queues one task of four stages that run strictly
+//! one at a time: port inventory (`nmap`), service inventory (`nmap -sV` on
+//! the open ports only), web crawl (`katana`) and directory inventory
+//! (`feroxbuster`). Each tool runs with `stdin` closed, in its own process
+//! group (a Job Object on Windows), under a wall-clock timeout and an output
+//! size cap, and writes a structured file to `<workspace>/tmp/` that is
+//! parsed and then deleted. Stage status is kept in `state.db` so an
+//! interrupted task can be resumed when the session is reopened.
+
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, Semaphore};
+
+use crate::coordinator::State;
+use crate::db::Db;
+use crate::endpoint::{HostAddr, Target};
+use crate::graph::{Graph, Host};
+use crate::mode::Mode;
+use crate::parsers;
+use crate::timeutil::now_rfc3339;
+
+const MAX_HOSTS_PER_STAGE: usize = 64;
+const MAX_URLS_PER_STAGE: usize = 32;
+const CAP_POLL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Ports,
+    Services,
+    Crawl,
+    Dirs,
+}
+
+pub const STAGES: [Stage; 4] = [Stage::Ports, Stage::Services, Stage::Crawl, Stage::Dirs];
+
+impl Stage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage::Ports => "ports",
+            Stage::Services => "services",
+            Stage::Crawl => "crawl",
+            Stage::Dirs => "dirs",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        STAGES.into_iter().find(|stage| stage.as_str() == text)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings and presets
+// ---------------------------------------------------------------------------
+
+/// Tool flags for one mode. `None` means "use the built-in default".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PresetOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nmap_ports: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nmap_services: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub katana_depth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ferox_rate_limit: Option<u32>,
+}
+
+impl PresetOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preset {
+    pub nmap_ports: Vec<String>,
+    pub nmap_services: Vec<String>,
+    pub katana_depth: u32,
+    /// Requests per second for feroxbuster; `None` uses `--auto-tune`.
+    pub ferox_rate_limit: Option<u32>,
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_owned()).collect()
+}
+
+impl Preset {
+    /// Built-in flags for a mode. `light` never runs tools.
+    pub fn builtin(mode: Mode) -> Self {
+        let scripts = "ssl-cert,http-server-header,http-title";
+        match mode {
+            Mode::Aggressive => Self {
+                nmap_ports: strings(&["-sS", "-T4", "-p-", "-O"]),
+                nmap_services: strings(&["-sV", "--version-all", "-T4", "--script", scripts]),
+                katana_depth: 4,
+                ferox_rate_limit: None,
+            },
+            _ => Self {
+                nmap_ports: strings(&["-sS", "-T3", "--top-ports", "1000"]),
+                nmap_services: strings(&[
+                    "-sV",
+                    "--version-intensity",
+                    "5",
+                    "-T3",
+                    "--script",
+                    scripts,
+                ]),
+                katana_depth: 2,
+                ferox_rate_limit: Some(20),
+            },
+        }
+    }
+
+    fn apply(mut self, over: &PresetOverride) -> Self {
+        if let Some(flags) = &over.nmap_ports {
+            self.nmap_ports = flags.clone();
+        }
+        if let Some(flags) = &over.nmap_services {
+            self.nmap_services = flags.clone();
+        }
+        if let Some(depth) = over.katana_depth {
+            self.katana_depth = depth;
+        }
+        if over.ferox_rate_limit.is_some() {
+            self.ferox_rate_limit = over.ferox_rate_limit;
+        }
+        self
+    }
+}
+
+/// `[recon]` section of `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ReconSettings {
+    /// Wall-clock limit for each tool run.
+    pub stage_timeout_secs: u64,
+    /// A tool whose output file grows past this is stopped.
+    pub output_cap_mb: u64,
+    /// Wordlist for feroxbuster; standard system paths are tried otherwise.
+    pub wordlist_path: Option<String>,
+    /// Program names or paths of the tools.
+    pub nmap: String,
+    pub katana: String,
+    pub feroxbuster: String,
+    pub mild: PresetOverride,
+    pub aggressive: PresetOverride,
+}
+
+impl Default for ReconSettings {
+    fn default() -> Self {
+        Self {
+            stage_timeout_secs: 1800,
+            output_cap_mb: 50,
+            wordlist_path: None,
+            nmap: "nmap".to_owned(),
+            katana: "katana".to_owned(),
+            feroxbuster: "feroxbuster".to_owned(),
+            mild: PresetOverride::default(),
+            aggressive: PresetOverride::default(),
+        }
+    }
+}
+
+impl ReconSettings {
+    /// Flags for `mode`: built-in, then `config.toml`, then `profile.toml`.
+    pub fn preset(&self, mode: Mode, profile: &PresetOverride) -> Preset {
+        let from_config = match mode {
+            Mode::Aggressive => &self.aggressive,
+            _ => &self.mild,
+        };
+        Preset::builtin(mode).apply(from_config).apply(profile)
+    }
+
+    fn limits(&self) -> RunLimits {
+        RunLimits {
+            timeout: Duration::from_secs(self.stage_timeout_secs.max(1)),
+            cap_bytes: self.output_cap_mb.max(1) * 1024 * 1024,
+        }
+    }
+}
+
+const STANDARD_WORDLISTS: &[&str] = &[
+    "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+    "/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt",
+    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/dirb/wordlists/common.txt",
+    "/opt/homebrew/share/seclists/Discovery/Web-Content/common.txt",
+    "/usr/local/share/seclists/Discovery/Web-Content/common.txt",
+];
+
+/// The configured wordlist if it exists, else the first standard one found.
+pub fn find_wordlist(configured: Option<&str>) -> Option<PathBuf> {
+    configured
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .into_iter()
+        .chain(STANDARD_WORDLISTS.iter().copied())
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+// ---------------------------------------------------------------------------
+// Command builders
+// ---------------------------------------------------------------------------
+
+/// True when the process may send raw packets (root / elevated).
+pub fn is_privileged() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: IsUserAnAdmin takes no arguments.
+        unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+    }
+}
+
+const HIGH_RATE_FLAGS: &[&str] = &["-T4", "-T5", "-A"];
+
+/// Which of `flags` are high-rate (`-T4`, `-T5`, `-A`).
+pub fn high_rate_flags(flags: &[String]) -> Vec<&str> {
+    flags
+        .iter()
+        .map(String::as_str)
+        .filter(|flag| HIGH_RATE_FLAGS.contains(flag))
+        .collect()
+}
+
+/// Adapts nmap flags to an unprivileged process: `-sS` (raw SYN scan)
+/// becomes `-sT` (connect scan) and `-O` (OS detection) is removed, since
+/// both need raw sockets. Returns the flags and a notice for each change.
+pub fn adapt_for_privilege(flags: Vec<String>, privileged: bool) -> (Vec<String>, Vec<String>) {
+    if privileged {
+        return (flags, Vec::new());
+    }
+    let mut out = Vec::with_capacity(flags.len());
+    let mut notices = Vec::new();
+    for flag in flags {
+        if flag == "-O" {
+            notices.push(
+                "not running as root: removed -O (OS detection needs raw sockets)".to_owned(),
+            );
+        } else if flag.starts_with("-s") && !flag.starts_with("--") && flag[2..].contains('S') {
+            notices.push(format!(
+                "not running as root: {flag} replaced with {} (connect scan)",
+                flag.replacen('S', "T", 1)
+            ));
+            out.push(flag.replacen('S', "T", 1));
+        } else {
+            out.push(flag);
+        }
+    }
+    (out, notices)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub output: PathBuf,
+}
+
+fn path_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Stage 1: port inventory.
+pub fn ports_command(
+    settings: &ReconSettings,
+    preset: &Preset,
+    target: &Target,
+    extra: &[String],
+    privileged: bool,
+    output: &Path,
+) -> (ToolCommand, Vec<String>) {
+    let mut flags = preset.nmap_ports.clone();
+    flags.extend(extra.iter().cloned());
+    let (mut args, notices) = adapt_for_privilege(flags, privileged);
+    let ipv6 = match target {
+        Target::Host(host) => host.ip().is_some_and(|ip| ip.is_ipv6()),
+        Target::Network(network) => network.is_ipv6(),
+    };
+    if ipv6 && !args.iter().any(|a| a == "-6") {
+        args.push("-6".to_owned());
+    }
+    args.extend(["-oX".to_owned(), path_arg(output), target.to_string()]);
+    (
+        ToolCommand {
+            program: settings.nmap.clone(),
+            args,
+            output: output.to_path_buf(),
+        },
+        notices,
+    )
+}
+
+/// Stage 2: service inventory, only on the ports stage 1 found open.
+pub fn services_command(
+    settings: &ReconSettings,
+    preset: &Preset,
+    address: &str,
+    ports: &[u16],
+    privileged: bool,
+    output: &Path,
+) -> (ToolCommand, Vec<String>) {
+    let (mut args, notices) = adapt_for_privilege(preset.nmap_services.clone(), privileged);
+    if address.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
+        args.push("-6".to_owned());
+    }
+    let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+    args.extend([
+        "-p".to_owned(),
+        ports.join(","),
+        "-oX".to_owned(),
+        path_arg(output),
+        address.to_owned(),
+    ]);
+    (
+        ToolCommand {
+            program: settings.nmap.clone(),
+            args,
+            output: output.to_path_buf(),
+        },
+        notices,
+    )
+}
+
+/// Stage 3: web link and JavaScript route crawl.
+pub fn crawl_command(
+    settings: &ReconSettings,
+    preset: &Preset,
+    url: &str,
+    output: &Path,
+) -> ToolCommand {
+    let depth = preset.katana_depth.to_string();
+    ToolCommand {
+        program: settings.katana.clone(),
+        args: strings(&[
+            "-u",
+            url,
+            "-jsonl",
+            "-silent",
+            "-nc",
+            "-jc",
+            "-ct",
+            "5m",
+            "-d",
+            &depth,
+            "-o",
+            &path_arg(output),
+        ]),
+        output: output.to_path_buf(),
+    }
+}
+
+/// Stage 4: directory and endpoint inventory. `--rate-limit` (with
+/// `--scan-limit 1` and `--auto-bail`) and `--auto-tune` exclude each other.
+pub fn dirs_command(
+    settings: &ReconSettings,
+    preset: &Preset,
+    url: &str,
+    wordlist: &Path,
+    output: &Path,
+) -> ToolCommand {
+    let mut args = strings(&["-u", url, "--quiet", "--no-state"]);
+    match preset.ferox_rate_limit {
+        Some(rate) => args.extend(strings(&[
+            "--rate-limit",
+            &rate.to_string(),
+            "--scan-limit",
+            "1",
+            "--auto-bail",
+            "--time-limit",
+            "10m",
+        ])),
+        None => args.extend(strings(&["--auto-tune", "--time-limit", "15m"])),
+    }
+    args.extend(strings(&[
+        "--json",
+        "-o",
+        &path_arg(output),
+        "-w",
+        &path_arg(wordlist),
+    ]));
+    ToolCommand {
+        program: settings.feroxbuster.clone(),
+        args,
+        output: output.to_path_buf(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Running one tool
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLimits {
+    pub timeout: Duration,
+    pub cap_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The tool exited by itself with this code (`None`: killed by a signal).
+    Exited(Option<i32>),
+    TimedOut,
+    OutputCapExceeded,
+    NotInstalled,
+    Failed(String),
+}
+
+/// Kills the whole process group when dropped, so a cancelled stage or a
+/// closing session never leaves scanners running.
+#[cfg(unix)]
+struct GroupGuard(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // SAFETY: plain syscall; the child was started as the leader of
+            // its own process group, so this cannot signal our own group.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// A Job Object with kill-on-close: closing the handle ends every process
+/// the tool started.
+#[cfg(windows)]
+struct GroupGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+// SAFETY: a job handle may be used and closed from any thread.
+unsafe impl Send for GroupGuard {}
+
+#[cfg(windows)]
+impl GroupGuard {
+    fn attach(process: std::os::windows::io::RawHandle) -> Option<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // SAFETY: all pointers are valid for the duration of each call and
+        // the structure is plain data that may be zero-initialised.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0;
+            if !configured || AssignProcessToJobObject(job, process as _) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by this guard and closed exactly once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Runs one tool to completion, or stops it at the time or size limit.
+pub async fn run_tool(command: &ToolCommand, limits: RunLimits) -> RunOutcome {
+    let mut process = tokio::process::Command::new(&command.program);
+    process
+        .args(&command.args)
+        // No terminal input: a tool that asks a question gets EOF instead of
+        // hanging the queue.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    process.process_group(0);
+    #[cfg(target_os = "linux")]
+    // SAFETY: the closure only calls prctl, which is async-signal-safe.
+    unsafe {
+        process.pre_exec(|| {
+            // If meow itself is killed, the kernel stops the tool.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RunOutcome::NotInstalled
+        }
+        Err(error) => {
+            return RunOutcome::Failed(format!("cannot start {}: {error}", command.program))
+        }
+    };
+    #[cfg(unix)]
+    let _group = GroupGuard(child.id());
+    #[cfg(windows)]
+    let _group = child.raw_handle().and_then(GroupGuard::attach);
+
+    let deadline = tokio::time::sleep(limits.timeout);
+    tokio::pin!(deadline);
+    let mut poll = tokio::time::interval(CAP_POLL);
+    let outcome = loop {
+        tokio::select! {
+            status = child.wait() => break match status {
+                Ok(status) => RunOutcome::Exited(status.code()),
+                Err(error) => RunOutcome::Failed(error.to_string()),
+            },
+            () = &mut deadline => break RunOutcome::TimedOut,
+            _ = poll.tick() => {
+                let size = tokio::fs::metadata(&command.output).await.map(|m| m.len()).unwrap_or(0);
+                if size > limits.cap_bytes {
+                    break RunOutcome::OutputCapExceeded;
+                }
+            }
+        }
+    };
+    if !matches!(outcome, RunOutcome::Exited(_)) {
+        let _ = child.kill().await;
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StageRow {
+    pub stage: Stage,
+    /// `pending`, `running`, `interrupted`, `done`, `skipped` or `failed`.
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskRow {
+    pub id: i64,
+    pub target: String,
+    pub mode: Mode,
+    pub extra_flags: Vec<String>,
+    pub created_utc: String,
+    pub stages: Vec<StageRow>,
+}
+
+impl TaskRow {
+    /// Still has work to do (now or after a resume).
+    pub fn unfinished(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|s| matches!(s.status.as_str(), "pending" | "running" | "interrupted"))
+    }
+
+    /// `recon 10.0.0.0/24: services interrupted`
+    pub fn describe(&self) -> String {
+        let current = self
+            .stages
+            .iter()
+            .find(|s| matches!(s.status.as_str(), "running" | "interrupted" | "pending"));
+        match current {
+            Some(stage) => format!(
+                "recon {}: {} {}",
+                self.target,
+                stage.stage.as_str(),
+                stage.status
+            ),
+            None => format!("recon {}: finished", self.target),
+        }
+    }
+}
+
+pub fn enqueue(db: &Db, target: &str, mode: Mode, extra_flags: &[String]) -> Result<i64> {
+    let conn = db.conn();
+    conn.execute(
+        "INSERT INTO tasks (target, mode, extra_flags, created_utc) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            target,
+            mode.as_str(),
+            serde_json::to_string(extra_flags)?,
+            now_rfc3339()
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    for (position, stage) in STAGES.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO task_stages (task_id, stage, position, status) VALUES (?1, ?2, ?3, 'pending')",
+            params![id, stage.as_str(), position as i64],
+        )?;
+    }
+    Ok(id)
+}
+
+pub fn set_stage(db: &Db, task: i64, stage: Stage, status: &str, detail: &str) -> Result<()> {
+    let now = now_rfc3339();
+    let (started, finished) = match status {
+        "running" => (Some(now), None),
+        "pending" => (None, None),
+        _ => (None, Some(now)),
+    };
+    db.conn().execute(
+        "UPDATE task_stages SET status = ?3, detail = ?4,
+                started_utc = COALESCE(?5, started_utc), finished_utc = ?6
+         WHERE task_id = ?1 AND stage = ?2",
+        params![task, stage.as_str(), status, detail, started, finished],
+    )?;
+    Ok(())
+}
+
+/// The most recent tasks, newest first.
+pub fn tasks(db: &Db, limit: usize) -> Result<Vec<TaskRow>> {
+    let conn = db.conn();
+    let mut statement = conn.prepare(
+        "SELECT id, target, mode, extra_flags, created_utc FROM tasks ORDER BY id DESC LIMIT ?1",
+    )?;
+    let mut rows: Vec<TaskRow> = statement
+        .query_map([limit as i64], |row| {
+            let mode: String = row.get(2)?;
+            let flags: String = row.get(3)?;
+            Ok(TaskRow {
+                id: row.get(0)?,
+                target: row.get(1)?,
+                mode: match mode.as_str() {
+                    "aggressive" => Mode::Aggressive,
+                    "light" => Mode::Light,
+                    _ => Mode::Mild,
+                },
+                extra_flags: serde_json::from_str(&flags).unwrap_or_default(),
+                created_utc: row.get(4)?,
+                stages: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stages = conn.prepare(
+        "SELECT stage, status, detail FROM task_stages WHERE task_id = ?1 ORDER BY position",
+    )?;
+    for task in &mut rows {
+        task.stages = stages
+            .query_map([task.id], |row| {
+                let stage: String = row.get(0)?;
+                Ok((stage, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .filter_map(|row| row.ok())
+            .filter_map(|(stage, status, detail)| {
+                Some(StageRow {
+                    stage: Stage::parse(&stage)?,
+                    status,
+                    detail,
+                })
+            })
+            .collect();
+    }
+    Ok(rows)
+}
+
+pub fn task(db: &Db, id: i64) -> Result<Option<TaskRow>> {
+    Ok(tasks(db, 1000)?.into_iter().find(|task| task.id == id))
+}
+
+/// Tasks with pending or interrupted stages, oldest first.
+pub fn unfinished(db: &Db) -> Result<Vec<TaskRow>> {
+    let mut found: Vec<TaskRow> = tasks(db, 1000)?
+        .into_iter()
+        .filter(TaskRow::unfinished)
+        .collect();
+    found.reverse();
+    Ok(found)
+}
+
+/// A stage still marked `running` belongs to a session that ended (or
+/// crashed) while it ran. Returns how many were marked `interrupted`.
+pub fn mark_running_interrupted(db: &Db) -> Result<usize> {
+    Ok(db.conn().execute(
+        "UPDATE task_stages SET status = 'interrupted', detail = 'the session ended while this stage was running'
+         WHERE status = 'running'",
+        [],
+    )?)
+}
+
+/// The operator declined to resume: the remaining stages are skipped.
+pub fn decline(db: &Db, task: i64) -> Result<()> {
+    db.conn().execute(
+        "UPDATE task_stages SET status = 'skipped', detail = 'not resumed', finished_utc = ?2
+         WHERE task_id = ?1 AND status IN ('pending', 'interrupted', 'running')",
+        params![task, now_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Number of unfinished tasks in a workspace's `state.db`, without creating
+/// or migrating it (used by the workspace listing).
+pub fn count_unfinished(state_db: &Path) -> usize {
+    if !state_db.is_file() {
+        return 0;
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    rusqlite::Connection::open_with_flags(state_db, flags)
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT COUNT(DISTINCT task_id) FROM task_stages
+                 WHERE status IN ('pending', 'running', 'interrupted')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// The worker
+// ---------------------------------------------------------------------------
+
+enum StageEnd {
+    Done(String),
+    Skipped(String),
+}
+
+fn hosts_in_target(graph: &Graph, target: &Target) -> Vec<Host> {
+    match target {
+        Target::Host(HostAddr::Name(name)) => graph.host(name).cloned().into_iter().collect(),
+        _ => graph
+            .hosts
+            .values()
+            .filter(|host| {
+                host.address
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| target.contains(ip))
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Parses a tool's output file into the graph, then deletes it.
+fn ingest(state: &State, output: &Path) -> Result<usize> {
+    let result = parsers::parse_file(output).map(|parsed| {
+        let changed = state.graph().apply_all(parsed.observations);
+        if changed > 0 {
+            state.mark_dirty();
+        }
+        changed
+    });
+    let _ = std::fs::remove_file(output);
+    result
+}
+
+fn describe_failure(program: &str, outcome: &RunOutcome, limits: RunLimits) -> String {
+    match outcome {
+        RunOutcome::Exited(Some(code)) => format!("{program} exited with code {code}"),
+        RunOutcome::Exited(None) => format!("{program} was killed by a signal"),
+        RunOutcome::TimedOut => format!("{program} timed out after {} s", limits.timeout.as_secs()),
+        RunOutcome::OutputCapExceeded => format!(
+            "{program} exceeded the {} MB output cap",
+            limits.cap_bytes / (1024 * 1024)
+        ),
+        RunOutcome::NotInstalled => format!("{program} is not installed"),
+        RunOutcome::Failed(reason) => reason.clone(),
+    }
+}
+
+async fn run_stage(
+    state: &Arc<State>,
+    task: &TaskRow,
+    target: &Target,
+    stage: Stage,
+) -> Result<StageEnd> {
+    let settings = state.config.recon.clone();
+    let preset = settings.preset(task.mode, &state.profile_recon());
+    let limits = settings.limits();
+    let tmp = state.workspace_dir().join("tmp");
+    let privileged = is_privileged();
+    let out = |suffix: &str| tmp.join(format!("{}_{}{suffix}", stage_file(stage), task.id));
+
+    match stage {
+        Stage::Ports => {
+            let (command, notices) = ports_command(
+                &settings,
+                &preset,
+                target,
+                &task.extra_flags,
+                privileged,
+                &out(".xml"),
+            );
+            for notice in notices {
+                state.notice(notice);
+            }
+            let outcome = run_tool(&command, limits).await;
+            if !matches!(outcome, RunOutcome::Exited(Some(0))) {
+                let _ = std::fs::remove_file(&command.output);
+                bail!(describe_failure(&command.program, &outcome, limits));
+            }
+            let changed = ingest(state, &command.output)?;
+            let hosts = hosts_in_target(&state.graph(), target);
+            let open: usize = hosts.iter().map(|h| h.open_ports().count()).sum();
+            Ok(StageEnd::Done(format!(
+                "{} hosts up, {open} open ports ({changed} new facts)",
+                hosts.len()
+            )))
+        }
+        Stage::Services => {
+            let hosts: Vec<(String, Vec<u16>)> = hosts_in_target(&state.graph(), target)
+                .iter()
+                .map(|host| {
+                    let ports = host
+                        .open_ports()
+                        .filter(|p| p.protocol == "tcp")
+                        .map(|p| p.number)
+                        .collect::<Vec<_>>();
+                    (host.address.clone(), ports)
+                })
+                .filter(|(_, ports)| !ports.is_empty())
+                .take(MAX_HOSTS_PER_STAGE)
+                .collect();
+            if hosts.is_empty() {
+                return Ok(StageEnd::Skipped("no open TCP ports to inspect".to_owned()));
+            }
+            let mut changed = 0;
+            for (index, (address, ports)) in hosts.iter().enumerate() {
+                let (command, notices) = services_command(
+                    &settings,
+                    &preset,
+                    address,
+                    ports,
+                    privileged,
+                    &out(&format!("_{index}.xml")),
+                );
+                if index == 0 {
+                    for notice in notices {
+                        state.notice(notice);
+                    }
+                }
+                let outcome = run_tool(&command, limits).await;
+                if !matches!(outcome, RunOutcome::Exited(Some(0))) {
+                    let _ = std::fs::remove_file(&command.output);
+                    bail!(describe_failure(&command.program, &outcome, limits));
+                }
+                changed += ingest(state, &command.output)?;
+            }
+            Ok(StageEnd::Done(format!(
+                "{} hosts inspected ({changed} new facts)",
+                hosts.len()
+            )))
+        }
+        Stage::Crawl | Stage::Dirs => {
+            let urls: Vec<String> = hosts_in_target(&state.graph(), target)
+                .iter()
+                .flat_map(|host| {
+                    host.web_origins()
+                        .into_iter()
+                        .map(|(url, _)| url)
+                        .collect::<Vec<_>>()
+                })
+                .take(MAX_URLS_PER_STAGE)
+                .collect();
+            if urls.is_empty() {
+                return Ok(StageEnd::Skipped(
+                    "no HTTP or HTTPS port is open".to_owned(),
+                ));
+            }
+            let wordlist = match stage {
+                Stage::Dirs => match find_wordlist(settings.wordlist_path.as_deref()) {
+                    Some(path) => Some(path),
+                    None => {
+                        return Ok(StageEnd::Skipped(
+                            "no wordlist found: set recon.wordlist_path in config.toml".to_owned(),
+                        ))
+                    }
+                },
+                _ => None,
+            };
+            let mut changed = 0;
+            for (index, url) in urls.iter().enumerate() {
+                let output = out(&format!("_{index}.jsonl"));
+                let command = match &wordlist {
+                    Some(wordlist) => dirs_command(&settings, &preset, url, wordlist, &output),
+                    None => crawl_command(&settings, &preset, url, &output),
+                };
+                let outcome = run_tool(&command, limits).await;
+                match outcome {
+                    RunOutcome::NotInstalled => {
+                        return Ok(StageEnd::Skipped(format!(
+                            "{} is not installed",
+                            command.program
+                        )))
+                    }
+                    RunOutcome::Failed(reason) => bail!(reason),
+                    // JSON Lines stay valid when a run is cut short, so keep
+                    // whatever was written before a limit was hit.
+                    _ => {}
+                }
+                if command.output.is_file() {
+                    changed += ingest(state, &command.output).unwrap_or(0);
+                }
+                if matches!(
+                    outcome,
+                    RunOutcome::TimedOut | RunOutcome::OutputCapExceeded
+                ) {
+                    state.notice(describe_failure(&command.program, &outcome, limits));
+                }
+            }
+            Ok(StageEnd::Done(format!(
+                "{} sites covered ({changed} new facts)",
+                urls.len()
+            )))
+        }
+    }
+}
+
+fn stage_file(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Ports => "nmap_ports",
+        Stage::Services => "nmap_svc",
+        Stage::Crawl => "katana",
+        Stage::Dirs => "ferox",
+    }
+}
+
+async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
+    let Some(task) = task(&state.db_lock(), id)? else {
+        return Ok(());
+    };
+    let target =
+        Target::parse(&task.target).with_context(|| format!("invalid target '{}'", task.target))?;
+    let update = |stage: Stage, status: &str, detail: &str| {
+        let result = set_stage(&state.db_lock(), id, stage, status, detail);
+        state.touch();
+        result
+    };
+
+    for row in &task.stages {
+        if !matches!(row.status.as_str(), "pending" | "interrupted" | "running") {
+            continue;
+        }
+        let stage = row.stage;
+        // Light mode sends no packets: stop here and keep the rest for later.
+        if state.mode() == Mode::Light {
+            update(stage, "interrupted", "paused: the session is in light mode")?;
+            state.notice(format!(
+                "recon {} paused: light mode sends no packets",
+                task.target
+            ));
+            return Ok(());
+        }
+        update(stage, "running", "")?;
+        state.notice(format!("recon {}: {} started", task.target, stage.as_str()));
+        match run_stage(state, &task, &target, stage).await {
+            Ok(StageEnd::Done(detail)) => {
+                update(stage, "done", &detail)?;
+                state.notice(format!(
+                    "recon {}: {} done, {detail}",
+                    task.target,
+                    stage.as_str()
+                ));
+            }
+            Ok(StageEnd::Skipped(reason)) => {
+                update(stage, "skipped", &reason)?;
+                state.notice(format!(
+                    "recon {}: {} skipped, {reason}",
+                    task.target,
+                    stage.as_str()
+                ));
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                update(stage, "failed", &reason)?;
+                state.notice(format!(
+                    "recon {}: {} failed, {reason}",
+                    task.target,
+                    stage.as_str()
+                ));
+                if stage == Stage::Ports {
+                    // Nothing to build on: the later stages cannot run.
+                    for later in &STAGES[1..] {
+                        update(*later, "skipped", "the port inventory failed")?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let addresses: Vec<String> = hosts_in_target(&state.graph(), &target)
+        .into_iter()
+        .map(|host| host.address)
+        .collect();
+    for address in addresses {
+        state.request_grounding(&address);
+    }
+    Ok(())
+}
+
+/// Runs queued tasks strictly one at a time.
+pub async fn worker(state: Arc<State>, mut queue: mpsc::UnboundedReceiver<i64>) {
+    let one_at_a_time = Semaphore::new(1);
+    while let Some(id) = queue.recv().await {
+        let Ok(_permit) = one_at_a_time.acquire().await else {
+            break;
+        };
+        if let Err(error) = run_task(&state, id).await {
+            state.notice(format!("recon task {id} failed: {error:#}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(command: &ToolCommand) -> String {
+        command.args.join(" ")
+    }
+
+    fn target(text: &str) -> Target {
+        Target::parse(text).unwrap()
+    }
+
+    #[test]
+    fn unprivileged_scans_fall_back_to_connect_and_drop_os_detection() {
+        let flags = strings(&[
+            "-sS", "-T4", "-p-", "-O", "--script", "ssl-cert", "-sV", "-sSV",
+        ]);
+        let (root, notices) = adapt_for_privilege(flags.clone(), true);
+        assert_eq!(root, flags);
+        assert!(notices.is_empty());
+
+        let (user, notices) = adapt_for_privilege(flags, false);
+        assert_eq!(
+            user,
+            strings(&["-sT", "-T4", "-p-", "--script", "ssl-cert", "-sV", "-sTV"])
+        );
+        assert_eq!(notices.len(), 3);
+        assert!(notices[0].contains("-sS replaced with -sT"));
+        assert!(notices[1].contains("removed -O"));
+    }
+
+    #[test]
+    fn port_stage_command_is_built_from_preset_extra_flags_and_target() {
+        let settings = ReconSettings::default();
+        let mild = settings.preset(Mode::Mild, &PresetOverride::default());
+        let out = Path::new("/w/tmp/nmap_ports_7.xml");
+
+        let (command, notices) =
+            ports_command(&settings, &mild, &target("10.0.0.0/24"), &[], true, out);
+        assert_eq!(command.program, "nmap");
+        assert_eq!(
+            args(&command),
+            "-sS -T3 --top-ports 1000 -oX /w/tmp/nmap_ports_7.xml 10.0.0.0/24"
+        );
+        assert!(notices.is_empty());
+
+        let extra = strings(&["-p", "80,443", "-O"]);
+        let (command, notices) =
+            ports_command(&settings, &mild, &target("10.0.0.5"), &extra, false, out);
+        assert_eq!(
+            args(&command),
+            "-sT -T3 --top-ports 1000 -p 80,443 -oX /w/tmp/nmap_ports_7.xml 10.0.0.5"
+        );
+        assert_eq!(notices.len(), 2);
+
+        let aggressive = settings.preset(Mode::Aggressive, &PresetOverride::default());
+        let (command, _) = ports_command(
+            &settings,
+            &aggressive,
+            &target("2001:db8::/64"),
+            &[],
+            true,
+            out,
+        );
+        assert_eq!(
+            args(&command),
+            "-sS -T4 -p- -O -6 -oX /w/tmp/nmap_ports_7.xml 2001:db8::/64"
+        );
+    }
+
+    #[test]
+    fn service_stage_probes_only_the_open_ports() {
+        let settings = ReconSettings::default();
+        let mild = settings.preset(Mode::Mild, &PresetOverride::default());
+        let (command, _) = services_command(
+            &settings,
+            &mild,
+            "10.0.0.5",
+            &[22, 443, 8080],
+            false,
+            Path::new("/t/svc.xml"),
+        );
+        assert_eq!(
+            args(&command),
+            "-sV --version-intensity 5 -T3 --script ssl-cert,http-server-header,http-title \
+             -p 22,443,8080 -oX /t/svc.xml 10.0.0.5"
+        );
+        let (command, _) = services_command(
+            &settings,
+            &mild,
+            "2001:db8::a",
+            &[80],
+            true,
+            Path::new("/t/svc.xml"),
+        );
+        assert!(args(&command).contains("-6 -p 80 "));
+    }
+
+    #[test]
+    fn web_stage_commands_match_the_mode_rules() {
+        let settings = ReconSettings::default();
+        let none = PresetOverride::default();
+        let mild = settings.preset(Mode::Mild, &none);
+        let aggressive = settings.preset(Mode::Aggressive, &none);
+        let out = Path::new("/t/out.jsonl");
+        let url = "https://app.lab.local:8443";
+
+        assert_eq!(
+            args(&crawl_command(&settings, &mild, url, out)),
+            "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -ct 5m -d 2 -o /t/out.jsonl"
+        );
+        assert!(args(&crawl_command(&settings, &aggressive, url, out)).contains(" -d 4 "));
+
+        let wordlist = Path::new("/usr/share/wordlists/common.txt");
+        assert_eq!(
+            args(&dirs_command(&settings, &mild, url, wordlist, out)),
+            "-u https://app.lab.local:8443 --quiet --no-state --rate-limit 20 --scan-limit 1 --auto-bail \
+             --time-limit 10m --json -o /t/out.jsonl -w /usr/share/wordlists/common.txt"
+        );
+        let fast = args(&dirs_command(&settings, &aggressive, url, wordlist, out));
+        assert_eq!(
+            fast,
+            "-u https://app.lab.local:8443 --quiet --no-state --auto-tune --time-limit 15m \
+             --json -o /t/out.jsonl -w /usr/share/wordlists/common.txt"
+        );
+        assert!(!fast.contains("--rate-limit") && !fast.contains("--auto-bail"));
+    }
+
+    #[test]
+    fn presets_layer_builtin_config_and_profile() {
+        let mut settings = ReconSettings::default();
+        settings.mild.nmap_ports = Some(strings(&["-sT", "--top-ports", "100"]));
+        settings.mild.katana_depth = Some(3);
+        let profile = PresetOverride {
+            katana_depth: Some(1),
+            ferox_rate_limit: Some(5),
+            ..PresetOverride::default()
+        };
+        let preset = settings.preset(Mode::Mild, &profile);
+        assert_eq!(preset.nmap_ports, strings(&["-sT", "--top-ports", "100"]));
+        assert_eq!(preset.katana_depth, 1, "profile.toml wins over config.toml");
+        assert_eq!(preset.ferox_rate_limit, Some(5));
+        assert_eq!(
+            preset.nmap_services,
+            Preset::builtin(Mode::Mild).nmap_services
+        );
+        // The aggressive preset is untouched by the mild overrides.
+        assert_eq!(
+            settings.preset(Mode::Aggressive, &PresetOverride::default()),
+            Preset::builtin(Mode::Aggressive)
+        );
+
+        let parsed: ReconSettings = toml::from_str(
+            "stage_timeout_secs = 60\nwordlist_path = \"/w.txt\"\nnmap = \"/opt/nmap\"\n\
+             [aggressive]\nnmap_ports = [\"-sS\", \"-T5\"]\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.stage_timeout_secs, 60);
+        assert_eq!(parsed.output_cap_mb, 50);
+        assert_eq!(parsed.nmap, "/opt/nmap");
+        assert_eq!(parsed.aggressive.nmap_ports, Some(strings(&["-sS", "-T5"])));
+        assert_eq!(
+            high_rate_flags(&strings(&["-sS", "-T5", "-A", "-T3"])),
+            ["-T5", "-A"]
+        );
+    }
+
+    #[test]
+    fn wordlist_is_only_used_if_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("words.txt");
+        std::fs::write(&list, "admin\n").unwrap();
+        assert_eq!(find_wordlist(Some(list.to_str().unwrap())), Some(list));
+        let missing = dir.path().join("missing.txt");
+        let found = find_wordlist(Some(missing.to_str().unwrap()));
+        assert!(found.is_none_or(|path| STANDARD_WORDLISTS.contains(&path.to_str().unwrap())));
+    }
+
+    #[test]
+    fn task_rows_track_stage_status() {
+        let db = Db::open_in_memory().unwrap();
+        let id = enqueue(&db, "10.0.0.0/24", Mode::Mild, &strings(&["-p", "80"])).unwrap();
+        let row = task(&db, id).unwrap().unwrap();
+        assert_eq!(row.target, "10.0.0.0/24");
+        assert_eq!(row.mode, Mode::Mild);
+        assert_eq!(row.extra_flags, ["-p", "80"]);
+        let statuses = |db: &Db| -> Vec<String> {
+            task(db, id)
+                .unwrap()
+                .unwrap()
+                .stages
+                .iter()
+                .map(|s| s.status.clone())
+                .collect()
+        };
+        assert_eq!(statuses(&db), ["pending"; 4]);
+        assert_eq!(row.describe(), "recon 10.0.0.0/24: ports pending");
+
+        set_stage(&db, id, Stage::Ports, "done", "3 hosts").unwrap();
+        set_stage(&db, id, Stage::Services, "running", "").unwrap();
+        assert_eq!(unfinished(&db).unwrap().len(), 1);
+
+        // The session dies here; on reopen the running stage is interrupted.
+        assert_eq!(mark_running_interrupted(&db).unwrap(), 1);
+        assert_eq!(statuses(&db), ["done", "interrupted", "pending", "pending"]);
+        let row = task(&db, id).unwrap().unwrap();
+        assert!(row.unfinished());
+        assert_eq!(row.describe(), "recon 10.0.0.0/24: services interrupted");
+
+        decline(&db, id).unwrap();
+        assert_eq!(statuses(&db), ["done", "skipped", "skipped", "skipped"]);
+        assert!(unfinished(&db).unwrap().is_empty());
+        assert_eq!(
+            task(&db, id).unwrap().unwrap().describe(),
+            "recon 10.0.0.0/24: finished"
+        );
+        assert_eq!(task(&db, 999).unwrap(), None);
+    }
+
+    #[test]
+    fn unfinished_tasks_are_counted_without_touching_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        assert_eq!(count_unfinished(&path), 0);
+        assert!(!path.exists(), "counting must not create the file");
+        {
+            let db = Db::open(&path).unwrap();
+            let first = enqueue(&db, "10.0.0.5", Mode::Mild, &[]).unwrap();
+            enqueue(&db, "10.0.0.6", Mode::Mild, &[]).unwrap();
+            decline(&db, first).unwrap();
+        }
+        assert_eq!(count_unfinished(&path), 1);
+    }
+
+    #[cfg(unix)]
+    mod tools {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn script(dir: &Path, name: &str, body: &str) -> String {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        fn command(program: String, output: &Path) -> ToolCommand {
+            ToolCommand {
+                program,
+                args: vec![output.to_string_lossy().into_owned()],
+                output: output.to_path_buf(),
+            }
+        }
+
+        const GENEROUS: RunLimits = RunLimits {
+            timeout: Duration::from_secs(20),
+            cap_bytes: 1024 * 1024,
+        };
+
+        #[tokio::test]
+        async fn a_tool_runs_with_stdin_closed_and_its_exit_code_is_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            // `read` returns at once on a closed stdin; an interactive prompt
+            // would otherwise wait forever.
+            let ok = script(
+                dir.path(),
+                "ok",
+                "read answer; echo \"answer=[$answer]\" > \"$1\"; exit 0",
+            );
+            assert_eq!(
+                run_tool(&command(ok, &out), GENEROUS).await,
+                RunOutcome::Exited(Some(0))
+            );
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "answer=[]\n");
+
+            let bad = script(dir.path(), "bad", "exit 3");
+            assert_eq!(
+                run_tool(&command(bad, &out), GENEROUS).await,
+                RunOutcome::Exited(Some(3))
+            );
+            let missing = command(dir.path().join("nope").to_string_lossy().into_owned(), &out);
+            assert_eq!(run_tool(&missing, GENEROUS).await, RunOutcome::NotInstalled);
+        }
+
+        fn alive(pid: &str) -> bool {
+            Path::new(&format!("/proc/{pid}")).exists()
+                || std::process::Command::new("kill")
+                    .args(["-0", pid])
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+        }
+
+        async fn wait_gone(pid: &str) {
+            for _ in 0..100 {
+                if !alive(pid) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("process {pid} is still running");
+        }
+
+        #[tokio::test]
+        async fn a_runaway_tool_is_stopped_at_the_timeout_with_its_children() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let pids = dir.path().join("pids");
+            // The tool starts a child of its own; both must die.
+            let body = format!("sleep 300 &\necho \"$$ $!\" > {}\nwait", pids.display());
+            let slow = script(dir.path(), "slow", &body);
+            let limits = RunLimits {
+                timeout: Duration::from_millis(600),
+                cap_bytes: 1024 * 1024,
+            };
+            let started = std::time::Instant::now();
+            assert_eq!(
+                run_tool(&command(slow, &out), limits).await,
+                RunOutcome::TimedOut
+            );
+            assert!(started.elapsed() < Duration::from_secs(10));
+            let recorded = std::fs::read_to_string(&pids).unwrap();
+            for pid in recorded.split_whitespace() {
+                wait_gone(pid).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_tool_that_floods_its_output_is_stopped_at_the_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let flood = script(
+                dir.path(),
+                "flood",
+                "while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx >> \"$1\"; done",
+            );
+            let limits = RunLimits {
+                timeout: Duration::from_secs(30),
+                cap_bytes: 64 * 1024,
+            };
+            assert_eq!(
+                run_tool(&command(flood, &out), limits).await,
+                RunOutcome::OutputCapExceeded
+            );
+            let size = std::fs::metadata(&out).unwrap().len();
+            assert!(size > 64 * 1024 && size < 64 * 1024 * 1024, "{size}");
+        }
+
+        #[tokio::test]
+        async fn dropping_a_running_tool_kills_its_process_group() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let pids = dir.path().join("pids");
+            let body = format!("sleep 300 &\necho \"$$ $!\" > {}\nwait", pids.display());
+            let slow = script(dir.path(), "slow", &body);
+            let command = command(slow, &out);
+            // Cancel the run (as a closing session does) once it has started.
+            let cancelled =
+                tokio::time::timeout(Duration::from_millis(600), run_tool(&command, GENEROUS))
+                    .await;
+            assert!(cancelled.is_err());
+            let recorded = std::fs::read_to_string(&pids).unwrap();
+            for pid in recorded.split_whitespace() {
+                wait_gone(pid).await;
+            }
+        }
+    }
+}

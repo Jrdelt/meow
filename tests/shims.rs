@@ -281,3 +281,41 @@ fn unsupported_shell_runs_unhooked_with_a_notice() {
     assert!(out.contains("[!] No replay hooks for this shell"), "{out}");
     assert!(!sandbox.workspace().join("replay.sh").exists());
 }
+
+/// Light mode cannot stop a command typed by hand, but it warns before a
+/// high-rate scan starts.
+fn check_rate_warning(shell: &str, rc_name: &str) {
+    let sandbox = Sandbox::new();
+    std::fs::write(sandbox.path("user-home").join(rc_name), "PS1='$ '\n").unwrap();
+    let script = "echo nmap -sS -T4 10.0.0.5\n\
+                  echo nmap -sT 10.0.0.5\n\
+                  \"$MEOW_BIN\" mode mild\n\
+                  echo nmap -A 10.0.0.5\n\
+                  exit\n";
+    let output = sandbox.session(shell, script, &[]);
+    let out = text(&output);
+    assert_eq!(
+        out.matches("[meow] light mode: this command uses a high-rate scan flag")
+            .count(),
+        1,
+        "exactly the -T4 command in light mode should warn:\n{out}"
+    );
+    // The warning comes before the command's own output.
+    let warning = out.find("[meow] light mode").unwrap();
+    let ran = out.rfind("nmap -sS -T4 10.0.0.5\r\n").unwrap();
+    assert!(warning < ran, "{out}");
+}
+
+#[test]
+fn bash_warns_about_high_rate_flags_in_light_mode() {
+    if installed("/bin/bash") {
+        check_rate_warning("/bin/bash", ".bashrc");
+    }
+}
+
+#[test]
+fn zsh_warns_about_high_rate_flags_in_light_mode() {
+    if installed("/usr/bin/zsh") {
+        check_rate_warning("/usr/bin/zsh", ".zshrc");
+    }
+}

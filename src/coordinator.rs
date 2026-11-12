@@ -35,12 +35,14 @@ use tokio::sync::{mpsc, watch};
 use crate::checklist;
 use crate::cve::CveClient;
 use crate::db::Db;
+use crate::endpoint::Target;
 use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
 use crate::graph::{Graph, LocalNet, Observation};
 use crate::mode::Mode;
 use crate::observer;
 use crate::parsers::text::TextParser;
 use crate::pty::LineSink;
+use crate::queue;
 use crate::timeutil::now_rfc3339;
 use crate::workspace::{write_private_atomic, Config, Workspace};
 
@@ -128,6 +130,14 @@ pub enum Command {
         advisory: String,
         status: VerificationStatus,
     },
+    /// Queues an authorized asset and service inventory (`meow recon`).
+    Recon {
+        target: String,
+        /// Extra nmap flags, given after `--`.
+        flags: Vec<String>,
+    },
+    /// Puts unfinished tasks back on the queue.
+    Resume,
 }
 
 /// Everything the coordinator owns, shared between its tasks.
@@ -144,6 +154,7 @@ pub struct State {
     revision: watch::Sender<u64>,
     dirty: AtomicBool,
     ground_queue: mpsc::UnboundedSender<String>,
+    recon_queue: mpsc::UnboundedSender<i64>,
     cve: Option<CveClient>,
 }
 
@@ -165,6 +176,24 @@ impl State {
 
     pub fn workspace_dir(&self) -> PathBuf {
         lock(&self.workspace).dir.clone()
+    }
+
+    pub fn db_lock(&self) -> MutexGuard<'_, Db> {
+        lock(&self.db)
+    }
+
+    /// Tool flag overrides from this workspace's `profile.toml`.
+    pub fn profile_recon(&self) -> crate::queue::PresetOverride {
+        lock(&self.workspace).profile.recon.clone()
+    }
+
+    /// Puts every unfinished task back on the queue; returns how many.
+    pub fn resume_unfinished(&self) -> Result<usize> {
+        let unfinished = queue::unfinished(&self.db_lock())?;
+        for task in &unfinished {
+            let _ = self.recon_queue.send(task.id);
+        }
+        Ok(unfinished.len())
     }
 
     fn graph_path(&self) -> PathBuf {
@@ -244,6 +273,7 @@ impl State {
             "revision": *self.revision.borrow(),
             "graph": &*graph,
             "checklists": checklists,
+            "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
             "notices": &*lock(&self.notices),
         })
     }
@@ -255,7 +285,12 @@ impl State {
             Command::SetMode { mode } => {
                 lock(&self.workspace).set_mode(mode)?;
                 self.notice(format!("mode set to {mode}"));
-                Ok(json!({ "mode": mode }))
+                // Tasks paused by light mode continue once it is left.
+                let resumed = match mode {
+                    Mode::Light => 0,
+                    _ => self.resume_unfinished()?,
+                };
+                Ok(json!({ "mode": mode, "resumed": resumed }))
             }
             Command::Note { address, text } => {
                 let text = text.trim().to_owned();
@@ -325,6 +360,32 @@ impl State {
                 self.notice(format!("{advisory} on {address} marked {status}"));
                 Ok(json!({ "status": status }))
             }
+            Command::Recon { target, flags } => {
+                let mode = self.mode();
+                if mode == Mode::Light {
+                    bail!(
+                        "light mode sends no packets, so recon is refused; \
+                         run `meow mode mild` (or aggressive) first"
+                    );
+                }
+                let parsed = Target::parse(&target).with_context(|| {
+                    format!("'{target}' is not a host name, an IP address or a CIDR range")
+                })?;
+                let id = queue::enqueue(&self.db_lock(), &parsed.to_string(), mode, &flags)?;
+                let risky = queue::high_rate_flags(&flags).join(" ");
+                if mode == Mode::Mild && !risky.is_empty() {
+                    self.notice(format!(
+                        "recon {parsed}: high-rate flags in mild mode ({risky})"
+                    ));
+                }
+                let _ = self.recon_queue.send(id);
+                self.notice(format!("recon {parsed} queued as task {id} ({mode})"));
+                let ahead = queue::unfinished(&self.db_lock())?.len().saturating_sub(1);
+                Ok(
+                    json!({ "task": id, "target": parsed.to_string(), "mode": mode, "ahead": ahead }),
+                )
+            }
+            Command::Resume => Ok(json!({ "resumed": self.resume_unfinished()? })),
         }
     }
 }
@@ -689,6 +750,9 @@ impl Coordinator {
 
         let (revision, _) = watch::channel(0u64);
         let (ground_queue, ground_rx) = mpsc::unbounded_channel();
+        let (recon_queue, recon_rx) = mpsc::unbounded_channel();
+        // Stages left "running" belong to a session that ended mid-run.
+        queue::mark_running_interrupted(&lock(&db))?;
         let (tap, tap_rx) = mpsc::channel(TAP_QUEUE);
         let state = Arc::new(State {
             session: workspace.name.clone(),
@@ -702,6 +766,7 @@ impl Coordinator {
             revision,
             dirty: AtomicBool::new(true),
             ground_queue,
+            recon_queue,
             cve,
         });
 
@@ -713,6 +778,7 @@ impl Coordinator {
         runtime.spawn(observe_loop(Arc::clone(&state)));
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
         runtime.spawn(grounding_loop(Arc::clone(&state), ground_rx));
+        runtime.spawn(queue::worker(Arc::clone(&state), recon_rx));
         state.save_if_dirty();
 
         Ok(Self {
@@ -765,6 +831,8 @@ impl Coordinator {
         }
         runtime.shutdown_timeout(Duration::from_secs(2));
         self.state.save_if_dirty();
+        // A tool that was running has just been killed with the runtime.
+        let _ = queue::mark_running_interrupted(&self.state.db_lock());
     }
 }
 

@@ -39,6 +39,19 @@ const SH_REFRESH_MODE: &str = r##"_meow_refresh_mode() {
 }
 "##;
 
+/// Shared by bash and zsh: light mode cannot stop a command typed by hand,
+/// but it says so before a high-rate scan starts.
+const SH_RATE_WARNING: &str = r##"_meow_rate_warning() {
+  [[ ${MEOW_MODE-} == light ]] || return 0
+  case " $1 " in
+    *nmap*' -T4 '* | *nmap*' -T5 '* | *nmap*' -A '* | *masscan* | *' --min-rate '*)
+      printf '%s\n' "[meow] light mode: this command uses a high-rate scan flag. \
+Run \`meow mode mild\` (or aggressive) first if that is intended." >&2
+      ;;
+  esac
+}
+"##;
+
 const ZSH_ENV: &str = r##"# meow session shim (generated, rewritten at every session start).
 # Loads your own .zshenv, then keeps meow's ZDOTDIR until .zshrc has run.
 _meow_shim_dir=$ZDOTDIR
@@ -79,10 +92,12 @@ typeset -g _meow_profile=@PROFILE@
 typeset -g _meow_pending=
 
 @REFRESH_MODE@
+@RATE_WARNING@
 # Stage 1: before the command runs.
 _meow_preexec() {
   local cmd=${1:-$3}
   _meow_pending=1
+  _meow_rate_warning "$cmd"
   {
     print -r -- "# [CWD] $PWD"
     if [[ -z $cmd ]] || [[ -o hist_ignore_space && $cmd == ' '* ]]; then
@@ -130,6 +145,7 @@ _meow_ready=
 _meow_cwd=$PWD
 
 @REFRESH_MODE@
+@RATE_WARNING@
 # Sets _meow_h_num / _meow_h_cmd from the newest history entry.
 _meow_history_last() {
   local entry re='^[[:space:]]*([0-9]+)[* ] (.*)$'
@@ -160,6 +176,7 @@ _meow_fix_histcontrol() {
 # Stage 1 (bash 4.4+): runs from PS0, in a subshell, before the command.
 _meow_preexec() {
   _meow_history_last
+  _meow_rate_warning "$_meow_h_cmd"
   {
     printf '# [CWD] %s\n' "$PWD"
     if [[ -n $_meow_h_num && $_meow_h_num != "$_meow_histnum" ]]; then
@@ -364,6 +381,7 @@ pub fn prepare(
     let fill = |template: &str| -> Result<String> {
         Ok(template
             .replace("@REFRESH_MODE@", SH_REFRESH_MODE)
+            .replace("@RATE_WARNING@", SH_RATE_WARNING)
             .replace("@REPLAY@", &quote(utf8(&workspace.replay_path())?))
             .replace("@LAST_CWD@", &quote(utf8(&workspace.last_cwd_path())?))
             .replace("@PROFILE@", &quote(utf8(&workspace.profile_path())?))
@@ -427,6 +445,7 @@ mod tests {
     fn assert_filled(text: &str) {
         for placeholder in [
             "@REFRESH_MODE@",
+            "@RATE_WARNING@",
             "@REPLAY@",
             "@LAST_CWD@",
             "@PROFILE@",

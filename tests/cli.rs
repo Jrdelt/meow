@@ -553,6 +553,61 @@ fn add_imports_files_into_the_graph() {
 }
 
 #[test]
+fn recon_needs_a_live_session_that_is_not_in_light_mode() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["acme"], &[]);
+    // No session is running: nothing can host the scan.
+    let output = sandbox.run(&["recon", "10.0.0.5", "--session", "acme"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("`meow recon` needs a live session: start `meow acme` first"),
+        "{}",
+        stderr(&output)
+    );
+    // The listing shows the new columns for the idle workspace.
+    let listing = stdout(&sandbox.run(&[], &[]));
+    assert!(
+        listing.contains("HOSTS") && listing.contains("TASKS"),
+        "{listing}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recon_inside_a_light_session_is_refused_with_the_reason() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let sandbox = Sandbox::new();
+    let script = "\"$MEOW_BIN\" recon 10.0.0.0/24 -- -T4; echo \"recon-rc=$?\"\nexit\n";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meow"))
+        .arg("acme")
+        .current_dir(sandbox.project())
+        .env("MEOW_HOME", sandbox.home())
+        .env("SHELL", "/bin/sh")
+        .env("MEOW_BIN", env!("CARGO_BIN_EXE_meow"))
+        .env_remove("MEOW_SESSION")
+        .env_remove("MEOW_WORKSPACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let text = stdout(&child.wait_with_output().unwrap());
+    assert!(
+        text.contains("[!] light mode sends no packets, so recon is refused"),
+        "{text}"
+    );
+    assert!(text.contains("recon-rc=1"), "{text}");
+}
+
+#[test]
 fn usage_errors_exit_with_code_2() {
     let sandbox = Sandbox::new();
     for args in [

@@ -53,26 +53,25 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 3, Step 1 complete (session coordinator +
-  helper IPC). Owner asked to build straight through Phases 2-4 without
+- **Active Phase & Step:** Phase 3, Step 2 complete (process-grouped recon
+  queue + resume). Owner asked to build straight through Phases 2-4 without
   pausing; checkpoint after every step.
-- **Last Verified Commit:** `feat(phase3-step1)` — see `git log -n 1
+- **Last Verified Commit:** `feat(phase3-step2)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
-  Phase 3 so far: `coordinator`, `ipc`. Tests: unit tests per module plus
-  `tests/{cli,pty,shims,cve}.rs`.
-- **In-Progress / Partial Work:** `recon`/`map`/`hud`/`report` report "not
-  built yet". The coordinator's `/` route is a text stub until `meow map`.
-  `tasks`/`vault`/`ai_usage`/`prompt_cache` tables are unused.
-- **Next Exact Action:** Phase 3, Step 2 — `src/queue.rs`:
-  `tasks`/`task_stages` persistence, stage command builders (nmap ports ->
-  nmap -sV -> katana -> feroxbuster) with privilege fallback (`-sS`->`-sT`,
-  strip `-O`), wordlist check, mode presets from config/profile, one-at-a-time
-  `Semaphore`, process groups + `kill_on_drop`, stage timeout, 50 MB cap;
-  `Recon` command + `meow recon`; light mode refusal; `[Y/n]` resume of
-  interrupted tasks at session start.
+  Phase 3 so far: `coordinator`, `ipc`, `queue`. Tests: unit tests per module
+  plus `tests/{cli,pty,shims,cve,recon}.rs`.
+- **In-Progress / Partial Work:** `map`/`hud`/`report` report "not built yet".
+  The coordinator's `/` route is a text stub until `meow map`.
+  `vault`/`ai_usage`/`prompt_cache` tables are unused.
+- **Next Exact Action:** Phase 3, Step 3 — `meow map`: add `petgraph`,
+  `src/topology.rs` (local machine, interfaces, gateways, hosts, ports as a
+  graph; Cytoscape elements + reachability), vendor `cytoscape.min.js` under
+  `assets/` and serve an embedded page at `/?token=` that live-updates over
+  the WebSocket; `meow map` opens the URL in the default browser. Then Step 4:
+  `meow hud` (Ratatui 0.30 over the WebSocket).
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it (owner decision).
     Terminal control via `ratatui::crossterm` only.
@@ -92,4 +91,6 @@ Before every push:
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
     `gcc-mingw-w64-x86-64`); macOS has never been built.
   - CI workflow deferred: repo is private, macOS runners cost Actions minutes.
-  - Listing lacks host count / unfinished tasks until Phase 3.
+  - Recon runs only inside a live session; light mode refuses it and pauses
+    queued stages. Tests use stand-in tools (`tests/recon.rs`); real `nmap`
+    was smoke-tested on 127.0.0.1 only, `katana`/`feroxbuster` never.

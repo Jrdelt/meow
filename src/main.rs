@@ -1,7 +1,7 @@
 //! `meow` entry point: parse the command line, refuse nested sessions, then
 //! dispatch.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -10,15 +10,17 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
-use meow::coordinator::{Command as Request, Coordinator};
+use meow::coordinator::{self, Command as Request, Coordinator};
 use meow::cve::{self, CveClient, CveSettings};
 use meow::db::Db;
 use meow::graph::Graph;
 use meow::ipc;
 use meow::lock::{LockError, SessionLock};
+use meow::mode::Mode;
 use meow::observer;
 use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
+use meow::queue;
 use meow::shims;
 use meow::workspace::{
     format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config, MeowHome,
@@ -127,6 +129,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Recon {
+            target, nmap_flags, ..
+        } => {
+            let request = Request::Recon {
+                target: target.clone(),
+                flags: nmap_flags.clone(),
+            };
+            let Some(result) = ipc::send(&workspace, &request)? else {
+                bail!(
+                    "`meow recon` needs a live session: start `meow {}` first; \
+                     the scan runs in the background of that session",
+                    workspace.name
+                );
+            };
+            let ahead = match result["ahead"].as_u64().unwrap_or(0) {
+                0 => String::new(),
+                n => format!(", {n} task(s) ahead of it"),
+            };
+            println!(
+                "[+] Recon of {} queued as task {} ({} mode{ahead})",
+                result["target"].as_str().unwrap_or(target),
+                result["task"],
+                result["mode"].as_str().unwrap_or("?"),
+            );
+            println!("[+] Stages run one at a time in the session; follow them with `meow hud`");
+            Ok(ExitCode::SUCCESS)
+        }
         other => {
             let planned = match other {
                 Command::Report { .. } => "Phase 4",
@@ -203,6 +232,8 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
         );
     }
 
+    offer_resume(&state)?;
+
     let sink = tee_sink(coordinator.tap_sink(), debug_tap_log()?);
     let outcome = pty::run_session(&spec, sink);
     coordinator.shutdown();
@@ -240,6 +271,49 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
         summary.kev,
         graph.advisory_count()
     );
+    Ok(())
+}
+
+/// Background tasks left unfinished by an earlier session: ask whether to
+/// resume them. Without a terminal nothing is started unattended.
+fn offer_resume(state: &coordinator::State) -> Result<()> {
+    let unfinished = queue::unfinished(&state.db_lock())?;
+    if unfinished.is_empty() {
+        return Ok(());
+    }
+    println!("[!] {} unfinished background task(s):", unfinished.len());
+    for task in &unfinished {
+        println!("      {}", task.describe());
+    }
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "[!] Not resumed (no terminal to ask on); they continue when the mode \
+             is set to mild or aggressive"
+        );
+        return Ok(());
+    }
+    print!("[?] Resume? [Y/n] ");
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("cannot read the answer")?;
+    if answer.trim().to_ascii_lowercase().starts_with('n') {
+        for task in &unfinished {
+            queue::decline(&state.db_lock(), task.id)?;
+        }
+        println!("[+] Not resumed; the remaining stages are marked skipped");
+    } else {
+        state.resume_unfinished()?;
+        if state.mode() == Mode::Light {
+            println!(
+                "[!] Light mode sends no packets: the tasks stay paused until \
+                 `meow mode mild` (or aggressive)"
+            );
+        } else {
+            println!("[+] Resumed in the background");
+        }
+    }
     Ok(())
 }
 

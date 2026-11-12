@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cve::CveSettings;
 use crate::mode::Mode;
+use crate::queue::{PresetOverride, ReconSettings};
 
 /// Name of the active session, exported inside a session shell.
 pub const SESSION_ENV: &str = "MEOW_SESSION";
@@ -55,6 +56,18 @@ default_mode = "light"
 enabled = true
 # Optional NVD API key: lookups are paced at 0.7 s instead of 6.5 s each.
 # nvd_api_key = "..."
+
+[recon]
+# `meow recon` settings. Each tool run is stopped after this many seconds,
+# or when its output file grows past the cap.
+stage_timeout_secs = 1800
+output_cap_mb = 50
+# Wordlist for feroxbuster. Standard seclists/dirb paths are tried otherwise;
+# without any wordlist the directory stage is skipped.
+# wordlist_path = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+# Override the built-in nmap flags per mode, for example:
+# [recon.mild]
+# nmap_ports = ["-sS", "-T3", "--top-ports", "1000"]
 "#;
 
 /// Validates a workspace name so it is a safe single directory name on
@@ -320,6 +333,7 @@ pub struct Config {
     /// Shell program to launch instead of the platform default.
     pub shell: Option<String>,
     pub cve: CveSettings,
+    pub recon: ReconSettings,
 }
 
 impl Config {
@@ -356,6 +370,9 @@ pub struct Profile {
     /// Session name the workspace was last opened as.
     pub name: String,
     pub mode: Mode,
+    /// Tool flags for this workspace; they win over `config.toml`.
+    #[serde(skip_serializing_if = "PresetOverride::is_empty")]
+    pub recon: PresetOverride,
 }
 
 impl Profile {
@@ -410,6 +427,7 @@ impl Workspace {
             Profile {
                 name: name.clone(),
                 mode: default_mode,
+                recon: PresetOverride::default(),
             }
         };
         profile.name = name.clone();
@@ -577,6 +595,10 @@ pub struct WorkspaceSummary {
     pub local: bool,
     /// `None` when `profile.toml` cannot be parsed.
     pub mode: Option<Mode>,
+    /// Hosts in `graph.json`.
+    pub hosts: usize,
+    /// Background tasks with pending or interrupted stages.
+    pub unfinished_tasks: usize,
     pub last_active: Option<SystemTime>,
 }
 
@@ -627,8 +649,23 @@ fn summarize(dir: &Path, name: Option<String>, local: bool) -> Option<WorkspaceS
         dir: dir.to_path_buf(),
         local,
         mode: profile.map(|p| p.mode),
+        hosts: count_hosts(&dir.join("graph.json")),
+        unfinished_tasks: crate::queue::count_unfinished(&dir.join("state.db")),
         last_active: last_active(dir),
     })
+}
+
+/// Number of hosts in a `graph.json`, read without validating the rest.
+fn count_hosts(graph: &Path) -> usize {
+    fs::read_to_string(graph)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| {
+            json.get("hosts")
+                .and_then(|h| h.as_object())
+                .map(|h| h.len())
+        })
+        .unwrap_or(0)
 }
 
 /// Newest modification time among the directory and its top-level entries
@@ -658,34 +695,40 @@ pub fn format_listing(workspaces: &[WorkspaceSummary], now: SystemTime) -> Strin
     if workspaces.is_empty() {
         return "No workspaces yet. Start one with `meow <name>`.\n".to_owned();
     }
-    let rows: Vec<[String; 3]> = workspaces
-        .iter()
-        .map(|w| {
-            let name = if w.local {
-                format!("{} (local)", w.name)
-            } else {
-                w.name.clone()
-            };
-            let mode = w.mode.map_or("?", Mode::as_str).to_owned();
-            let age = w
-                .last_active
-                .map(|at| format_age(now.duration_since(at).unwrap_or_default()))
-                .unwrap_or_else(|| "unknown".to_owned());
-            [name, mode, age]
-        })
+    let header = ["NAME", "MODE", "HOSTS", "TASKS", "LAST ACTIVE"].map(str::to_owned);
+    let mut rows = vec![header];
+    for w in workspaces {
+        let name = if w.local {
+            format!("{} (local)", w.name)
+        } else {
+            w.name.clone()
+        };
+        let age = w
+            .last_active
+            .map(|at| format_age(now.duration_since(at).unwrap_or_default()))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let tasks = match w.unfinished_tasks {
+            0 => "-".to_owned(),
+            n => format!("{n} unfinished"),
+        };
+        rows.push([
+            name,
+            w.mode.map_or("?", Mode::as_str).to_owned(),
+            w.hosts.to_string(),
+            tasks,
+            age,
+        ]);
+    }
+    let widths: Vec<usize> = (0..4)
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect();
-    let header = ["NAME", "MODE", "LAST ACTIVE"];
-    let width = |col: usize| {
-        rows.iter()
-            .map(|row| row[col].len())
-            .chain([header[col].len()])
-            .max()
-            .unwrap_or(0)
-    };
-    let (w0, w1) = (width(0), width(1));
-    let mut out = format!("{:<w0$}  {:<w1$}  {}\n", header[0], header[1], header[2]);
+    let mut out = String::new();
     for row in &rows {
-        out.push_str(&format!("{:<w0$}  {:<w1$}  {}\n", row[0], row[1], row[2]));
+        for (col, width) in widths.iter().enumerate() {
+            out.push_str(&format!("{:<width$}  ", row[col]));
+        }
+        out.push_str(&row[4]);
+        out.push('\n');
     }
     out
 }
@@ -768,7 +811,8 @@ mod tests {
             ws.profile,
             Profile {
                 name: "acme".into(),
-                mode: Mode::Light
+                mode: Mode::Light,
+                recon: PresetOverride::default(),
             }
         );
 
@@ -1050,6 +1094,7 @@ mod tests {
                 default_mode: Mode::Mild,
                 shell: Some("/bin/zsh".into()),
                 cve: CveSettings::default(),
+                recon: ReconSettings::default(),
             }
         );
 
@@ -1096,6 +1141,21 @@ mod tests {
         let names: Vec<_> = listed.iter().map(|w| (w.name.as_str(), w.local)).collect();
         assert_eq!(names, [("busy", false), ("webapp", true), ("old", false)]);
         assert_eq!(listed[0].mode, Some(Mode::Mild));
+        assert_eq!((listed[0].hosts, listed[0].unfinished_tasks), (0, 0));
+
+        // Host and task counts come from graph.json and state.db.
+        fs::write(
+            old.graph_path(),
+            r#"{"version":1,"updated_utc":"","hosts":{"10.0.0.5":{},"10.0.0.6":{}}}"#,
+        )
+        .unwrap();
+        {
+            let db = crate::db::Db::open(&old.state_db_path()).unwrap();
+            crate::queue::enqueue(&db, "10.0.0.0/24", Mode::Mild, &[]).unwrap();
+        }
+        let listed = list_workspaces(&fx.home, &fx.cwd).unwrap();
+        let old_row = listed.iter().find(|w| w.name == "old").unwrap();
+        assert_eq!((old_row.hosts, old_row.unfinished_tasks), (2, 1));
         assert_eq!(listed[2].dir, old.dir);
     }
 
@@ -1107,6 +1167,8 @@ mod tests {
             dir: PathBuf::new(),
             local,
             mode,
+            hosts: if local { 12 } else { 0 },
+            unfinished_tasks: usize::from(mode.is_none()),
             last_active: Some(now - Duration::from_secs(secs)),
         };
         let text = format_listing(
@@ -1119,10 +1181,10 @@ mod tests {
         );
         assert_eq!(
             text,
-            "NAME         MODE        LAST ACTIVE\n\
-             acme-lab     aggressive  just now\n\
-             web (local)  light       2m ago\n\
-             old          ?           3d ago\n"
+            "NAME         MODE        HOSTS  TASKS         LAST ACTIVE\n\
+             acme-lab     aggressive  0      -             just now\n\
+             web (local)  light       12     -             2m ago\n\
+             old          ?           0      1 unfinished  3d ago\n"
         );
         assert!(format_listing(&[], now).contains("No workspaces yet"));
         assert_eq!(format_age(Duration::from_secs(7300)), "2h ago");

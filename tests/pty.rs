@@ -34,7 +34,13 @@ struct Hosted {
 
 impl Hosted {
     fn start(name: &str) -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        let mut hosted = Self::spawn(name, tempfile::tempdir().unwrap());
+        assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
+        hosted
+    }
+
+    /// Starts `meow <name>` in the outer PTY without waiting for the shell.
+    fn spawn(name: &str, tmp: tempfile::TempDir) -> Self {
         let pair = native_pty_system().openpty(size(24, 80)).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_meow"));
         command.arg(name);
@@ -60,16 +66,14 @@ impl Hosted {
                 }
             }
         });
-        let mut hosted = Self {
+        Self {
             _tmp: tmp,
             master: pair.master,
             writer,
             child,
             output,
             seen: Vec::new(),
-        };
-        assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
-        hosted
+        }
     }
 
     fn workspace(&self, name: &str) -> std::path::PathBuf {
@@ -103,7 +107,14 @@ impl Hosted {
     }
 
     /// Waits for `meow` to exit and collects everything it still wrote.
-    fn finish(mut self) -> (u32, Vec<u8>) {
+    fn finish(self) -> (u32, Vec<u8>) {
+        let (code, seen, _tmp) = self.finish_keeping_files();
+        (code, seen)
+    }
+
+    /// Like [`Hosted::finish`], but hands back the sandbox directory so the
+    /// files the session left behind can be inspected.
+    fn finish_keeping_files(mut self) -> (u32, Vec<u8>, tempfile::TempDir) {
         let deadline = Instant::now() + PATIENCE;
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -121,7 +132,7 @@ impl Hosted {
         while let Ok(chunk) = self.output.recv_timeout(Duration::from_millis(300)) {
             self.seen.extend_from_slice(&chunk);
         }
-        (status.exit_code(), self.seen)
+        (status.exit_code(), self.seen, self._tmp)
     }
 
     fn dump(&self) -> String {
@@ -212,4 +223,76 @@ fn sigterm_ends_the_session_and_still_resets_the_terminal() {
     let (_, seen) = hosted.finish();
     assert_eq!(count(&seen, RESET), 1, "{}", text(&seen));
     assert!(seen.ends_with(b"closed\r\n"), "{}", text(&seen));
+}
+
+/// Leaves a task with an interrupted stage in a fresh workspace, the way a
+/// session that died mid-scan would.
+fn workspace_with_interrupted_task() -> (tempfile::TempDir, std::path::PathBuf) {
+    use meow::mode::Mode;
+    use meow::queue::{self, Stage};
+    use meow::workspace::{MeowHome, Workspace};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = MeowHome::at(tmp.path().join("meow-home")).unwrap();
+    let (workspace, _) =
+        Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+    let db_path = workspace.state_db_path();
+    let db = meow::db::Db::open(&db_path).unwrap();
+    let id = queue::enqueue(&db, "10.0.0.0/24", Mode::Mild, &[]).unwrap();
+    queue::set_stage(&db, id, Stage::Ports, "done", "").unwrap();
+    queue::set_stage(&db, id, Stage::Services, "running", "").unwrap();
+    (tmp, db_path)
+}
+
+#[test]
+fn reopening_offers_to_resume_and_no_marks_the_task_skipped() {
+    let (tmp, db_path) = workspace_with_interrupted_task();
+    let mut hosted = Hosted::spawn("acme", tmp);
+    assert!(
+        hosted.wait_for(b"[?] Resume? [Y/n] ", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    assert!(
+        hosted.contains(b"1 unfinished background task(s):"),
+        "{}",
+        hosted.dump()
+    );
+    assert!(
+        hosted.contains(b"recon 10.0.0.0/24: services interrupted"),
+        "{}",
+        hosted.dump()
+    );
+
+    hosted.send("n\r");
+    assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
+    assert!(hosted.contains(b"Not resumed; the remaining stages are marked skipped"));
+    hosted.send("exit\r");
+    let (code, _, _files) = hosted.finish_keeping_files();
+    assert_eq!(code, 0);
+    assert!(db_path.is_file());
+    assert_eq!(meow::queue::count_unfinished(&db_path), 0);
+}
+
+#[test]
+fn accepting_the_resume_in_light_mode_keeps_the_task_paused() {
+    let (tmp, db_path) = workspace_with_interrupted_task();
+    let mut hosted = Hosted::spawn("acme", tmp);
+    assert!(
+        hosted.wait_for(b"[?] Resume? [Y/n] ", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    // Plain Enter takes the default, yes.
+    hosted.send("\r");
+    assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
+    assert!(
+        hosted.contains(b"Light mode sends no packets: the tasks stay paused"),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send("exit\r");
+    let (_, _, _files) = hosted.finish_keeping_files();
+    // Still there for when the mode is changed.
+    assert_eq!(meow::queue::count_unfinished(&db_path), 1);
 }
