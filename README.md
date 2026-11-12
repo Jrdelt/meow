@@ -84,7 +84,8 @@ the CISA known-exploited catalog.
 Both `meow map` and `meow hud` always show how this machine is connected (the
 interface, its address and the gateway) and whether a VPN is up, with the
 networks that VPN carries. The local link stays listed while a VPN is up, also
-when the VPN takes all traffic. The map has a badge for it in the header and a
+when the VPN takes all traffic. An interface is shown by its IPv4 address, with
+its IPv6 address beside it if it has one. The map has a badge for it in the header and a
 "This machine" panel; the HUD has a line under its header.
 
 Below that is everything meow read about the machine: interfaces, routes,

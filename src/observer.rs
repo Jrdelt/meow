@@ -249,8 +249,12 @@ pub mod linux {
 pub mod macos {
     use super::*;
 
-    fn prefix_from_hex_mask(mask: &str) -> Option<u8> {
-        let value = u32::from_str_radix(mask.trim_start_matches("0x"), 16).ok()?;
+    /// `0xffffff00` (macOS, the BSDs) or `255.255.255.0`.
+    fn prefix_from_mask(mask: &str) -> Option<u8> {
+        let value = match mask.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => u32::from(mask.parse::<std::net::Ipv4Addr>().ok()?),
+        };
         (value.leading_ones() + value.trailing_zeros() == 32).then(|| value.leading_ones() as u8)
     }
 
@@ -278,15 +282,17 @@ pub mod macos {
                     .position(|f| *f == key)
                     .and_then(|i| fields.get(i + 1))
             };
+            // An address is kept even if its mask cannot be read: a wrong
+            // network size is a smaller fault than a missing address.
             let address = match fields.first().copied() {
-                Some("inet") => fields
-                    .get(1)
-                    .and_then(|a| canonical_ip(a))
-                    .zip(after("netmask").and_then(|m| prefix_from_hex_mask(m))),
-                Some("inet6") => fields
-                    .get(1)
-                    .and_then(|a| canonical_ip(a))
-                    .zip(after("prefixlen").and_then(|p| p.parse::<u8>().ok())),
+                Some("inet") => fields.get(1).and_then(|a| canonical_ip(a)).map(|address| {
+                    let prefix = after("netmask").and_then(|m| prefix_from_mask(m));
+                    (address, prefix.unwrap_or(32))
+                }),
+                Some("inet6") => fields.get(1).and_then(|a| canonical_ip(a)).map(|address| {
+                    let prefix = after("prefixlen").and_then(|p| p.parse::<u8>().ok());
+                    (address, prefix.unwrap_or(128))
+                }),
                 _ => None,
             };
             if let Some((address, prefix)) = address {
@@ -647,19 +653,29 @@ pub fn has_routable_address(interface: &Interface) -> bool {
     routable_address(interface).is_some()
 }
 
-/// The first address of the interface that is neither loopback nor
-/// link-local, in CIDR form.
-pub fn routable_address(interface: &Interface) -> Option<&str> {
+/// The interface's first address of one family that is neither loopback
+/// nor link-local, in CIDR form.
+fn usable_address(interface: &Interface, ipv4: bool) -> Option<&str> {
     interface
         .addresses
         .iter()
         .find(|address| {
             IpNetwork::from_str(address).is_ok_and(|network| match network.ip() {
-                IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_link_local(),
-                IpAddr::V6(ip) => !ip.is_loopback() && (ip.segments()[0] & 0xffc0) != 0xfe80,
+                IpAddr::V4(ip) => ipv4 && !ip.is_loopback() && !ip.is_link_local(),
+                IpAddr::V6(ip) => {
+                    !ipv4 && !ip.is_loopback() && (ip.segments()[0] & 0xffc0) != 0xfe80
+                }
             })
         })
         .map(String::as_str)
+}
+
+/// The address an interface is known by: its IPv4 address, or its IPv6
+/// address when it has no IPv4 one. Never by the order the operating system
+/// lists them in: macOS can put a global IPv6 address before the IPv4 one,
+/// which then hid the address people know their machine by.
+pub fn routable_address(interface: &Interface) -> Option<&str> {
+    usable_address(interface, true).or_else(|| usable_address(interface, false))
 }
 
 /// A VPN interface that is up and actually addressed.
@@ -814,12 +830,14 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
             Some(gateways) => format!("gateway {}", gateways.join(" and ")),
             None => "local network only (no default route)".to_owned(),
         };
-        format!(
-            "{} ({}) {}, {how}",
-            interface.name,
-            interface.kind,
-            routable_address(interface).unwrap_or("no usable address")
-        )
+        let ipv4 = usable_address(interface, true);
+        let ipv6 = usable_address(interface, false);
+        let address = match (ipv4, ipv6) {
+            (Some(ipv4), Some(ipv6)) => format!("{ipv4} (IPv6 {ipv6})"),
+            (Some(only), None) | (None, Some(only)) => only.to_owned(),
+            (None, None) => "no usable address".to_owned(),
+        };
+        format!("{} ({}) {address}, {how}", interface.name, interface.kind)
     };
     let mut links: Vec<&Interface> = local.interfaces.iter().filter(|i| in_use(i)).collect();
     links.sort_by_key(|i| gateways_of(i).is_none());
@@ -1300,6 +1318,68 @@ mod tests {
         // No targets and no VPN: nothing to compare against, so no warnings.
         assert!(route_warnings(&local, &[]).is_empty());
         assert!(route_warnings(&LocalNet::default(), &[ip("10.0.0.1")]).is_empty());
+    }
+
+    /// As reported from a real Mac: the map did not show the machine's IPv4
+    /// address. macOS lists addresses in the order they were configured, so
+    /// a global IPv6 address can come before the IPv4 one.
+    #[test]
+    fn the_ipv4_address_is_shown_wherever_the_system_lists_it() {
+        let mut local = LocalNet::default();
+        macos::ifconfig(
+            "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \toptions=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>\n\
+             \tether a4:83:e7:11:22:33\n\
+             \tinet6 fe80::1c71:9b2d:2156:23ce%en0 prefixlen 64 secured scopeid 0xb\n\
+             \tinet6 2607:f8b0:4005:80a::200e prefixlen 64 autoconf secured\n\
+             \tinet6 2607:f8b0:4005:80a:d5f:1:2:3 prefixlen 64 autoconf temporary\n\
+             \tinet 10.104.168.20 netmask 0xfffffc00 broadcast 10.104.171.255\n\
+             \tnat64 prefix 64:ff9b:: prefixlen 96\n\
+             \tnd6 options=201<PERFORMNUD,DAD>\n\
+             \tmedia: autoselect\n\
+             \tstatus: active\n\
+             en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet 192.168.50.2 netmask 255.255.255.0 broadcast 192.168.50.255\n\
+             en8: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet 192.168.60.2 netmask garbled\n\
+             en9: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet6 fe80::9%en9 prefixlen 64 scopeid 0xc\n\
+             \tinet6 fd00::9 prefixlen 64\n",
+            &mut local.interfaces,
+        );
+        macos::routes(
+            "Internet:\nDestination        Gateway            Flags           Netif Expire\n\
+             default            10.104.168.1       UGScg             en0\n",
+            &mut local.routes,
+        );
+        let by_name = |name: &str| local.interfaces.iter().find(|i| i.name == name).unwrap();
+        let en0 = by_name("en0");
+        assert_eq!(
+            en0.addresses,
+            [
+                "fe80::1c71:9b2d:2156:23ce/64",
+                "2607:f8b0:4005:80a::200e/64",
+                "2607:f8b0:4005:80a:d5f:1:2:3/64",
+                "10.104.168.20/22",
+            ]
+        );
+        assert_eq!(routable_address(en0), Some("10.104.168.20/22"));
+        assert_eq!(primary_address(&local).as_deref(), Some("10.104.168.20"));
+        let report = machine_report(&local);
+        assert_eq!(
+            report.connection[0],
+            "en0 (ethernet) 10.104.168.20/22 (IPv6 2607:f8b0:4005:80a::200e/64), \
+             gateway 10.104.168.1"
+        );
+        // A dotted mask is read too, and an unreadable one does not cost
+        // the address.
+        assert_eq!(by_name("en7").addresses, ["192.168.50.2/24"]);
+        assert_eq!(by_name("en8").addresses, ["192.168.60.2/32"]);
+        // No IPv4 address at all: then the IPv6 one is what it is known by.
+        assert_eq!(routable_address(by_name("en9")), Some("fd00::9/64"));
+        assert!(report
+            .connection
+            .contains(&"en9 (ethernet) fd00::9/64, local network only (no default route)".into()));
     }
 
     #[test]

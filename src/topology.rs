@@ -709,11 +709,13 @@ mod tests {
             (NodeKind::Interface, "tun0 10.10.14.3/23")
         );
 
-        // macOS lists the link-local address first; the label and the
-        // segment use the address the interface is really used with.
+        // macOS lists the link-local address first, and can list a global
+        // IPv6 address before the IPv4 one; the label, the segment and the
+        // "You" caption use the IPv4 address all the same.
         let mut mac = graph.clone();
         mac.local.interfaces[1].addresses = vec![
             "fe80::1c71:9b2d:2156:23ce/64".into(),
+            "2607:f8b0:4005:80a::200e/64".into(),
             "192.168.1.5/24".into(),
         ];
         let topology = Topology::build(&mac);
@@ -723,6 +725,8 @@ mod tests {
         let nodes = elements["nodes"].as_array().unwrap();
         let segment = nodes.iter().find(|n| n["data"]["id"] == "if:eth0").unwrap();
         assert_eq!(segment["data"]["network"], "192.168.1.0/24");
+        assert_eq!(segment["data"]["caption"], "LAN eth0\n192.168.1.0/24");
+        assert_eq!(nodes[0]["data"]["caption"], "You\n192.168.1.5");
     }
 
     #[test]
