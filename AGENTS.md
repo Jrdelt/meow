@@ -53,21 +53,21 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 4, Step 3 complete (`meow report`). Every
-  command in SPEC.md is implemented.
-- **Last Verified Commit:** `feat(phase4-step3)` — see `git log -n 1
-  --oneline`.
+- **Active Phase & Step:** All four phases complete. Every command in SPEC.md
+  is implemented and tested on Linux.
+- **Last Verified Commit:** `docs(final)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
   Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
-  `assets/`). Tests: per module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
-- **In-Progress / Partial Work:** None. AI tiers were tested against stand-in
-  servers only: no real OpenRouter or local-model request has ever been made.
-- **Next Exact Action:** Finish: write `README.md` (build, usage, config,
-  safety model, platform status), verify `cargo build --release`, final
-  handoff. After that, the open work is verification on real macOS and Windows
-  machines and real `katana`/`feroxbuster`/OpenRouter runs (see notes).
+  `assets/`); Phase 4 (`vault`, `ai`, `report`); `README.md`. Tests: per
+  module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
+- **In-Progress / Partial Work:** None.
+- **Next Exact Action:** No build step is pending. Open verification work, in
+  order of value: (1) build and run the test suite on real macOS and Windows;
+  (2) run `meow recon` with real `katana` and `feroxbuster`; (3) make one real
+  `[L]`, `[C]` and `[R]` request; (4) add CI and release packaging if the
+  owner wants them (not approved yet: private repo, paid macOS minutes).
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
