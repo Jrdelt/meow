@@ -53,17 +53,20 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 1, Step 2 complete (C tap filter + FFI tests).
-- **Last Verified Commit:** `feat(phase1-step2)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** Phase 1, Step 3 complete (CLI + anti-nesting guard).
+- **Last Verified Commit:** `feat(phase1-step3)` — see `git log -n 1 --oneline`.
 - **Completed Files:** `Cargo.toml`, `Cargo.lock`, `build.rs`, `.gitignore`,
-  `AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `src/c/tap_filter.h`,
-  `src/c/tap_filter.c`, `src/tap.rs` (21 tests), `src/lib.rs`.
-- **In-Progress / Partial Work:** `src/main.rs` is a version-printing stub,
-  replaced in Step 3.
-- **Next Exact Action:** Phase 1, Step 3 — write `src/cli.rs` (clap derive:
-  bare `meow`, `meow <name> [--local]`, `mode`, `recon <target> [-- flags]`,
-  `map`, `hud`, `add <file>`, `report`) and wire `src/main.rs` to it with the
-  `MEOW_SESSION` anti-nesting check (exit code 1 before touching the terminal).
+  `AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `src/c/tap_filter.{h,c}`, `src/tap.rs`,
+  `src/cli.rs`, `src/lib.rs`, `src/main.rs`, `tests/cli.rs` (39 tests total).
+- **In-Progress / Partial Work:** `src/main.rs::run` parses, enforces the
+  nesting guard and resolves the helper session, then reports every command
+  as "not built yet" (exit 1). Replace each arm as its feature lands.
+- **Next Exact Action:** Phase 1, Step 4 — write `src/workspace.rs`: resolve
+  `~/.meow/workspaces/<name>/` (or `./.meow/` with `--local`), create it with
+  `0700` dirs / `0600` files (current-user ACL on Windows), load/create
+  `~/.meow/config.toml` and `<workspace>/profile.toml` (move `cli::Mode` use
+  into the profile), list workspaces by most recent activity, and wire bare
+  `meow` (listing) in `main.rs`.
 - **Blockers / Notes:**
   - `Cargo.toml` lists Phase 1 crates only (owner decision); add each
     later-phase crate from the SPEC §7 baseline in the step that first uses it.
@@ -73,4 +76,7 @@ Before every push:
     pass `clippy -D warnings` before the binary wires them up.
   - `TapFilter` allocates `tap_state_t` using `tap_state_size()` from C; never
     mirror the struct layout in Rust.
-  - Windows NTFS ACL crate is added with the workspace-permissions step.
+  - Helpers find their session via `--session` or `$MEOW_SESSION` (name
+    only). A `--local` session must also export its workspace path so helpers
+    can find `./.meow/`; decide the variable in Step 4.
+  - Exit codes: 1 = runtime refusal/failure, 2 = usage error (clap).
