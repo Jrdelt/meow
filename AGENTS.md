@@ -53,22 +53,22 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 1, Step 3 complete (CLI + anti-nesting guard).
-- **Last Verified Commit:** `feat(phase1-step3)` — see `git log -n 1 --oneline`.
-- **Completed Files:** `Cargo.toml`, `Cargo.lock`, `build.rs`, `.gitignore`,
-  `AGENTS.md`, `CLAUDE.md`, `SPEC.md`, `src/c/tap_filter.{h,c}`, `src/tap.rs`,
-  `src/cli.rs`, `src/lib.rs`, `src/main.rs`, `tests/cli.rs` (39 tests total).
-- **In-Progress / Partial Work:** `src/main.rs::run` parses, enforces the
-  nesting guard and resolves the helper session, then reports every command
-  as "not built yet" (exit 1). Replace each arm as its feature lands.
-- **Next Exact Action:** Phase 1, Step 4 — write `src/workspace.rs`: resolve
-  `~/.meow/workspaces/<name>/` (or `./.meow/` with `--local`), create it with
-  `0700` dirs / `0600` files (current-user ACL on Windows), load/create
-  `~/.meow/config.toml` and `<workspace>/profile.toml` (move `cli::Mode` use
-  into the profile), list workspaces by most recent activity, and wire bare
-  `meow` (listing) in `main.rs`.
+- **Active Phase & Step:** Phase 1, Step 4 complete (workspace + config).
+- **Last Verified Commit:** `feat(phase1-step4)` — see `git log -n 1 --oneline`.
+- **Completed Files:** scaffold, `src/c/tap_filter.{h,c}`, `src/tap.rs`,
+  `src/cli.rs`, `src/mode.rs`, `src/workspace.rs`, `src/lib.rs`,
+  `src/main.rs`, `tests/cli.rs` (59 tests total).
+- **In-Progress / Partial Work:** `main.rs::run` implements bare `meow`
+  (listing), workspace create/resume, and `meow mode` (direct `profile.toml`
+  write). `meow <name>` then stops with "session shell is not built yet";
+  `recon`/`map`/`hud`/`add`/`report` report "not built yet" (exit 1).
+- **Next Exact Action:** Phase 1, Step 5 — write `src/lock.rs`: hold an
+  `fd-lock` write lock on `Workspace::lock_path()` (file opened with
+  `workspace::private_open_options()`) for the life of the session; a second
+  `meow <name>` on the same workspace must fail fast with a clear message.
+  Wire it into `main.rs` right after `Workspace::open_or_create`.
 - **Blockers / Notes:**
-  - `Cargo.toml` lists Phase 1 crates only (owner decision); add each
+  - `Cargo.toml` lists only crates in use (owner decision); add each
     later-phase crate from the SPEC §7 baseline in the step that first uses it.
   - Terminal control comes from `ratatui::crossterm`; do not add a direct
     `crossterm` dependency.
@@ -76,7 +76,12 @@ Before every push:
     pass `clippy -D warnings` before the binary wires them up.
   - `TapFilter` allocates `tap_state_t` using `tap_state_size()` from C; never
     mirror the struct layout in Rust.
-  - Helpers find their session via `--session` or `$MEOW_SESSION` (name
-    only). A `--local` session must also export its workspace path so helpers
-    can find `./.meow/`; decide the variable in Step 4.
+  - Helper targeting order: `--local`, `--session`, `$MEOW_WORKSPACE`,
+    `$MEOW_SESSION`. The PTY step must export `MEOW_SESSION`,
+    `MEOW_WORKSPACE` (= `Workspace::dir`, already absolute) and `MEOW_MODE`.
+  - `$MEOW_HOME` overrides `~/.meow`; tests rely on it. Create files with
+    `private_open_options()` / `write_private_atomic()` only.
+  - Windows ACL (`icacls` in `workspace.rs`) has never been compiled or run.
+  - Listing shows name/mode/last-active; host count and unfinished tasks join
+    when `graph.json` (Phase 2) and `state.db` tasks (Phase 3) exist.
   - Exit codes: 1 = runtime refusal/failure, 2 = usage error (clap).

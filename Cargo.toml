@@ -12,7 +12,7 @@ name = "meow"
 path = "src/main.rs"
 
 # Phase 1 dependencies only. Later phases add their crates when their code lands
-# (rusqlite, tokio, axum, petgraph, reqwest, ipnetwork, tempfile).
+# (rusqlite, tokio, axum, petgraph, reqwest, ipnetwork).
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -22,6 +22,7 @@ portable-pty = "0.9"
 # Terminal control is used through the `ratatui::crossterm` re-export.
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]

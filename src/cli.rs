@@ -1,24 +1,15 @@
 //! Command-line interface definitions (`clap` derive).
 //!
 //! `meow` and `meow <name>` start a session; every subcommand is a helper
-//! that targets an existing session, named by `$MEOW_SESSION` (exported inside
-//! a session shell) or by `--session`.
+//! that targets an existing workspace: `--local`, `--session`, or the session
+//! of the current shell (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
 
-use std::fmt;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
-/// Environment variable exported inside an active session shell.
-pub const SESSION_ENV: &str = "MEOW_SESSION";
-
-const NAME_MAX: usize = 64;
-
-/// Device names Windows refuses as file or directory names.
-const WINDOWS_RESERVED: &[&str] = &[
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-];
+pub use crate::mode::Mode;
+use crate::workspace::validate_name;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -30,7 +21,7 @@ const WINDOWS_RESERVED: &[&str] = &[
 )]
 pub struct Cli {
     /// Workspace to create or resume (~/.meow/workspaces/<NAME>/)
-    #[arg(value_name = "NAME", value_parser = parse_workspace_name)]
+    #[arg(value_name = "NAME", value_parser = validate_name)]
     pub name: Option<String>,
 
     /// Keep the workspace in ./.meow/ instead of ~/.meow/workspaces/
@@ -83,39 +74,17 @@ pub enum Command {
     },
 }
 
-/// Which session a helper subcommand targets.
+/// Which workspace a helper subcommand targets. Without either flag it is
+/// the session of the current shell.
 #[derive(Debug, Clone, Default, Args)]
 pub struct SessionArg {
-    /// Session to target (defaults to the session of the current shell)
-    #[arg(long, value_name = "NAME", env = SESSION_ENV)]
+    /// Target the workspace in ./.meow/ of the current directory
+    #[arg(long, conflicts_with = "session")]
+    pub local: bool,
+
+    /// Target the saved workspace <NAME>
+    #[arg(long, value_name = "NAME", value_parser = validate_name)]
     pub session: Option<String>,
-}
-
-/// Discovery load/rate profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Mode {
-    /// Passive only: zero outbound packets (default)
-    Light,
-    /// Rate-limited active discovery
-    Mild,
-    /// Auto-tuned active discovery
-    Aggressive,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Light => "light",
-            Mode::Mild => "mild",
-            Mode::Aggressive => "aggressive",
-        }
-    }
-}
-
-impl fmt::Display for Mode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 impl Command {
@@ -131,7 +100,7 @@ impl Command {
         }
     }
 
-    fn session_arg(&self) -> &SessionArg {
+    pub fn session_arg(&self) -> &SessionArg {
         match self {
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
@@ -139,17 +108,6 @@ impl Command {
             | Command::Hud { session }
             | Command::Add { session, .. }
             | Command::Report { session } => session,
-        }
-    }
-
-    /// Resolves and validates the session this helper targets.
-    pub fn session(&self) -> Result<String, String> {
-        match self.session_arg().session.as_deref() {
-            None | Some("") => Err(format!(
-                "No active meow session. Run `meow {}` inside `meow <name>`, or pass --session <name>.",
-                self.name()
-            )),
-            Some(name) => parse_workspace_name(name),
         }
     }
 }
@@ -161,7 +119,7 @@ impl Cli {
     }
 
     /// Returns the refusal message when this invocation would start a session
-    /// inside another one. `active` is the value of `$MEOW_SESSION`.
+    /// inside another one. `active` is `SessionEnv::active_label()`.
     pub fn nesting_error(&self, active: Option<&str>) -> Option<String> {
         match active {
             Some(active) if !active.is_empty() && self.starts_session() => Some(format!(
@@ -170,29 +128,6 @@ impl Cli {
             _ => None,
         }
     }
-}
-
-/// Validates a workspace name so it is a safe single directory name on
-/// macOS, Linux and Windows.
-pub fn parse_workspace_name(raw: &str) -> Result<String, String> {
-    if raw.is_empty() || raw.len() > NAME_MAX {
-        return Err(format!("name must be 1-{NAME_MAX} characters"));
-    }
-    let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
-    if !raw.chars().all(valid_char) {
-        return Err("name may contain only letters, digits, '-', '_' and '.'".into());
-    }
-    if !raw.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        return Err("name must start with a letter or digit".into());
-    }
-    if raw.ends_with('.') {
-        return Err("name must not end with '.'".into());
-    }
-    let stem = raw.split('.').next().unwrap_or(raw).to_ascii_lowercase();
-    if WINDOWS_RESERVED.contains(&stem.as_str()) {
-        return Err(format!("'{raw}' is a reserved device name on Windows"));
-    }
-    Ok(raw.to_owned())
 }
 
 #[cfg(test)]
@@ -314,25 +249,26 @@ mod tests {
     }
 
     #[test]
-    fn helper_session_is_resolved_and_validated() {
-        let command = parse(&["report", "--session", "acme"])
-            .unwrap()
-            .command
-            .unwrap();
-        assert_eq!(command.session().as_deref(), Ok("acme"));
+    fn helpers_accept_session_or_local_but_not_both() {
+        let arg = |args: &[&str]| parse(args).unwrap().command.unwrap().session_arg().clone();
 
-        let command = parse(&["report", "--session", "../etc"])
-            .unwrap()
-            .command
-            .unwrap();
-        assert!(command.session().is_err());
+        let named = arg(&["report", "--session", "acme"]);
+        assert_eq!(
+            (named.local, named.session.as_deref()),
+            (false, Some("acme"))
+        );
+        let local = arg(&["hud", "--local"]);
+        assert_eq!((local.local, local.session), (true, None));
+        let bare = arg(&["map"]);
+        assert_eq!((bare.local, bare.session), (false, None));
 
-        let command = Command::Hud {
-            session: SessionArg::default(),
-        };
-        let message = command.session().unwrap_err();
-        assert!(message.contains("No active meow session"), "{message}");
-        assert!(message.contains("meow hud"), "{message}");
+        assert_eq!(
+            parse(&["report", "--local", "--session", "acme"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ArgumentConflict
+        );
+        assert!(parse(&["report", "--session", "../etc"]).is_err());
     }
 
     #[test]
@@ -356,31 +292,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_names_are_single_safe_directory_names() {
-        for good in ["a", "acme-lab", "client_2026.q4", "HTB.box-01", "7days"] {
-            assert_eq!(parse_workspace_name(good).as_deref(), Ok(good));
-        }
-        let too_long = "a".repeat(65);
-        for bad in [
-            "",
-            ".",
-            "..",
-            ".hidden",
-            "-flag",
-            "a/b",
-            "a\\b",
-            "a b",
-            "caf\u{e9}",
-            "trailing.",
-            "nul",
-            "CON",
-            "com1.txt",
-            "~",
-            "a:b",
-            too_long.as_str(),
-        ] {
-            assert!(parse_workspace_name(bad).is_err(), "accepted {bad:?}");
-        }
+    fn workspace_name_is_validated_at_parse_time() {
         assert!(parse(&["../../etc"]).is_err());
+        assert!(parse(&["nul"]).is_err());
     }
 }

@@ -2,53 +2,87 @@
 //! dispatch.
 
 use std::process::ExitCode;
+use std::time::SystemTime;
 
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use meow::cli::{Cli, SESSION_ENV};
+use meow::cli::{Cli, Command};
+use meow::workspace::{
+    format_listing, list_workspaces, resolve_helper_dir, Config, MeowHome, SessionEnv, Workspace,
+};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("[!] {message}");
+        Err(error) => {
+            eprintln!("[!] {error:#}");
             ExitCode::from(1)
         }
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+fn run(cli: Cli) -> Result<()> {
     // Must come first: a nested `meow` exits before any terminal state changes.
-    let active = std::env::var(SESSION_ENV).ok();
-    if let Some(message) = cli.nesting_error(active.as_deref()) {
-        return Err(message);
+    let env = SessionEnv::from_process();
+    if let Some(message) = cli.nesting_error(env.active_label().as_deref()) {
+        bail!(message);
     }
 
-    match &cli.command {
-        None => match &cli.name {
-            None => Err(unavailable("meow", "workspace listing", "Phase 1, Step 4")),
-            Some(name) => Err(unavailable(
-                &format!("meow {name}"),
-                "the session shell",
-                "Phase 1, Steps 4-6",
-            )),
-        },
-        Some(command) => {
-            let session = command.session()?;
-            let phase = match command.name() {
-                "add" => "Phase 2",
-                "report" => "Phase 4",
+    let home = MeowHome::from_env()?;
+    let cwd = std::env::current_dir().context("cannot determine the current directory")?;
+
+    let Some(command) = &cli.command else {
+        return match &cli.name {
+            None => {
+                let workspaces = list_workspaces(&home, &cwd)?;
+                print!("{}", format_listing(&workspaces, SystemTime::now()));
+                Ok(())
+            }
+            Some(name) => {
+                let config = Config::load_or_create(&home)?;
+                let (workspace, created) =
+                    Workspace::open_or_create(&home, &cwd, name, cli.local, config.default_mode)?;
+                println!(
+                    "[+] {} workspace '{}' at {} (mode: {})",
+                    if created { "Created" } else { "Resumed" },
+                    workspace.name,
+                    workspace.dir.display(),
+                    workspace.profile.mode
+                );
+                Err(unavailable(
+                    &format!("meow {name}"),
+                    "the session shell",
+                    "Phase 1, Steps 5-7",
+                ))
+            }
+        };
+    };
+
+    let target = command.session_arg();
+    let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
+    let mut workspace = Workspace::load(&dir)?;
+    match command {
+        Command::Mode { mode, .. } => {
+            workspace.set_mode(*mode)?;
+            println!("[+] Mode set to {mode} (session: {})", workspace.name);
+            Ok(())
+        }
+        other => {
+            let planned = match other {
+                Command::Add { .. } => "Phase 2",
+                Command::Report { .. } => "Phase 4",
                 _ => "Phase 3",
             };
             Err(unavailable(
-                &format!("meow {}", command.name()),
-                &format!("this command (session: {session})"),
-                phase,
+                &format!("meow {}", other.name()),
+                &format!("this command (session: {})", workspace.name),
+                planned,
             ))
         }
     }
 }
 
-fn unavailable(invocation: &str, what: &str, planned: &str) -> String {
-    format!("`{invocation}`: {what} is not built yet (planned: {planned})")
+fn unavailable(invocation: &str, what: &str, planned: &str) -> anyhow::Error {
+    anyhow!("`{invocation}`: {what} is not built yet (planned: {planned})")
 }
