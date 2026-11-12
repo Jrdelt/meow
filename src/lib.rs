@@ -18,6 +18,7 @@ pub mod observer;
 pub mod parsers;
 pub mod pty;
 pub mod queue;
+pub mod report;
 pub mod shims;
 pub mod tap;
 pub mod timeutil;

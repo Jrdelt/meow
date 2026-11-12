@@ -53,25 +53,21 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 4, Step 2 complete (AI tiers [L]/[C]/[R],
-  LLM01 sandboxing, budget lock, chats). Owner asked to build straight through
-  Phase 4 without pausing.
-- **Last Verified Commit:** `feat(phase4-step2)` — see `git log -n 1
+- **Active Phase & Step:** Phase 4, Step 3 complete (`meow report`). Every
+  command in SPEC.md is implemented.
+- **Last Verified Commit:** `feat(phase4-step3)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
   Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
   `assets/`). Tests: per module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
-- **In-Progress / Partial Work:** `meow report` reports "not built yet"; it is
-  the only command left. AI tiers were tested against stand-in servers only:
-  no real OpenRouter or local-model request has ever been made.
-- **Next Exact Action:** Phase 4, Step 3 — `src/report.rs` + `meow report`:
-  compile `REPORT.md` in the workspace from `graph.json` (Mermaid topology via
-  `Topology::mermaid`), `Confirmed` findings separate from
-  `UnverifiedHypothesis` items (and false positives), route warnings, secrets
-  to rotate (`Vault::exposed_secrets`), task history, `replay.sh` and
-  `chats/*.md`; no AI, no network. Then finish: README, final handoff.
+- **In-Progress / Partial Work:** None. AI tiers were tested against stand-in
+  servers only: no real OpenRouter or local-model request has ever been made.
+- **Next Exact Action:** Finish: write `README.md` (build, usage, config,
+  safety model, platform status), verify `cargo build --release`, final
+  handoff. After that, the open work is verification on real macOS and Windows
+  machines and real `katana`/`feroxbuster`/OpenRouter runs (see notes).
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY

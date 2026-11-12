@@ -251,10 +251,12 @@ fn helpers_need_an_existing_workspace() {
     );
 
     sandbox.run(&["acme"], &[]);
+    // With the session variable set, a helper is allowed (it is not a
+    // nested shell) and finds the workspace.
     let output = sandbox.run(&["report"], &[("MEOW_SESSION", "acme")]);
-    let text = stderr(&output);
-    assert!(!text.contains("Nested"), "{text}");
-    assert!(text.contains("session: acme"), "{text}");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("Nested"));
+    assert!(stdout(&output).contains("[+] Report written to "));
 }
 
 /// Drives a whole session through a pipe: the shell runs inside the PTY,
@@ -622,6 +624,47 @@ fn recon_inside_a_light_session_is_refused_with_the_reason() {
         "{text}"
     );
     assert!(text.contains("recon-rc=1"), "{text}");
+}
+
+#[test]
+fn report_compiles_the_workspace_without_a_session() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["acme"], &[]);
+    std::fs::write(
+        sandbox.project().join("scan.xml"),
+        r#"<?xml version="1.0"?><nmaprun><host><status state="up"/><address addr="10.0.0.5" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.18.0"/></port></ports></host></nmaprun>"#,
+    )
+    .unwrap();
+    let env = [("MEOW_SESSION", "acme")];
+    assert!(sandbox
+        .run(&["add", "scan.xml", "--no-cve"], &env)
+        .status
+        .success());
+
+    let output = sandbox.run(&["report"], &env);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report_path = sandbox.workspace("acme").join("REPORT.md");
+    assert!(stdout(&output).contains(&format!("[+] Report written to {}", report_path.display())));
+    let report = std::fs::read_to_string(&report_path).unwrap();
+    assert!(report.starts_with("# Audit report: acme\n"), "{report}");
+    assert!(report.contains("```mermaid\ngraph LR\n"), "{report}");
+    assert!(
+        report.contains("| 80/tcp | open | http | nginx | 1.18.0 |"),
+        "{report}"
+    );
+    assert!(
+        report.contains("## Confirmed findings\n\nNone."),
+        "{report}"
+    );
+    assert!(
+        report.contains("## Unverified hypotheses\n\nNone."),
+        "{report}"
+    );
+
+    let output = sandbox.run(&["report", "--session", "ghost"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("no meow workspace"));
 }
 
 #[test]

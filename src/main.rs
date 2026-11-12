@@ -22,6 +22,7 @@ use meow::observer;
 use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
 use meow::queue;
+use meow::report;
 use meow::shims;
 use meow::webui;
 use meow::workspace::{
@@ -182,16 +183,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             hud::run(&workspace)?;
             Ok(ExitCode::SUCCESS)
         }
-        other => {
-            let planned = match other {
-                Command::Report { .. } => "Phase 4",
-                _ => "Phase 3",
-            };
-            Err(anyhow!(
-                "`meow {}`: this command (session: {}) is not built yet (planned: {planned})",
-                other.name(),
-                workspace.name
-            ))
+        Command::Report { .. } => {
+            let path = report::write(&workspace)?;
+            println!("[+] Report written to {}", path.display());
+            println!("[+] It is not masked: review it before sharing");
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
