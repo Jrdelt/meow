@@ -170,6 +170,89 @@ fn list_and_ls_show_every_workspace_also_from_inside_a_session() {
 }
 
 #[test]
+fn delete_removes_one_workspace_and_only_when_confirmed() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["acme"], &[]);
+    sandbox.run(&["beta"], &[]);
+    sandbox.run(&["webapp", "--local"], &[]);
+    let acme = sandbox.workspace("acme");
+    let local = sandbox.project().join(".meow");
+    assert!(acme.join("profile.toml").is_file() && local.join("profile.toml").is_file());
+
+    // Without a terminal to ask on, and without --yes, nothing is deleted.
+    let output = sandbox.run(&["delete", "acme"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("Not deleting workspace 'acme' without confirmation"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(acme.is_dir());
+
+    let output = sandbox.run(&["delete", "acme", "--yes"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("[+] Deleted workspace 'acme'"));
+    assert!(!acme.exists());
+    let listing = stdout(&sandbox.run(&["list"], &[]));
+    assert!(
+        !listing.contains("acme") && listing.contains("beta"),
+        "{listing}"
+    );
+
+    // Deleting it again, or something that was never there, is an error.
+    for name in ["acme", "nope"] {
+        let output = sandbox.run(&["rm", name, "-y"], &[]);
+        assert_eq!(output.status.code(), Some(1));
+        let expected = format!("There is no workspace named '{name}'");
+        assert!(stderr(&output).contains(&expected), "{}", stderr(&output));
+    }
+    // A name can never reach outside the workspaces directory.
+    assert_eq!(
+        sandbox
+            .run(&["delete", "../project", "-y"], &[])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert!(sandbox.project().is_dir());
+
+    // The local workspace goes with --local, from its own directory only.
+    let elsewhere = sandbox.run_in(sandbox.tmp.path(), &["delete", "--local", "-y"], &[]);
+    assert_eq!(elsewhere.status.code(), Some(1));
+    assert!(stderr(&elsewhere).contains("There is no workspace in"));
+    let output = sandbox.run(&["delete", "--local", "-y"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!local.exists());
+    assert!(sandbox.project().is_dir(), "only ./.meow is removed");
+    assert!(
+        sandbox.workspace("beta").is_dir(),
+        "other workspaces are untouched"
+    );
+}
+
+/// A link in the workspaces directory is never followed: what it points to
+/// is someone else's directory.
+#[cfg(unix)]
+#[test]
+fn delete_never_follows_a_link() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["acme"], &[]);
+    let precious = sandbox.tmp.path().join("precious");
+    std::fs::create_dir(&precious).unwrap();
+    std::fs::write(
+        precious.join("profile.toml"),
+        "name = \"x\"\nmode = \"light\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&precious, sandbox.workspace("link")).unwrap();
+
+    let output = sandbox.run(&["delete", "link", "--yes"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("There is no workspace named 'link'"));
+    assert!(precious.join("profile.toml").is_file());
+}
+
+#[test]
 fn opening_a_name_creates_then_resumes_the_workspace() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["acme"], &[]);
@@ -417,6 +500,8 @@ fn live_session_serves_helpers_and_mines_terminal_output() {
 "$MEOW_BIN" mode mild
 "$MEOW_BIN" map --no-open
 "$MEOW_BIN" list | sed 's/^/inside: /'
+"$MEOW_BIN" delete acme --yes; echo "delete-inside-rc=$?"
+env -u MEOW_SESSION -u MEOW_WORKSPACE "$MEOW_BIN" delete acme --yes; echo "delete-outside-rc=$?"
 env -u MEOW_SESSION -u MEOW_WORKSPACE "$MEOW_BIN" list | sed 's/^/outside: /'
 echo "Discovered open port 8443/tcp on 10.0.0.77"
 exit
@@ -469,6 +554,19 @@ exit
     };
     assert!(listed("inside: ").contains("this session"), "{text}");
     assert!(listed("outside: ").contains("running"), "{text}");
+    // A workspace with an open session cannot be deleted, from its own
+    // shell or from any other terminal.
+    assert!(text.contains("delete-inside-rc=1"), "{text}");
+    assert!(text.contains("delete-outside-rc=1"), "{text}");
+    // (Inside the session the helpers' error output is part of the terminal.)
+    assert!(
+        text.contains("You are inside the session of workspace 'acme'; exit it first"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Workspace 'acme' is already open in another meow session"),
+        "{text}"
+    );
     let url_at = text
         .find("http://127.0.0.1:")
         .expect("map URL was not printed");

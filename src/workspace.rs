@@ -33,6 +33,7 @@ pub const HOME_ENV: &str = "MEOW_HOME";
 const LOCAL_DIR: &str = ".meow";
 const CONFIG_FILE: &str = "config.toml";
 const PROFILE_FILE: &str = "profile.toml";
+const LOCK_FILE: &str = "session.lock";
 /// Port and token of the running session; present only while one is open.
 pub const RUNTIME_FILE: &str = "runtime.json";
 const NAME_MAX: usize = 64;
@@ -515,7 +516,7 @@ impl Workspace {
     }
 
     pub fn lock_path(&self) -> PathBuf {
-        self.dir.join("session.lock")
+        self.dir.join(LOCK_FILE)
     }
 
     pub fn replay_path(&self) -> PathBuf {
@@ -696,6 +697,49 @@ fn summarize(dir: &Path, name: Option<String>, local: bool) -> Option<WorkspaceS
         unfinished_tasks: crate::queue::count_unfinished(&dir.join("state.db")),
         last_active: last_active(dir),
     })
+}
+
+/// The workspace `meow delete` is asked to remove: the saved one called
+/// `name`, or `./.meow/` of `cwd`. Only what the listing shows can be
+/// deleted: a real directory (never a link to one) that holds a profile.
+pub fn find_for_deletion(
+    home: &MeowHome,
+    cwd: &Path,
+    name: Option<&str>,
+) -> Result<WorkspaceSummary> {
+    let (dir, checked) = match name {
+        Some(name) => {
+            let checked = checked_name(name)?;
+            (home.workspace_dir(&checked), Some(checked))
+        }
+        None => (home.local_dir(cwd)?, None),
+    };
+    summarize(&dir, checked, name.is_none()).ok_or_else(|| match name {
+        Some(name) => anyhow!("There is no workspace named '{name}' (`meow list` shows them)"),
+        None => anyhow!("There is no workspace in {}", dir.display()),
+    })
+}
+
+/// Fails while a session is open on the workspace. Taking its lock for a
+/// moment is the proof that none is.
+pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
+    use crate::lock::{LockError, SessionLock};
+    match SessionLock::acquire(&workspace.dir.join(LOCK_FILE)) {
+        Ok(_released_at_once) => Ok(()),
+        Err(error @ LockError::Held { .. }) => Err(anyhow!(
+            "Workspace '{}' is {error}; exit that session first",
+            workspace.name
+        )),
+        Err(error) => Err(anyhow!("Workspace '{}': {error}", workspace.name)),
+    }
+}
+
+/// Removes the workspace directory with everything in it: replay log,
+/// graph, state, notes, chats and report. Refused while a session is open.
+pub fn delete(workspace: &WorkspaceSummary) -> Result<()> {
+    ensure_closed(workspace)?;
+    fs::remove_dir_all(&workspace.dir)
+        .with_context(|| format!("cannot delete {}", workspace.dir.display()))
 }
 
 /// Number of hosts in a `graph.json`, read without validating the rest.

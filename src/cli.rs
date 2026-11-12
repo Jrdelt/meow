@@ -1,7 +1,8 @@
 //! Command-line interface definitions (`clap` derive).
 //!
 //! `meow` and `meow <name>` start a session; `meow list` shows every saved
-//! workspace; every other subcommand is a helper that targets an existing
+//! workspace and `meow delete` removes one; every other subcommand is a
+//! helper that targets an existing
 //! workspace: `--local`, `--session`, or the session of the current shell
 //! (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
 
@@ -38,6 +39,24 @@ pub enum Command {
     /// List every saved workspace and whether its session is running
     #[command(visible_alias = "ls")]
     List,
+    /// Delete a saved workspace and everything in it
+    #[command(visible_alias = "rm")]
+    Delete {
+        /// Workspace to delete (~/.meow/workspaces/<NAME>/)
+        #[arg(
+            value_name = "NAME",
+            value_parser = validate_name,
+            required_unless_present = "local",
+            conflicts_with = "local"
+        )]
+        name: Option<String>,
+        /// Delete the workspace in ./.meow/ of the current directory
+        #[arg(long)]
+        local: bool,
+        /// Do not ask for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Switch the discovery load/rate profile of the session
     Mode {
         #[arg(value_enum)]
@@ -102,6 +121,7 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::List => "list",
+            Command::Delete { .. } => "delete",
             Command::Mode { .. } => "mode",
             Command::Recon { .. } => "recon",
             Command::Map { .. } => "map",
@@ -111,10 +131,11 @@ impl Command {
         }
     }
 
-    /// The workspace a helper targets. `None` for `list`, which targets none.
+    /// The workspace a helper targets. `None` for `list` and `delete`, which
+    /// are not helpers of a session.
     pub fn session_arg(&self) -> Option<&SessionArg> {
         match self {
-            Command::List => None,
+            Command::List | Command::Delete { .. } => None,
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
             | Command::Map { session, .. }
@@ -205,6 +226,38 @@ mod tests {
             assert_eq!(cli.nesting_error(Some("acme")), None);
         }
         assert!(parse(&["list", "--session", "x"]).is_err());
+    }
+
+    #[test]
+    fn delete_takes_one_workspace_name_or_local() {
+        let delete = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+            Ok(Some(Command::Delete { name, local, yes })) => Ok((name, local, yes)),
+            Ok(other) => panic!("unexpected parse: {other:?}"),
+            Err(error) => Err(error.kind()),
+        };
+        assert_eq!(
+            delete(&["delete", "acme"]),
+            Ok((Some("acme".to_owned()), false, false))
+        );
+        assert_eq!(
+            delete(&["rm", "acme", "--yes"]),
+            Ok((Some("acme".to_owned()), false, true))
+        );
+        assert_eq!(delete(&["delete", "-y", "--local"]), Ok((None, true, true)));
+        assert_eq!(delete(&["delete"]), Err(ErrorKind::MissingRequiredArgument));
+        assert_eq!(
+            delete(&["delete", "acme", "--local"]),
+            Err(ErrorKind::ArgumentConflict)
+        );
+        assert!(delete(&["delete", "../../etc"]).is_err());
+        assert!(delete(&["delete", "a", "b"]).is_err());
+
+        let cli = parse(&["delete", "acme"]).unwrap();
+        let command = cli.command.as_ref().unwrap();
+        assert_eq!(command.name(), "delete");
+        assert!(command.session_arg().is_none());
+        // Deleting another workspace from inside a session is allowed.
+        assert_eq!(cli.nesting_error(Some("other")), None);
     }
 
     #[test]

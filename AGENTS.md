@@ -54,8 +54,8 @@ Before every push:
 ## Current Handoff State
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
-  list`, the sketched-diagram map and fixes from real macOS runs.
-- **Last Verified Commit:** `fix(ai,map)` — see `git log -n 1 --oneline`.
+  list`, `meow delete`, the sketched map and fixes from real macOS runs.
+- **Last Verified Commit:** `feat(delete)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -76,8 +76,8 @@ Before every push:
     `ipc::send` and fall back to the files on `None`. New requests go into
     `coordinator::Command` (HTTP `/api/command` and WebSocket share it).
   - Helper targeting: `--local`, `--session`, `$MEOW_WORKSPACE`,
-    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`. `meow list`
-    targets no workspace and pings each session (`ipc::is_live`).
+    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`; `meow delete`
+    needs it free. `meow list` pings each session (`ipc::is_live`).
   - `$MEOW_HOME` overrides `~/.meow` (tests). Create files via
     `private_open_options()` / `write_private_atomic()` only.
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system

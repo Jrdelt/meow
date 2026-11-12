@@ -41,9 +41,14 @@ impl Hosted {
 
     /// Starts `meow <name>` in the outer PTY without waiting for the shell.
     fn spawn(name: &str, tmp: tempfile::TempDir) -> Self {
+        Self::spawn_args(&[name], tmp)
+    }
+
+    /// Starts `meow <args>` in the outer PTY.
+    fn spawn_args(args: &[&str], tmp: tempfile::TempDir) -> Self {
         let pair = native_pty_system().openpty(size(24, 80)).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_meow"));
-        command.arg(name);
+        command.args(args);
         command.cwd(tmp.path());
         command.env("MEOW_HOME", tmp.path().join("meow-home"));
         command.env("SHELL", "/bin/sh");
@@ -295,4 +300,47 @@ fn accepting_the_resume_in_light_mode_keeps_the_task_paused() {
     let (_, _, _files) = hosted.finish_keeping_files();
     // Still there for when the mode is changed.
     assert_eq!(meow::queue::count_unfinished(&db_path), 1);
+}
+
+/// `meow delete` asks on the terminal, and only a "y" deletes.
+#[test]
+fn delete_asks_first_and_keeps_the_workspace_on_anything_but_yes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = meow::workspace::MeowHome::at(tmp.path().join("meow-home")).unwrap();
+    let (workspace, _) = meow::workspace::Workspace::open_or_create(
+        &home,
+        tmp.path(),
+        "acme",
+        false,
+        meow::mode::Mode::Light,
+    )
+    .unwrap();
+    let dir = workspace.dir.clone();
+
+    // Enter alone is "no".
+    let mut hosted = Hosted::spawn_args(&["delete", "acme"], tmp);
+    assert!(
+        hosted.wait_for(b"[?] Delete it? [y/N] ", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    assert!(hosted.contains(b"This deletes workspace 'acme' for good:"));
+    assert!(hosted.contains(dir.to_str().unwrap().as_bytes()));
+    hosted.send("\r");
+    let (code, output, tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 1, "{}", text(&output));
+    assert!(text(&output).contains("[+] Nothing deleted"));
+    assert!(dir.join("profile.toml").is_file());
+
+    let mut hosted = Hosted::spawn_args(&["delete", "acme"], tmp);
+    assert!(
+        hosted.wait_for(b"[?] Delete it? [y/N] ", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send("y\r");
+    let (code, output, _tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0, "{}", text(&output));
+    assert!(text(&output).contains("[+] Deleted workspace 'acme'"));
+    assert!(!dir.exists());
 }

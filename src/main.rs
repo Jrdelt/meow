@@ -26,8 +26,8 @@ use meow::report;
 use meow::shims;
 use meow::webui;
 use meow::workspace::{
-    format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config, MeowHome,
-    SessionEnv, SessionState, Workspace,
+    self, format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config,
+    MeowHome, SessionEnv, SessionState, Workspace,
 };
 
 /// Debug aid: when set to a file path, the clean lines produced by the
@@ -62,6 +62,53 @@ fn print_listing(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
+/// `meow delete`: says what would go, asks, then removes the workspace.
+/// `name` is `None` for `--local`.
+fn delete_workspace(
+    home: &MeowHome,
+    cwd: &Path,
+    env: &SessionEnv,
+    name: Option<&str>,
+    yes: bool,
+) -> Result<ExitCode> {
+    let target = workspace::find_for_deletion(home, cwd, name)?;
+    let label = if target.local {
+        format!("the local workspace '{}'", target.name)
+    } else {
+        format!("workspace '{}'", target.name)
+    };
+    if env.workspace.as_deref() == Some(target.dir.as_path()) {
+        bail!("You are inside the session of {label}; exit it first");
+    }
+    // Before asking, so nobody confirms a deletion that is then refused.
+    workspace::ensure_closed(&target)?;
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("Not deleting {label} without confirmation: run this in a terminal or add --yes");
+        }
+        println!("[!] This deletes {label} for good:");
+        println!("      {}", target.dir.display());
+        println!(
+            "      {} host(s), its command log, notes, AI chats and report",
+            target.hosts
+        );
+        print!("[?] Delete it? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("cannot read the answer")?;
+        if !answer.trim().to_ascii_lowercase().starts_with('y') {
+            println!("[+] Nothing deleted");
+            return Ok(ExitCode::from(1));
+        }
+    }
+    workspace::delete(&target)?;
+    println!("[+] Deleted {label} ({})", target.dir.display());
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
     // Must come first: a nested `meow` exits before any terminal state changes.
     let env = SessionEnv::from_process();
@@ -79,13 +126,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
         };
     };
     let Some(target) = command.session_arg() else {
-        return print_listing(&home, &cwd, &env);
+        return match command {
+            Command::Delete { name, yes, .. } => {
+                delete_workspace(&home, &cwd, &env, name.as_deref(), *yes)
+            }
+            _ => print_listing(&home, &cwd, &env),
+        };
     };
 
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     match command {
-        Command::List => unreachable!("`list` targets no workspace and returned above"),
+        Command::List | Command::Delete { .. } => {
+            unreachable!("`list` and `delete` are not session helpers and returned above")
+        }
         Command::Mode { mode, .. } => {
             // A live session applies the change itself; otherwise write the
             // profile directly.

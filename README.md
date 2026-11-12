@@ -47,6 +47,7 @@ cargo test                   # the full test suite
 | Command | What it does |
 |---|---|
 | `meow list` | Lists every saved workspace (and `./.meow/` of the current directory): whether its session is running, mode, host count, unfinished tasks, last activity. `meow ls` and a bare `meow` do the same; inside a session use `meow list`. |
+| `meow delete <name>` | Deletes a saved workspace and everything in it (command log, graph, notes, AI chats, report), after asking. `--yes` skips the question; `--local` deletes `./.meow/` of the current directory. Refused while a session is open on it. `meow rm` does the same. |
 | `meow <name>` | Creates or resumes `~/.meow/workspaces/<name>/` and starts the session shell. `--local` uses `./.meow/` instead. |
 | `meow mode <light\|mild\|aggressive>` | Switches the discovery profile. |
 | `meow recon <target> [-- <nmap flags>]` | Queues a four-stage inventory of a host or CIDR range. Runs in the background of the session, one tool at a time. |
