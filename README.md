@@ -11,9 +11,31 @@ from every conclusion. Nothing leaves your machine unless you ask for it.
 The full specification is in [`SPEC.md`](SPEC.md). Notes for contributors and
 coding agents are in [`AGENTS.md`](AGENTS.md).
 
-## Build
+## Install
 
-Needs Rust 1.88 or newer and a C compiler.
+On macOS or Linux, from a clone of this repository:
+
+```sh
+./install.sh
+```
+
+The script checks what is missing, shows what it will do, asks once, and then
+does it. It installs a C compiler if there is none (the Xcode Command Line
+Tools on macOS, the distribution's compiler package on Linux) and the Rust
+toolchain through `rustup` if there is none or it is older than 1.88. Then it
+builds meow and installs it as `~/.cargo/bin/meow`. Anything already present is
+left alone, so it is safe to run again after a `git pull`.
+
+| Option | Effect |
+|---|---|
+| `--dry-run` | Only show the plan. |
+| `--yes` | Do not ask before starting. |
+| `--with-tools` | Also install `nmap`, `katana` and `feroxbuster` where Homebrew or the system package manager offers them. |
+
+On Windows, install Rust from <https://rustup.rs> with the Visual Studio C++
+build tools, then run `cargo install --path . --locked`.
+
+To build by hand instead (Rust 1.88 or newer and a C compiler):
 
 ```sh
 cargo build --release        # binary: target/release/meow
@@ -116,8 +138,9 @@ Be aware of what has and has not been exercised:
 
 - **Linux**: developed and tested here, including real `nmap` runs against
   `127.0.0.1` and live NVD, OSV and KEV lookups.
-- **macOS**: never built or run. The zsh shims and the macOS network-table
-  parsers are tested on Linux only.
+- **macOS**: builds, and a session starts with zsh (first run on a real Mac).
+  The full test suite has not yet passed there, and `install.sh` has not been
+  run on a Mac.
 - **Windows**: compiles and lints for `x86_64-pc-windows-gnu`, but has never
   been run. This covers the ACL setup, console modes, Job Objects and the
   PowerShell shim.

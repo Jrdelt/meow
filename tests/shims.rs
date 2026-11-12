@@ -10,20 +10,25 @@ use std::process::{Command, Output, Stdio};
 const HEADER_LINES: usize = 4;
 
 struct Sandbox {
-    tmp: tempfile::TempDir,
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
 }
 
 impl Sandbox {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
+        // The shell reports its directory with symlinks resolved (on macOS
+        // the temp directory is under /var, a link to /private/var), so the
+        // expected paths must be the resolved ones too.
+        let root = tmp.path().canonicalize().unwrap();
         for dir in ["project", "other", "user-home"] {
-            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::create_dir(root.join(dir)).unwrap();
         }
-        Self { tmp }
+        Self { _tmp: tmp, root }
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.tmp.path().join(name)
+        self.root.join(name)
     }
 
     fn workspace(&self) -> PathBuf {
@@ -73,12 +78,38 @@ impl Sandbox {
     }
 }
 
-fn installed(shell: &str) -> bool {
-    let found = Path::new(shell).exists();
-    if !found {
-        eprintln!("note: {shell} is not installed; skipping");
+/// Finds a shell by name in the usual places (zsh is /bin/zsh on macOS and
+/// /usr/bin/zsh on most Linux systems).
+fn find_shell(name: &str) -> Option<String> {
+    let found = ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+        .iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|path| Path::new(path).exists());
+    if found.is_none() {
+        eprintln!("note: {name} is not installed; skipping");
     }
     found
+}
+
+/// Bash gained `PS0` (the hook that runs before a command) in 4.4. The bash
+/// that ships with macOS is 3.2, which only supports the later-logging path.
+fn bash_with_ps0() -> Option<String> {
+    let bash = find_shell("bash")?;
+    let version = Command::new(&bash)
+        .args(["-c", "echo ${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&version.stdout).into_owned();
+    let mut parts = text
+        .split_whitespace()
+        .filter_map(|p| p.parse::<u32>().ok());
+    let (major, minor) = (parts.next()?, parts.next()?);
+    if major > 4 || (major == 4 && minor >= 4) {
+        Some(bash)
+    } else {
+        eprintln!("note: {bash} is version {major}.{minor}, older than 4.4 (no PS0); skipping");
+        None
+    }
 }
 
 fn text(output: &Output) -> String {
@@ -166,11 +197,11 @@ exit 5
 
 #[test]
 fn bash_session_is_logged_in_two_stages() {
-    if !installed("/bin/bash") {
+    let Some(bash) = bash_with_ps0() else {
         return;
-    }
+    };
     check_full_session(
-        "/bin/bash",
+        &bash,
         ".bashrc",
         "export MEOW_TEST_RC=loaded\n\
          HISTCONTROL=ignoreboth\n\
@@ -181,11 +212,11 @@ fn bash_session_is_logged_in_two_stages() {
 
 #[test]
 fn zsh_session_is_logged_in_two_stages() {
-    if !installed("/usr/bin/zsh") {
+    let Some(zsh) = find_shell("zsh") else {
         return;
-    }
+    };
     check_full_session(
-        "/usr/bin/zsh",
+        &zsh,
         ".zshrc",
         "export MEOW_TEST_RC=loaded\n\
          setopt hist_ignore_space\n\
@@ -198,9 +229,9 @@ fn zsh_session_is_logged_in_two_stages() {
 
 #[test]
 fn zsh_keeps_the_users_own_zdotdir() {
-    if !installed("/usr/bin/zsh") {
+    let Some(zsh) = find_shell("zsh") else {
         return;
-    }
+    };
     let sandbox = Sandbox::new();
     let zdot = sandbox.path("user-home").join("zdot");
     std::fs::create_dir(&zdot).unwrap();
@@ -216,11 +247,7 @@ fn zsh_keeps_the_users_own_zdotdir() {
     let script = "echo \"env=$FROM_ZSHENV rc=$FROM_ZSHRC zd=$ZDOTDIR\"\n\
                   zsh -ic 'echo nested=$ZDOTDIR'\n\
                   exit\n";
-    let output = sandbox.session(
-        "/usr/bin/zsh",
-        script,
-        &[("ZDOTDIR", zdot.to_str().unwrap())],
-    );
+    let output = sandbox.session(&zsh, script, &[("ZDOTDIR", zdot.to_str().unwrap())]);
     let out = text(&output);
     let expected = format!("env=yes rc=yes zd={}", zdot.display());
     assert!(out.contains(&expected), "{out}");
@@ -232,15 +259,16 @@ fn zsh_keeps_the_users_own_zdotdir() {
 
 #[test]
 fn bash_without_ps0_logs_each_command_when_it_finishes() {
-    if !installed("/bin/bash") {
+    // Any bash will do: the variable forces the path that old versions take.
+    let Some(bash) = find_shell("bash") else {
         return;
-    }
+    };
     let sandbox = Sandbox::new();
     std::fs::write(sandbox.path("user-home").join(".bashrc"), "PS1='$ '\n").unwrap();
     let project = sandbox.path("project");
     let other = sandbox.path("other");
     let script = format!("cd {}\nfalse\necho dup\necho dup\nexit\n", other.display());
-    let output = sandbox.session("/bin/bash", &script, &[("MEOW_BASH_LEGACY", "1")]);
+    let output = sandbox.session(&bash, &script, &[("MEOW_BASH_LEGACY", "1")]);
     assert!(output.status.success(), "{}", text(&output));
 
     let expected: Vec<String> = [
@@ -256,13 +284,13 @@ fn bash_without_ps0_logs_each_command_when_it_finishes() {
 
 #[test]
 fn multi_line_commands_are_logged_whole() {
-    if !installed("/bin/bash") {
+    let Some(bash) = bash_with_ps0() else {
         return;
-    }
+    };
     let sandbox = Sandbox::new();
     std::fs::write(sandbox.path("user-home").join(".bashrc"), "PS1='$ '\n").unwrap();
     let script = "for i in 1 2; do\necho \"n=$i\"\ndone\nexit\n";
-    let output = sandbox.session("/bin/bash", script, &[]);
+    let output = sandbox.session(&bash, script, &[]);
     assert!(text(&output).contains("n=2"), "{}", text(&output));
 
     let replay = sandbox.replay().join("\n");
@@ -308,14 +336,14 @@ fn check_rate_warning(shell: &str, rc_name: &str) {
 
 #[test]
 fn bash_warns_about_high_rate_flags_in_light_mode() {
-    if installed("/bin/bash") {
-        check_rate_warning("/bin/bash", ".bashrc");
+    if let Some(bash) = bash_with_ps0() {
+        check_rate_warning(&bash, ".bashrc");
     }
 }
 
 #[test]
 fn zsh_warns_about_high_rate_flags_in_light_mode() {
-    if installed("/usr/bin/zsh") {
-        check_rate_warning("/usr/bin/zsh", ".zshrc");
+    if let Some(zsh) = find_shell("zsh") {
+        check_rate_warning(&zsh, ".zshrc");
     }
 }

@@ -592,7 +592,7 @@ pub fn route_warnings(local: &LocalNet, targets: &[IpAddr]) -> Vec<String> {
         lab = local
             .interfaces
             .iter()
-            .filter(|i| i.kind == "vpn" && i.up && !i.addresses.is_empty())
+            .filter(|i| is_active_vpn(i))
             .map(|i| i.name.as_str())
             .collect();
     }
@@ -638,12 +638,42 @@ pub fn route_warnings(local: &LocalNet, targets: &[IpAddr]) -> Vec<String> {
     warnings
 }
 
+/// True if the interface has an address that can carry traffic to other
+/// networks: not loopback and not link-local. macOS keeps many interfaces
+/// (`utun0`..., `awdl0`, `llw0`) that are up with nothing but an `fe80::`
+/// address; they say nothing about where the lab is.
+pub fn has_routable_address(interface: &Interface) -> bool {
+    routable_address(interface).is_some()
+}
+
+/// The first address of the interface that is neither loopback nor
+/// link-local, in CIDR form.
+fn routable_address(interface: &Interface) -> Option<&str> {
+    interface
+        .addresses
+        .iter()
+        .find(|address| {
+            IpNetwork::from_str(address).is_ok_and(|network| match network.ip() {
+                IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_link_local(),
+                IpAddr::V6(ip) => !ip.is_loopback() && (ip.segments()[0] & 0xffc0) != 0xfe80,
+            })
+        })
+        .map(String::as_str)
+}
+
+/// A VPN interface that is up and actually addressed.
+fn is_active_vpn(interface: &Interface) -> bool {
+    interface.kind == "vpn" && interface.up && has_routable_address(interface)
+}
+
 /// One summary line for the session banner.
 pub fn summary(local: &LocalNet) -> String {
     let up = local
         .interfaces
         .iter()
-        .filter(|i| i.up && i.kind != "loopback")
+        .filter(|i| {
+            i.up && !matches!(i.kind.as_str(), "loopback" | "virtual") && has_routable_address(i)
+        })
         .count();
     let gateway = local
         .routes
@@ -658,8 +688,8 @@ pub fn summary(local: &LocalNet) -> String {
     let vpn: Vec<String> = local
         .interfaces
         .iter()
-        .filter(|i| i.kind == "vpn" && i.up && !i.addresses.is_empty())
-        .map(|i| format!("{} {}", i.name, i.addresses[0]))
+        .filter(|i| is_active_vpn(i))
+        .map(|i| format!("{} {}", i.name, routable_address(i).unwrap_or_default()))
         .collect();
     let vpn = if vpn.is_empty() {
         String::new()
@@ -678,15 +708,16 @@ pub fn summary(local: &LocalNet) -> String {
 // ---------------------------------------------------------------------------
 
 /// Runs a read-only OS tool and returns its stdout, or an empty string if
-/// it is missing or fails.
+/// it is missing.
 fn run(program: &str, args: &[&str]) -> String {
+    // The exit code is not checked: some of these tools print a usable table
+    // and still exit non-zero (for example when one entry cannot be read).
+    // The parsers ignore anything they do not recognise.
     Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .ok()
-        .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default()
 }
@@ -1097,10 +1128,60 @@ mod tests {
     }
 
     #[test]
+    fn link_local_only_interfaces_are_not_counted_or_called_vpns() {
+        // What a Mac reports: the Wi-Fi interface plus a crowd of tunnel and
+        // helper interfaces that are "up" with only an fe80:: address.
+        let mut local = LocalNet::default();
+        let mut text = String::from(
+            "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\
+             en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet6 fe80::1c2a:3b4c:5d6e:7f80%en0 prefixlen 64 secured scopeid 0xb\n\
+             \tinet 172.26.147.20 netmask 0xfffff800 broadcast 172.26.151.255\n\
+             awdl0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet6 fe80::8c1f:64ff:fe01:2345%awdl0 prefixlen 64 scopeid 0xd\n",
+        );
+        for n in 0..8 {
+            text.push_str(&format!(
+                "utun{n}: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\
+                 \tinet6 fe80::ad3c:36a1:b46f:22{n}c%utun{n} prefixlen 64 scopeid 0x1{n}\n"
+            ));
+        }
+        macos::ifconfig(&text, &mut local.interfaces);
+        macos::routes(
+            "Internet:\nDestination        Gateway            Flags           Netif Expire\n\
+             default            172.26.147.1       UGScg             en0\n",
+            &mut local.routes,
+        );
+        assert_eq!(local.interfaces.len(), 11);
+        assert_eq!(
+            summary(&local),
+            "1 interfaces up, gateway 172.26.147.1 via en0, 0 neighbours, 0 listeners"
+        );
+        // Idle tunnels are not mistaken for the lab, so nothing is flagged.
+        local.listeners.push(Listener {
+            protocol: "tcp".into(),
+            address: "172.26.147.20".into(),
+            port: 8000,
+        });
+        assert!(route_warnings(&local, &[]).is_empty());
+
+        // A tunnel with a real address is a VPN.
+        local.interfaces.push(Interface {
+            name: "utun9".into(),
+            kind: "vpn".into(),
+            up: true,
+            addresses: vec!["fe80::1/64".into(), "10.10.14.3/23".into()],
+        });
+        assert!(summary(&local).contains("2 interfaces up"));
+        assert!(summary(&local).contains("VPN utun9 10.10.14.3/23"));
+        assert_eq!(route_warnings(&local, &[]).len(), 1);
+    }
+
+    #[test]
     fn summary_line_names_gateway_and_vpn() {
         assert_eq!(
             summary(&linux_fixture()),
-            "3 interfaces up, gateway 192.168.1.1 via eth0, VPN tun0 10.10.14.3/23, 2 neighbours, 8 listeners"
+            "2 interfaces up, gateway 192.168.1.1 via eth0, VPN tun0 10.10.14.3/23, 2 neighbours, 8 listeners"
         );
         assert_eq!(
             summary(&LocalNet::default()),

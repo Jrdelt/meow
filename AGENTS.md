@@ -53,9 +53,9 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** All four phases complete. Every command in SPEC.md
-  is implemented and tested on Linux.
-- **Last Verified Commit:** `docs(final)` — see `git log -n 1 --oneline`.
+- **Active Phase & Step:** All four phases complete, plus `install.sh` and the
+  first fixes from a real macOS run.
+- **Last Verified Commit:** `feat(install)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -63,11 +63,11 @@ Before every push:
   `assets/`); Phase 4 (`vault`, `ai`, `report`); `README.md`. Tests: per
   module plus `tests/{cli,pty,shims,cve,recon,hud}.rs`.
 - **In-Progress / Partial Work:** None.
-- **Next Exact Action:** No build step is pending. Open verification work, in
-  order of value: (1) build and run the test suite on real macOS and Windows;
-  (2) run `meow recon` with real `katana` and `feroxbuster`; (3) make one real
-  `[L]`, `[C]` and `[R]` request; (4) add CI and release packaging if the
-  owner wants them (not approved yet: private repo, paid macOS minutes).
+- **Next Exact Action:** Wait for the owner's macOS results: `cargo test
+  --no-fail-fast` output, and (if the banner still says 0 neighbours / 0
+  listeners) the output of `arp -an` and `netstat -an -p tcp`, then fix what
+  they show. Other open verification: real `katana`/`feroxbuster` runs, one
+  real `[L]`/`[C]`/`[R]` request, Windows.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
@@ -87,5 +87,12 @@ Before every push:
     only, `katana`/`feroxbuster` never. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
-    `gcc-mingw-w64-x86-64`); macOS has never been built. No CI: the repo is
-    private and macOS runners cost Actions minutes.
+    `gcc-mingw-w64-x86-64`). No CI: the repo is private and macOS runners
+    cost Actions minutes.
+  - macOS (owner's machine): builds and a zsh session starts. First test run
+    stopped at one lib test that depended on `$USER` (fixed), so the
+    integration tests have not run there yet. Tests must not depend on the
+    login name, on `/usr/bin/zsh`, on bash >= 4.4, or on unresolved temp paths.
+  - `install.sh` (macOS/Linux) installs a C compiler and Rust if missing,
+    then `cargo install --path . --locked`. Tested with stand-ins
+    (`tests/install.rs`) and for real on Linux; never run on macOS.

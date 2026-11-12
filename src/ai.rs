@@ -647,6 +647,7 @@ impl AiEngine {
         let (masked_user, mut unmasker) = {
             let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
             vault.register_graph(graph);
+            vault.register_operator();
             let masked = vault.mask_json(&prompt.user).to_string();
             let leaks = vault.leaks(&masked);
             if !leaks.is_empty() {

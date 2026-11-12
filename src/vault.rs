@@ -345,8 +345,8 @@ impl Vault {
     }
 
     /// Registers everything the graph knows to be private: host addresses,
-    /// names, TLS SANs, redirect hosts, local interface addresses, gateways,
-    /// neighbours and the operator's own user name.
+    /// names, TLS SANs, redirect hosts, local interface addresses, gateways
+    /// and neighbours.
     pub fn register_graph(&mut self, graph: &Graph) {
         let domain = |vault: &mut Self, name: &str| {
             let name = name.trim_start_matches("*.");
@@ -401,6 +401,12 @@ impl Vault {
         for address in addresses.map(str::to_owned).collect::<Vec<_>>() {
             self.register(Kind::Host, &address);
         }
+    }
+
+    /// Registers the operator's own login name, which turns up in prompts,
+    /// paths and tool output. Kept apart from [`Vault::register_graph`] so
+    /// that what the graph yields does not depend on who runs meow.
+    pub fn register_operator(&mut self) {
         for user in ["USER", "USERNAME", "LOGNAME"]
             .iter()
             .filter_map(|key| std::env::var(key).ok())

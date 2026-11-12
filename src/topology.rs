@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::checklist;
 use crate::evidence::VerificationStatus;
 use crate::graph::Graph;
-use crate::observer::route_for;
+use crate::observer::{has_routable_address, route_for};
 
 pub const LOCAL_ID: &str = "local";
 
@@ -109,7 +109,7 @@ impl Topology {
             .interfaces
             .iter()
             .filter(|i| {
-                i.up && !i.addresses.is_empty()
+                i.up && has_routable_address(i)
                     && !matches!(i.kind.as_str(), "loopback" | "virtual")
             })
             .map(|i| i.name.clone())
