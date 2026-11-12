@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, Request, State as AxumState};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State as AxumState};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +44,8 @@ use crate::parsers::text::TextParser;
 use crate::pty::LineSink;
 use crate::queue;
 use crate::timeutil::now_rfc3339;
+use crate::topology::Topology;
+use crate::webui;
 use crate::workspace::{write_private_atomic, Config, Workspace};
 
 pub const FIRST_PORT: u16 = 8765;
@@ -108,6 +110,8 @@ pub struct Notice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
+    /// Cheap liveness check.
+    Ping,
     /// Returns the full state snapshot.
     State,
     SetMode {
@@ -273,6 +277,7 @@ impl State {
             "revision": *self.revision.borrow(),
             "graph": &*graph,
             "checklists": checklists,
+            "topology": Topology::build(&graph).cytoscape(&graph),
             "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
             "notices": &*lock(&self.notices),
         })
@@ -281,6 +286,7 @@ impl State {
     /// Carries out one command. Fast: long work is handed to background tasks.
     pub fn execute(self: &Arc<Self>, command: Command) -> Result<Value> {
         match command {
+            Command::Ping => Ok(json!({ "session": self.session, "port": self.port })),
             Command::State => Ok(self.snapshot()),
             Command::SetMode { mode } => {
                 lock(&self.workspace).set_mode(mode)?;
@@ -457,6 +463,12 @@ fn token_from(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
 }
 
 async fn guard(AxumState(state): AxumState<Shared>, request: Request, next: Next) -> Response {
+    let mut response = check_and_run(&state, request, next).await;
+    webui::security_headers(&mut response, state.port);
+    response
+}
+
+async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response {
     let headers = request.headers();
     if !host_allowed(headers, state.port) {
         return deny(StatusCode::FORBIDDEN, "unexpected Host header");
@@ -534,23 +546,18 @@ async fn serve_socket(state: Shared, mut socket: WebSocket) {
     }
 }
 
-#[derive(Deserialize)]
-struct PageQuery {
-    #[allow(dead_code)]
-    token: String,
+async fn index(AxumState(state): AxumState<Shared>) -> Response {
+    webui::page(&state.token)
 }
 
-async fn index(Query(_query): Query<PageQuery>) -> Response {
-    (
-        StatusCode::OK,
-        "meow coordinator is running. The topology map arrives with `meow map`.",
-    )
-        .into_response()
+async fn asset(AxumPath(name): AxumPath<String>) -> Response {
+    webui::asset(&name)
 }
 
 fn router(state: Shared) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/assets/{name}", get(asset))
         .route("/api/state", get(get_state))
         .route("/api/command", post(post_command))
         .route("/ws", get(websocket))
@@ -991,6 +998,67 @@ mod tests {
         assert_eq!(status, 200);
         let (status, _) = request(&info, "GET", &format!("/?token={}", info.token), &[], None);
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn map_page_and_assets_are_served_with_a_strict_content_policy() {
+        let fx = fixture();
+        let info = fx.coordinator.info();
+        let fetch = |path: &str| {
+            block_on(async {
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let response = client
+                    .get(format!("{}{path}", info.base_url()))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let headers = response.headers().clone();
+                (status, headers, response.text().await.unwrap())
+            })
+        };
+        let (status, headers, page) = fetch(&format!("/?token={}", info.token));
+        assert_eq!(status, 200);
+        assert!(headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        assert!(page.contains(&format!("/assets/map.js?token={}", info.token)));
+        let policy = headers["content-security-policy"].to_str().unwrap();
+        assert!(policy.contains("script-src 'self';"), "{policy}");
+        assert!(
+            policy.contains(&format!("ws://127.0.0.1:{}", info.port)),
+            "{policy}"
+        );
+        assert!(!policy.contains("unsafe-eval"), "{policy}");
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+
+        for (asset, kind) in [
+            ("map.js", "text/javascript"),
+            ("map.css", "text/css"),
+            ("cytoscape.min.js", "text/javascript"),
+        ] {
+            let (status, headers, body) = fetch(&format!("/assets/{asset}?token={}", info.token));
+            assert_eq!(status, 200, "{asset}");
+            assert!(
+                headers["content-type"].to_str().unwrap().starts_with(kind),
+                "{asset}"
+            );
+            assert!(!body.is_empty());
+            // Assets are behind the token as well.
+            assert_eq!(fetch(&format!("/assets/{asset}")).0, 401, "{asset}");
+        }
+        assert_eq!(
+            fetch(&format!("/assets/secret.txt?token={}", info.token)).0,
+            404
+        );
+
+        // The snapshot carries ready-made Cytoscape elements.
+        let snapshot = fx.coordinator.state().snapshot();
+        assert_eq!(snapshot["topology"]["nodes"][0]["data"]["id"], "local");
+        assert!(snapshot["topology"]["edges"].is_array());
     }
 
     #[test]

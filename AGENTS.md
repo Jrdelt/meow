@@ -53,25 +53,25 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 3, Step 2 complete (process-grouped recon
-  queue + resume). Owner asked to build straight through Phases 2-4 without
-  pausing; checkpoint after every step.
-- **Last Verified Commit:** `feat(phase3-step2)` — see `git log -n 1
+- **Active Phase & Step:** Phase 3, Step 3 complete (`meow map`: petgraph
+  topology + embedded Cytoscape page). Owner asked to build straight through
+  Phases 2-4 without pausing; checkpoint after every step.
+- **Last Verified Commit:** `feat(phase3-step3)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
-  Phase 3 so far: `coordinator`, `ipc`, `queue`. Tests: unit tests per module
-  plus `tests/{cli,pty,shims,cve,recon}.rs`.
-- **In-Progress / Partial Work:** `map`/`hud`/`report` report "not built yet".
-  The coordinator's `/` route is a text stub until `meow map`.
+  Phase 3 so far: `coordinator`, `ipc`, `queue`, `topology`, `webui`,
+  `assets/`. Tests: unit tests per module plus
+  `tests/{cli,pty,shims,cve,recon}.rs`.
+- **In-Progress / Partial Work:** `hud` and `report` report "not built yet".
   `vault`/`ai_usage`/`prompt_cache` tables are unused.
-- **Next Exact Action:** Phase 3, Step 3 — `meow map`: add `petgraph`,
-  `src/topology.rs` (local machine, interfaces, gateways, hosts, ports as a
-  graph; Cytoscape elements + reachability), vendor `cytoscape.min.js` under
-  `assets/` and serve an embedded page at `/?token=` that live-updates over
-  the WebSocket; `meow map` opens the URL in the default browser. Then Step 4:
-  `meow hud` (Ratatui 0.30 over the WebSocket).
+- **Next Exact Action:** Phase 3, Step 4 — `src/hud.rs`: Ratatui 0.30 TUI over
+  the coordinator WebSocket (`tokio-tungstenite`): host list, node/endpoint
+  inspector, Evidence vs Hypothesis checklist, CVE feed, queue status,
+  notices, manual catch-up notes box, verdict keys, and `[L]`/`[C]`/`[R]`
+  triggers (wired to AI in Phase 4). Render logic must be testable with
+  `ratatui::backend::TestBackend`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it (owner decision).
     Terminal control via `ratatui::crossterm` only.
@@ -91,6 +91,9 @@ Before every push:
     x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
     `gcc-mingw-w64-x86-64`); macOS has never been built.
   - CI workflow deferred: repo is private, macOS runners cost Actions minutes.
+  - Map page: `assets/map.{html,js,css}` + vendored `cytoscape.min.js`
+    (3.33.1, MIT). No inline scripts and no `innerHTML`: scraped text must
+    stay inert. Checked by hand in Chromium via Playwright, not in `cargo test`.
   - Recon runs only inside a live session; light mode refuses it and pauses
     queued stages. Tests use stand-in tools (`tests/recon.rs`); real `nmap`
     was smoke-tested on 127.0.0.1 only, `katana`/`feroxbuster` never.

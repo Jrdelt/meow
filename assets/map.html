@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>meow map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/assets/map.css?token={{TOKEN}}">
+</head>
+<body>
+<header>
+  <strong>meow</strong>
+  <span id="session"></span>
+  <span id="mode" class="badge"></span>
+  <span id="counts"></span>
+  <span id="conn" class="badge off">connecting</span>
+</header>
+<main>
+  <div id="cy"></div>
+  <aside>
+    <section id="warnings" hidden>
+      <h2>Route warnings</h2>
+      <ul id="warning-list"></ul>
+    </section>
+    <section>
+      <h2 id="detail-title">Select a node</h2>
+      <div id="detail"></div>
+    </section>
+    <section>
+      <h2>Background tasks</h2>
+      <ul id="tasks"></ul>
+    </section>
+    <section>
+      <h2>Notices</h2>
+      <ul id="notices"></ul>
+    </section>
+  </aside>
+</main>
+<script src="/assets/cytoscape.min.js?token={{TOKEN}}"></script>
+<script src="/assets/map.js?token={{TOKEN}}"></script>
+</body>
+</html>

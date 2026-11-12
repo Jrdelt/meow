@@ -11,8 +11,7 @@ build = "build.rs"
 name = "meow"
 path = "src/main.rs"
 
-# Phase 1 dependencies only. Later phases add their crates when their code lands
-# (petgraph).
+# Crates are added in the step that first uses them.
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
@@ -22,6 +21,7 @@ fd-lock = "4.0"
 futures-util = "0.3"
 getrandom = "0.3"
 ipnetwork = "0.20"
+petgraph = "0.7"
 portable-pty = "0.9"
 # Terminal control is used through the `ratatui::crossterm` re-export.
 ratatui = "0.30"

@@ -53,6 +53,9 @@ pub enum Command {
     },
     /// Open the live topology map in the default browser
     Map {
+        /// Print the map URL instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
         #[command(flatten)]
         session: SessionArg,
     },
@@ -107,7 +110,7 @@ impl Command {
         match self {
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
-            | Command::Map { session }
+            | Command::Map { session, .. }
             | Command::Hud { session }
             | Command::Add { session, .. }
             | Command::Report { session } => session,

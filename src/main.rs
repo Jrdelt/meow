@@ -22,6 +22,7 @@ use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
 use meow::queue;
 use meow::shims;
+use meow::webui;
 use meow::workspace::{
     format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config, MeowHome,
     SessionEnv, Workspace,
@@ -154,6 +155,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 result["mode"].as_str().unwrap_or("?"),
             );
             println!("[+] Stages run one at a time in the session; follow them with `meow hud`");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Map { no_open, .. } => {
+            let live = ipc::send(&workspace, &Request::Ping)?.is_some();
+            let Some(info) = ipc::runtime_info(&workspace).filter(|_| live) else {
+                bail!(
+                    "`meow map` needs a live session: start `meow {}` first",
+                    workspace.name
+                );
+            };
+            let url = webui::map_url(info.port, &info.token);
+            if !no_open && webui::open_in_browser(&url) {
+                println!(
+                    "[+] Opened the topology map of '{}' in your browser (127.0.0.1:{})",
+                    workspace.name, info.port
+                );
+            } else {
+                println!("[+] Open this URL in a browser on this machine (it contains the session token):");
+                println!("    {url}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         other => {

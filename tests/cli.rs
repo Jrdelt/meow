@@ -356,6 +356,7 @@ fn live_session_serves_helpers_and_mines_terminal_output() {
     let script = r#"cat "$MEOW_WORKSPACE/runtime.json"; echo
 "$MEOW_BIN" add scan.xml
 "$MEOW_BIN" mode mild
+"$MEOW_BIN" map --no-open
 echo "Discovered open port 8443/tcp on 10.0.0.77"
 exit
 "#;
@@ -397,6 +398,19 @@ exit
         text.contains("[+] Mode set to mild (session: acme)"),
         "{text}"
     );
+    let url_at = text
+        .find("http://127.0.0.1:")
+        .expect("map URL was not printed");
+    let url: String = text[url_at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    let token = url
+        .split("/?token=")
+        .nth(1)
+        .expect("no token in the map URL");
+    assert_eq!(token.len(), 64, "{url}");
+    assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{url}");
 
     // The session is over: its connection details are gone, its data is not.
     assert!(!workspace.join("runtime.json").exists());
@@ -564,6 +578,9 @@ fn recon_needs_a_live_session_that_is_not_in_light_mode() {
         "{}",
         stderr(&output)
     );
+    let output = sandbox.run(&["map", "--no-open", "--session", "acme"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("`meow map` needs a live session"));
     // The listing shows the new columns for the idle workspace.
     let listing = stdout(&sandbox.run(&[], &[]));
     assert!(

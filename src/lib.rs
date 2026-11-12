@@ -19,4 +19,6 @@ pub mod queue;
 pub mod shims;
 pub mod tap;
 pub mod timeutil;
+pub mod topology;
+pub mod webui;
 pub mod workspace;
