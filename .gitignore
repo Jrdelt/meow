@@ -1,2 +1,9 @@
 /target
 .meow/
+*.db
+*.db-wal
+*.db-shm
+runtime.json
+session.lock
+tmp/
+.env*

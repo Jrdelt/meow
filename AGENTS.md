@@ -1,0 +1,73 @@
+# AGENTS.md — `meow`
+
+Local security triage shell, topology mapper and grounded audit workspace.
+Rust (MSRV 1.88) + C11 via FFI. The full specification is in `SPEC.md`; read it
+before changing anything. This file must stay under 100 lines.
+
+## Toolchain Commands
+
+```sh
+cargo build                                  # debug build (compiles src/c/tap_filter.c via build.rs)
+cargo test                                   # unit + FFI tests
+cargo fmt --check                            # formatting gate
+cargo clippy --all-targets -- -D warnings    # lint gate
+```
+
+All three gates (`fmt`, `clippy`, `test`) must pass before every commit.
+
+## Non-Negotiable Boundaries
+
+- Never place `tap_filter.c` inline with PTY `stdout`; clone read-only slices
+  to the filter worker via `try_send` only.
+- Never call `crossterm::event::read()` in the PTY host; `std::io::stdin()`
+  owns raw input.
+- Never promote `Observed` banners/headers directly to `Confirmed` findings.
+- Never use `NamedTempFile::new()` across mount points; use
+  `NamedTempFile::new_in(&workspace_dir)` only.
+- Never send unvaulted IPs, hostnames, paths, or secrets to cloud APIs.
+- Never commit workspace or secret files (`.meow/`, `*.db*`, `runtime.json`,
+  `session.lock`, `.env*`).
+- Never force-push, run destructive resets, or commit unverified code.
+- Never modify the user's `~/.zshrc` / `~/.bashrc`; use per-session shims.
+- Never leave `// TODO` placeholders or implement more than one step at a time.
+
+## Handoff Protocol
+
+Cold start (run before writing any code):
+
+1. Read `AGENTS.md` and `SPEC.md`.
+2. `git status` and `git log -n 5 --oneline`.
+3. `cargo test` to confirm baseline health.
+4. Continue from `Next Exact Action` below.
+
+Before every push:
+
+1. `cargo fmt --check`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+4. Update `## Current Handoff State` in place.
+5. Stage source/doc files only, then
+   `git commit -m "feat(phaseX-stepY): <summary>"` and `git push -u origin HEAD`.
+6. If the push needs a hardware key touch or `origin` is missing, print the
+   exact command and wait.
+
+## Current Handoff State
+
+- **Active Phase & Step:** Phase 1, Step 1 complete (repo and handoff scaffold).
+- **Last Verified Commit:** `feat(phase1-step1)` — see `git log -n 1 --oneline`.
+- **Completed Files:** `Cargo.toml`, `Cargo.lock`, `build.rs`, `.gitignore`,
+  `AGENTS.md`, `CLAUDE.md`, `SPEC.md`.
+- **In-Progress / Partial Work:** none.
+- **Next Exact Action:** Phase 1, Step 2 — write `src/c/tap_filter.h` and
+  `src/c/tap_filter.c` (stateful ECMA-48 filter: GROUND/ESCAPE/CSI/OSC + UTF-8
+  continuation state, `\r` rewind, `?1049h`/`?1049l` pause, binary and
+  password-prompt drop), then `src/tap.rs` FFI bindings with unit tests.
+- **Blockers / Notes:**
+  - No `src/` yet, so `cargo build`/`test`/`clippy` cannot run until
+    `src/main.rs` and `src/c/tap_filter.c` exist. Step 1 was verified with
+    `cargo tree --depth 1` (dependency resolution) only.
+  - `Cargo.toml` lists Phase 1 crates only; add each later-phase crate from
+    the SPEC §7 baseline in the step that first uses it.
+  - Terminal control comes from `ratatui::crossterm`; do not add a direct
+    `crossterm` dependency.
+  - Windows NTFS ACL crate is added with the workspace-permissions step.
