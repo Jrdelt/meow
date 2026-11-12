@@ -53,19 +53,23 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 1 complete (Step 7, shell shims, was last).
-- **Last Verified Commit:** `feat(phase1-step7)` — see `git log -n 1 --oneline`.
-- **Completed Files:** scaffold, `src/c/tap_filter.{h,c}`, `src/{tap,cli,mode,
-  workspace,lock,pty,shims,lib,main}.rs`, `tests/{cli,pty,shims}.rs`
-  (95 tests + 1 ignored helper).
-- **In-Progress / Partial Work:** none in Phase 1. `recon`/`map`/`hud`/
-  `add`/`report` report "not built yet" (exit 1) until their phases.
-- **Next Exact Action:** Ask the owner which comes first: (a) a GitHub
-  Actions CI workflow running the three gates on Linux, macOS and Windows
-  (offered, not yet approved), or (b) Phase 2, Step 1 — add `rusqlite`
-  (`bundled`) and write `src/db.rs`: open `<workspace>/state.db` with
-  `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, a
-  `schema_version` table and migrations, file created `0600`.
+- **Active Phase & Step:** Phase 2, Step 1 complete (SQLite `state.db`). Owner
+  asked to build straight through Phases 2-4 without pausing; checkpoint after
+  every step.
+- **Last Verified Commit:** `feat(phase2-step1)` — see `git log -n 1
+  --oneline`.
+- **Completed Files:** Phase 1 (scaffold, C tap filter, `tap`, `cli`, `mode`,
+  `workspace`, `lock`, `pty`, `shims`, `main`) plus `src/db.rs`; tests in
+  `tests/{cli,pty,shims}.rs`.
+- **In-Progress / Partial Work:** `recon`/`map`/`hud`/`add`/`report` still
+  report "not built yet". `db.rs` already defines every table (meta,
+  cve_cache, tasks, task_stages, vault, ai_usage, prompt_cache); nothing uses
+  them yet.
+- **Next Exact Action:** Phase 2, Step 2 — `src/timeutil.rs` (RFC-3339 UTC
+  without chrono), `src/evidence.rs` (5-field `EvidenceRecord`, legal status
+  transitions) and `src/graph.rs` (hosts/ports/paths/advisories model +
+  same-FS atomic `graph.json`). CI workflow is deferred: repo is private,
+  macOS runners cost Actions minutes.
 - **Blockers / Notes:**
   - `Cargo.toml` lists only crates in use (owner decision); add later-phase
     crates from SPEC §7 in the step that first uses them.

@@ -477,6 +477,18 @@ impl Workspace {
         self.dir.join("replay.sh")
     }
 
+    pub fn state_db_path(&self) -> PathBuf {
+        self.dir.join("state.db")
+    }
+
+    pub fn graph_path(&self) -> PathBuf {
+        self.dir.join("graph.json")
+    }
+
+    pub fn runtime_path(&self) -> PathBuf {
+        self.dir.join("runtime.json")
+    }
+
     pub fn tmp_dir(&self) -> PathBuf {
         self.dir.join("tmp")
     }
