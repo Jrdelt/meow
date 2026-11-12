@@ -53,23 +53,23 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 2, Step 1 complete (SQLite `state.db`). Owner
-  asked to build straight through Phases 2-4 without pausing; checkpoint after
-  every step.
-- **Last Verified Commit:** `feat(phase2-step1)` — see `git log -n 1
+- **Active Phase & Step:** Phase 2, Step 2 complete (evidence schema,
+  endpoints, graph model). Owner asked to build straight through Phases 2-4
+  without pausing; checkpoint after every step.
+- **Last Verified Commit:** `feat(phase2-step2)` — see `git log -n 1
   --oneline`.
 - **Completed Files:** Phase 1 (scaffold, C tap filter, `tap`, `cli`, `mode`,
-  `workspace`, `lock`, `pty`, `shims`, `main`) plus `src/db.rs`; tests in
+  `workspace`, `lock`, `pty`, `shims`, `main`); Phase 2 so far: `db`,
+  `timeutil`, `evidence`, `endpoint`, `graph`; tests in
   `tests/{cli,pty,shims}.rs`.
 - **In-Progress / Partial Work:** `recon`/`map`/`hud`/`add`/`report` still
-  report "not built yet". `db.rs` already defines every table (meta,
-  cve_cache, tasks, task_stages, vault, ai_usage, prompt_cache); nothing uses
-  them yet.
-- **Next Exact Action:** Phase 2, Step 2 — `src/timeutil.rs` (RFC-3339 UTC
-  without chrono), `src/evidence.rs` (5-field `EvidenceRecord`, legal status
-  transitions) and `src/graph.rs` (hosts/ports/paths/advisories model +
-  same-FS atomic `graph.json`). CI workflow is deferred: repo is private,
-  macOS runners cost Actions minutes.
+  report "not built yet". Nothing produces `graph::Observation`s yet, and
+  `db.rs` tables are unused.
+- **Next Exact Action:** Phase 2, Step 3 — `src/parsers/`: Nmap XML
+  (`roxmltree`), katana and feroxbuster JSONL, log/PTY regex and `git diff`
+  parsers that emit `graph::Observation`s, format auto-detection, then wire
+  `meow add <file>` (load graph, apply, atomic save). CI workflow is deferred:
+  repo is private, macOS runners cost Actions minutes.
 - **Blockers / Notes:**
   - `Cargo.toml` lists only crates in use (owner decision); add later-phase
     crates from SPEC §7 in the step that first uses them.
