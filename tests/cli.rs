@@ -382,6 +382,87 @@ fn unknown_shell_is_reported_and_releases_the_workspace() {
 }
 
 #[test]
+fn add_imports_files_into_the_graph() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&["acme"], &[]);
+    let graph_path = sandbox.workspace("acme").join("graph.json");
+    let write = |name: &str, body: &str| {
+        let path = sandbox.project().join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+    let graph = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&graph_path).unwrap()).unwrap()
+    };
+    let env = [("MEOW_SESSION", "acme")];
+
+    write(
+        "scan.xml",
+        r#"<?xml version="1.0"?><!DOCTYPE nmaprun><nmaprun>
+<host><status state="up"/><address addr="10.0.0.5" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.18.0" method="probed" conf="10"><cpe>cpe:/a:nginx:nginx:1.18.0</cpe></service></port>
+</ports></host></nmaprun>"#,
+    );
+    let output = sandbox.run(&["add", "scan.xml"], &env);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains("scan.xml (Nmap XML): 2 facts parsed, 2 new"),
+        "{out}"
+    );
+    assert!(out.contains("now has 1 hosts"), "{out}");
+    let port = &graph()["hosts"]["10.0.0.5"]["ports"]["80/tcp"];
+    assert_eq!(port["product"], "nginx");
+    assert_eq!(
+        port["cpes"][0],
+        "cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*"
+    );
+    assert_eq!(port["facts"][0]["source"], "nmap_xml");
+    assert_eq!(port["facts"][0]["verification_status"], "Observed");
+
+    // Importing the same file again changes nothing.
+    let out = stdout(&sandbox.run(&["add", "scan.xml"], &env));
+    assert!(out.contains("2 facts parsed, 0 new"), "{out}");
+
+    write(
+        "ferox.jsonl",
+        "{\"type\":\"response\",\"url\":\"http://10.0.0.5/admin/\",\"status\":401}\n{\"type\":\"statistics\"}\n",
+    );
+    let out = stdout(&sandbox.run(&["add", "ferox.jsonl"], &env));
+    assert!(
+        out.contains("(JSON Lines): 1 facts parsed, 1 new or updated, 1 lines skipped"),
+        "{out}"
+    );
+    assert_eq!(
+        graph()["hosts"]["10.0.0.5"]["ports"]["80/tcp"]["paths"]["children"]["admin"]["status"],
+        401
+    );
+
+    write("notes.log", "Discovered open port 22/tcp on 10.0.0.9\n");
+    write(
+        "fix.diff",
+        "--- a/x.conf\n+++ b/x.conf\n@@ -1 +1 @@\n-tokens on\n+tokens off\n",
+    );
+    assert!(stdout(&sandbox.run(&["add", "notes.log"], &env)).contains("(text log)"));
+    assert!(stdout(&sandbox.run(&["add", "fix.diff"], &env)).contains("(git diff)"));
+    let graph = graph();
+    assert_eq!(graph["hosts"].as_object().unwrap().len(), 2);
+    assert_eq!(graph["notes"][0]["claim"], "git diff: x.conf (+1 -1)");
+    assert_eq!(graph["notes"][0]["source"], "git_diff");
+
+    let output = sandbox.run(&["add", "missing.xml"], &env);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("missing.xml"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&graph_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[test]
 fn usage_errors_exit_with_code_2() {
     let sandbox = Sandbox::new();
     for args in [

@@ -9,7 +9,9 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
+use meow::graph::Graph;
 use meow::lock::{LockError, SessionLock};
+use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
 use meow::shims;
 use meow::workspace::{
@@ -62,9 +64,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("[+] Mode set to {mode} (session: {})", workspace.name);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Add { file, .. } => {
+            let parsed = parsers::parse_file(file)?;
+            let path = workspace.graph_path();
+            let mut graph = Graph::load(&path)?;
+            let total = parsed.observations.len();
+            let changed = graph.apply_all(parsed.observations);
+            graph.save(&path)?;
+            println!(
+                "[+] {} ({}): {total} facts parsed, {changed} new or updated{}",
+                file.display(),
+                parsed.format,
+                match parsed.skipped {
+                    0 => String::new(),
+                    n => format!(", {n} lines skipped"),
+                }
+            );
+            println!(
+                "[+] Session '{}' now has {} hosts",
+                workspace.name,
+                graph.hosts.len()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         other => {
             let planned = match other {
-                Command::Add { .. } => "Phase 2",
                 Command::Report { .. } => "Phase 4",
                 _ => "Phase 3",
             };

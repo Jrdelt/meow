@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{path_segments, web_origin, HostAddr};
-use crate::evidence::{sanitize, EvidenceRecord, IllegalTransition, VerificationStatus};
+use crate::evidence::{sanitize, EvidenceRecord, IllegalTransition, Source, VerificationStatus};
 use crate::timeutil::now_rfc3339;
 use crate::workspace::write_private_atomic;
 
@@ -170,7 +170,8 @@ impl Port {
     }
 
     fn absorb(&mut self, other: Port) {
-        if other.is_open() || self.state.is_empty() {
+        // "open" is never downgraded by a weaker observation.
+        if !other.state.is_empty() && (other.is_open() || !self.is_open()) {
             self.state = other.state;
         }
         for (mine, theirs) in [
@@ -468,7 +469,7 @@ impl Graph {
                 .or_insert_with(|| Port {
                     number,
                     protocol,
-                    state: "open".to_owned(),
+                    state: "unverified".to_owned(),
                     ..Port::default()
                 }),
         )
@@ -617,6 +618,7 @@ impl Graph {
                 if san.is_empty() || !entry.tls_sans.insert(san.clone()) {
                     return false;
                 }
+                entry.state = "open".to_owned();
                 let claim = format!("TLS certificate names {san}");
                 push_fact(&mut entry.facts, Fact { claim, record });
                 // Wildcards are certificate patterns, not hostnames.
@@ -637,6 +639,7 @@ impl Graph {
                     return false;
                 };
                 let before = entry.http.clone();
+                entry.state = "open".to_owned();
                 let mut http = entry.http.clone().unwrap_or_default();
                 http.scheme = if scheme.eq_ignore_ascii_case("https") {
                     "https"
@@ -692,6 +695,13 @@ impl Graph {
                         .to_owned(),
                         ..HttpInfo::default()
                     });
+                }
+                // A crawler or scanner got an answer; a URL that merely
+                // appears in text proves nothing about the port.
+                let answered = status.is_some()
+                    || !matches!(record.source, Source::PtyRegex | Source::LogRegex);
+                if answered {
+                    entry.state = "open".to_owned();
                 }
                 let segments = path_segments(&path);
                 if segments.is_empty() {
@@ -806,7 +816,7 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evidence::{Confidence, Source};
+    use crate::evidence::Confidence;
 
     fn rec(source: Source) -> EvidenceRecord {
         EvidenceRecord::observed(source, Confidence::High, "raw snippet")

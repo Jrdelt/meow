@@ -53,46 +53,36 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** Phase 2, Step 2 complete (evidence schema,
-  endpoints, graph model). Owner asked to build straight through Phases 2-4
-  without pausing; checkpoint after every step.
-- **Last Verified Commit:** `feat(phase2-step2)` — see `git log -n 1
-  --oneline`.
-- **Completed Files:** Phase 1 (scaffold, C tap filter, `tap`, `cli`, `mode`,
-  `workspace`, `lock`, `pty`, `shims`, `main`); Phase 2 so far: `db`,
-  `timeutil`, `evidence`, `endpoint`, `graph`; tests in
-  `tests/{cli,pty,shims}.rs`.
-- **In-Progress / Partial Work:** `recon`/`map`/`hud`/`add`/`report` still
-  report "not built yet". Nothing produces `graph::Observation`s yet, and
-  `db.rs` tables are unused.
-- **Next Exact Action:** Phase 2, Step 3 — `src/parsers/`: Nmap XML
-  (`roxmltree`), katana and feroxbuster JSONL, log/PTY regex and `git diff`
-  parsers that emit `graph::Observation`s, format auto-detection, then wire
-  `meow add <file>` (load graph, apply, atomic save). CI workflow is deferred:
-  repo is private, macOS runners cost Actions minutes.
+- **Active Phase & Step:** Phase 2, Step 3 complete (parsers + `meow add`).
+  Owner asked to build straight through Phases 2-4 without pausing;
+  checkpoint after every step.
+- **Last Verified Commit:** `feat(phase2-step3)` — see `git log -n 1 --oneline`.
+- **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
+  `pty`, `shims`, `main`, C filter); Phase 2 so far: `db`, `timeutil`,
+  `evidence`, `endpoint`, `graph`, `cpe`, `parsers/{nmap,jsonl,text,diff}`.
+  Tests: unit tests in each module plus `tests/{cli,pty,shims}.rs`.
+- **In-Progress / Partial Work:** `recon`/`map`/`hud`/`report` report "not
+  built yet". `db.rs` tables are unused. Live PTY tap lines are not parsed
+  yet (wired with the coordinator in Phase 3).
+- **Next Exact Action:** Phase 2, Step 4 — `src/observer.rs`: passive local
+  network observer (interfaces, routes, ARP neighbours, listening sockets from
+  OS tools, no sudo, zero packets) filling `graph.local` plus one-line
+  subnet/interface route warnings; run once at session start. Then Step 5:
+  CVE grounding (NVD v2.0, OSV, CISA KEV) and the verification checklist.
 - **Blockers / Notes:**
-  - `Cargo.toml` lists only crates in use (owner decision); add later-phase
-    crates from SPEC §7 in the step that first uses them.
-  - Terminal control comes from `ratatui::crossterm`; never add a direct
-    `crossterm` dependency. Library modules are exposed via `src/lib.rs`.
-  - `TapFilter` sizes `tap_state_t` via `tap_state_size()`; never mirror it.
-  - Helper targeting order: `--local`, `--session`, `$MEOW_WORKSPACE`,
-    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`; mutate the
-    workspace as a session only after it (`record_open`).
-  - `$MEOW_HOME` overrides `~/.meow` (tests rely on it). `$MEOW_TAP_LOG=<file>`
-    appends the tap's clean lines to a file (debug aid; nothing else consumes
-    tap lines until Phase 2). Create files with `private_open_options()` /
+  - Add a crate only in the step that first uses it (owner decision).
+    Terminal control via `ratatui::crossterm` only.
+  - Parsers emit `graph::Observation`; only `Graph::apply` mutates hosts.
+    Advisories enter via `Graph::add_advisory` as `UnverifiedHypothesis`.
+  - Helper targeting: `--local`, `--session`, `$MEOW_WORKSPACE`,
+    `$MEOW_SESSION`. Only `meow <name>` takes `SessionLock`.
+  - `$MEOW_HOME` overrides `~/.meow` (tests). `$MEOW_TAP_LOG=<file>` dumps
+    clean tap lines. Create files via `private_open_options()` /
     `write_private_atomic()` only.
-  - Shims: zsh and bash are tested end to end; `init.ps1` has never been run.
-    Bash strips `ignoredups`/`erasedups` from `HISTCONTROL` in-session (a new
-    history number identifies a command); history-excluded commands are
-    logged as `# [UNRECORDED]`. `MEOW_BASH_LEGACY=1` forces the no-`PS0` path.
-    Other shells (sh, fish, wsl) run unhooked with a notice.
-  - Non-tty stdin: no raw mode, no reset sequence; at input EOF Ctrl-D is
-    retyped every 250 ms until the shell exits.
-  - Windows code is compile-checked only, never run: `rustup target add
-    x86_64-pc-windows-gnu`, install `gcc-mingw-w64-x86-64`, then
-    `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`.
-  - Listing lacks host count / unfinished tasks until Phases 2 and 3.
-  - Exit codes: `meow <name>` returns the shell's; otherwise 1 = failure,
-    2 = usage error.
+  - Shims: zsh/bash tested end to end; `init.ps1` never run. Bash strips
+    `ignoredups`/`erasedups` in-session; `MEOW_BASH_LEGACY=1` forces no-`PS0`.
+  - Windows code is compile-checked only (`cargo clippy --target
+    x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
+    `gcc-mingw-w64-x86-64`); macOS has never been built.
+  - CI workflow deferred: repo is private, macOS runners cost Actions minutes.
+  - Listing lacks host count / unfinished tasks until Phase 3.

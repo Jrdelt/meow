@@ -159,6 +159,14 @@ impl EvidenceRecord {
         )
     }
 
+    /// An observation whose evidence keeps its line breaks.
+    pub fn observed_block(source: Source, confidence: Confidence, evidence: &str) -> Self {
+        Self {
+            evidence: sanitize_block(evidence, EVIDENCE_MAX),
+            ..Self::observed(source, confidence, "")
+        }
+    }
+
     pub fn transition(&mut self, to: VerificationStatus) -> Result<(), IllegalTransition> {
         if !self.verification_status.can_become(to) {
             return Err(IllegalTransition {
@@ -169,6 +177,23 @@ impl EvidenceRecord {
         self.verification_status = to;
         Ok(())
     }
+}
+
+/// Like [`sanitize`], but keeps line breaks: for multi-line evidence such as
+/// a `git diff` block.
+pub fn sanitize_block(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let line = sanitize(line, max);
+        if out.len() + line.len() + 1 > max {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    }
+    out
 }
 
 /// Makes scraped text safe to store, print in a terminal and embed in a
