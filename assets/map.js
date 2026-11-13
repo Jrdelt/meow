@@ -436,6 +436,22 @@
       var line = list.appendChild(row(name, marked(facts.join(' · '), kind)));
       if (data.id === selected) { line.className += ' current'; }
     });
+
+    // Names that were only printed in the session shell or a log, usually
+    // inside a URL. Nothing was seen on them and no address is known, so
+    // they are listed here and not drawn as machines.
+    var mentioned = state.topology.mentioned || [];
+    if (mentioned.length) {
+      var names = list.appendChild(fold('mentioned', 'names', false));
+      names.appendChild(el('summary', null, 'Names only mentioned (' + mentioned.length + ')'));
+      names.appendChild(el('p', 'note', 'These appeared in the terminal or a log, usually inside a URL. ' +
+        'meow has not contacted them and they are not part of the network drawn above.'));
+      mentioned.forEach(function (entry) {
+        var what = entry.ports.join(', ') || 'no port';
+        if (entry.paths) { what += ' · ' + entry.paths + (entry.paths === 1 ? ' path' : ' paths'); }
+        names.appendChild(row(entry.name, what, 'dim'));
+      });
+    }
   }
 
   function renderSide() {

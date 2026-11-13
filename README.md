@@ -75,6 +75,11 @@ clients, with this machine marked as "You".
 | Client | Nothing is known to listen on it. Devices in the neighbour table (ARP, NDP) are drawn as clients without becoming hosts: reading that table sends nothing. |
 | Network segment | One per active interface: the LAN, Wi-Fi or VPN this machine is attached to. Crowded segments stack their devices in rows above and below the line. |
 
+A name that only appeared in text (a URL printed in the session shell, such
+as `curl https://example.com/install.sh`) is not drawn: nothing was seen on
+it and it has no address to place it by. Such names are listed under
+**Names only mentioned** in the Hosts card, and after the machines in the HUD.
+
 The page around the drawing is a dashboard of cards, each with a heading and
 rows of label and value:
 

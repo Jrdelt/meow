@@ -250,6 +250,24 @@ fn is_single_device(address: &str, mac: &str) -> bool {
 
 /// The role of a host and what it was derived from. Text evidence wins over
 /// position: a gateway whose OS guess says it is a firewall is a firewall.
+/// A host known by a name alone, with nothing seen on it: the name was
+/// printed in the session shell or a log, usually inside a URL, and nobody
+/// looked at the machine. There is no address to place it by, so it is
+/// listed and never drawn.
+pub fn only_mentioned(host: &Host) -> bool {
+    host.address.parse::<IpAddr>().is_err()
+        && host.open_ports().count() == 0
+        && host.advisories.is_empty()
+        && host.os.is_none()
+        && host.mac.is_none()
+        // A server or redirect header means something answered.
+        && host.ports.values().all(|port| {
+            port.http
+                .as_ref()
+                .is_none_or(|http| http.server.is_none() && http.location.is_none())
+        })
+}
+
 pub fn host_role(graph: &Graph, host: &Host) -> (Role, String) {
     let mut text = host.os.clone().unwrap_or_default();
     for port in host.ports.values() {
@@ -410,6 +428,9 @@ impl Topology {
         }
 
         for host in graph.hosts.values() {
+            if only_mentioned(host) {
+                continue;
+            }
             let node = topology.node(host_id(&host.address), NodeKind::Host, host.label());
             let Ok(ip) = host.address.parse::<IpAddr>() else {
                 continue; // known by name only: no route can be derived
@@ -672,7 +693,18 @@ impl Topology {
                 } }));
             }
         }
-        json!({ "nodes": nodes, "edges": edges })
+        // Listed, not drawn: names that were only printed somewhere.
+        let mentioned: Vec<Value> = graph
+            .hosts
+            .values()
+            .filter(|host| only_mentioned(host))
+            .map(|host| {
+                let ports: Vec<String> = host.ports.keys().cloned().collect();
+                let paths: usize = host.ports.values().map(|port| port.paths.count()).sum();
+                json!({ "name": host.address, "ports": ports, "paths": paths })
+            })
+            .collect();
+        json!({ "nodes": nodes, "edges": edges, "mentioned": mentioned })
     }
 
     /// A Mermaid flowchart of the topology.
@@ -1148,6 +1180,59 @@ mod tests {
         let edges = elements["edges"].as_array().unwrap();
         let link = edges.iter().find(|e| e["data"]["kind"] == "internet");
         assert_eq!(link.unwrap()["data"]["target"], "if:tun0");
+    }
+
+    #[test]
+    fn names_only_printed_in_the_terminal_are_listed_not_drawn() {
+        let mut graph = Graph::default();
+        let printed =
+            |line: &str| EvidenceRecord::observed(Source::PtyRegex, Confidence::Low, line);
+        // `curl https://claude.ai/...` in the session shell.
+        graph.apply(Observation::Path {
+            address: "claude.ai".into(),
+            port: 443,
+            scheme: "https".into(),
+            path: "/install.sh".into(),
+            status: None,
+            record: printed("curl https://claude.ai/install.sh"),
+        });
+        // A name that answered with a server header was looked at.
+        graph.apply(Observation::Path {
+            address: "app.example.test".into(),
+            port: 80,
+            scheme: "http".into(),
+            path: "/".into(),
+            status: None,
+            record: printed("http://app.example.test/"),
+        });
+        graph.apply(Observation::Http {
+            address: "app.example.test".into(),
+            port: 80,
+            scheme: "http".into(),
+            server: Some("nginx".into()),
+            location: None,
+            record: EvidenceRecord::observed(
+                Source::HttpHeader,
+                Confidence::Medium,
+                "Server: nginx",
+            ),
+        });
+        assert!(only_mentioned(&graph.hosts["claude.ai"]));
+        assert!(!only_mentioned(&graph.hosts["app.example.test"]));
+
+        let drawn = Topology::build(&graph).cytoscape(&graph);
+        let ids: Vec<&str> = drawn["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["data"]["id"].as_str().unwrap())
+            .collect();
+        assert!(!ids.contains(&"host:claude.ai"), "{ids:?}");
+        assert!(ids.contains(&"host:app.example.test"), "{ids:?}");
+        assert_eq!(
+            drawn["mentioned"],
+            json!([ { "name": "claude.ai", "ports": ["443/tcp"], "paths": 1 } ])
+        );
     }
 
     #[test]

@@ -65,6 +65,9 @@ button.link:hover { text-decoration: underline; }
 .mark.bad { background: rgba(248, 81, 73, .2); color: var(--bad); border: 1px solid var(--bad); }
 .mark.info { background: rgba(57, 197, 207, .18); color: var(--info); border: 1px solid var(--info); }
 
+.names { margin-top: 10px; }
+.names > summary { cursor: pointer; color: var(--dim); }
+
 /* What to update: the instruction in full, where it applies underneath. */
 .todo { margin: 0 0 14px; }
 .todo h3 { margin-top: 0; }

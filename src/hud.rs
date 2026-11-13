@@ -35,7 +35,7 @@ use crate::graph::{Advisory, Graph, Host, PathNode};
 use crate::mode::Mode;
 use crate::observer::{machine_report, MachineReport};
 use crate::queue::{self, TaskRow};
-use crate::topology::{host_headline, host_open_ports};
+use crate::topology::{host_headline, host_open_ports, only_mentioned};
 use crate::workspace::Workspace;
 
 const MAX_PATH_LINES: usize = 40;
@@ -128,11 +128,16 @@ impl Model {
         }
     }
 
+    /// Machines that were seen first; names that were only printed in the
+    /// terminal come after them.
     pub fn hosts(&self) -> Vec<&Host> {
-        self.snapshot
+        let mut hosts: Vec<&Host> = self
+            .snapshot
             .as_ref()
             .map(|s| s.graph.hosts.values().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        hosts.sort_by_key(|host| only_mentioned(host));
+        hosts
     }
 
     pub fn selected_host(&self) -> Option<&Host> {
@@ -639,11 +644,24 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         Span::styled(" meow hud ", TITLE),
         Span::raw(format!("| {} | mode ", snapshot.session)),
         Span::styled(snapshot.mode.as_str(), mode_style),
-        Span::raw(format!(
-            " | {} hosts | {} advisories | ",
-            snapshot.graph.hosts.len(),
-            snapshot.graph.advisory_count()
-        )),
+        Span::raw({
+            let names = snapshot
+                .graph
+                .hosts
+                .values()
+                .filter(|host| only_mentioned(host))
+                .count();
+            let seen = snapshot.graph.hosts.len() - names;
+            let mentioned = if names > 0 {
+                format!(" ({names} names only mentioned)")
+            } else {
+                String::new()
+            };
+            format!(
+                " | {seen} hosts{mentioned} | {} advisories | ",
+                snapshot.graph.advisory_count()
+            )
+        }),
         link,
         Span::styled(
             if snapshot.budget.has_key {
@@ -675,6 +693,10 @@ fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot)
                     a.record.verification_status == VerificationStatus::UnverifiedHypothesis
                 })
                 .count();
+            if only_mentioned(host) {
+                // A name from a URL in the terminal, not a machine seen.
+                return ListItem::new(Line::styled(format!("{}  mentioned", host.label()), DIM));
+            }
             let mut spans = vec![Span::raw(host.label())];
             spans.push(Span::styled(
                 format!("  p:{}", host.open_ports().count()),
