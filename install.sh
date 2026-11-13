@@ -1,13 +1,13 @@
 #!/bin/sh
-# Builds and installs meow, first installing whatever it needs that is
-# missing: a C compiler and the Rust toolchain. For macOS and Linux.
+# Builds and installs meow with everything it uses, first installing what
+# is missing: a C compiler, the Rust toolchain, the scanners `meow recon`
+# drives (nmap, katana, feroxbuster) and a wordlist for the directory stage.
+# For macOS and Linux. `meow update` pulls the latest code and runs this again.
 #
 #   ./install.sh               show the plan, ask once, then do it
 #   ./install.sh --yes         do not ask
 #   ./install.sh --dry-run     only show what would be done
-#   ./install.sh --with-tools  also install the scanners that `meow recon`
-#                              drives (nmap, katana, feroxbuster) where a
-#                              package manager offers them
+#   ./install.sh --no-tools    leave out the scanners and the wordlist
 #
 # Nothing is installed that is already present, so it is safe to run again.
 
@@ -15,6 +15,9 @@ set -eu
 
 MIN_RUST_MINOR=88
 RUSTUP_URL="https://sh.rustup.rs"
+# The SecLists web-content wordlist (about 4,700 entries), from GitHub.
+WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
+KATANA_GO="github.com/projectdiscovery/katana/cmd/katana@latest"
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -26,12 +29,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 assume_yes=no
 dry_run=no
-with_tools=no
+with_tools=yes
 for arg in "$@"; do
     case "$arg" in
     -y | --yes) assume_yes=yes ;;
     -n | --dry-run) dry_run=yes ;;
     --with-tools) with_tools=yes ;;
+    --no-tools) with_tools=no ;;
     -h | --help)
         sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
@@ -137,16 +141,44 @@ else
     fi
 fi
 
-need_fetcher=no
-if [ "$need_rust" = yes ] && ! have curl && ! have wget; then
-    need_fetcher=yes
-fi
-
 missing_tools=""
 for tool in nmap katana feroxbuster; do
     have "$tool" || missing_tools="$missing_tools $tool"
 done
 missing_tools=${missing_tools# }
+
+# A wordlist anywhere meow looks for one (see queue.rs) is enough.
+meow_home=${MEOW_HOME:-$HOME/.meow}
+wordlist_dir="$meow_home/wordlists"
+need_wordlist=yes
+for list in \
+    /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt \
+    /usr/share/seclists/Discovery/Web-Content/common.txt \
+    /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt \
+    /usr/share/wordlists/dirb/common.txt \
+    /usr/share/dirb/wordlists/common.txt \
+    /opt/homebrew/share/seclists/Discovery/Web-Content/common.txt \
+    /usr/local/share/seclists/Discovery/Web-Content/common.txt \
+    "$wordlist_dir"/*.txt; do
+    if [ -f "$list" ]; then
+        need_wordlist=no
+        break
+    fi
+done
+[ "$with_tools" = yes ] || need_wordlist=no
+
+need_fetcher=no
+if [ "$need_rust$need_wordlist" != nono ] && ! have curl && ! have wget; then
+    need_fetcher=yes
+fi
+
+fetch() {
+    if have curl; then
+        curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"
+    else
+        wget -q -O "$2" "$1"
+    fi
+}
 
 # --- The plan -------------------------------------------------------------
 
@@ -171,10 +203,14 @@ if [ "$update_rust" = yes ]; then
 fi
 echo "  - build meow in release mode and install it to $cargo_home/bin/meow"
 if [ "$with_tools" = yes ] && [ -n "$missing_tools" ]; then
-    echo "  - try to install with ${pm:-a package manager}: $missing_tools"
+    echo "  - install the scanners meow recon drives: $missing_tools"
+    echo "    (with ${pm:-a package manager}${sudo:+, using sudo}; feroxbuster can also be built with cargo, katana with go)"
 fi
-if [ "$need_compiler$need_fetcher$need_rust$update_rust" = "nononono" ]; then
-    echo "The C compiler and Rust are already installed; nothing else is needed."
+if [ "$need_wordlist" = yes ]; then
+    echo "  - download the SecLists web-content wordlist from GitHub to $wordlist_dir/common.txt"
+fi
+if [ "$need_compiler$need_rust$update_rust" = "nonono" ]; then
+    echo "The C compiler and Rust are already installed."
 fi
 
 if [ "$dry_run" = yes ]; then
@@ -182,8 +218,11 @@ if [ "$dry_run" = yes ]; then
     exit 0
 fi
 
-# Problems that would stop the install half-way are reported before it starts.
-if [ "$os" = linux ] && [ "$need_compiler$need_fetcher" != "nono" ]; then
+# Problems that would stop the install half-way are reported before it
+# starts. Only the wordlist needing curl is not one: it is skipped instead.
+must_fetch=no
+[ "$need_fetcher$need_rust" = yesyes ] && must_fetch=yes
+if [ "$os" = linux ] && [ "$need_compiler$must_fetch" != "nono" ]; then
     [ -n "$pm" ] || die "No supported package manager found. Install a C compiler (gcc) and curl yourself, then rerun this script."
     if [ -n "$sudo" ] && ! have sudo; then
         die "Installing packages needs root. Rerun this script as root, or install $(compiler_packages) and curl yourself."
@@ -224,7 +263,11 @@ fi
 
 if [ "$need_fetcher" = yes ]; then
     say "Installing curl"
-    pm_install curl || die "Could not install curl."
+    if ! pm_install curl; then
+        [ "$must_fetch" = no ] || die "Could not install curl."
+        warn "Could not install curl, so the wordlist is not downloaded. Put any .txt wordlist in $wordlist_dir and meow will use it."
+        need_wordlist=no
+    fi
 fi
 
 if [ "$need_rust" = yes ]; then
@@ -265,29 +308,59 @@ installed="$cargo_home/bin/meow"
 [ -x "$installed" ] || die "The build finished but $installed is missing."
 say "Installed $("$installed" --version) at $installed"
 
-# --- Optional scanners ----------------------------------------------------
+# --- Scanners and wordlist -----------------------------------------------
+# A tool that cannot be installed is reported and skipped: meow works
+# without it, and `meow recon` says which stage it leaves out.
+
+install_tool() {
+    tool=$1
+    if [ -n "$pm" ] && pm_install "$tool"; then
+        return 0
+    fi
+    case "$tool" in
+    feroxbuster)
+        say "Building feroxbuster with cargo (a few minutes)"
+        cargo install feroxbuster --locked
+        ;;
+    katana)
+        if have go; then
+            say "Building katana with go"
+            go install "$KATANA_GO" && say "katana is in $(go env GOPATH)/bin; that folder must be on PATH"
+        else
+            return 1
+        fi
+        ;;
+    *) return 1 ;;
+    esac
+}
 
 if [ "$with_tools" = yes ] && [ -n "$missing_tools" ]; then
-    if [ -z "$pm" ]; then
-        if [ "$os" = macos ]; then
-            warn "Homebrew is not installed, so the scanners were not installed. Install it from https://brew.sh, then run: brew install $missing_tools"
+    for tool in $missing_tools; do
+        say "Installing $tool"
+        install_tool "$tool" && continue
+        if [ "$os" = macos ] && [ -z "$pm" ]; then
+            warn "Could not install $tool: Homebrew is not installed. Install it from https://brew.sh, then run ./install.sh again."
+        elif [ -z "$pm" ]; then
+            warn "Could not install $tool: no supported package manager found. Install it yourself."
+        elif [ "$tool" = katana ]; then
+            warn "Could not install katana: $pm has no package and Go is not installed. With Go: go install $KATANA_GO"
         else
-            warn "No supported package manager found; install these yourself: $missing_tools"
+            warn "Could not install $tool with $pm."
         fi
+    done
+fi
+
+if [ "$need_wordlist" = yes ]; then
+    say "Downloading the wordlist"
+    mkdir -p "$wordlist_dir"
+    part="$wordlist_dir/.common.txt.part"
+    if fetch "$WORDLIST_URL" "$part" && [ -s "$part" ] && ! grep -qi '<html' "$part"; then
+        mv "$part" "$wordlist_dir/common.txt"
+        say "Wordlist saved to $wordlist_dir/common.txt"
     else
-        for tool in $missing_tools; do
-            say "Installing $tool"
-            if ! pm_install "$tool"; then
-                case "$tool" in
-                katana) warn "$pm has no katana package. With Go installed: go install github.com/projectdiscovery/katana/cmd/katana@latest" ;;
-                feroxbuster) warn "$pm has no feroxbuster package. Alternative: cargo install feroxbuster" ;;
-                *) warn "Could not install $tool with $pm." ;;
-                esac
-            fi
-        done
+        rm -f "$part"
+        warn "Could not download the wordlist from $WORDLIST_URL. Put any .txt wordlist in $wordlist_dir and meow will use it."
     fi
-elif [ -n "$missing_tools" ]; then
-    say "Optional scanners not found: $missing_tools. meow works without them; rerun with --with-tools to install them."
 fi
 
 case ":$original_path:" in

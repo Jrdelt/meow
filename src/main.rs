@@ -25,6 +25,7 @@ use meow::queue;
 use meow::report;
 use meow::setup;
 use meow::shims;
+use meow::update;
 use meow::webui;
 use meow::workspace::{
     self, format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config,
@@ -159,6 +160,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     forget_key: *forget_key,
                 },
             ),
+            Command::Update { check, source } => update::run(&update::UpdateArgs {
+                check: *check,
+                source: source.clone(),
+            }),
             _ => print_listing(&home, &cwd, &env),
         };
     };
@@ -166,8 +171,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     match command {
-        Command::List | Command::Delete { .. } | Command::Setup { .. } => {
-            unreachable!("`list`, `delete` and `setup` are not session helpers and returned above")
+        Command::List | Command::Delete { .. } | Command::Setup { .. } | Command::Update { .. } => {
+            unreachable!(
+                "`list`, `delete`, `setup` and `update` are not session helpers and returned above"
+            )
         }
         Command::Mode { mode, .. } => {
             // A live session applies the change itself; otherwise write the

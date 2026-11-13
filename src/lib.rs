@@ -25,6 +25,7 @@ pub mod shims;
 pub mod tap;
 pub mod timeutil;
 pub mod topology;
+pub mod update;
 pub mod vault;
 pub mod webui;
 pub mod workspace;

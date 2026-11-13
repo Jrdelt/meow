@@ -20,17 +20,42 @@ On macOS or Linux, from a clone of this repository:
 ```
 
 The script checks what is missing, shows what it will do, asks once, and then
-does it. It installs a C compiler if there is none (the Xcode Command Line
-Tools on macOS, the distribution's compiler package on Linux) and the Rust
-toolchain through `rustup` if there is none or it is older than 1.88. Then it
-builds meow and installs it as `~/.cargo/bin/meow`. Anything already present is
-left alone, so it is safe to run again after a `git pull`.
+does it, all in one go:
+
+- a C compiler if there is none (the Xcode Command Line Tools on macOS, the
+  distribution's compiler package on Linux);
+- the Rust toolchain through `rustup` if there is none or it is older than 1.88;
+- meow itself, built and installed as `~/.cargo/bin/meow`;
+- the scanners `meow recon` drives: `nmap`, `katana` and `feroxbuster`, with
+  Homebrew on macOS or the system package manager on Linux (`feroxbuster` is
+  built with cargo, and `katana` with Go, where no package has them);
+- a wordlist for the directory stage: the SecLists web-content list, downloaded
+  from GitHub to `~/.meow/wordlists/common.txt`.
+
+Anything already present is left alone, so it is safe to run again. A tool
+that cannot be installed is reported and skipped; meow works without it.
 
 | Option | Effect |
 |---|---|
 | `--dry-run` | Only show the plan. |
 | `--yes` | Do not ask before starting. |
-| `--with-tools` | Also install `nmap`, `katana` and `feroxbuster` where Homebrew or the system package manager offers them. |
+| `--no-tools` | Leave out the scanners and the wordlist. |
+
+### Updating
+
+```sh
+meow update            # pull the latest from GitHub, rebuild, add new tools
+meow update --check    # only show what is new
+```
+
+`meow update` works in the folder meow was installed from (or `--source
+<folder>`). It pulls only when that folder has no local changes and the pull is
+a fast-forward, then runs `./install.sh --yes` there. Sessions that are open keep
+the old version until they are closed and reopened. `git pull && ./install.sh`
+in the folder does the same by hand.
+
+Works on macOS (Apple silicon and Intel, with Homebrew for the scanners) and on
+Linux with `apt`, `dnf`, `yum`, `pacman`, `zypper` or `apk`.
 
 On Windows, install Rust from <https://rustup.rs> with the Visual Studio C++
 build tools, then run `cargo install --path . --locked`.
@@ -56,6 +81,7 @@ cargo test                   # the full test suite
 | `meow add <file>` | Imports an Nmap XML, JSON Lines, log or `git diff` file. `--no-cve` skips the vulnerability lookups. |
 | `meow report` | Writes `REPORT.md` into the workspace. No AI, no network. |
 | `meow setup` | Sets up your own AI: a model server on your machine or your own cloud API key. See [Your own AI](#your-own-ai-meow-setup). |
+| `meow update` | Pulls the latest meow from GitHub and rebuilds it, with every tool it uses. `--check` only shows what is new. See [Updating](#updating). |
 
 Inside a session the helper commands find it by themselves. From another
 terminal, add `--session <name>` or `--local`.

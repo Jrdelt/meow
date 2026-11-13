@@ -28,4 +28,22 @@ fn main() {
     }
 
     build.compile("tap_filter");
+
+    // The commit this binary is built from, so `meow update` can tell when
+    // the checkout has moved on since. Empty outside a git checkout.
+    // A path that does not exist would rerun this script on every build.
+    for watched in [".git/HEAD", ".git/refs/heads"] {
+        if std::path::Path::new(watched).exists() {
+            println!("cargo:rerun-if-changed={watched}");
+        }
+    }
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=MEOW_BUILD_COMMIT={commit}");
 }

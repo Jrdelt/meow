@@ -77,6 +77,15 @@ pub enum Command {
         #[arg(long)]
         forget_key: bool,
     },
+    /// Pull the latest meow from GitHub and rebuild it, with every tool it uses
+    Update {
+        /// Only show what is new; change nothing
+        #[arg(long)]
+        check: bool,
+        /// The meow checkout to update (default: the folder meow was built from)
+        #[arg(long, value_name = "DIR")]
+        source: Option<std::path::PathBuf>,
+    },
     /// Delete a saved workspace and everything in it
     #[command(visible_alias = "rm")]
     Delete {
@@ -161,6 +170,7 @@ impl Command {
             Command::List => "list",
             Command::Delete { .. } => "delete",
             Command::Setup { .. } => "setup",
+            Command::Update { .. } => "update",
             Command::Mode { .. } => "mode",
             Command::Recon { .. } => "recon",
             Command::Map { .. } => "map",
@@ -170,11 +180,14 @@ impl Command {
         }
     }
 
-    /// The workspace a helper targets. `None` for `list`, `delete` and
-    /// `setup`, which are not helpers of a session.
+    /// The workspace a helper targets. `None` for `list`, `delete`,
+    /// `setup` and `update`, which are not helpers of a session.
     pub fn session_arg(&self) -> Option<&SessionArg> {
         match self {
-            Command::List | Command::Delete { .. } | Command::Setup { .. } => None,
+            Command::List
+            | Command::Delete { .. }
+            | Command::Setup { .. }
+            | Command::Update { .. } => None,
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
             | Command::Map { session, .. }

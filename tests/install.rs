@@ -20,7 +20,7 @@ impl Machine {
         std::fs::create_dir(tmp.path().join("home")).unwrap();
         let machine = Self { tmp };
         for tool in [
-            "dirname", "grep", "uname", "id", "sed", "mkdir", "chmod", "cat", "mktemp", "rm",
+            "dirname", "grep", "uname", "id", "sed", "mkdir", "chmod", "cat", "mktemp", "rm", "mv",
         ] {
             let real = std::env::var_os("PATH")
                 .and_then(|paths| {
@@ -81,6 +81,21 @@ impl Machine {
             .stdin(Stdio::null())
             .output()
             .unwrap()
+    }
+
+    /// A `curl` that serves `body` for every download.
+    fn with_curl(&self, body: &str) -> &Self {
+        self.tool(
+            "curl",
+            &format!(
+                "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
+                 printf '%s' '{body}' > \"$out\""
+            ),
+        )
+    }
+
+    fn wordlist(&self) -> PathBuf {
+        self.home().join(".meow/wordlists/common.txt")
     }
 
     fn cargo_calls(&self) -> String {
@@ -183,50 +198,109 @@ fn nothing_happens_without_consent() {
 #[test]
 fn yes_builds_installs_and_explains_the_path() {
     let machine = Machine::bare();
-    machine.with_compiler().with_rust(90);
+    machine
+        .with_compiler()
+        .with_rust(90)
+        .with_curl("admin\nlogin\n");
     let output = machine.run(&["--yes"]);
     let text = out(&output);
     assert!(output.status.success(), "{}\n{}", text, err(&output));
-    assert_eq!(machine.cargo_calls().trim(), "install --path . --locked");
+    let calls = machine.cargo_calls();
+    assert_eq!(calls.lines().next(), Some("install --path . --locked"));
     let installed = machine.home().join(".cargo/bin/meow");
     assert!(
         text.contains(&format!("Installed meow 9.9.9 at {}", installed.display())),
-        "{text}"
-    );
-    assert!(
-        text.contains("Optional scanners not found: nmap katana feroxbuster"),
         "{text}"
     );
     // ~/.cargo/bin is not on this shell's PATH, so the user is told how to
     // get it there.
     assert!(text.contains("Open a new terminal"), "{text}");
 
-    // With the scanners present there is nothing to mention.
+    // Everything meow recon drives comes along by default.
+    assert!(
+        calls.contains("install feroxbuster --locked"),
+        "feroxbuster is built with cargo when no package has it: {calls}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(machine.wordlist()).unwrap(),
+        "admin\nlogin\n"
+    );
+    assert!(
+        text.contains(&format!(
+            "Wordlist saved to {}",
+            machine.wordlist().display()
+        )),
+        "{text}"
+    );
+
+    // With everything present there is nothing more to do.
     machine
         .tool("nmap", "exit 0")
         .tool("katana", "exit 0")
         .tool("feroxbuster", "exit 0");
-    let text = out(&machine.run(&["--yes", "--with-tools"]));
-    assert!(!text.contains("scanners"), "{text}");
+    let text = out(&machine.run(&["--yes"]));
+    assert!(!text.contains("Installing"), "{text}");
+    assert!(!text.contains("wordlist"), "{text}");
 }
 
 #[test]
 fn scanners_need_a_package_manager() {
     let machine = Machine::bare();
-    machine.with_compiler().with_rust(90);
-    let output = machine.run(&["--yes", "--with-tools"]);
+    machine.with_compiler().with_rust(90).with_curl("admin\n");
+    let plan = out(&machine.run(&["--dry-run"]));
+    assert!(
+        plan.contains("install the scanners meow recon drives: nmap katana feroxbuster"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("download the SecLists web-content wordlist from GitHub"),
+        "{plan}"
+    );
+
+    let output = machine.run(&["--yes"]);
     assert!(
         output.status.success(),
         "the missing scanners must not fail the install"
     );
     let warning = err(&output);
     let expected = if cfg!(target_os = "macos") {
-        "Homebrew is not installed"
+        "Could not install nmap: Homebrew is not installed"
     } else {
-        "No supported package manager found"
+        "Could not install nmap: no supported package manager found"
     };
     assert!(warning.contains(expected), "{warning}");
-    assert!(warning.contains("nmap katana feroxbuster"), "{warning}");
+    assert!(warning.contains("Could not install katana"), "{warning}");
+    assert!(
+        !warning.contains("feroxbuster"),
+        "built with cargo: {warning}"
+    );
+}
+
+#[test]
+fn no_tools_installs_meow_alone_and_a_failed_download_is_only_a_warning() {
+    let machine = Machine::bare();
+    machine
+        .with_compiler()
+        .with_rust(90)
+        .tool("curl", "exit 22");
+    let plan = out(&machine.run(&["--dry-run", "--no-tools"]));
+    assert!(!plan.contains("scanners"), "{plan}");
+    assert!(!plan.contains("wordlist"), "{plan}");
+    let output = machine.run(&["--yes", "--no-tools"]);
+    assert!(output.status.success(), "{}", err(&output));
+    assert_eq!(machine.cargo_calls().trim(), "install --path . --locked");
+    assert!(!machine.wordlist().exists());
+
+    // GitHub not answering leaves no half-written wordlist behind.
+    let output = machine.run(&["--yes"]);
+    assert!(output.status.success(), "{}", err(&output));
+    assert!(
+        err(&output).contains("Could not download the wordlist"),
+        "{}",
+        err(&output)
+    );
+    let dir = machine.wordlist().parent().unwrap().to_path_buf();
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
 }
 
 #[test]
