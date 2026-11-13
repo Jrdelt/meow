@@ -155,6 +155,10 @@ pub struct ReconSettings {
     pub feroxbuster: String,
     pub mild: PresetOverride,
     pub aggressive: PresetOverride,
+    /// `~/.meow/wordlists`: any `.txt` file put there is used when no
+    /// wordlist is configured and none is installed system-wide.
+    #[serde(skip)]
+    pub wordlist_dir: Option<PathBuf>,
 }
 
 impl Default for ReconSettings {
@@ -168,6 +172,7 @@ impl Default for ReconSettings {
             feroxbuster: "feroxbuster".to_owned(),
             mild: PresetOverride::default(),
             aggressive: PresetOverride::default(),
+            wordlist_dir: None,
         }
     }
 }
@@ -200,15 +205,44 @@ const STANDARD_WORDLISTS: &[&str] = &[
     "/usr/local/share/seclists/Discovery/Web-Content/common.txt",
 ];
 
-/// The configured wordlist if it exists, else the first standard one found.
-pub fn find_wordlist(configured: Option<&str>) -> Option<PathBuf> {
-    configured
+/// The configured wordlist if it exists, else the first standard one found,
+/// else the first `.txt` file (by name) in `own_dir`.
+pub fn find_wordlist(configured: Option<&str>, own_dir: Option<&Path>) -> Option<PathBuf> {
+    let found = configured
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .into_iter()
         .chain(STANDARD_WORDLISTS.iter().copied())
         .map(PathBuf::from)
-        .find(|path| path.is_file())
+        .find(|path| path.is_file());
+    found.or_else(|| {
+        let mut own: Vec<PathBuf> = std::fs::read_dir(own_dir?)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|e| e == "txt") && path.is_file())
+            .collect();
+        own.sort();
+        own.into_iter().next()
+    })
+}
+
+/// How to get a missing tool, said where the stage is skipped.
+fn install_hint(program: &str) -> String {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    let how = if cfg!(target_os = "macos") {
+        format!("brew install {name}")
+    } else if name == "katana" {
+        "go install github.com/projectdiscovery/katana/cmd/katana@latest".to_owned()
+    } else if name == "feroxbuster" {
+        "cargo install feroxbuster".to_owned()
+    } else {
+        format!("install {name} with your package manager")
+    };
+    format!("{program} is not installed (to add it: {how})")
 }
 
 // ---------------------------------------------------------------------------
@@ -892,12 +926,20 @@ async fn run_stage(
                 ));
             }
             let wordlist = match stage {
-                Stage::Dirs => match find_wordlist(settings.wordlist_path.as_deref()) {
+                Stage::Dirs => match find_wordlist(
+                    settings.wordlist_path.as_deref(),
+                    settings.wordlist_dir.as_deref(),
+                ) {
                     Some(path) => Some(path),
                     None => {
-                        return Ok(StageEnd::Skipped(
-                            "no wordlist found: set recon.wordlist_path in config.toml".to_owned(),
-                        ))
+                        let own = settings
+                            .wordlist_dir
+                            .as_ref()
+                            .map(|dir| format!("put a .txt wordlist in {}, or ", dir.display()))
+                            .unwrap_or_default();
+                        return Ok(StageEnd::Skipped(format!(
+                            "no wordlist found: {own}set recon.wordlist_path in config.toml"
+                        )));
                     }
                 },
                 _ => None,
@@ -912,10 +954,7 @@ async fn run_stage(
                 let outcome = run_tool(&command, limits).await;
                 match outcome {
                     RunOutcome::NotInstalled => {
-                        return Ok(StageEnd::Skipped(format!(
-                            "{} is not installed",
-                            command.program
-                        )))
+                        return Ok(StageEnd::Skipped(install_hint(&command.program)))
                     }
                     RunOutcome::Failed(reason) => bail!(reason),
                     // JSON Lines stay valid when a run is cut short, so keep
@@ -1207,10 +1246,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let list = dir.path().join("words.txt");
         std::fs::write(&list, "admin\n").unwrap();
-        assert_eq!(find_wordlist(Some(list.to_str().unwrap())), Some(list));
+        assert_eq!(
+            find_wordlist(Some(list.to_str().unwrap()), None),
+            Some(list)
+        );
         let missing = dir.path().join("missing.txt");
-        let found = find_wordlist(Some(missing.to_str().unwrap()));
+        let found = find_wordlist(Some(missing.to_str().unwrap()), None);
         assert!(found.is_none_or(|path| STANDARD_WORDLISTS.contains(&path.to_str().unwrap())));
+
+        // Without a configured or system wordlist, the user's own folder is
+        // read: the first .txt file by name, nothing else.
+        let own = dir.path().join("own");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::write(own.join("notes.md"), "x").unwrap();
+        std::fs::write(own.join("b.txt"), "x").unwrap();
+        std::fs::write(own.join("a.txt"), "x").unwrap();
+        let installed = STANDARD_WORDLISTS.iter().any(|p| Path::new(p).is_file());
+        if !installed {
+            assert_eq!(find_wordlist(None, Some(&own)), Some(own.join("a.txt")));
+            assert_eq!(find_wordlist(None, Some(&dir.path().join("none"))), None);
+        }
     }
 
     #[test]

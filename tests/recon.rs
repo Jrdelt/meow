@@ -313,16 +313,13 @@ fn missing_tools_and_wordlists_skip_their_stage_cleanly() {
         ["done", "done", "skipped", "skipped"]
     );
     let row = task(&coordinator, id);
-    assert!(
-        row.stages[2].detail.ends_with("is not installed"),
-        "{}",
-        row.stages[2].detail
-    );
-    assert!(
-        row.stages[3].detail.ends_with("is not installed"),
-        "{}",
-        row.stages[3].detail
-    );
+    for stage in &row.stages[2..] {
+        assert!(
+            stage.detail.contains("is not installed (to add it: "),
+            "{}",
+            stage.detail
+        );
+    }
     // The facts from the stages that did run are kept.
     assert!(coordinator.state().graph().hosts["10.0.0.5"]
         .ports

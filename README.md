@@ -147,7 +147,9 @@ not that there is nothing there.
 
 Recon stages: port inventory, service inventory on the open ports only, web
 crawl (`katana`), directory inventory (`feroxbuster`). A missing tool or
-wordlist skips its stage. Without root, `-sS` becomes `-sT` and `-O` is dropped.
+wordlist skips its stage, and the map and HUD say how to add it. A wordlist
+is looked for in `recon.wordlist_path`, then in the usual system places, then
+in `~/.meow/wordlists/` (the first `.txt` file there). Without root, `-sS` becomes `-sT` and `-O` is dropped.
 Each tool has a time limit and a 50 MB output cap, and is killed with
 everything it started when the session ends. Unfinished tasks are offered for
 resume the next time the workspace is opened.

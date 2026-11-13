@@ -466,6 +466,10 @@
         var kind = { done: 'ok', running: 'warn', failed: 'bad', interrupted: 'bad' }[stage.status] || 'info';
         var line = item.appendChild(row(stage.stage, marked(stage.status, kind)));
         line.title = stage.detail || '';
+        // Why a stage was skipped or failed, and how to fix it, in plain view.
+        if (stage.detail && (stage.status === 'skipped' || stage.status === 'failed')) {
+          item.appendChild(el('div', 'note why', stage.detail));
+        }
       });
       return item;
     });

@@ -66,6 +66,7 @@ button.link:hover { text-decoration: underline; }
 .mark.info { background: rgba(57, 197, 207, .18); color: var(--info); border: 1px solid var(--info); }
 
 .names { margin-top: 10px; }
+.note.why { margin: 2px 2px 6px; overflow-wrap: anywhere; }
 .names > summary { cursor: pointer; color: var(--dim); }
 
 /* What to update: the instruction in full, where it applies underneath. */

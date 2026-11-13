@@ -68,7 +68,8 @@ enabled = true
 stage_timeout_secs = 1800
 output_cap_mb = 50
 # Wordlist for feroxbuster. Standard seclists/dirb paths are tried otherwise;
-# without any wordlist the directory stage is skipped.
+# without any wordlist the directory stage is skipped. A .txt file put in
+# ~/.meow/wordlists is used when nothing else is found.
 # wordlist_path = "/usr/share/seclists/Discovery/Web-Content/common.txt"
 # Override the built-in nmap flags per mode, for example:
 # [recon.mild]
@@ -386,6 +387,7 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
         // Each user's own AI setup lives beside the config, not in it.
         config.ai.user_file = Some(home.ai_path());
+        config.recon.wordlist_dir = Some(home.root().join("wordlists"));
         Ok(config)
     }
 }
@@ -1181,6 +1183,7 @@ mod tests {
         // A loaded config also knows where this user's own AI setup lives.
         let mut expected = Config::default();
         expected.ai.user_file = Some(fx.home.root().join("ai.toml"));
+        expected.recon.wordlist_dir = Some(fx.home.root().join("wordlists"));
         assert_eq!(Config::load_or_create(&fx.home).unwrap(), expected);
         assert_eq!(
             fs::read_to_string(fx.home.config_path()).unwrap(),
@@ -1198,7 +1201,7 @@ mod tests {
                 default_mode: Mode::Mild,
                 shell: Some("/bin/zsh".into()),
                 cve: CveSettings::default(),
-                recon: ReconSettings::default(),
+                recon: expected.recon.clone(),
                 ai: expected.ai.clone(),
             }
         );
