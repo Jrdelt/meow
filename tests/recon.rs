@@ -76,7 +76,10 @@ impl Lab {
         config.recon.katana = tool(
             "katana",
             &format!(
-                "{}{}printf '{{\"request\":{{\"endpoint\":\"%s/portal/login\"}},\"response\":{{\"status_code\":200}}}}\\n' \"$url\" > \"$out\"",
+                // The page also links to another site, as a default web
+                // server page does.
+                "{}{}printf '{{\"request\":{{\"endpoint\":\"%s/portal/login\"}},\"response\":{{\"status_code\":200}}}}\\n' \"$url\" > \"$out\"\n\
+                 printf '{{\"request\":{{\"endpoint\":\"https://www.example.org/download\"}},\"response\":{{\"status_code\":200,\"headers\":{{\"server\":\"Apache\"}}}}}}\\n' >> \"$out\"",
                 find("-u", "url"),
                 find("-o", "out"),
             ),
@@ -211,7 +214,7 @@ fn four_stages_run_in_order_one_at_a_time_and_fill_the_graph() {
         calls[2]
     );
     assert!(
-        calls[4].contains("-u https://10.0.0.5 -jsonl -silent -nc -jc -ct 5m -d 2 -o "),
+        calls[4].contains("-u https://10.0.0.5 -jsonl -silent -nc -jc -fs fqdn -ct 5m -d 2 -o "),
         "{}",
         calls[4]
     );
@@ -244,7 +247,15 @@ fn four_stages_run_in_order_one_at_a_time_and_fill_the_graph() {
             assert_eq!(paths, ["/admin", "/portal/", "/portal/login"], "{port}");
             assert_eq!(host.ports[port].paths.children["admin"].status, Some(403));
         }
+        // A link to another site is not a host, and says nothing about it.
+        assert_eq!(
+            graph.hosts.keys().collect::<Vec<_>>(),
+            ["10.0.0.5"],
+            "only the scanned hosts"
+        );
     }
+    let crawl = &task(&coordinator, id).stages[2].detail;
+    assert!(crawl.contains("links to 1 other site left out"), "{crawl}");
     // Structured tool output is deleted once parsed.
     assert_eq!(leftovers(&tmp_dir), Vec::<String>::new());
 

@@ -55,7 +55,7 @@ Before every push:
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh` (tools
   and wordlist by default), `meow list`/`delete`/`setup`/`update`, the map.
-- **Last Verified Commit:** `feat(update)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `fix(crawl)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);

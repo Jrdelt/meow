@@ -770,8 +770,23 @@ fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
     let [queue_area, notice_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
     let mut lines: Vec<Line> = Vec::new();
-    for task in snapshot.tasks.iter().take(4) {
+    // The newest run of each target; earlier runs are only counted.
+    let mut shown: Vec<&TaskRow> = Vec::new();
+    for task in &snapshot.tasks {
+        if !shown.iter().any(|t| t.target == task.target) {
+            shown.push(task);
+        }
+    }
+    for task in shown.into_iter().take(4) {
+        let runs = snapshot
+            .tasks
+            .iter()
+            .filter(|t| t.target == task.target)
+            .count();
         let mut spans = vec![Span::raw(format!("recon {} ", task.target))];
+        if runs > 1 {
+            spans.push(Span::styled(format!("(+{} earlier) ", runs - 1), DIM));
+        }
         for stage in &task.stages {
             let style = match stage.status.as_str() {
                 "done" => GOOD,
@@ -1270,6 +1285,25 @@ mod tests {
             ["one two", "three", "four"]
         );
         assert_eq!(wrap_words("abcdefghijkl mn", 8), ["abcdefgh", "ijkl mn"]);
+    }
+
+    #[test]
+    fn only_the_newest_run_of_a_target_is_shown() {
+        let mut message: serde_json::Value =
+            serde_json::from_str(&state_message(&graph())).unwrap();
+        let run = |id: i64, status: &str| {
+            json!({ "id": id, "target": "10.10.10.5", "mode": "mild", "extra_flags": [], "created_utc": "",
+                "stages": [ { "stage": "ports", "status": status, "detail": "" } ] })
+        };
+        message["state"]["tasks"] = json!([run(3, "running"), run(2, "done"), run(1, "done")]);
+        let mut model = Model::new(true);
+        model.apply_message(&message.to_string());
+        let text = screen(&model, 160, 64);
+        assert!(
+            text.contains("recon 10.10.10.5 (+2 earlier) ports:running"),
+            "{text}"
+        );
+        assert_eq!(text.matches("recon 10.10.10.5").count(), 1, "{text}");
     }
 
     #[test]

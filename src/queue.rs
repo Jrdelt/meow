@@ -390,6 +390,11 @@ pub fn crawl_command(
             "-silent",
             "-nc",
             "-jc",
+            // Stay on the host being crawled. The default scope is the root
+            // domain, which an IP address does not have, so links to other
+            // sites (and to `localhost`) would be followed.
+            "-fs",
+            "fqdn",
             "-ct",
             "5m",
             "-d",
@@ -801,12 +806,36 @@ fn hosts_in_target(graph: &Graph, target: &Target) -> Vec<Host> {
 
 /// Parses a tool's output file into the graph, then deletes it.
 fn ingest(state: &State, output: &Path) -> Result<usize> {
+    ingest_only(state, output, None).map(|(changed, _)| changed)
+}
+
+type Names = std::collections::BTreeSet<String>;
+
+/// Like [`ingest`], but with `only` set, observations about any other host
+/// are dropped: a crawler reports the links a page makes to other sites,
+/// which says nothing about those sites. Returns the facts changed and the
+/// other hosts that were left out.
+fn ingest_only(state: &State, output: &Path, only: Option<&Names>) -> Result<(usize, Names)> {
     let result = parsers::parse_file(output).map(|parsed| {
-        let changed = state.graph().apply_all(parsed.observations);
+        let mut dropped = Names::new();
+        let kept: Vec<_> = parsed
+            .observations
+            .into_iter()
+            .filter(|observation| {
+                let Some(names) = only else { return true };
+                let address = observation.address().unwrap_or("").to_ascii_lowercase();
+                let keep = names.contains(&address);
+                if !keep && !address.is_empty() {
+                    dropped.insert(address);
+                }
+                keep
+            })
+            .collect();
+        let changed = state.graph().apply_all(kept);
         if changed > 0 {
             state.mark_dirty();
         }
-        changed
+        (changed, dropped)
     });
     let _ = std::fs::remove_file(output);
     result
@@ -910,7 +939,17 @@ async fn run_stage(
             )))
         }
         Stage::Crawl | Stage::Dirs => {
-            let urls: Vec<String> = hosts_in_target(&state.graph(), target)
+            let in_target = hosts_in_target(&state.graph(), target);
+            // What a crawl may add to: the hosts being crawled, by address
+            // or by any name they are known under.
+            let names: Names = in_target
+                .iter()
+                .flat_map(|host| {
+                    std::iter::once(host.address.clone()).chain(host.hostnames.iter().cloned())
+                })
+                .map(|name| name.to_ascii_lowercase())
+                .collect();
+            let urls: Vec<String> = in_target
                 .iter()
                 .flat_map(|host| {
                     host.web_origins()
@@ -945,6 +984,7 @@ async fn run_stage(
                 _ => None,
             };
             let mut changed = 0;
+            let mut elsewhere = Names::new();
             for (index, url) in urls.iter().enumerate() {
                 let output = out(&format!("_{index}.jsonl"));
                 let command = match &wordlist {
@@ -962,7 +1002,10 @@ async fn run_stage(
                     _ => {}
                 }
                 if command.output.is_file() {
-                    changed += ingest(state, &command.output).unwrap_or(0);
+                    let (added, dropped) =
+                        ingest_only(state, &command.output, Some(&names)).unwrap_or_default();
+                    changed += added;
+                    elsewhere.extend(dropped);
                 }
                 if matches!(
                     outcome,
@@ -971,8 +1014,13 @@ async fn run_stage(
                     state.notice(describe_failure(&command.program, &outcome, limits));
                 }
             }
+            let left_out = match elsewhere.len() {
+                0 => String::new(),
+                1 => "; links to 1 other site left out".to_owned(),
+                n => format!("; links to {n} other sites left out"),
+            };
             Ok(StageEnd::Done(format!(
-                "{} sites covered ({changed} new facts)",
+                "{} sites covered ({changed} new facts{left_out})",
                 urls.len()
             )))
         }
@@ -1183,7 +1231,7 @@ mod tests {
 
         assert_eq!(
             args(&crawl_command(&settings, &mild, url, out)),
-            "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -ct 5m -d 2 -o /t/out.jsonl"
+            "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -fs fqdn -ct 5m -d 2 -o /t/out.jsonl"
         );
         assert!(args(&crawl_command(&settings, &aggressive, url, out)).contains(" -d 4 "));
 

@@ -415,9 +415,11 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::crossterm::terminal;
 
+    // Echo goes off before the prompt shows: a key pasted the moment the
+    // prompt appears must not be echoed by the terminal.
+    terminal::enable_raw_mode().context("cannot switch the terminal to hidden input")?;
     print!("{prompt}");
     std::io::stdout().flush().ok();
-    terminal::enable_raw_mode().context("cannot switch the terminal to hidden input")?;
     let mut secret = String::new();
     let outcome = loop {
         match event::read() {

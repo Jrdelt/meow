@@ -459,7 +459,16 @@
     renderHosts();
     renderAdvisory();
 
-    renderList(byId('tasks'), state.tasks || [], 'No recon tasks yet.', function (task) {
+    // The newest run of each target in full; earlier runs of the same
+    // target (all kept in the workspace) fold away under it.
+    var latest = [];
+    var earlier = {};
+    (state.tasks || []).forEach(function (task) {
+      if (task.target in earlier) { earlier[task.target].push(task); return; }
+      earlier[task.target] = [];
+      latest.push(task);
+    });
+    renderList(byId('tasks'), latest, 'No recon tasks yet.', function (task) {
       var item = el('li');
       item.appendChild(el('div', 'label', 'recon ' + task.target));
       task.stages.forEach(function (stage) {
@@ -471,6 +480,19 @@
           item.appendChild(el('div', 'note why', stage.detail));
         }
       });
+      var older = earlier[task.target];
+      if (older.length) {
+        var past = item.appendChild(fold('runs:' + task.target, 'names', false));
+        past.appendChild(el('summary', null, 'Earlier runs (' + older.length + ')'));
+        older.forEach(function (run) {
+          var when = (run.created_utc || '').replace('T', ' ').slice(0, 16);
+          var line = past.appendChild(el('div', 'fact'));
+          line.appendChild(el('div', null, '#' + run.id + (when ? '  ' + when : '')));
+          line.appendChild(el('div', 'dim', run.stages.map(function (stage) {
+            return stage.stage + ' ' + stage.status;
+          }).join(' · ')));
+        });
+      }
       return item;
     });
 
@@ -751,19 +773,18 @@
       var parts = data.headline.split(' -> ');
       var guessed = / \(OS read off a service banner\)$/;
       var version = (parts[3] || '').replace(guessed, '');
+      // Open ports have a card of their own; why the node is drawn as it is
+      // and where the system came from are tooltips here.
       detail.appendChild(row('Address', parts[0]));
-      detail.appendChild(row('Type', parts[1]));
-      detail.appendChild(row('System', guessed.test(parts[3] || '') ? marked(parts[2], 'info') : parts[2]));
+      detail.appendChild(row('Type', parts[1])).title = 'Drawn this way because ' + data.why + '.';
+      var banner = guessed.test(parts[3] || '');
+      var system = detail.appendChild(row('System', banner ? marked(parts[2], 'info') : parts[2]));
+      if (banner) { system.title = 'Read off a service banner, not reported by an OS scan.'; }
       detail.appendChild(row('Version', version));
       (host.hostnames || []).forEach(function (name) { detail.appendChild(row('Name', name)); });
       if (host.mac) { detail.appendChild(row('Hardware address', host.mac)); }
       detail.appendChild(row('Route', data.reachable ? marked('known', 'ok')
         : marked(data.by_name ? 'address not known' : 'none known', 'warn')));
-      detail.appendChild(row('Open ports', data.ports_line));
-      if (guessed.test(parts[3] || '')) {
-        detail.appendChild(el('p', 'note', 'The system was read off a service banner, not reported by an OS scan.'));
-      }
-      detail.appendChild(drawnAs(data));
       hostCards(host, data).forEach(function (one) { cards.appendChild(one); });
       var box = cards.querySelector('textarea');
       if (box && draftText) { box.value = draftText; }

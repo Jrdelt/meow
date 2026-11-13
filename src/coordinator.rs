@@ -946,6 +946,16 @@ impl Coordinator {
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
         runtime.spawn(grounding_loop(Arc::clone(&state), ground_rx));
         runtime.spawn(queue::worker(Arc::clone(&state), recon_rx));
+        let cleaned = std::mem::take(&mut state.graph().cleaned);
+        if !cleaned.is_empty() {
+            state.mark_dirty();
+            state.notice(format!(
+                "removed {} sites an earlier web crawl had followed links to ({}); crawls now stay on the host they crawl",
+                cleaned.len(),
+                cleaned.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                    + if cleaned.len() > 5 { ", ..." } else { "" }
+            ));
+        }
         state.save_if_dirty();
 
         Ok(Self {

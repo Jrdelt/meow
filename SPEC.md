@@ -84,7 +84,7 @@ The primary `meow <name>` process acts as the single session coordinator: it own
   - Spawns child tools with `Stdio::null()` on `stdin` inside OS process groups (`setpgid` on Unix / Job Objects on Windows) with `kill_on_drop(true)`, a configurable stage wall-clock timeout, and a `50 MB` output cap, writing structured files to `<workspace>/tmp/`:
     1. **Port Inventory (`nmap`):** Uses configured flags + `-oX <tmp>/nmap_ports.xml`. **Privilege Check:** If unprivileged (`geteuid() != 0` on Unix / non-elevated Windows), automatically replaces `-sS` with `-sT` and strips `-O`, logging a notice in `meow hud`.
     2. **Service & Header Inventory (`nmap -sV`):** Probes only open ports found in Stage 1 (`-p <ports> -oX <tmp>/nmap_svc.xml`) plus HTTP/TLS SAN metadata.
-    3. **Web Link & JS Route Crawl (`katana`, if HTTP/HTTPS open):** Outputs structured JSONL (`-j -silent -nc -jc -ct 5m -o <tmp>/katana.jsonl`).
+    3. **Web Link & JS Route Crawl (`katana`, if HTTP/HTTPS open):** Outputs structured JSONL (`-j -silent -nc -jc -fs fqdn -ct 5m -o <tmp>/katana.jsonl`), staying on the crawled host; links to other sites are left out of the graph.
     4. **Directory/Endpoint Inventory (`feroxbuster`, if HTTP/HTTPS open & wordlist verified):** Validates `wordlist_path` in `config.toml` or standard system paths first (skipping cleanly with a HUD notice if absent on macOS/Windows). Enforces mutual-exclusion rules (`--rate-limit` + `--scan-limit 1` + `--auto-bail` in `mild`; `--auto-tune` without `--rate-limit` in `aggressive`) writing structured `--json -o <tmp>/ferox.jsonl` with `--quiet --no-state`.
   - Persists stage status (`pending`, `running`, `interrupted`, `done`) in `state.db` for `[Y/n]` resume on reopen.
 

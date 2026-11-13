@@ -172,7 +172,8 @@ not that there is nothing there.
   feroxbuster auto-tune.
 
 Recon stages: port inventory, service inventory on the open ports only, web
-crawl (`katana`), directory inventory (`feroxbuster`). A missing tool or
+crawl (`katana`, kept on the host being crawled: links to other sites are
+neither followed nor stored), directory inventory (`feroxbuster`). A missing tool or
 wordlist skips its stage, and the map and HUD say how to add it. A wordlist
 is looked for in `recon.wordlist_path`, then in the usual system places, then
 in `~/.meow/wordlists/` (the first `.txt` file there). Without root, `-sS` becomes `-sT` and `-O` is dropped.

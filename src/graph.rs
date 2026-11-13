@@ -17,7 +17,9 @@ use crate::evidence::{sanitize, EvidenceRecord, IllegalTransition, Source, Verif
 use crate::timeutil::now_rfc3339;
 use crate::workspace::write_private_atomic;
 
-pub const GRAPH_VERSION: u32 = 1;
+/// 2: crawls stay on the crawled host; loading a version 1 graph removes the
+/// other sites an earlier crawl had followed links to.
+pub const GRAPH_VERSION: u32 = 2;
 /// Upper bounds that keep a hostile or runaway scan from bloating the file.
 const MAX_FACTS: usize = 200;
 const MAX_PATH_NODES: usize = 5000;
@@ -403,6 +405,9 @@ pub struct Graph {
     /// Workspace-level operator notes.
     #[serde(default)]
     pub notes: Vec<Fact>,
+    /// Hosts removed while loading an older graph; nothing is saved.
+    #[serde(skip)]
+    pub cleaned: Vec<String>,
 }
 
 impl Default for Graph {
@@ -413,8 +418,37 @@ impl Default for Graph {
             local: LocalNet::default(),
             hosts: BTreeMap::new(),
             notes: Vec::new(),
+            cleaned: Vec::new(),
         }
     }
+}
+
+/// Everything known about `host` came from a web crawl: the pages a
+/// crawler fetched there and their headers, and nothing from a scan, a
+/// banner in the terminal, a note or a vulnerability lookup.
+fn only_crawled(host: &Host) -> bool {
+    let crawled = |record: &EvidenceRecord| record.source == Source::KatanaJsonl;
+    // Headers of a crawled page carry the crawler's JSON line as evidence.
+    let crawled_header = |record: &EvidenceRecord| {
+        record.source == Source::HttpHeader && record.evidence.trim_start().starts_with('{')
+    };
+    let mut seen_crawl = false;
+    let quiet = host.advisories.is_empty()
+        && host.facts.is_empty()
+        && host.os.is_none()
+        && host.mac.is_none()
+        && host.ports.values().all(|port| {
+            let paths = port.paths.walk();
+            seen_crawl |= paths
+                .iter()
+                .any(|(_, node)| node.record.as_ref().is_some_and(crawled));
+            port.tls_sans.is_empty()
+                && port.facts.iter().all(|fact| crawled_header(&fact.record))
+                && paths
+                    .iter()
+                    .all(|(_, node)| node.record.as_ref().is_none_or(crawled))
+        });
+    quiet && seen_crawl
 }
 
 fn clean(text: &str) -> String {
@@ -436,6 +470,21 @@ fn push_fact(facts: &mut Vec<Fact>, fact: Fact) -> bool {
     true
 }
 
+impl Observation {
+    /// The host this observation is about; `None` for a workspace note.
+    pub fn address(&self) -> Option<&str> {
+        match self {
+            Observation::Host { address, .. }
+            | Observation::Hostname { address, .. }
+            | Observation::Port { address, .. }
+            | Observation::TlsSan { address, .. }
+            | Observation::Http { address, .. }
+            | Observation::Path { address, .. } => Some(address),
+            Observation::Note { address, .. } => address.as_deref(),
+        }
+    }
+}
+
 impl Graph {
     /// Loads `graph.json`; a missing file is an empty graph.
     pub fn load(path: &Path) -> Result<Self> {
@@ -444,7 +493,7 @@ impl Graph {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
-        let graph: Graph =
+        let mut graph: Graph =
             serde_json::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
         if graph.version > GRAPH_VERSION {
             bail!(
@@ -453,6 +502,21 @@ impl Graph {
                 graph.version
             );
         }
+        if graph.version < 2 {
+            // Before version 2 a crawl of an IP address followed links to
+            // other sites and stored them as hosts.
+            let gone: Vec<String> = graph
+                .hosts
+                .values()
+                .filter(|host| only_crawled(host))
+                .map(|host| host.address.clone())
+                .collect();
+            for address in &gone {
+                graph.hosts.remove(address);
+            }
+            graph.cleaned = gone;
+        }
+        graph.version = GRAPH_VERSION;
         Ok(graph)
     }
 
@@ -1167,6 +1231,71 @@ mod tests {
         assert!(Graph::load(&file).is_err());
         std::fs::write(&file, r#"{"version": 999, "updated_utc": ""}"#).unwrap();
         assert!(format!("{:#}", Graph::load(&file).unwrap_err()).contains("newer"));
+    }
+
+    #[test]
+    fn an_older_workspace_loses_the_sites_a_crawl_followed_links_to() {
+        let crawled = |address: &str, server: Option<&str>| {
+            let line = format!(r#"{{"request":{{"endpoint":"https://{address}/"}}}}"#);
+            let record = EvidenceRecord::observed(Source::KatanaJsonl, Confidence::High, &line);
+            let mut out = vec![Observation::Path {
+                address: address.into(),
+                port: 443,
+                scheme: "https".into(),
+                path: "/download/".into(),
+                status: Some(200),
+                record: record.clone(),
+            }];
+            if let Some(server) = server {
+                out.push(Observation::Http {
+                    address: address.into(),
+                    port: 443,
+                    scheme: "https".into(),
+                    server: Some(server.into()),
+                    location: None,
+                    record: EvidenceRecord {
+                        source: Source::HttpHeader,
+                        ..record
+                    },
+                });
+            }
+            out
+        };
+        let mut graph = Graph {
+            version: 1,
+            ..Graph::default()
+        };
+        // Scanned, then crawled: kept.
+        graph.apply(port("10.0.0.5", 443, "https", Some("Apache httpd")));
+        graph.apply_all(crawled("10.0.0.5", Some("Apache")));
+        // Only ever reached by following links: removed.
+        graph.apply_all(crawled("www.example.org", Some("Apache")));
+        graph.apply_all(crawled("localhost", None));
+        // Crawled only, but the operator wrote a note on it: kept.
+        graph.apply_all(crawled("intranet.example.test", None));
+        graph.apply(Observation::Note {
+            address: Some("intranet.example.test".into()),
+            text: "ours, check it".into(),
+            record: rec(Source::ManualNote),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.save(&file).unwrap();
+        let mut loaded = Graph::load(&file).unwrap();
+        assert_eq!(
+            loaded.hosts.keys().collect::<Vec<_>>(),
+            ["10.0.0.5", "intranet.example.test"]
+        );
+        assert_eq!(loaded.cleaned, ["localhost", "www.example.org"]);
+        assert_eq!(loaded.version, GRAPH_VERSION);
+
+        // Once saved at the current version, nothing is removed on load.
+        loaded.apply_all(crawled("www.example.org", None));
+        loaded.save(&file).unwrap();
+        let again = Graph::load(&file).unwrap();
+        assert!(again.hosts.contains_key("www.example.org"));
+        assert!(again.cleaned.is_empty());
     }
 
     #[cfg(unix)]
