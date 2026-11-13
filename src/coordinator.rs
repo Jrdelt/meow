@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::ai::{self, AiEngine, Tier};
 use crate::checklist;
-use crate::cve::CveClient;
+use crate::cve::{self, CveClient};
 use crate::db::Db;
 use crate::endpoint::Target;
 use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
@@ -295,6 +295,13 @@ impl State {
                 checklists.insert(host.address.clone(), Value::Object(per_host));
             }
         }
+        let fixes: serde_json::Map<String, Value> = graph
+            .hosts
+            .values()
+            .map(|host| (host.address.clone(), cve::fix_plan(host)))
+            .filter(|(_, plan)| !plan.is_empty())
+            .map(|(address, plan)| (address, json!(plan)))
+            .collect();
         json!({
             "session": self.session,
             "mode": self.mode(),
@@ -302,6 +309,7 @@ impl State {
             "revision": *self.revision.borrow(),
             "graph": &*graph,
             "checklists": checklists,
+            "fixes": fixes,
             "topology": Topology::build(&graph).cytoscape(&graph),
             "machine": observer::machine_report(&graph.local),
             "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
@@ -789,22 +797,15 @@ async fn grounding_loop(state: Shared, mut queue: mpsc::UnboundedReceiver<String
             continue;
         };
         let grounding = client.ground(&host).await;
-        let mut added = 0;
-        let mut kev = 0;
-        {
+        let (merged, first_fix) = {
             let mut graph = state.graph();
-            for advisory in grounding.advisories {
-                let known = host.advisories.iter().any(|a| a.id == advisory.id);
-                let in_kev = advisory.kev;
-                if graph.add_advisory(&address, advisory) && !known {
-                    added += 1;
-                    kev += usize::from(in_kev);
-                }
-            }
-            for fact in grounding.facts {
-                graph.add_host_fact(&address, fact);
-            }
-        }
+            let merged = cve::merge(&mut graph, &address, &grounding);
+            let first_fix = graph
+                .hosts
+                .get(&address)
+                .and_then(|host| cve::fix_plan(host).into_iter().next());
+            (merged, first_fix)
+        };
         // Every source that failed, not only the first: a missing catalog
         // and an unanswered database are different problems.
         if !grounding.errors.is_empty() {
@@ -819,10 +820,30 @@ async fn grounding_loop(state: Shared, mut queue: mpsc::UnboundedReceiver<String
                 shown.join("; ")
             ));
         }
-        if added > 0 {
+        if merged.added > 0 || merged.dropped > 0 {
             state.mark_dirty();
+        }
+        if merged.dropped > 0 {
             state.notice(format!(
-                "{added} new advisories for {address} ({kev} in CISA KEV), stored as UnverifiedHypothesis"
+                "{} earlier matches for {address} no longer apply and were removed",
+                merged.dropped
+            ));
+        }
+        if merged.added > 0 {
+            // Say what these are and what answers most of them, in words
+            // that do not need the evidence model explained first.
+            let fix = first_fix
+                .map(|fix| format!(" Most come from one place: {}", fix.action))
+                .unwrap_or_default();
+            let noun = if merged.added == 1 {
+                "advisory"
+            } else {
+                "advisories"
+            };
+            state.notice(format!(
+                "{} possible {noun} for {address} ({} known exploited), matched by version \
+                 number only and not verified.{fix}",
+                merged.added, merged.kev
             ));
         }
     }
@@ -1410,6 +1431,8 @@ mod tests {
         state.graph().add_advisory(
             "10.0.0.5",
             crate::graph::Advisory {
+                fixed_in: None,
+                last_affected: None,
                 id: "CVE-2021-23017".into(),
                 title: "t".into(),
                 severity: None,

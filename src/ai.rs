@@ -1104,6 +1104,8 @@ mod tests {
         graph.add_advisory(
             "10.10.10.5",
             Advisory {
+                fixed_in: None,
+                last_affected: None,
                 id: "CVE-2021-23017".into(),
                 title: "nginx resolver off-by-one".into(),
                 severity: Some("HIGH".into()),

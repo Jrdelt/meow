@@ -389,12 +389,27 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
     for error in &summary.errors {
         println!("[!] CVE lookup failed: {error}");
     }
+    if summary.dropped > 0 {
+        println!(
+            "[+] CVE lookups: {} earlier matches no longer apply and were removed",
+            summary.dropped
+        );
+    }
     println!(
-        "[+] CVE lookups: {} new advisories ({} in CISA KEV), all stored as UnverifiedHypothesis; {} in total",
+        "[+] CVE lookups: {} new possible {} ({} known exploited), matched by version number only and not verified; {} in total",
         summary.new_advisories,
+        if summary.new_advisories == 1 { "advisory" } else { "advisories" },
         summary.kev,
         graph.advisory_count()
     );
+    for host in graph.hosts.values() {
+        for fix in cve::fix_plan(host) {
+            println!(
+                "[+] {}: {} (answers {})",
+                host.address, fix.action, fix.advisories
+            );
+        }
+    }
     Ok(())
 }
 

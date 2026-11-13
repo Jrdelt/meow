@@ -65,6 +65,12 @@ button.link:hover { text-decoration: underline; }
 .mark.bad { background: rgba(248, 81, 73, .2); color: var(--bad); border: 1px solid var(--bad); }
 .mark.info { background: rgba(57, 197, 207, .18); color: var(--info); border: 1px solid var(--info); }
 
+/* What to update: the instruction in full, where it applies underneath. */
+.todo { margin: 0 0 14px; }
+.todo h3 { margin-top: 0; }
+.todo .fix { padding: 7px 2px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.todo .fix .dim { font-size: 12.5px; }
+
 /* Advisory: one tinted bar per kind of entry, most urgent first. */
 .group { border-radius: 4px; margin: 0 0 8px; padding: 8px 12px; }
 .group > summary { cursor: pointer; font-size: 16px; list-style-position: inside; }

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::cpe;
 use crate::db::Db;
-use crate::evidence::{Confidence, EvidenceRecord, Source};
+use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
 use crate::graph::{Advisory, Fact, Host};
 
 pub const NVD_URL: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
@@ -153,6 +153,61 @@ pub struct VersionRange {
     pub start_excluding: Option<String>,
     pub end_including: Option<String>,
     pub end_excluding: Option<String>,
+    /// Operating systems (`vendor product`) the record ties this range to:
+    /// "OpenSSH as packaged for Red Hat Enterprise Linux". Empty when the
+    /// range applies wherever the product runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only_on: Vec<String>,
+}
+
+/// The operating system family a host or a platform name belongs to, when
+/// that can be told at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Windows,
+    Linux,
+    Mac,
+}
+
+const LINUX_WORDS: &[&str] = &[
+    "linux",
+    "ubuntu",
+    "debian",
+    "redhat",
+    "red hat",
+    "fedora",
+    "centos",
+    "suse",
+    "raspbian",
+    "alpine",
+    "canonical",
+];
+
+fn family_of(text: &str) -> Option<Family> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("windows") || text.contains("microsoft") {
+        Some(Family::Windows)
+    } else if text.contains("macos") || text.contains("mac_os") || text.contains("mac os") {
+        Some(Family::Mac)
+    } else if LINUX_WORDS.iter().any(|word| text.contains(word)) {
+        Some(Family::Linux)
+    } else {
+        None
+    }
+}
+
+/// The family a host belongs to, from an OS scan or from what its services
+/// say about themselves (`OpenSSH for_Windows_9.5`, `Ubuntu 3ubuntu13`).
+pub fn host_family(host: &Host) -> Option<Family> {
+    if let Some(family) = host.os.as_deref().and_then(family_of) {
+        return Some(family);
+    }
+    host.ports.values().find_map(|port| {
+        [&port.product, &port.version, &port.extra_info]
+            .into_iter()
+            .flatten()
+            .find_map(|text| family_of(text))
+    })
 }
 
 fn normalize_product(name: &str) -> String {
@@ -165,13 +220,30 @@ fn normalize_product(name: &str) -> String {
 }
 
 impl VersionRange {
-    fn covers(&self, product: &str, version: &str) -> bool {
+    /// Whether this range is about `product` at all.
+    fn names(&self, product: &str) -> bool {
         let wanted = normalize_product(product);
         let mine = normalize_product(&self.product);
-        if mine != wanted
-            && !mine.ends_with(&format!("_{wanted}"))
-            && !wanted.ends_with(&format!("_{mine}"))
-        {
+        mine == wanted
+            || mine.ends_with(&format!("_{wanted}"))
+            || wanted.ends_with(&format!("_{mine}"))
+    }
+
+    /// False only when the range is tied to operating systems and the host
+    /// is known to run a different one.
+    fn runs_on(&self, family: Option<Family>) -> bool {
+        let Some(family) = family else {
+            return true;
+        };
+        self.only_on.is_empty()
+            || self
+                .only_on
+                .iter()
+                .any(|platform| family_of(platform).is_none_or(|theirs| theirs == family))
+    }
+
+    fn covers(&self, product: &str, version: &str) -> bool {
+        if !self.names(product) {
             return false;
         }
         if let Some(exact) = &self.exact {
@@ -229,36 +301,79 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The operating systems a configuration node names as a mere platform:
+/// every entry is an `o` CPE that is not itself vulnerable.
+fn platform_node(node: &Value) -> Option<Vec<String>> {
+    let matches = node.get("cpeMatch").and_then(Value::as_array)?;
+    let mut names = Vec::new();
+    for matched in matches {
+        if matched.get("vulnerable").and_then(Value::as_bool) != Some(false) {
+            return None;
+        }
+        let parts = matched
+            .get("criteria")
+            .and_then(Value::as_str)
+            .and_then(cpe::parts)?;
+        if parts.part != 'o' {
+            return None;
+        }
+        let name = format!("{} {}", parts.vendor, parts.product);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
 fn ranges_from_configurations(cve: &Value, out: &mut Vec<VersionRange>) {
-    let nodes = cve
+    for configuration in cve
         .get("configurations")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|c| c.get("nodes").and_then(Value::as_array))
-        .flatten();
-    for matched in nodes
-        .filter_map(|n| n.get("cpeMatch").and_then(Value::as_array))
-        .flatten()
     {
-        if matched.get("vulnerable").and_then(Value::as_bool) == Some(false) {
-            continue;
+        let nodes: Vec<&Value> = configuration
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .collect();
+        // "A running on B": the vulnerable product only counts on B.
+        let only_on: Vec<String> =
+            if configuration.get("operator").and_then(Value::as_str) == Some("AND") {
+                nodes
+                    .iter()
+                    .filter_map(|node| platform_node(node))
+                    .flatten()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        for matched in nodes
+            .iter()
+            .filter_map(|n| n.get("cpeMatch").and_then(Value::as_array))
+            .flatten()
+        {
+            if matched.get("vulnerable").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let Some(parts) = matched
+                .get("criteria")
+                .and_then(Value::as_str)
+                .and_then(cpe::parts)
+            else {
+                continue;
+            };
+            out.push(VersionRange {
+                product: parts.product,
+                exact: parts.version,
+                start_including: text_field(matched, "versionStartIncluding"),
+                start_excluding: text_field(matched, "versionStartExcluding"),
+                end_including: text_field(matched, "versionEndIncluding"),
+                end_excluding: text_field(matched, "versionEndExcluding"),
+                only_on: only_on.clone(),
+            });
         }
-        let Some(parts) = matched
-            .get("criteria")
-            .and_then(Value::as_str)
-            .and_then(cpe::parts)
-        else {
-            continue;
-        };
-        out.push(VersionRange {
-            product: parts.product,
-            exact: parts.version,
-            start_including: text_field(matched, "versionStartIncluding"),
-            start_excluding: text_field(matched, "versionStartExcluding"),
-            end_including: text_field(matched, "versionEndIncluding"),
-            end_excluding: text_field(matched, "versionEndExcluding"),
-        });
     }
 }
 
@@ -303,6 +418,7 @@ fn ranges_from_affected(cve: &Value, out: &mut Vec<VersionRange>) {
                 start_excluding: None,
                 end_including,
                 end_excluding,
+                only_on: Vec::new(),
             });
         }
     }
@@ -369,24 +485,81 @@ pub fn parse_nvd(body: &Value) -> Vec<NvdCve> {
     out
 }
 
+/// How a CVE record bears on one product at one version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relevance {
+    pub confidence: Confidence,
+    /// The first release the record says is no longer affected.
+    pub fixed_in: Option<String>,
+    /// The last release the record says is affected, when it names no fix.
+    pub last_affected: Option<String>,
+}
+
 impl NvdCve {
-    /// Whether a keyword hit really concerns `product` at `version`, and how
-    /// sure that is. `None` means it does not apply.
-    pub fn applies_to(&self, product: &str, version: &str) -> Option<Confidence> {
-        if !self.ranges.is_empty() {
-            return self
-                .ranges
-                .iter()
-                .any(|range| range.covers(product, version))
-                .then_some(Confidence::Medium);
+    /// Whether this record really concerns `product` at `version` on a host
+    /// of `family`, and how sure that is. `None` means it does not apply.
+    ///
+    /// `matched_by_nvd` is set for `cpeName` lookups, where NVD compared the
+    /// version itself. NVD also returns records that only name the product
+    /// as the platform another product runs on; those are dropped here.
+    pub fn relevance(
+        &self,
+        product: &str,
+        version: &str,
+        family: Option<Family>,
+        matched_by_nvd: bool,
+    ) -> Option<Relevance> {
+        if self.ranges.is_empty() {
+            if matched_by_nvd {
+                return Some(Relevance {
+                    confidence: Confidence::Medium,
+                    fixed_in: None,
+                    last_affected: None,
+                });
+            }
+            // No applicability data: accept only an explicit mention of both.
+            let text = self.description.to_ascii_lowercase();
+            let product = product.to_ascii_lowercase().replace('_', " ");
+            let mentions_version = text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+                .any(|word| word.trim_matches('.') == version.to_ascii_lowercase());
+            return (text.contains(&product) && mentions_version).then_some(Relevance {
+                confidence: Confidence::Low,
+                fixed_in: None,
+                last_affected: None,
+            });
         }
-        // No applicability data: accept only an explicit mention of both.
-        let text = self.description.to_ascii_lowercase();
-        let product = product.to_ascii_lowercase().replace('_', " ");
-        let mentions_version = text
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
-            .any(|word| word.trim_matches('.') == version.to_ascii_lowercase());
-        (text.contains(&product) && mentions_version).then_some(Confidence::Low)
+        let named: Vec<&VersionRange> = self.ranges.iter().filter(|r| r.names(product)).collect();
+        let mut covering: Vec<&VersionRange> = named
+            .iter()
+            .copied()
+            .filter(|r| r.covers(product, version))
+            .collect();
+        if covering.is_empty() && matched_by_nvd {
+            // NVD's own version comparison wins over the one made here.
+            covering = named;
+        }
+        covering.retain(|r| r.runs_on(family));
+        if covering.is_empty() {
+            return None;
+        }
+        let newest = |pick: fn(&VersionRange) -> &Option<String>| {
+            covering
+                .iter()
+                .filter_map(|r| pick(r).clone())
+                .max_by(|a, b| cmp_versions(a, b))
+        };
+        Some(Relevance {
+            confidence: Confidence::Medium,
+            fixed_in: newest(|r| &r.end_excluding),
+            last_affected: newest(|r| &r.end_including),
+        })
+    }
+
+    /// [`NvdCve::relevance`] for a keyword hit on a host of unknown family.
+    pub fn applies_to(&self, product: &str, version: &str) -> Option<Confidence> {
+        self.relevance(product, version, None, false)
+            .map(|found| found.confidence)
     }
 }
 
@@ -496,11 +669,18 @@ pub fn plan(host: &Host) -> Vec<Lookup> {
             let Some(parts) = cpe::parts(name) else {
                 continue;
             };
-            let Some(version) = parts.version else {
+            let Some(reported) = parts.version else {
                 continue;
             };
+            // Nmap reports Windows OpenSSH as version `for_windows_9.5`,
+            // which no database entry is written against.
+            let version = cpe::clean_version(&reported);
+            let cpe = (version != reported)
+                .then(|| cpe::with_version(name, &version))
+                .flatten()
+                .unwrap_or_else(|| name.clone());
             push(Lookup::Cpe {
-                cpe: name.clone(),
+                cpe,
                 port: key.clone(),
             });
             push(Lookup::Keyword {
@@ -641,7 +821,9 @@ impl CveClient {
     }
 
     async fn nvd_query(&self, param: &str, value: &str) -> Result<Vec<NvdCve>> {
-        let key = cache_key(&format!("nvd:{param}"), value);
+        // `nvd2`: answers cached before platform conditions were kept are
+        // not reused.
+        let key = cache_key(&format!("nvd2:{param}"), value);
         if let Some(found) = self
             .cached(&key, DAY)
             .and_then(|body| serde_json::from_str(&body).ok())
@@ -657,6 +839,11 @@ impl CveClient {
                 .http
                 .get(&self.settings.nvd_url)
                 .query(&[(param, value), ("resultsPerPage", "200")]);
+            if param == "cpeName" {
+                // Leave out records that name the product only as the
+                // platform something else runs on.
+                request = request.query(&[("isVulnerable", "")]);
+            }
             if let Some(api_key) = self.settings.api_key() {
                 request = request.header("apiKey", api_key);
             }
@@ -838,6 +1025,7 @@ impl CveClient {
             }
         };
 
+        let family = host_family(host);
         let mut packages: Vec<(Package, Option<String>)> = Vec::new();
         // One slow answer is not an outage: the next lookup is still tried.
         // After a second failure the rest is skipped.
@@ -849,25 +1037,35 @@ impl CveClient {
                     packages.push((package.clone(), port.clone()));
                     continue;
                 }
-                Lookup::Cpe { cpe, port } => (format!("cpeName={cpe}"), None, None, port),
+                Lookup::Cpe { cpe, port } => {
+                    let Some(parts) = cpe::parts(cpe) else {
+                        continue;
+                    };
+                    (
+                        format!("cpeName={cpe}"),
+                        parts.product,
+                        parts.version.unwrap_or_default(),
+                        port,
+                    )
+                }
                 Lookup::Keyword {
                     product,
                     version,
                     port,
                 } => (
                     format!("keywordSearch={product} {version}"),
-                    Some(product.as_str()),
-                    Some(version.as_str()),
+                    product.clone(),
+                    version.clone(),
                     port,
                 ),
             };
             if offline {
                 continue;
             }
-            let result = match (lookup, product, version) {
-                (Lookup::Cpe { cpe, .. }, _, _) => self.nvd_by_cpe(cpe).await,
-                (_, Some(product), Some(version)) => self.nvd_by_keyword(product, version).await,
-                _ => continue,
+            let matched_by_nvd = matches!(lookup, Lookup::Cpe { .. });
+            let result = match lookup {
+                Lookup::Cpe { cpe, .. } => self.nvd_by_cpe(cpe).await,
+                _ => self.nvd_by_keyword(&product, &version).await,
             };
             let found = match result {
                 Ok(found) => found,
@@ -879,14 +1077,12 @@ impl CveClient {
                 }
             };
             for cve in found {
-                // NVD already matched cpeName server-side; keyword hits are
-                // checked against the version ranges here.
-                let confidence = match (product, version) {
-                    (Some(product), Some(version)) => match cve.applies_to(product, version) {
-                        Some(confidence) => confidence,
-                        None => continue,
-                    },
-                    _ => Confidence::Medium,
+                // NVD matched cpeName itself, but also returns records that
+                // name the product only as a platform, or only on another
+                // operating system; keyword hits are checked in full.
+                let Some(relevance) = cve.relevance(&product, &version, family, matched_by_nvd)
+                else {
+                    continue;
                 };
                 let evidence = json!({
                     "query": query, "id": cve.id, "vulnStatus": cve.status, "cvss": cve.cvss,
@@ -903,7 +1099,13 @@ impl CveClient {
                         matched: query.clone(),
                         port: Some(port.clone()),
                         references: cve.references,
-                        record: EvidenceRecord::hypothesis(Source::NvdApi, confidence, &evidence),
+                        fixed_in: relevance.fixed_in,
+                        last_affected: relevance.last_affected,
+                        record: EvidenceRecord::hypothesis(
+                            Source::NvdApi,
+                            relevance.confidence,
+                            &evidence,
+                        ),
                     },
                 );
             }
@@ -946,6 +1148,8 @@ impl CveClient {
                                     .map(str::to_owned),
                                 cvss: None,
                                 matched: package.label(),
+                                fixed_in: None,
+                                last_affected: None,
                                 port: port.clone(),
                                 references: details
                                     .get("references")
@@ -988,7 +1192,148 @@ pub struct GraphGrounding {
     pub lookups: usize,
     pub new_advisories: usize,
     pub kev: usize,
+    /// Earlier matches the databases no longer return.
+    pub dropped: usize,
     pub errors: Vec<String>,
+}
+
+/// What merging one host's lookups into the graph changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Merged {
+    pub added: usize,
+    pub kev: usize,
+    /// Earlier matches the databases no longer return for this host.
+    pub dropped: usize,
+}
+
+/// Merges one host's grounding into the graph. After a lookup that reached
+/// every source, unverified matches it did not return are removed.
+pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Grounding) -> Merged {
+    let mut merged = Merged::default();
+    let known: BTreeSet<String> = graph
+        .hosts
+        .get(address)
+        .map(|host| host.advisories.iter().map(|a| a.id.clone()).collect())
+        .unwrap_or_default();
+    for advisory in &grounding.advisories {
+        if graph.add_advisory(address, advisory.clone()) && !known.contains(&advisory.id) {
+            merged.added += 1;
+            merged.kev += usize::from(advisory.kev);
+        }
+    }
+    for fact in &grounding.facts {
+        graph.add_host_fact(address, fact.clone());
+    }
+    if grounding.lookups > 0 && grounding.errors.is_empty() {
+        let current: BTreeSet<String> = grounding.advisories.iter().map(|a| a.id.clone()).collect();
+        merged.dropped = graph.drop_stale_advisories(address, &current);
+    }
+    merged
+}
+
+/// One piece of software on a host and what to do about its advisories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FixItem {
+    /// `Apache httpd 2.4.34`
+    pub software: String,
+    pub port: Option<String>,
+    pub advisories: usize,
+    pub kev: usize,
+    /// `2.4.69 or later`
+    pub target: String,
+    /// The whole instruction, as one sentence.
+    pub action: String,
+}
+
+/// Groups a host's advisories by the software they were matched on: one
+/// update usually answers all of them. False positives are left out.
+pub fn fix_plan(host: &Host) -> Vec<FixItem> {
+    struct Group<'a> {
+        software: String,
+        port: Option<String>,
+        advisories: Vec<&'a Advisory>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for advisory in &host.advisories {
+        if advisory.record.verification_status == VerificationStatus::FalsePositive {
+            continue;
+        }
+        let seen = advisory
+            .port
+            .as_ref()
+            .and_then(|key| host.ports.get(key))
+            .and_then(|port| {
+                let product = port.product.as_deref()?;
+                Some(match port.version.as_deref() {
+                    Some(version) => format!("{product} {version}"),
+                    None => product.to_owned(),
+                })
+            });
+        let software = if let Some(cpe) = advisory.matched.strip_prefix("cpeName=") {
+            seen.or_else(|| {
+                let parts = cpe::parts(cpe)?;
+                Some(format!("{} {}", parts.product, parts.version?).replace('_', " "))
+            })
+            .unwrap_or_else(|| cpe.to_owned())
+        } else if let Some(words) = advisory.matched.strip_prefix("keywordSearch=") {
+            seen.unwrap_or_else(|| words.to_owned())
+        } else {
+            advisory.matched.clone()
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.software == software && g.port == advisory.port)
+        {
+            Some(group) => group.advisories.push(advisory),
+            None => groups.push(Group {
+                software,
+                port: advisory.port.clone(),
+                advisories: vec![advisory],
+            }),
+        }
+    }
+    let mut plan: Vec<FixItem> = groups
+        .into_iter()
+        .map(|group| {
+            let newest = |pick: fn(&Advisory) -> &Option<String>| {
+                group
+                    .advisories
+                    .iter()
+                    .filter_map(|a| pick(a).clone())
+                    .max_by(|a, b| cmp_versions(a, b))
+            };
+            let fixed = newest(|a| &a.fixed_in);
+            let last = newest(|a| &a.last_affected);
+            let target = match (fixed, last) {
+                (Some(fixed), Some(last)) if cmp_versions(&last, &fixed) != Ordering::Less => {
+                    format!("a release newer than {last}")
+                }
+                (Some(fixed), _) => format!("{fixed} or later"),
+                (None, Some(last)) => format!("a release newer than {last}"),
+                (None, None) => "its newest release".to_owned(),
+            };
+            let close = group
+                .port
+                .as_ref()
+                .map(|port| format!(", or close {port} if the service is not needed"))
+                .unwrap_or_default();
+            FixItem {
+                action: format!("Update {} to {target}{close}.", group.software),
+                software: group.software,
+                port: group.port,
+                advisories: group.advisories.len(),
+                kev: group.advisories.iter().filter(|a| a.kev).count(),
+                target,
+            }
+        })
+        .collect();
+    plan.sort_by(|a, b| {
+        b.kev
+            .cmp(&a.kev)
+            .then(b.advisories.cmp(&a.advisories))
+            .then(a.software.cmp(&b.software))
+    });
+    plan
 }
 
 /// Grounds every host that has something to look up and merges the results
@@ -1009,17 +1354,10 @@ pub async fn ground_graph(client: &CveClient, graph: &mut crate::graph::Graph) -
         let grounding = client.ground(&host).await;
         summary.hosts += 1;
         summary.lookups += grounding.lookups;
-        for advisory in grounding.advisories {
-            let kev = advisory.kev;
-            let known = host.advisories.iter().any(|a| a.id == advisory.id);
-            if graph.add_advisory(&address, advisory) && !known {
-                summary.new_advisories += 1;
-                summary.kev += usize::from(kev);
-            }
-        }
-        for fact in grounding.facts {
-            graph.add_host_fact(&address, fact);
-        }
+        let merged = merge(graph, &address, &grounding);
+        summary.new_advisories += merged.added;
+        summary.kev += merged.kev;
+        summary.dropped += merged.dropped;
         if !grounding.errors.is_empty() {
             summary.errors = grounding.errors;
             break;
@@ -1466,7 +1804,9 @@ mod tests {
         );
         let sent = mock.queries.lock().unwrap().join("\n");
         assert!(
-            sent.contains("cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*&resultsPerPage=200"),
+            sent.contains(
+                "cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*&isVulnerable=&resultsPerPage=200"
+            ),
             "{sent}"
         );
         assert!(sent.contains("keywordSearch=nginx 1.18.0"), "{sent}");
@@ -1482,6 +1822,212 @@ mod tests {
         assert_eq!(mock.nvd.load(AtomicOrdering::SeqCst), 3);
         assert_eq!(mock.kev.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(mock.osv_detail.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    /// Records shaped like the ones NVD returns for an old web server and
+    /// for an SSH server packaged by one Linux vendor.
+    fn conditional_body() -> Value {
+        json!({ "vulnerabilities": [
+            { "cve": {
+                "id": "CVE-2026-4001", "vulnStatus": "Analyzed",
+                "descriptions": [ { "lang": "en", "value": "A panel is unsafe when httpd serves it." } ],
+                "configurations": [ { "operator": "AND", "nodes": [
+                    { "cpeMatch": [ { "vulnerable": true, "criteria": "cpe:2.3:a:panel_project:panel:4.3:*:*:*:*:*:*:*" } ] },
+                    { "cpeMatch": [ { "vulnerable": false, "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*" } ] }
+                ] } ]
+            } },
+            { "cve": {
+                "id": "CVE-2026-4002", "vulnStatus": "Analyzed",
+                "descriptions": [ { "lang": "en", "value": "Vendor packages of the SSH server were tampered with." } ],
+                "configurations": [ { "operator": "AND", "nodes": [
+                    { "cpeMatch": [ { "vulnerable": false, "criteria": "cpe:2.3:o:redhat:enterprise_linux:5.0:*:*:*:*:*:*:*" } ] },
+                    { "cpeMatch": [ { "vulnerable": true, "criteria": "cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*" } ] }
+                ] } ]
+            } },
+            { "cve": {
+                "id": "CVE-2026-4003", "vulnStatus": "Analyzed",
+                "descriptions": [ { "lang": "en", "value": "Request smuggling in httpd." } ],
+                "configurations": [ { "nodes": [ { "cpeMatch": [
+                    { "vulnerable": true, "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                      "versionStartIncluding": "2.4.0", "versionEndExcluding": "2.4.60" }
+                ] } ] } ]
+            } },
+            { "cve": {
+                "id": "CVE-2026-4004", "vulnStatus": "Analyzed",
+                "descriptions": [ { "lang": "en", "value": "Overflow in a httpd module." } ],
+                "configurations": [ { "nodes": [ { "cpeMatch": [
+                    { "vulnerable": true, "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                      "versionEndIncluding": "2.4.68" }
+                ] } ] } ]
+            } }
+        ] })
+    }
+
+    #[test]
+    fn platform_only_and_other_system_matches_are_dropped() {
+        let cves = parse_nvd(&conditional_body());
+        let by = |id: &str| cves.iter().find(|c| c.id == id).unwrap();
+
+        // The web server is only what the vulnerable panel runs on.
+        let panel = by("CVE-2026-4001");
+        assert_eq!(panel.relevance("http_server", "2.4.34", None, true), None);
+
+        // Tied to one Linux vendor: not on a Windows host, still shown
+        // where the system is unknown or is that family.
+        let packaged = by("CVE-2026-4002");
+        assert_eq!(packaged.ranges[0].only_on, ["redhat enterprise_linux"]);
+        assert_eq!(
+            packaged.relevance("openssh", "9.5", Some(Family::Windows), true),
+            None
+        );
+        for family in [None, Some(Family::Linux)] {
+            assert!(packaged.relevance("openssh", "9.5", family, true).is_some());
+        }
+
+        // A plain match says which release ends it.
+        let fixed = by("CVE-2026-4003")
+            .relevance("http_server", "2.4.34", Some(Family::Windows), true)
+            .unwrap();
+        assert_eq!(fixed.fixed_in.as_deref(), Some("2.4.60"));
+        let open = by("CVE-2026-4004")
+            .relevance("http_server", "2.4.34", None, false)
+            .unwrap();
+        assert_eq!(
+            (open.fixed_in.as_deref(), open.last_affected.as_deref()),
+            (None, Some("2.4.68"))
+        );
+    }
+
+    #[test]
+    fn decorated_versions_are_looked_up_by_their_number() {
+        let mut graph = Graph::default();
+        graph.apply(Observation::Port {
+            address: "192.0.2.7".into(),
+            port: 22,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("ssh".into()),
+            product: Some("OpenSSH".into()),
+            version: Some("for_Windows_9.5".into()),
+            extra_info: Some("protocol 2.0".into()),
+            cpes: vec!["cpe:/a:openbsd:openssh:for_windows_9.5".into()],
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        let host = graph.hosts["192.0.2.7"].clone();
+        assert_eq!(host_family(&host), Some(Family::Windows));
+        assert_eq!(
+            plan(&host),
+            [
+                Lookup::Cpe {
+                    cpe: "cpe:2.3:a:openbsd:openssh:9.5:*:*:*:*:*:*:*".into(),
+                    port: "22/tcp".into(),
+                },
+                Lookup::Keyword {
+                    product: "openssh".into(),
+                    version: "9.5".into(),
+                    port: "22/tcp".into(),
+                },
+            ]
+        );
+    }
+
+    fn matched(
+        id: &str,
+        kev: bool,
+        fixed_in: Option<&str>,
+        last_affected: Option<&str>,
+    ) -> Advisory {
+        Advisory {
+            id: id.into(),
+            title: format!("about {id}"),
+            severity: None,
+            cvss: None,
+            kev,
+            matched: "cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*".into(),
+            port: Some("80/tcp".into()),
+            references: Vec::new(),
+            fixed_in: fixed_in.map(Into::into),
+            last_affected: last_affected.map(Into::into),
+            record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "x"),
+        }
+    }
+
+    #[test]
+    fn one_update_answers_a_whole_group_of_advisories() {
+        let mut host = sample_host();
+        host.advisories = vec![
+            matched("CVE-2026-5001", true, Some("1.20.1"), None),
+            matched("CVE-2026-5002", false, Some("1.19.4"), None),
+            matched("CVE-2026-5003", false, None, Some("1.19.9")),
+            matched("CVE-2026-5004", false, None, None),
+        ];
+        host.advisories[3].matched = "jquery@3.4.1 (npm)".into();
+        host.advisories[1].record.verification_status = VerificationStatus::FalsePositive;
+        let plan = fix_plan(&host);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            (plan[0].software.as_str(), plan[0].advisories, plan[0].kev),
+            ("nginx 1.18.0", 2, 1),
+            "the false positive is not counted"
+        );
+        assert_eq!(
+            plan[0].action,
+            "Update nginx 1.18.0 to 1.20.1 or later, or close 80/tcp if the service is not needed."
+        );
+        assert_eq!(plan[1].software, "jquery@3.4.1 (npm)");
+        assert_eq!(plan[1].target, "its newest release");
+
+        // No release is named as fixed past the last affected one.
+        host.advisories[2].last_affected = Some("1.21.0".into());
+        assert_eq!(fix_plan(&host)[0].target, "a release newer than 1.21.0");
+    }
+
+    #[test]
+    fn a_complete_lookup_removes_matches_it_no_longer_returns() {
+        let mut graph = Graph::default();
+        graph.hosts.insert("10.0.0.5".into(), sample_host());
+        for id in ["CVE-2026-5001", "CVE-2026-5002", "CVE-2026-5003"] {
+            graph.add_advisory("10.0.0.5", matched(id, false, None, None));
+        }
+        graph
+            .set_advisory_status("10.0.0.5", "CVE-2026-5002", VerificationStatus::Confirmed)
+            .unwrap();
+        let mut grounding = Grounding {
+            advisories: vec![
+                matched("CVE-2026-5001", false, Some("1.20.1"), None),
+                matched("CVE-2026-5009", true, None, None),
+            ],
+            lookups: 2,
+            ..Grounding::default()
+        };
+
+        // An incomplete lookup proves nothing about what is missing.
+        grounding.errors.push("NVD answered HTTP 503".into());
+        let partial = merge(&mut graph.clone(), "10.0.0.5", &grounding);
+        assert_eq!((partial.added, partial.dropped), (1, 0));
+
+        grounding.errors.clear();
+        let merged = merge(&mut graph, "10.0.0.5", &grounding);
+        assert_eq!(
+            merged,
+            Merged {
+                added: 1,
+                kev: 1,
+                dropped: 1
+            }
+        );
+        let host = &graph.hosts["10.0.0.5"];
+        let ids: Vec<&str> = host.advisories.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["CVE-2026-5001", "CVE-2026-5002", "CVE-2026-5009"],
+            "the operator's confirmed finding stays; the unverified leftover goes"
+        );
+        assert_eq!(
+            host.advisories[0].fixed_in.as_deref(),
+            Some("1.20.1"),
+            "a known match learns its fixed release"
+        );
     }
 
     #[tokio::test]

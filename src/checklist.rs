@@ -195,6 +195,8 @@ mod tests {
 
     fn advisory(port: &str) -> Advisory {
         Advisory {
+            fixed_in: None,
+            last_affected: None,
             id: "CVE-2021-23017".into(),
             title: "resolver issue".into(),
             severity: None,

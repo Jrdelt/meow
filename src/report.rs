@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 
 use crate::checklist;
+use crate::cve;
 use crate::db::Db;
 use crate::evidence::{Source, VerificationStatus};
 use crate::graph::{Advisory, Fact, Graph, Host};
@@ -235,6 +236,37 @@ pub fn render(inputs: &Inputs) -> String {
         out.push('\n');
     }
 
+    // What to do, before the lists of what was matched: one update per
+    // piece of software usually answers every advisory matched on it.
+    let fixes: Vec<(&Host, cve::FixItem)> = graph
+        .hosts
+        .values()
+        .flat_map(|host| cve::fix_plan(host).into_iter().map(move |fix| (host, fix)))
+        .collect();
+    if !fixes.is_empty() {
+        out.push_str("## What to update\n\n");
+        out.push_str(
+            "One line per piece of software. The advisories behind each line were matched by \
+             version number only; a system that takes security updates from its vendor may \
+             already carry the fix under the same version number.\n\n",
+        );
+        for (host, fix) in &fixes {
+            let known = if fix.kev > 0 {
+                format!(", {} known exploited", fix.kev)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                out,
+                "- {}: {} (answers {}{known})",
+                md(&host.label()),
+                md(&fix.action),
+                fix.advisories
+            );
+        }
+        out.push('\n');
+    }
+
     out.push_str("## Confirmed findings\n\n");
     if confirmed.is_empty() {
         out.push_str("None. No hypothesis has been confirmed by the operator yet.\n\n");
@@ -248,6 +280,11 @@ pub fn render(inputs: &Inputs) -> String {
         }
         let _ = writeln!(out, "- Port: {}", advisory.port.as_deref().unwrap_or("-"));
         let _ = writeln!(out, "- Matched on: {}", code(&advisory.matched));
+        if let Some(fixed) = &advisory.fixed_in {
+            let _ = writeln!(out, "- Fixed in: {}", md(fixed));
+        } else if let Some(last) = &advisory.last_affected {
+            let _ = writeln!(out, "- Affected up to: {}", md(last));
+        }
         let _ = writeln!(
             out,
             "- Source: {} ({:?} confidence), matched {}",
@@ -468,6 +505,8 @@ mod tests {
 
     fn advisory(id: &str, cvss: f64, kev: bool) -> Advisory {
         Advisory {
+            fixed_in: None,
+            last_affected: None,
             id: id.into(),
             title: format!("{id} summary with <b>markup</b> | pipe"),
             severity: Some("HIGH".into()),
@@ -674,6 +713,7 @@ mod tests {
             "```mermaid\ngraph LR\n",
             "-->|routed|",
             "Route warnings:",
+            "## What to update",
             "## Confirmed findings",
             "## Unverified hypotheses",
             "## Dismissed as false positives",

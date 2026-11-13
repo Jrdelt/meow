@@ -55,7 +55,7 @@ Before every push:
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
   list`/`delete`/`setup`, the sketched map and macOS fixes.
-- **Last Verified Commit:** `feat(claude)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `fix(cve)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -70,7 +70,7 @@ Before every push:
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
     host must not).
   - Parsers emit `graph::Observation`; only `Graph::apply` mutates hosts.
-    Advisories enter via `Graph::add_advisory` as `UnverifiedHypothesis`.
+    Advisories enter via `cve::merge`, unverified; `cve::fix_plan` groups them.
   - A live coordinator is the only writer of `graph.json`; helpers call
     `ipc::send` and fall back to the files on `None`. New requests go into
     `coordinator::Command` (HTTP `/api/command` and WebSocket share it).

@@ -159,6 +159,17 @@ Vulnerability lookups use NIST NVD (by CPE name and by keyword), OSV.dev and
 the CISA KEV catalog. They send only software names and versions, are paced to
 NVD's rate limit, cached in the workspace, and fail fast when offline.
 
+A match means "this version number appears in the advisory", nothing more. An
+old server can match a hundred advisories at once, so the map, the HUD and the
+report start with **What to update**: one line per piece of software, naming
+the release that answers all of its matches (`Update Apache httpd 2.4.34 to
+2.4.60 or later, or close 8080/tcp if the service is not needed`) and whether
+that host is this machine or another one. Left out are advisories that name
+the software only as the platform another product runs on, and ones tied to an
+operating system the host does not run. After the update, scan the host again:
+matches the databases no longer return are removed, while anything you marked
+`Confirmed` or `FalsePositive` stays.
+
 ## AI tiers (optional, started by hand)
 
 From the HUD: `L`, `C` and `R`. From the map: the buttons on a host.

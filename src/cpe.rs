@@ -154,6 +154,28 @@ pub fn parts(cpe: &str) -> Option<CpeParts> {
     })
 }
 
+/// The numeric version inside a decorated one: `for_windows_9.5` is `9.5`.
+/// A version that already starts with a digit, or holds none, is kept.
+pub fn clean_version(version: &str) -> String {
+    let starts_numeric = |text: &str| text.starts_with(|c: char| c.is_ascii_digit());
+    if starts_numeric(version) {
+        return version.to_owned();
+    }
+    version
+        .rsplit('_')
+        .find(|piece| starts_numeric(piece))
+        .unwrap_or(version)
+        .to_owned()
+}
+
+/// The same CPE name with another version.
+pub fn with_version(cpe: &str, version: &str) -> Option<String> {
+    let cpe23 = to_cpe23(cpe)?;
+    let mut fields = split_23(cpe23.strip_prefix("cpe:2.3:")?);
+    fields[3] = encode_23(version);
+    Some(format!("cpe:2.3:{}", fields.join(":")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

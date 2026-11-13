@@ -52,6 +52,12 @@ pub struct Advisory {
     pub port: Option<String>,
     #[serde(default)]
     pub references: Vec<String>,
+    /// The first release the database says is no longer affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_in: Option<String>,
+    /// The last release the database says is affected, when it names no fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_affected: Option<String>,
     #[serde(flatten)]
     pub record: EvidenceRecord,
 }
@@ -792,6 +798,8 @@ impl Graph {
                 }
                 existing.severity = existing.severity.take().or(advisory.severity);
                 existing.cvss = existing.cvss.or(advisory.cvss);
+                existing.fixed_in = advisory.fixed_in.or(existing.fixed_in.take());
+                existing.last_affected = advisory.last_affected.or(existing.last_affected.take());
                 for reference in advisory.references {
                     if !existing.references.contains(&reference) {
                         existing.references.push(reference);
@@ -804,6 +812,22 @@ impl Graph {
                 true
             }
         }
+    }
+
+    /// Removes database matches that a complete new lookup no longer
+    /// returns: the software was updated, or the match was a wrong one.
+    /// Anything the operator has ruled on stays.
+    pub fn drop_stale_advisories(&mut self, address: &str, current: &BTreeSet<String>) -> usize {
+        let Some(host) = self.host_entry(address) else {
+            return 0;
+        };
+        let before = host.advisories.len();
+        host.advisories.retain(|advisory| {
+            current.contains(&advisory.id)
+                || advisory.record.verification_status != VerificationStatus::UnverifiedHypothesis
+                || !matches!(advisory.record.source, Source::NvdApi | Source::OsvApi)
+        });
+        before - host.advisories.len()
     }
 
     /// Adds a host-level fact that did not come from a parser (for example
@@ -887,6 +911,8 @@ mod tests {
 
     fn advisory(id: &str) -> Advisory {
         Advisory {
+            fixed_in: None,
+            last_affected: None,
             id: id.into(),
             title: "example".into(),
             severity: Some("HIGH".into()),

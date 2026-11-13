@@ -110,7 +110,7 @@ fn add_grounds_new_software_as_unverified_hypotheses() {
         "{text}"
     );
     assert!(
-        text.contains("[+] CVE lookups: 1 new advisories (1 in CISA KEV), all stored as UnverifiedHypothesis; 1 in total"),
+        text.contains("[+] CVE lookups: 1 new possible advisory (1 known exploited), matched by version number only and not verified; 1 in total"),
         "{text}"
     );
 
@@ -136,7 +136,17 @@ fn add_grounds_new_software_as_unverified_hypotheses() {
 
     // Re-importing finds nothing new, and the answers come from state.db.
     let text = out(&sandbox.run(&["add", "scan.xml", "--session", "acme"]));
-    assert!(text.contains("0 new advisories (0 in CISA KEV)"), "{text}");
+    assert!(
+        text.contains("0 new possible advisories (0 known exploited)"),
+        "{text}"
+    );
+    // What to do about what is already known is said every time.
+    assert!(
+        text.contains(
+            "[+] 10.0.0.5: Update nginx 1.18.0 to 1.20.1 or later, or close 80/tcp if the service is not needed. (answers 1)"
+        ),
+        "{text}"
+    );
     assert!(Path::new(&sandbox.workspace().join("state.db")).is_file());
 
     // --no-cve skips the lookups entirely.
@@ -158,7 +168,7 @@ fn offline_grounding_fails_fast_without_failing_the_import() {
     assert!(output.status.success(), "{text}");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert!(text.contains("[!] CVE lookup failed: "), "{text}");
-    assert!(text.contains("0 new advisories"), "{text}");
+    assert!(text.contains("0 new possible advisories"), "{text}");
     // The imported facts are kept even though grounding failed.
     assert_eq!(
         sandbox.graph()["hosts"]["10.0.0.5"]["ports"]["80/tcp"]["product"],

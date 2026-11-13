@@ -28,6 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::ai::{Budget, Tier};
 use crate::checklist;
 use crate::coordinator::{AiStatus, Command, Notice, RuntimeInfo};
+use crate::cve;
 use crate::db::Db;
 use crate::evidence::{sanitize, VerificationStatus};
 use crate::graph::{Advisory, Graph, Host, PathNode};
@@ -363,6 +364,35 @@ fn status_style(status: VerificationStatus) -> Style {
     }
 }
 
+/// Breaks `text` into lines of at most `width` characters at spaces; a word
+/// longer than a line is split.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = vec![String::new()];
+    let mut used = 0;
+    for word in text.split(' ').filter(|word| !word.is_empty()) {
+        let mut word: Vec<char> = word.chars().collect();
+        if used > 0 && used + 1 + word.len() > width {
+            lines.push(String::new());
+            used = 0;
+        }
+        if used > 0 {
+            lines.last_mut().expect("never empty").push(' ');
+            used += 1;
+        }
+        while used + word.len() > width {
+            let rest = word.split_off(width - used);
+            lines.last_mut().expect("never empty").extend(word);
+            lines.push(String::new());
+            used = 0;
+            word = rest;
+        }
+        used += word.len();
+        lines.last_mut().expect("never empty").extend(word);
+    }
+    lines
+}
+
 fn panel(title: &str, focused: bool) -> Block<'_> {
     let style = if focused { TITLE } else { DIM };
     Block::bordered().title(title).border_style(style)
@@ -398,6 +428,27 @@ fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
             Span::styled("Names       ", DIM),
             Span::raw(sanitize(&names.join(", "), 300)),
         ]));
+    }
+    // What to do about the advisories: one update per piece of software.
+    let fixes = cve::fix_plan(host);
+    if !fixes.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("What to update", TITLE));
+        for fix in fixes.iter().take(5) {
+            let known = if fix.kev > 0 {
+                format!(", {} known exploited", fix.kev)
+            } else {
+                String::new()
+            };
+            lines.push(Line::raw(format!("  {}", sanitize(&fix.action, 300))));
+            lines.push(Line::styled(
+                format!(
+                    "      answers {} matched by version only{known}",
+                    fix.advisories
+                ),
+                DIM,
+            ));
+        }
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled("Ports", TITLE));
@@ -472,9 +523,18 @@ fn advisory_detail(snapshot: &Snapshot, host: &Host, advisory: &Advisory) -> Vec
             ),
             DIM,
         ),
-        Line::raw(""),
-        Line::styled(format!("Verification checklist ({done}/{total})"), TITLE),
     ];
+    let fix = match (&advisory.fixed_in, &advisory.last_affected) {
+        (Some(fixed), _) => Some(format!("Fixed in {fixed}")),
+        (None, Some(last)) => Some(format!("Affected up to {last}; update past it")),
+        (None, None) => None,
+    };
+    lines.extend(fix.map(|text| Line::styled(sanitize(&text, 120), GOOD)));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("Verification checklist ({done}/{total})"),
+        TITLE,
+    ));
     for item in &list.items {
         let (mark, style) = if item.done {
             ("[x]", GOOD)
@@ -704,10 +764,10 @@ fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
         }
         lines.push(Line::from(spans));
         if let Some(active) = task.stages.iter().rev().find(|s| !s.detail.is_empty()) {
-            lines.push(Line::styled(
-                format!("  {}", sanitize(&active.detail, 200)),
-                DIM,
-            ));
+            let room = (queue_area.width as usize).saturating_sub(4);
+            for piece in wrap_words(&sanitize(&active.detail, 300), room) {
+                lines.push(Line::styled(format!("  {piece}"), DIM));
+            }
         }
     }
     if lines.is_empty() {
@@ -721,18 +781,29 @@ fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
         queue_area,
     );
 
-    let notices: Vec<Line> = snapshot
-        .notices
-        .iter()
-        .rev()
-        .take(notice_area.height.saturating_sub(2) as usize)
-        .map(|notice| {
-            Line::from(vec![
-                Span::styled(format!("{} ", notice.at.get(11..19).unwrap_or("")), DIM),
-                Span::raw(sanitize(&notice.text, 300)),
-            ])
-        })
-        .collect();
+    // Newest first, each one whole: a long notice continues on the next
+    // line under its text instead of being cut at the border.
+    let rows = notice_area.height.saturating_sub(2) as usize;
+    let room = (notice_area.width as usize).saturating_sub(2 + 9);
+    let mut notices: Vec<Line> = Vec::new();
+    for notice in snapshot.notices.iter().rev() {
+        if notices.len() >= rows {
+            break;
+        }
+        let time = format!("{:<9}", notice.at.get(11..19).unwrap_or(""));
+        for (index, piece) in wrap_words(&sanitize(&notice.text, 400), room)
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if index == 0 {
+                time.clone()
+            } else {
+                " ".repeat(9)
+            };
+            notices.push(Line::from(vec![Span::styled(lead, DIM), Span::raw(piece)]));
+        }
+    }
+    notices.truncate(rows);
     frame.render_widget(
         Paragraph::new(notices).block(panel("Notices", false)),
         notice_area,
@@ -813,10 +884,12 @@ fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
 
 /// Draws the whole panel. Pure: everything comes from `model`.
 pub fn draw(frame: &mut Frame, model: &Model) {
+    // A tall terminal gives the queue and the notices more lines.
+    let activity_rows = if frame.area().height >= 40 { 12 } else { 8 };
     let [header, body, activity, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(8),
-        Constraint::Length(8),
+        Constraint::Length(activity_rows),
         Constraint::Length(2),
     ])
     .areas(frame.area());
@@ -869,6 +942,7 @@ pub fn draw(frame: &mut Frame, model: &Model) {
         };
         frame.render_widget(
             Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
                 .scroll((model.inspector_scroll, 0))
                 .block(panel("Inspector: node, ports and sub-paths", false)),
             inspector,
@@ -1039,6 +1113,8 @@ mod tests {
             graph.add_advisory(
                 "10.10.10.5",
                 Advisory {
+                    fixed_in: None,
+                    last_affected: None,
                     id: id.into(),
                     title: format!("title of {id}"),
                     severity: Some("HIGH".into()),
@@ -1100,7 +1176,7 @@ mod tests {
     #[test]
     fn every_panel_is_drawn_from_the_session_state() {
         let model = model();
-        let text = screen(&model, 160, 54);
+        let text = screen(&model, 160, 64);
         for expected in [
             "meow hud",
             "| acme | mode mild | 2 hosts | 3 advisories | live",
@@ -1131,6 +1207,47 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn long_notices_wrap_and_the_host_says_what_to_update() {
+        let mut graph = graph();
+        for advisory in &mut graph.hosts.get_mut("10.10.10.5").unwrap().advisories {
+            advisory.fixed_in = Some("1.20.1".into());
+        }
+        let mut message: serde_json::Value = serde_json::from_str(&state_message(&graph)).unwrap();
+        message["state"]["notices"] = json!([ {
+            "at": "2026-11-12T09:41:00Z",
+            "text": "3 possible advisories for 10.10.10.5 (1 known exploited), matched by version \
+                     number only and not verified. Most come from one place: Update nginx to 1.20.1 or later."
+        } ]);
+        let mut model = Model::new(true);
+        model.apply_message(&message.to_string());
+
+        let text = screen(&model, 160, 54);
+        for expected in [
+            "What to update",
+            "Update cpe:2.3:a:nginx:nginx:1.18.0 to 1.20.1 or later, or close 80/tcp if the service",
+            "answers 3 matched by version only, 1 known exploited",
+            "Fixed in 1.20.1",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+
+        // On a narrow screen the notice continues under its own text.
+        let narrow = screen(&model, 100, 30);
+        for expected in ["09:41:00 3 possible advisories", "         or later."] {
+            assert!(
+                narrow.contains(expected),
+                "missing {expected:?} in:\n{narrow}"
+            );
+        }
+
+        assert_eq!(
+            wrap_words("one two three four", 9),
+            ["one two", "three", "four"]
+        );
+        assert_eq!(wrap_words("abcdefghijkl mn", 8), ["abcdefgh", "ijkl mn"]);
     }
 
     #[test]

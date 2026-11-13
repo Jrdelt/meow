@@ -491,6 +491,8 @@
     if (advisory.port) { where.push(advisory.port); }
     if (advisory.severity) { where.push(advisory.severity + (advisory.cvss ? ' ' + advisory.cvss : '')); }
     if (advisory.kev) { where.push('in the CISA known-exploited catalog'); }
+    if (advisory.fixed_in) { where.push('fixed in ' + advisory.fixed_in); }
+    else if (advisory.last_affected) { where.push('affected up to ' + advisory.last_affected); }
     where.push(advisory.matched);
     text.appendChild(el('span', 'dim', where.join(' · ')));
 
@@ -535,6 +537,37 @@
       { name: 'Informational', kind: 'info', open: false, items: [] },
       { name: 'False positives', kind: 'ok', open: false, items: [] }
     ];
+    // What to do comes first: one line per piece of software, since one
+    // update usually answers every advisory matched on it.
+    var fixes = state.fixes || {};
+    var mine = {};
+    (state.graph.local.interfaces || []).forEach(function (iface) {
+      (iface.addresses || []).forEach(function (cidr) { mine[cidr.split('/')[0]] = true; });
+    });
+    var plan = [];
+    Object.keys(fixes).forEach(function (address) {
+      if (only && address !== only) { return; }
+      fixes[address].forEach(function (fix) { plan.push({ address: address, fix: fix }); });
+    });
+    if (plan.length) {
+      var todo = box.appendChild(el('div', 'todo'));
+      todo.appendChild(el('h3', null, 'What to update'));
+      var elsewhere = false;
+      plan.forEach(function (entry) {
+        var fix = entry.fix;
+        var here = !!mine[entry.address];
+        elsewhere = elsewhere || !here;
+        var count = fix.advisories + (fix.advisories === 1 ? ' advisory' : ' advisories') +
+          (fix.kev ? ', ' + fix.kev + ' known exploited' : '');
+        var line = todo.appendChild(el('div', 'fix'));
+        line.appendChild(el('div', null, fix.action));
+        line.appendChild(el('div', 'dim', 'On ' + entry.address + (here ? ' (this machine)' : ' (another machine, not this one)') +
+          ' · answers ' + count));
+      });
+      todo.appendChild(el('p', 'note', (elsewhere ? 'An update has to be made on the machine named, by whoever looks after it. ' : '') +
+        'Every entry below was matched by version number only and is not proof: a system that takes security updates ' +
+        'from its vendor often has the fix under the same version number. After updating, scan again; what no longer matches is removed.'));
+    }
     Object.keys(state.graph.hosts).forEach(function (address) {
       if (only && address !== only) { return; }
       // Known-exploited first, then by severity score.
