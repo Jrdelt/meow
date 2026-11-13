@@ -1,12 +1,13 @@
 class Meow < Formula
   desc "Local security triage shell, topology mapper & grounded audit workspace"
   homepage "https://github.com/Jrdelt/meow"
-  version "0.1.0"
+  # Tap and install:
+  #   brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
+  #   brew trust Jrdelt/meow   # Homebrew 7+
+  #   brew install meow        # or `brew install --HEAD meow`
+  url Pathname.new(__dir__).parent.realpath.to_s, using: :git, tag: "v0.1.0"
   license "MIT"
-
-  # For installing from a local checkout (`brew install --HEAD ./Formula/meow.rb`)
-  # or a tapped repository (`brew tap <owner>/meow <git-url> && brew install --HEAD meow`).
-  head Pathname.new(__dir__).parent.realpath.to_s, using: :git
+  head Pathname.new(__dir__).parent.realpath.to_s, using: :git, branch: "main"
 
   depends_on "rust" => :build
   depends_on "feroxbuster"
@@ -27,9 +28,9 @@ class Meow < Formula
 
   def caveats
     <<~EOS
-         /\\_/\\   meow is installed!
-        ( ^w^ )  Run `meow` (or `meow setup`) in a terminal for the interactive
-         > ^ <   first-time Cat Setup GUI, or `meow <name>` to open a session.
+       /\\_/\\   meow is installed!
+      ( ^w^ )  Run `meow` (or `meow setup`) in a terminal for the interactive
+       > ^ <   first-time Cat Setup GUI, or `meow <name>` to open a session.
     EOS
   end
 

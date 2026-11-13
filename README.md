@@ -25,7 +25,8 @@ With Homebrew (macOS and Linuxbrew):
 
 ```sh
 brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
-brew install --HEAD meow
+brew trust Jrdelt/meow        # required once on Homebrew 7+
+brew install meow             # tagged release (or `brew install --HEAD meow`)
 ```
 
 Or on macOS / Linux, from a clone of this repository:
@@ -71,15 +72,16 @@ meow update --check    # only show what is new
 
 `meow update` works in the folder meow was installed from (or `--source
 <folder>`). It pulls only when that folder has no local changes and the pull is
-a fast-forward, then runs `./install.sh --yes` there. Sessions that are open keep
+a fast-forward, then runs `./install.sh --yes` there (on Windows, where a
+running executable cannot overwrite itself, it prints the `.\install.ps1 -Yes`
+command to finish rebuilding after closing `meow`). Sessions that are open keep
 the old version until they are closed and reopened. `git pull && ./install.sh`
 in the folder does the same by hand.
 
-Works on macOS (Apple silicon and Intel, with Homebrew for the scanners) and on
-Linux with `apt`, `dnf`, `yum`, `pacman`, `zypper` or `apk`.
-
-On Windows, install Rust from <https://rustup.rs> with the Visual Studio C++
-build tools, then run `cargo install --path . --locked`.
+Works on macOS (Apple silicon and Intel, with Homebrew for the scanners), on
+Linux with `apt`, `dnf`, `yum`, `pacman`, `zypper` or `apk`, and on Windows
+via `.\install.ps1` (`winget` or `scoop` for Visual Studio Build Tools and
+scanners, or manual Rust from <https://rustup.rs> + `cargo install --path . --locked`).
 
 To build by hand instead (Rust 1.88 or newer and a C compiler):
 
@@ -92,7 +94,7 @@ cargo test                   # the full test suite
 
 | Command | What it does |
 |---|---|
-| `meow list` | Lists every saved workspace (and `./.meow/` of the current directory): whether its session is running, mode, host count, unfinished tasks, last activity. `meow ls` and a bare `meow` do the same; inside a session use `meow list`. |
+| `meow list` | Lists every saved workspace (and `./.meow/` of the current directory): whether its session is running, mode, host count, unfinished tasks, last activity. `meow ls` and a bare `meow` do the same (on a brand-new install, bare `meow` opens the interactive Cat Setup GUI first); inside a session use `meow list`. |
 | `meow delete <name>` | Deletes a saved workspace and everything in it (command log, graph, notes, AI chats, report), after asking. `--yes` skips the question; `--local` deletes `./.meow/` of the current directory. Refused while a session is open on it. `meow rm` does the same. |
 | `meow <name>` | Creates or resumes `~/.meow/workspaces/<name>/` and starts the session shell. `--local` uses `./.meow/` instead. |
 | `meow mode <light\|mild\|aggressive>` | Switches the discovery profile. |
@@ -101,7 +103,7 @@ cargo test                   # the full test suite
 | `meow hud` | Opens the terminal panel: this machine's connection and VPN, hosts, inspector, checklist, CVE feed, queue, notes, AI. |
 | `meow add <file>` | Imports an Nmap XML, JSON Lines, log or `git diff` file. `--no-cve` skips the vulnerability lookups. |
 | `meow report` | Writes `REPORT.md` into the workspace. No AI, no network. |
-| `meow setup` | Sets up your own AI: a model server on your machine or your own cloud API key. See [Your own AI](#your-own-ai-meow-setup). |
+| `meow setup` | Opens the interactive Cat Setup GUI (`--plain` for the line-by-line terminal menu): default discovery mode, local model server, cloud AI key, live CVE grounding / optional NVD key, scanner readiness and live endpoint check. See [Your own AI](#your-own-ai-meow-setup). |
 | `meow update` | Pulls the latest meow from GitHub and rebuilds it, with every tool it uses. `--check` only shows what is new. See [Updating](#updating). |
 
 Inside a session the helper commands find it by themselves. From another
@@ -338,15 +340,17 @@ never modified.
 
 Be aware of what has and has not been exercised:
 
+- **macOS**: developed and verified on Apple silicon (`cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, and the full `330`-test suite
+  including real PTY, Zsh/Bash shims, Cat Setup TUI, HUD, coordinator, CVE,
+  installer and updater tests), plus end-to-end `./install.sh` and Homebrew tap
+  (`Formula/meow.rb`) verification.
 - **Linux**: developed and tested here, including real `nmap` runs against
   `127.0.0.1` and live NVD, OSV and KEV lookups.
-- **macOS**: builds, and a session starts with zsh (first run on a real Mac).
-  The full test suite has not yet passed there, and `install.sh` has not been
-  run on a Mac.
-- **Windows**: compiles and lints for `x86_64-pc-windows-gnu`, but has never
-  been run. This covers the ACL setup, console modes, Job Objects and the
-  PowerShell shim.
-- `katana`, `feroxbuster`, OpenRouter and a local model server have only been
-  exercised through stand-ins in the test suite.
+- **Windows**: `install.ps1` and the Rust codebase (`x86_64-pc-windows-gnu`
+  ACL setup, console modes, Job Objects and PowerShell shim) compile and lint
+  cleanly, but have not yet been executed on a live Windows host.
+- `katana`, `feroxbuster`, OpenRouter and a local model server are exercised
+  through deterministic stand-ins in the automated test suite.
 
 Use it only on systems you are authorized to assess.

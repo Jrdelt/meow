@@ -251,7 +251,8 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     if cfg!(windows) {
         // A running program cannot be replaced on Windows.
         println!(
-            "[+] Pulled. Close meow, then run: cargo install --path \"{}\" --locked",
+            "[+] Pulled. Close meow, then run in PowerShell: & \"{}\\install.ps1\" -Yes  (or: cargo install --path \"{}\" --locked)",
+            dir.display(),
             dir.display()
         );
         return Ok(ExitCode::SUCCESS);

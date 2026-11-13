@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Local security triage shell, topology mapper & grounded audit workspace"
+repository = "https://github.com/Jrdelt/meow"
+readme = "README.md"
 license = "MIT"
 build = "build.rs"
 
