@@ -79,11 +79,11 @@ output_cap_mb = 50
 # [L] local: an OpenAI-compatible server on this machine. Free, nothing leaves.
 local_url = "http://localhost:1234/v1"
 # local_model = ""
-# [C] cloud triage and [R] grounded research go through OpenRouter. Private
-# values are replaced by placeholders first.
-# Run `meow setup` to add your own API key or to choose your own local model:
+# [C] cloud triage and [R] grounded research go through the Claude API (with
+# a Claude API key) or OpenRouter. Private values are replaced by placeholders
+# first. Run `meow setup` to add your own key or to choose your local model:
 # it keeps them in ai.toml next to this file and overrides what is set here.
-# The OPENROUTER_API_KEY environment variable also works for the key.
+# A key in the environment also works: ANTHROPIC_API_KEY or OPENROUTER_API_KEY.
 cloud_model = "anthropic/claude-sonnet-5.5"
 research_model = "anthropic/claude-opus-5.5"
 # Hard daily caps for the cloud tiers; when reached, [C] answers locally.

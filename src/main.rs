@@ -139,6 +139,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 cloud_url,
                 cloud_model,
                 research_model,
+                provider,
+                fallback_models,
                 api_key_stdin,
                 forget_key,
             } => setup::run(
@@ -151,6 +153,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     cloud_url: cloud_url.clone(),
                     cloud_model: cloud_model.clone(),
                     research_model: research_model.clone(),
+                    provider: provider.clone(),
+                    fallback_models: fallback_models.clone(),
                     api_key_stdin: *api_key_stdin,
                     forget_key: *forget_key,
                 },

@@ -16,7 +16,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use crate::ai::{AiOverrides, AiSettings};
+use crate::ai::{AiOverrides, AiSettings, CloudProvider};
+use crate::anthropic;
 use crate::workspace::{Config, MeowHome};
 
 /// Where model servers usually listen on the machine they run on.
@@ -37,6 +38,11 @@ pub struct SetupArgs {
     pub cloud_url: Option<String>,
     pub cloud_model: Option<String>,
     pub research_model: Option<String>,
+    /// `claude` (the Claude API with a Claude key) or `openrouter`.
+    pub provider: Option<String>,
+    /// Claude API only: the models asked next when one declines, comma
+    /// separated and in order. Empty leaves the choice to the API.
+    pub fallback_models: Option<String>,
     /// Read the API key from standard input. It is never taken from the
     /// command line, where it would end up in the shell history.
     pub api_key_stdin: bool,
@@ -53,6 +59,8 @@ impl SetupArgs {
                 &self.cloud_url,
                 &self.cloud_model,
                 &self.research_model,
+                &self.provider,
+                &self.fallback_models,
             ]
             .iter()
             .any(|value| value.is_some())
@@ -97,18 +105,75 @@ pub fn describe(settings: &AiSettings, file: &Path) -> String {
         (Some(key), Some(source)) => format!("{} (from {source})", masked(&key)),
         _ => "not set: [C] answers with the local model, [R] is unavailable".to_owned(),
     };
+    let claude = effective.provider() == CloudProvider::Anthropic;
+    let service = match claude {
+        true => "the Claude API".to_owned(),
+        false => effective.cloud_url.clone(),
+    };
+    // What happens when a model declines a request: the Claude API only.
+    let declined = match (claude, effective.fallbacks().as_slice()) {
+        (false, _) => String::new(),
+        (true, []) => "\x20 If it declines    left to the Claude API\n".to_owned(),
+        (true, chain) => format!("\x20 If it declines    then {}\n", chain.join(", then ")),
+    };
     format!(
         "Your AI setup ({}):\n\
          \x20 [L] local model    {}, model: {model}\n\
-         \x20 [C] cloud triage   {}, model: {}\n\
+         \x20 [C] cloud triage   {service}, model: {}\n\
          \x20 [R] research       model: {}\n\
+         {declined}\
          \x20 API key            {key}\n",
         file.display(),
         effective.local_url,
-        effective.cloud_url,
         effective.cloud_model,
         effective.research_model,
     )
+}
+
+/// Points the cloud tiers at the Claude API. Model names of another service
+/// mean nothing there, so they are replaced by the Claude defaults.
+fn use_claude(own: &mut AiOverrides, current: &AiSettings) {
+    own.cloud_provider = Some(CloudProvider::Anthropic);
+    own.cloud_url = Some(anthropic::API_URL.to_owned());
+    if !current.cloud_model.starts_with("claude-") {
+        own.cloud_model = Some(anthropic::DEFAULT_MODEL.to_owned());
+    }
+    if !current.research_model.starts_with("claude-") {
+        own.research_model = Some(anthropic::DEFAULT_MODEL.to_owned());
+    }
+    if own.cloud_fallbacks.is_none() {
+        let chain = anthropic::DEFAULT_FALLBACKS.iter();
+        own.cloud_fallbacks = Some(chain.map(|model| (*model).to_owned()).collect());
+    }
+}
+
+/// Points the cloud tiers at an OpenAI-style service (OpenRouter by
+/// default). Bare Claude model names belong to the Claude API, so they go
+/// back to this service's defaults.
+fn use_openai_style(own: &mut AiOverrides, current: &AiSettings, url: Option<String>) {
+    let defaults = AiSettings::default();
+    own.cloud_provider = Some(CloudProvider::OpenAi);
+    let was_claude = anthropic::is_claude_api(&current.cloud_url);
+    own.cloud_url = Some(url.unwrap_or(match was_claude {
+        true => defaults.cloud_url,
+        false => current.cloud_url.clone(),
+    }));
+    if current.cloud_model.starts_with("claude-") {
+        own.cloud_model = Some(defaults.cloud_model);
+    }
+    if current.research_model.starts_with("claude-") {
+        own.research_model = Some(defaults.research_model);
+    }
+    own.cloud_fallbacks = None;
+}
+
+/// `a, b` as a fallback chain; `none` or nothing is an empty one.
+fn parse_chain(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("none"))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn http() -> Result<reqwest::Client> {
@@ -208,8 +273,39 @@ fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> {
             writeln!(out, "[!] [L] {error:#}")?;
         }
     }
+    let claude = effective.provider() == CloudProvider::Anthropic;
     match effective.api_key() {
         None => writeln!(out, "[!] [C] no API key set, so it was not tried")?,
+        Some(key) if claude => {
+            // The key first, then every model the setup names: a key is not
+            // necessarily offered all of them.
+            let client = http()?;
+            let url = &effective.cloud_url;
+            match block_on(anthropic::list_models(&client, url, &key))? {
+                Ok(_) => writeln!(out, "[+] [C] the Claude API accepts your API key")?,
+                Err(error) => {
+                    writeln!(out, "[!] [C] {error:#}")?;
+                    return Ok(false);
+                }
+            }
+            let mut models = vec![effective.cloud_model.clone()];
+            models.push(effective.research_model.clone());
+            models.extend(effective.fallbacks());
+            let mut asked: Vec<String> = Vec::new();
+            for model in models {
+                if asked.contains(&model) {
+                    continue;
+                }
+                match block_on(anthropic::has_model(&client, url, &key, &model))? {
+                    Ok(()) => writeln!(out, "[+] [C] {model} is available to this key")?,
+                    Err(error) => {
+                        works = false;
+                        writeln!(out, "[!] [C] {model}: {error:#}")?;
+                    }
+                }
+                asked.push(model);
+            }
+        }
         Some(key) => match block_on(check_key(&effective.cloud_url, &key))? {
             Ok(()) => writeln!(out, "[+] [C] {} accepts your API key", effective.cloud_url)?,
             Err(error) => {
@@ -224,10 +320,32 @@ fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> {
 /// Applies the flags to the user's file. Returns what changed, in words.
 fn apply(
     args: &SetupArgs,
+    current: &AiSettings,
     own: &mut AiOverrides,
     key_from_stdin: Option<String>,
 ) -> Result<Vec<String>> {
     let mut changed = Vec::new();
+    match args.provider.as_deref().map(str::to_lowercase).as_deref() {
+        Some("claude" | "anthropic") => {
+            use_claude(own, current);
+            changed.push("cloud service: the Claude API, with your Claude API key".to_owned());
+        }
+        Some("openrouter" | "openai") => {
+            use_openai_style(own, current, None);
+            let url = own.cloud_url.clone().unwrap_or_default();
+            changed.push(format!("cloud service: {url}"));
+        }
+        Some(other) => bail!("unknown provider '{other}': use claude or openrouter"),
+        None => {}
+    }
+    if let Some(chain) = &args.fallback_models {
+        let chain = parse_chain(chain);
+        changed.push(match chain.as_slice() {
+            [] => "if a model declines: left to the Claude API".to_owned(),
+            chain => format!("if a model declines: then {}", chain.join(", then ")),
+        });
+        own.cloud_fallbacks = Some(chain);
+    }
     if let Some(url) = &args.local_url {
         let url = checked_url(url)?;
         changed.push(format!("local model server: {url}"));
@@ -243,6 +361,13 @@ fn apply(
     if let Some(url) = &args.cloud_url {
         let url = checked_url(url)?;
         changed.push(format!("cloud service: {url}"));
+        // The address decides the protocol unless a provider was named.
+        if args.provider.is_none() {
+            own.cloud_provider = Some(match anthropic::is_claude_api(&url) {
+                true => CloudProvider::Anthropic,
+                false => CloudProvider::OpenAi,
+            });
+        }
         own.cloud_url = Some(url);
     }
     for (value, slot, what) in [
@@ -364,7 +489,7 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         );
         "Server address (Enter to go back): ".to_owned()
     } else {
-        "Server [1], or type another address: ".to_owned()
+        "Server (press Enter for 1, or type a number or another address): ".to_owned()
     };
     let Some(url) = choose(&prompt, &urls, urls.first().map(String::as_str))? else {
         return Ok(false);
@@ -394,27 +519,100 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     Ok(true)
 }
 
-fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
-    let effective = settings.effective();
+fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     println!(
-        "Any OpenAI-compatible service works for [C]. [R] (research with web search) \
-         needs OpenRouter."
+        "Your Claude API key is created in the Claude Console, under API keys. It is kept \
+         in your setup file on this machine and sent to the Claude API only."
     );
-    let url = ask(&format!("Service address [{}]: ", effective.cloud_url))?.unwrap_or_default();
-    let url = match url.as_str() {
-        "" => effective.cloud_url.clone(),
-        typed => checked_url(typed)?,
-    };
-    let Some(key) =
-        ask_hidden("Your API key (hidden as you type; Enter to finish, Esc to cancel): ")?
+    let Some(key) = ask_hidden(
+        "Your Claude API key (nothing shows as you type or paste; Enter to finish, Esc to cancel): ",
+    )?
     else {
         println!("Nothing changed.");
         return Ok(false);
     };
-    let triage = ask(&format!("Triage model [{}]: ", effective.cloud_model))?.unwrap_or_default();
-    let research =
-        ask(&format!("Research model [{}]: ", effective.research_model))?.unwrap_or_default();
-    own.cloud_url = Some(url);
+    let mut next = own.clone();
+    use_claude(&mut next, &settings.effective());
+    let default = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
+    let effective = settings.effective();
+    let triage_now = default(&next.cloud_model, &effective.cloud_model);
+    let research_now = default(&next.research_model, &effective.research_model);
+    let chain_now = next.cloud_fallbacks.clone().unwrap_or_default();
+    let triage = ask(&format!(
+        "Model for [C] triage (press Enter to keep {triage_now}): "
+    ))?
+    .unwrap_or_default();
+    let research = ask(&format!(
+        "Model for [R] research (press Enter to keep {research_now}): "
+    ))?
+    .unwrap_or_default();
+    let chain = ask(&format!(
+        "If a model declines a request, ask these next, in this order\n\
+         (press Enter to keep {}; type none to leave it to the Claude API): ",
+        match chain_now.as_slice() {
+            [] => "none".to_owned(),
+            chain => chain.join(", "),
+        }
+    ))?
+    .unwrap_or_default();
+    next.api_key = Some(key);
+    if !triage.is_empty() {
+        next.cloud_model = Some(triage);
+    }
+    if !research.is_empty() {
+        next.research_model = Some(research);
+    }
+    if !chain.is_empty() {
+        next.cloud_fallbacks = Some(parse_chain(&chain));
+    }
+    *own = next;
+    Ok(true)
+}
+
+fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
+    let effective = settings.effective();
+    println!(
+        "Using OpenRouter? Press Enter at the first question, then paste your key \
+         (create one at openrouter.ai under Keys).\n\
+         Any other OpenAI-style service works for [C] too; [R] (research with web \
+         search) needs OpenRouter or a Claude API key."
+    );
+    // Coming from a Claude key, the address to propose is OpenRouter's.
+    let proposed = match anthropic::is_claude_api(&effective.cloud_url) {
+        true => AiSettings::default().cloud_url,
+        false => effective.cloud_url.clone(),
+    };
+    let url = ask(&format!(
+        "Service address (press Enter to keep {proposed}): "
+    ))?
+    .unwrap_or_default();
+    let url = match url.as_str() {
+        "" => proposed,
+        typed => checked_url(typed)?,
+    };
+    let Some(key) = ask_hidden(
+        "Your API key (nothing shows as you type or paste; Enter to finish, Esc to cancel): ",
+    )?
+    else {
+        println!("Nothing changed.");
+        return Ok(false);
+    };
+    // What would be kept if every question is answered with Enter: model
+    // names of the Claude API are replaced by this service's own.
+    let mut next = own.clone();
+    use_openai_style(&mut next, &effective, Some(url));
+    let kept = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
+    let triage_now = kept(&next.cloud_model, &effective.cloud_model);
+    let research_now = kept(&next.research_model, &effective.research_model);
+    let triage = ask(&format!(
+        "Triage model (press Enter to keep {triage_now}): "
+    ))?
+    .unwrap_or_default();
+    let research = ask(&format!(
+        "Research model (press Enter to keep {research_now}): "
+    ))?
+    .unwrap_or_default();
+    *own = next;
     own.api_key = Some(key);
     if !triage.is_empty() {
         own.cloud_model = Some(triage);
@@ -432,9 +630,10 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
         print!("{}", describe(settings, file));
         println!(
             "\n  1  Use a model on this machine (LM Studio, Ollama, llama.cpp, ...)\n\
-             \x20 2  Use my own cloud API key (OpenRouter or another service)\n\
-             \x20 3  Remove my API key\n\
-             \x20 4  Check that it works\n\
+             \x20 2  Use my Claude API key\n\
+             \x20 3  Use my OpenRouter key (or another OpenAI-style service)\n\
+             \x20 4  Remove my API key\n\
+             \x20 5  Check that it works\n\
              \x20 q  Done"
         );
         let Some(answer) = ask("> ")? else {
@@ -442,15 +641,16 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
         };
         let saved = match answer.as_str() {
             "1" => setup_local(settings, own),
-            "2" => setup_cloud(settings, own),
-            "3" => {
+            "2" => setup_claude(settings, own),
+            "3" => setup_cloud(settings, own),
+            "4" => {
                 own.api_key = None;
                 Ok(true)
             }
-            "4" => check(settings, &mut std::io::stdout()).map(|_| false),
+            "5" => check(settings, &mut std::io::stdout()).map(|_| false),
             "q" | "Q" | "" => return Ok(()),
             _ => {
-                println!("Type 1, 2, 3, 4 or q.");
+                println!("Type a number from 1 to 5, or q.");
                 Ok(false)
             }
         };
@@ -483,7 +683,7 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
         } else {
             None
         };
-        let changed = apply(args, &mut own, key)?;
+        let changed = apply(args, &settings.effective(), &mut own, key)?;
         own.save(&file)?;
         for line in &changed {
             println!("[+] {line}");
@@ -606,7 +806,13 @@ mod tests {
             ..SetupArgs::default()
         };
         assert!(args.changes_something());
-        let changed = apply(&args, &mut own, Some(format!("{GOOD_KEY}\n"))).unwrap();
+        let changed = apply(
+            &args,
+            &AiSettings::default(),
+            &mut own,
+            Some(format!("{GOOD_KEY}\n")),
+        )
+        .unwrap();
         assert_eq!(
             changed,
             [
@@ -625,6 +831,8 @@ mod tests {
                 cloud_url: None,
                 cloud_model: Some("kept/model".into()),
                 research_model: Some("my/research".into()),
+                cloud_provider: None,
+                cloud_fallbacks: None,
                 api_key: Some(GOOD_KEY.into()),
             }
         );
@@ -635,7 +843,7 @@ mod tests {
             local_model: Some(String::new()),
             ..SetupArgs::default()
         };
-        apply(&args, &mut own, None).unwrap();
+        apply(&args, &AiSettings::default(), &mut own, None).unwrap();
         assert_eq!(
             (own.api_key.as_deref(), own.local_model.as_deref()),
             (None, Some(""))
@@ -645,7 +853,13 @@ mod tests {
         let bad = |args: SetupArgs, key: Option<String>| {
             format!(
                 "{:#}",
-                apply(&args, &mut AiOverrides::default(), key).unwrap_err()
+                apply(
+                    &args,
+                    &AiSettings::default(),
+                    &mut AiOverrides::default(),
+                    key
+                )
+                .unwrap_err()
             )
         };
         let url = |url: &str| SetupArgs {
@@ -667,6 +881,151 @@ mod tests {
             ..SetupArgs::default()
         }
         .changes_something());
+    }
+
+    /// Choosing a Claude key switches the cloud tiers to the Claude API,
+    /// with Claude model names and the fallback chain, and back again.
+    #[test]
+    fn a_claude_key_brings_the_claude_api_its_models_and_the_fallback_chain() {
+        if std::env::var(anthropic::KEY_ENV).is_ok()
+            || std::env::var(crate::ai::API_KEY_ENV).is_ok()
+        {
+            return; // a key in the environment would be named as the source
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        let settings = AiSettings {
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let claude_key = "sk-ant-test-their-own-key-7c1d";
+        let mut own = AiOverrides::default();
+        let args = SetupArgs {
+            provider: Some("claude".into()),
+            api_key_stdin: true,
+            ..SetupArgs::default()
+        };
+        let changed = apply(
+            &args,
+            &settings.effective(),
+            &mut own,
+            Some(claude_key.into()),
+        )
+        .unwrap();
+        assert_eq!(
+            changed,
+            [
+                "cloud service: the Claude API, with your Claude API key",
+                "API key set, ends in 7c1d",
+            ]
+        );
+        assert_eq!(
+            own,
+            AiOverrides {
+                cloud_provider: Some(CloudProvider::Anthropic),
+                cloud_url: Some("https://api.anthropic.com/v1".into()),
+                // OpenRouter's model names mean nothing to the Claude API.
+                cloud_model: Some("claude-opus-5-5".into()),
+                research_model: Some("claude-opus-5-5".into()),
+                cloud_fallbacks: Some(vec!["claude-opus-4-6".into(), "claude-opus-4-8".into()]),
+                api_key: Some(claude_key.into()),
+                ..AiOverrides::default()
+            }
+        );
+        own.save(&file).unwrap();
+        let effective = settings.effective();
+        assert_eq!(effective.provider(), CloudProvider::Anthropic);
+        assert_eq!(
+            effective.fallbacks(),
+            ["claude-opus-4-6", "claude-opus-4-8"]
+        );
+        assert_eq!(effective.key_variable(), "ANTHROPIC_API_KEY");
+        let text = describe(&settings, &file);
+        for expected in [
+            "[C] cloud triage   the Claude API, model: claude-opus-5-5",
+            "[R] research       model: claude-opus-5-5",
+            "If it declines    then claude-opus-4-6, then claude-opus-4-8",
+            "API key            set, ends in 7c1d (from your setup file)",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(!text.contains(claude_key));
+        // The file says it in plain TOML, for anyone who prefers an editor.
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("cloud_provider = \"anthropic\""), "{saved}");
+        assert!(
+            saved.contains("cloud_fallbacks = [\"claude-opus-4-6\", \"claude-opus-4-8\"]"),
+            "{saved}"
+        );
+
+        // Their own chain, their own models; a model already chosen stays.
+        let args = SetupArgs {
+            cloud_model: Some("claude-sonnet-5-5".into()),
+            fallback_models: Some("claude-opus-4-8, claude-opus-5".into()),
+            ..SetupArgs::default()
+        };
+        let changed = apply(&args, &settings.effective(), &mut own, None).unwrap();
+        assert_eq!(
+            changed,
+            [
+                "if a model declines: then claude-opus-4-8, then claude-opus-5",
+                "triage model: claude-sonnet-5-5",
+            ]
+        );
+        own.save(&file).unwrap();
+        let again = SetupArgs {
+            provider: Some("anthropic".into()),
+            ..SetupArgs::default()
+        };
+        apply(&again, &settings.effective(), &mut own, None).unwrap();
+        assert_eq!(own.cloud_model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(
+            own.cloud_fallbacks,
+            Some(vec!["claude-opus-4-8".into(), "claude-opus-5".into()])
+        );
+        // An empty chain hands the choice to the Claude API.
+        let none = SetupArgs {
+            fallback_models: Some("none".into()),
+            ..SetupArgs::default()
+        };
+        let changed = apply(&none, &settings.effective(), &mut own, None).unwrap();
+        assert_eq!(changed, ["if a model declines: left to the Claude API"]);
+        own.save(&file).unwrap();
+        assert!(settings.effective().fallbacks().is_empty());
+        assert!(describe(&settings, &file).contains("If it declines    left to the Claude API"));
+
+        // Back to OpenRouter: its address and its model names return.
+        let back = SetupArgs {
+            provider: Some("openrouter".into()),
+            ..SetupArgs::default()
+        };
+        let changed = apply(&back, &settings.effective(), &mut own, None).unwrap();
+        assert_eq!(changed, ["cloud service: https://openrouter.ai/api/v1"]);
+        own.save(&file).unwrap();
+        let effective = settings.effective();
+        assert_eq!(effective.provider(), CloudProvider::OpenAi);
+        assert_eq!(effective.cloud_model, "anthropic/claude-sonnet-5.5");
+        assert_eq!(effective.research_model, "anthropic/claude-opus-5.5");
+        assert!(effective.fallbacks().is_empty());
+        assert_eq!(effective.key_variable(), "OPENROUTER_API_KEY");
+        assert!(!describe(&settings, &file).contains("If it declines"));
+
+        // The address alone is enough to know which protocol to speak.
+        let by_address = AiSettings {
+            cloud_url: "https://api.anthropic.com/v1".into(),
+            ..AiSettings::default()
+        };
+        assert_eq!(by_address.provider(), CloudProvider::Anthropic);
+        assert_eq!(
+            by_address.fallbacks(),
+            ["claude-opus-4-6", "claude-opus-4-8"]
+        );
+        assert_eq!(parse_chain(" a , ,b,none"), ["a", "b"]);
+        let unknown = SetupArgs {
+            provider: Some("other".into()),
+            ..SetupArgs::default()
+        };
+        assert!(apply(&unknown, &settings, &mut own, None).is_err());
     }
 
     #[test]

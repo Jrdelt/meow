@@ -57,6 +57,7 @@ impl Hosted {
         command.env_remove("MEOW_SESSION");
         command.env_remove("MEOW_WORKSPACE");
         command.env_remove("OPENROUTER_API_KEY");
+        command.env_remove("ANTHROPIC_API_KEY");
         command.env_remove("ENV");
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
@@ -346,11 +347,12 @@ fn delete_asks_first_and_keeps_the_workspace_on_anything_but_yes() {
     assert!(!dir.exists());
 }
 
-/// `meow setup` on a terminal: the menu, and an API key that is typed
-/// without ever appearing on screen.
+/// `meow setup` on a terminal: the menu, a Claude API key that is typed
+/// without ever appearing on screen, and the switch to another service.
 #[test]
 fn setup_asks_on_the_terminal_and_never_shows_the_key() {
-    const KEY: &str = "sk-pty-their-secret-key-77";
+    const CLAUDE_KEY: &str = "sk-ant-pty-their-secret-key-77";
+    const OTHER_KEY: &str = "sk-or-pty-another-secret-key-42";
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("meow-home").join("ai.toml");
     let mut hosted = Hosted::spawn_args(&["setup"], tmp);
@@ -363,21 +365,33 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
     };
     expect(&mut hosted, "meow setup: your own AI for meow.");
     expect(&mut hosted, "API key            not set");
+    expect(&mut hosted, "  2  Use my Claude API key");
     expect(&mut hosted, "  q  Done");
     expect(&mut hosted, "> ");
 
+    // A Claude API key: every question after it can be answered with Enter.
     hosted.send("2\r");
     expect(
         &mut hosted,
-        "Service address [https://openrouter.ai/api/v1]: ",
+        "Your Claude API key (nothing shows as you type or paste",
+    );
+    // A typo, corrected with backspace, then Enter.
+    hosted.send(&format!("{CLAUDE_KEY}x\x7f\r"));
+    expect(
+        &mut hosted,
+        "Model for [C] triage (press Enter to keep claude-opus-5-5): ",
     );
     hosted.send("\r");
-    expect(&mut hosted, "Your API key (hidden as you type");
-    // A typo, corrected with backspace, then Enter.
-    hosted.send(&format!("{KEY}x\x7f\r"));
-    expect(&mut hosted, "Triage model [anthropic/claude-sonnet-5.5]: ");
-    hosted.send("their/triage-model\r");
-    expect(&mut hosted, "Research model [");
+    expect(
+        &mut hosted,
+        "Model for [R] research (press Enter to keep claude-opus-5-5): ",
+    );
+    hosted.send("\r");
+    expect(
+        &mut hosted,
+        "(press Enter to keep claude-opus-4-6, claude-opus-4-8; type none to leave it to the \
+         Claude API): ",
+    );
     hosted.send("\r");
     expect(
         &mut hosted,
@@ -385,32 +399,81 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
     );
     expect(
         &mut hosted,
+        "[C] cloud triage   the Claude API, model: claude-opus-5-5",
+    );
+    expect(
+        &mut hosted,
+        "If it declines    then claude-opus-4-6, then claude-opus-4-8",
+    );
+    expect(
+        &mut hosted,
         "API key            set, ends in y-77 (from your setup file)",
     );
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        saved.contains(&format!("api_key = \"{CLAUDE_KEY}\"")),
+        "{saved}"
+    );
+    assert!(saved.contains("cloud_provider = \"anthropic\""), "{saved}");
+    assert!(
+        saved.contains("cloud_model = \"claude-opus-5-5\""),
+        "{saved}"
+    );
+
+    // On to OpenRouter: Enter keeps the proposed address, a model is typed.
+    hosted.send("3\r");
+    expect(
+        &mut hosted,
+        "Using OpenRouter? Press Enter at the first question",
+    );
+    expect(
+        &mut hosted,
+        "Service address (press Enter to keep https://openrouter.ai/api/v1): ",
+    );
+    hosted.send("\r");
+    expect(
+        &mut hosted,
+        "Your API key (nothing shows as you type or paste",
+    );
+    hosted.send(&format!("{OTHER_KEY}\r"));
+    expect(
+        &mut hosted,
+        "Triage model (press Enter to keep anthropic/claude-sonnet-5.5): ",
+    );
+    hosted.send("their/triage-model\r");
+    expect(&mut hosted, "Research model (press Enter to keep ");
+    hosted.send("\r");
     expect(&mut hosted, "model: their/triage-model");
+    expect(
+        &mut hosted,
+        "API key            set, ends in y-42 (from your setup file)",
+    );
 
     // Anything else than a menu entry is explained, not acted on.
     hosted.send("7\r");
-    expect(&mut hosted, "Type 1, 2, 3, 4 or q.");
+    expect(&mut hosted, "Type a number from 1 to 5, or q.");
     hosted.send("q\r");
     let (code, output, tmp) = hosted.finish_keeping_files();
     assert_eq!(code, 0, "{}", text(&output));
-    assert!(
-        !text(&output).contains(KEY) && !text(&output).contains("sk-pty"),
-        "the key was shown: {}",
-        text(&output)
-    );
+    for secret in [CLAUDE_KEY, OTHER_KEY, "sk-ant-pty", "sk-or-pty"] {
+        assert!(
+            !text(&output).contains(secret),
+            "a key was shown: {}",
+            text(&output)
+        );
+    }
 
     let saved = std::fs::read_to_string(&file).unwrap();
-    assert!(saved.contains(&format!("api_key = \"{KEY}\"")), "{saved}");
+    assert!(
+        saved.contains(&format!("api_key = \"{OTHER_KEY}\"")),
+        "{saved}"
+    );
+    assert!(saved.contains("cloud_provider = \"openai\""), "{saved}");
     assert!(
         saved.contains("cloud_model = \"their/triage-model\""),
         "{saved}"
     );
-    assert!(
-        !saved.contains("research_model"),
-        "Enter keeps the default: {saved}"
-    );
+    assert!(!saved.contains("cloud_fallbacks"), "{saved}");
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
@@ -420,7 +483,7 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
     // Removing the key again, from the menu.
     let mut hosted = Hosted::spawn_args(&["setup"], tmp);
     expect(&mut hosted, "> ");
-    hosted.send("3\r");
+    hosted.send("4\r");
     expect(&mut hosted, "[+] Saved.");
     expect(&mut hosted, "API key            not set");
     hosted.send("q\r");

@@ -53,7 +53,15 @@ pub enum Command {
         /// Model the local server should use ("" lets the server choose)
         #[arg(long, value_name = "NAME")]
         local_model: Option<String>,
-        /// Cloud service for [C] and [R] (default: OpenRouter)
+        /// Cloud service: `claude` (the Claude API, with a Claude API key)
+        /// or `openrouter`
+        #[arg(long, value_parser = ["claude", "anthropic", "openrouter", "openai"])]
+        provider: Option<String>,
+        /// Claude API only: models to ask next when one declines a request,
+        /// in order and comma separated ("" leaves it to the API)
+        #[arg(long, value_name = "A,B")]
+        fallback_models: Option<String>,
+        /// Address of another OpenAI-style cloud service
         #[arg(long, value_name = "URL")]
         cloud_url: Option<String>,
         /// Model for [C] cloud triage

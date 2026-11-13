@@ -55,7 +55,7 @@ Before every push:
 
 - **Active Phase & Step:** All four phases complete, plus `install.sh`, `meow
   list`/`delete`/`setup`, the sketched map and macOS fixes.
-- **Last Verified Commit:** `feat(dashboard)` — see `git log -n 1 --oneline`.
+- **Last Verified Commit:** `feat(claude)` — see `git log -n 1 --oneline`.
 - **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
   `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
   `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
@@ -63,8 +63,8 @@ Before every push:
   `assets/`); Phase 4 (`vault`, `ai`, `report`, `setup`); `install.sh`.
 - **In-Progress / Partial Work:** None.
 - **Next Exact Action:** Wait for the owner's macOS results: `cargo test
-  --no-fail-fast`, the map and HUD, `meow setup` with a real key or model.
-  Unverified: real `katana`/`feroxbuster`, Windows.
+  --no-fail-fast`, the map and HUD, `meow setup` with a real Claude key (never
+  run against the real API). Unverified: real `katana`/`feroxbuster`, Windows.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
@@ -81,19 +81,19 @@ Before every push:
     `private_open_options()` / `write_private_atomic()` only. `meow setup`
     keeps each user's AI in `~/.meow/ai.toml`, re-read per request. Shared
     repository: never print a key, never commit real addresses or keys.
-  - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system
-    files (Apple's pick the history location from it) and the user's
-    `.zshrc` load natively. Never keep `ZDOTDIR` on the shim past `.zshenv`.
-  - Map page: a dashboard of cards (heading, label/value rows); no inline
-    scripts, no `innerHTML`; checked by hand in Chromium (Playwright).
-    `topology::Role` picks a node's icon and carries the reason; the cloud and
-    neighbour clients are drawn only, never hosts. `observer::machine_report`
-    words "this machine" for the map and the HUD. Cytoscape 3.33.1 (MIT).
+  - Cloud tiers: `src/anthropic.rs` speaks the Claude API natively (raw
+    HTTP; prices and model families are tables there), `ai.rs` the
+    OpenAI-style one. A refusal walks the user's fallback chain in order.
+  - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system and
+    user startup files load natively. Never keep it on the shim after that.
+  - Map page: a dashboard of cards; no inline scripts, no `innerHTML`; checked
+    by hand in Chromium (Playwright). `topology::Role` picks a node's icon and
+    carries the reason; the cloud and neighbour clients are drawn only, never
+    hosts. `observer::machine_report` words "this machine" for map and HUD.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
-    x86_64-pc-windows-gnu --all-targets -- -D warnings`, needs
-    `gcc-mingw-w64-x86-64`). No CI: private repo, paid macOS runners.
+    x86_64-pc-windows-gnu --all-targets -- -D warnings`). No CI: private repo.
   - macOS (owner's machine): install, sessions, map and `nmap` recon work;
     no full test run reported. Tests must not depend on the login name,
     `/usr/bin/zsh`, bash >= 4.4 or unresolved temp paths.

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::anthropic;
 use crate::checklist;
 use crate::db::Db;
 use crate::evidence::{sanitize, sanitize_block, Source, VerificationStatus};
@@ -73,6 +74,17 @@ impl Tier {
     }
 }
 
+/// Which protocol the cloud service speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudProvider {
+    /// The OpenAI-style chat completions API: OpenRouter and many others.
+    #[serde(rename = "openai")]
+    OpenAi,
+    /// The Claude API itself, with a Claude API key.
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
 /// `[ai]` section of `config.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
@@ -90,6 +102,14 @@ pub struct AiSettings {
     /// Prefer `meow setup` or the `OPENROUTER_API_KEY` environment variable
     /// over this.
     pub openrouter_api_key: Option<String>,
+    /// `"anthropic"` for the Claude API with a Claude key, `"openai"` for
+    /// OpenRouter and other OpenAI-style services. Left out, it follows from
+    /// `cloud_url`.
+    pub cloud_provider: Option<CloudProvider>,
+    /// Claude API only: the models asked next, in this order, when the one
+    /// before declines a request. Left out, the built-in chain applies; an
+    /// empty list leaves the choice to the API.
+    pub cloud_fallbacks: Option<Vec<String>>,
     /// The user's own setup file (`~/.meow/ai.toml`), written by
     /// `meow setup`. Read again for every request, so a change applies to a
     /// running session at once.
@@ -108,6 +128,8 @@ impl Default for AiSettings {
             max_daily_usd: 1.0,
             max_daily_calls: 20,
             openrouter_api_key: None,
+            cloud_provider: None,
+            cloud_fallbacks: None,
             user_file: None,
         }
     }
@@ -130,6 +152,10 @@ pub struct AiOverrides {
     pub cloud_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub research_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_provider: Option<CloudProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_fallbacks: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -174,6 +200,12 @@ impl AiOverrides {
         if let Some(key) = self.api_key.filter(|k| !k.trim().is_empty()) {
             settings.openrouter_api_key = Some(key);
         }
+        if self.cloud_provider.is_some() {
+            settings.cloud_provider = self.cloud_provider;
+        }
+        if self.cloud_fallbacks.is_some() {
+            settings.cloud_fallbacks = self.cloud_fallbacks;
+        }
     }
 }
 
@@ -192,28 +224,59 @@ impl AiSettings {
         settings
     }
 
+    /// The protocol to speak: what the settings say, or else what the
+    /// address gives away.
+    pub fn provider(&self) -> CloudProvider {
+        self.cloud_provider
+            .unwrap_or(match anthropic::is_claude_api(&self.cloud_url) {
+                true => CloudProvider::Anthropic,
+                false => CloudProvider::OpenAi,
+            })
+    }
+
+    /// Claude API only: the models to ask, in order, after one declines.
+    pub fn fallbacks(&self) -> Vec<String> {
+        match (&self.cloud_fallbacks, self.provider()) {
+            (Some(own), _) => own.clone(),
+            (None, CloudProvider::Anthropic) => {
+                let chain = anthropic::DEFAULT_FALLBACKS.iter();
+                chain.map(|model| (*model).to_owned()).collect()
+            }
+            (None, CloudProvider::OpenAi) => Vec::new(),
+        }
+    }
+
+    /// The environment variable a key for this service is conventionally in.
+    pub fn key_variable(&self) -> &'static str {
+        match self.provider() {
+            CloudProvider::Anthropic => anthropic::KEY_ENV,
+            CloudProvider::OpenAi => API_KEY_ENV,
+        }
+    }
+
     /// Where the API key comes from, for `meow setup`: the environment wins
     /// over the user's file, which wins over `config.toml`.
-    pub fn key_source(&self) -> Option<&'static str> {
+    pub fn key_source(&self) -> Option<String> {
         let filled = |key: &Option<String>| key.as_deref().is_some_and(|k| !k.trim().is_empty());
         let in_file = self
             .user_file
             .as_deref()
             .and_then(|path| AiOverrides::load(path).ok())
             .is_some_and(|overrides| filled(&overrides.api_key));
-        if std::env::var(API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
-            Some("the OPENROUTER_API_KEY environment variable")
+        let variable = self.effective().key_variable();
+        if std::env::var(variable).is_ok_and(|key| !key.trim().is_empty()) {
+            Some(format!("the {variable} environment variable"))
         } else if in_file {
-            Some("your setup file")
+            Some("your setup file".to_owned())
         } else if filled(&self.openrouter_api_key) {
-            Some("config.toml")
+            Some("config.toml".to_owned())
         } else {
             None
         }
     }
 
     pub fn api_key(&self) -> Option<String> {
-        std::env::var(API_KEY_ENV)
+        std::env::var(self.key_variable())
             .ok()
             .or_else(|| self.openrouter_api_key.clone())
             .map(|key| key.trim().to_owned())
@@ -415,7 +478,9 @@ pub fn research_prompt(host: &Host) -> Prompt {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
-    /// Exact cost reported by OpenRouter, including server tool fees.
+    /// The cost: as reported by OpenRouter (exact, server tool fees
+    /// included), or worked out from token counts at list prices for the
+    /// Claude API, which reports tokens only.
     pub cost_usd: f64,
     pub web_search_requests: u32,
     pub prompt_tokens: u64,
@@ -819,33 +884,54 @@ impl AiEngine {
             return self.run_local(tier, &prompt, reason, on_text).await;
         }
 
-        let mut body = json!({
-            "model": model,
-            "messages": [
-                { "role": "system", "content": prompt.system },
-                { "role": "user", "content": masked_user },
-            ],
-            "stream": true,
-            "temperature": 0.2,
-            "usage": { "include": true },
-        });
-        if tier == Tier::Research {
-            body["tools"] = json!([{
-                "type": "openrouter:web_search",
-                "parameters": { "max_uses": 2, "max_results": 5, "search_context_size": "low" },
-            }]);
-        }
         let mut shown = String::new();
-        let result = self
-            .chat(&settings.cloud_url, Some(&api_key), &body, |piece| {
-                let ready = unmasker.push(piece);
-                if !ready.is_empty() {
-                    on_text(&ready);
-                    shown.push_str(&ready);
+        let mut deliver = |piece: &str| {
+            let ready = unmasker.push(piece);
+            if !ready.is_empty() {
+                on_text(&ready);
+                shown.push_str(&ready);
+            }
+        };
+        // (masked reply, what it cost, the model that answered)
+        let result: Result<(String, Usage, String)> = match settings.provider() {
+            // A Claude API key: the Claude API's own protocol, the user's
+            // fallback chain, and Claude's own web search for research.
+            CloudProvider::Anthropic => anthropic::ask(
+                &self.http,
+                &settings.cloud_url,
+                &api_key,
+                &model,
+                &settings.fallbacks(),
+                tier == Tier::Research,
+                &prompt.system,
+                &masked_user,
+                &mut deliver,
+            )
+            .await
+            .map(|answer| (answer.text, answer.usage, answer.model)),
+            CloudProvider::OpenAi => {
+                let mut body = json!({
+                    "model": model,
+                    "messages": [
+                        { "role": "system", "content": prompt.system },
+                        { "role": "user", "content": masked_user },
+                    ],
+                    "stream": true,
+                    "temperature": 0.2,
+                    "usage": { "include": true },
+                });
+                if tier == Tier::Research {
+                    body["tools"] = json!([{
+                        "type": "openrouter:web_search",
+                        "parameters": { "max_uses": 2, "max_results": 5, "search_context_size": "low" },
+                    }]);
                 }
-            })
-            .await;
-        let (masked_reply, usage) = match result {
+                self.chat(&settings.cloud_url, Some(&api_key), &body, &mut deliver)
+                    .await
+                    .map(|(text, usage)| (text, usage, model.clone()))
+            }
+        };
+        let (masked_reply, usage, answered_by) = match result {
             Ok(done) => done,
             Err(error) => {
                 // The attempt still counts against the call cap.
@@ -859,7 +945,7 @@ impl AiEngine {
 
         {
             let db = lock_db(&self.db);
-            record_usage(&db, tier, &model, &usage)?;
+            record_usage(&db, tier, &answered_by, &usage)?;
             db.conn().execute(
                 "INSERT OR REPLACE INTO prompt_cache (sha256, tier, response, created_utc) VALUES (?1, ?2, ?3, ?4)",
                 params![key, tier.as_str(), masked_reply, now_rfc3339()],
@@ -868,7 +954,7 @@ impl AiEngine {
         Ok(Outcome {
             requested: tier,
             tier,
-            model,
+            model: answered_by,
             text: shown,
             cost_usd: usage.cost_usd,
             web_search_requests: usage.web_search_requests,
@@ -1218,6 +1304,28 @@ mod tests {
                         Some(json!({ "prompt_tokens": 800, "completion_tokens": 120, "cost": 0.0042,
                                      "server_tool_use": { "web_search_requests": if body.get("tools").is_some() { 2 } else { 0 } } })),
                     )
+                }),
+            )
+            // The Claude API's own protocol, for users with a Claude key.
+            .route(
+                "/claude/messages",
+                post(|State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                    let key = headers.get("x-api-key").map(|v| v.to_str().unwrap().to_owned());
+                    mock.cloud.lock().unwrap().push((key, body.clone()));
+                    let event = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+                    let delta = |text: &str| json!({ "type": "content_block_delta", "index": 0,
+                        "delta": { "type": "text_delta", "text": text } });
+                    // A placeholder straddles two stream events here too.
+                    let stream = [
+                        json!({ "type": "message_start", "message": {
+                            "model": body["model"], "usage": { "input_tokens": 500, "output_tokens": 1 } } }),
+                        delta("Patch <<HO"),
+                        delta("ST_01>> now."),
+                        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" },
+                            "usage": { "output_tokens": 300 } }),
+                    ];
+                    let text: String = stream.into_iter().map(event).collect();
+                    ([("content-type", "text/event-stream")], text).into_response()
                 }),
             )
             .route(
@@ -1607,7 +1715,7 @@ mod tests {
         own.cloud_model = Some("their/model".into());
         own.save(&file).unwrap();
         assert!(engine.budget().has_key);
-        assert_eq!(settings.key_source(), Some("your setup file"));
+        assert_eq!(settings.key_source().as_deref(), Some("your setup file"));
         let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
         let outcome = outcome.unwrap();
         assert_eq!(
@@ -1636,6 +1744,78 @@ mod tests {
         std::fs::write(&file, "not toml [").unwrap();
         assert!(AiOverrides::load(&file).is_err());
         assert!(!engine.budget().has_key, "a broken file changes nothing");
+    }
+
+    /// A Claude API key: the same vault, the same budget, the Claude API's
+    /// own protocol.
+    #[tokio::test]
+    async fn a_claude_key_goes_through_the_vault_and_the_budget_like_any_other() {
+        if std::env::var(anthropic::KEY_ENV).is_ok() {
+            return; // the environment would win over the key under test
+        }
+        let (base, mock) = mock_models().await;
+        let settings = AiSettings {
+            local_url: format!("{base}/local"),
+            cloud_url: format!("{base}/claude"),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            cloud_model: "claude-opus-5-5".into(),
+            research_model: "claude-opus-5-5".into(),
+            openrouter_api_key: Some("sk-ant-their-key".into()),
+            ..AiSettings::default()
+        };
+        assert_eq!(settings.fallbacks(), ["claude-opus-4-6", "claude-opus-4-8"]);
+        let engine = AiEngine::new(
+            settings,
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        assert!(engine.budget().has_key);
+
+        let (outcome, streamed) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert_eq!(
+            (outcome.tier, outcome.model.as_str()),
+            (Tier::Cloud, "claude-opus-5-5")
+        );
+        // The reply names the real host again, on this machine only.
+        assert_eq!(outcome.text, "Patch 10.10.10.5 now.");
+        assert_eq!(streamed.concat(), outcome.text);
+        assert!(
+            streamed.iter().all(|piece| !piece.contains("<<")),
+            "a placeholder was shown: {streamed:?}"
+        );
+        // 500 tokens in and 300 out on Opus 5.5: worked out here, since the
+        // Claude API reports tokens and not money.
+        assert!(
+            (outcome.cost_usd - 0.008).abs() < 1e-9,
+            "{}",
+            outcome.cost_usd
+        );
+        let budget = engine.budget();
+        assert_eq!(budget.calls, 1);
+        assert!((budget.spent_usd - 0.008).abs() < 1e-9);
+
+        let (key, sent) = mock.cloud.lock().unwrap()[0].clone();
+        assert_eq!(key.as_deref(), Some("sk-ant-their-key"));
+        assert_eq!(sent["model"], "claude-opus-5-5");
+        assert!(sent["system"]
+            .as_str()
+            .unwrap()
+            .contains("untrusted_scan_data"));
+        let user = sent["messages"][0]["content"].as_str().unwrap();
+        assert!(user.contains("<<HOST_01>>"), "{user}");
+        for private in ["10.10.10.5", "web01.lab.local"] {
+            assert!(
+                !sent.to_string().contains(private),
+                "{private} left this machine"
+            );
+        }
+        // The same question again costs nothing: it is answered from the cache.
+        let (again, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        assert!(again.unwrap().cached);
+        assert_eq!(mock.cloud.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -270,6 +270,7 @@ fn setup_keeps_each_users_own_ai_in_their_private_file() {
             .current_dir(sandbox.project())
             .env("MEOW_HOME", sandbox.home())
             .env_remove("OPENROUTER_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -375,6 +376,50 @@ fn setup_keeps_each_users_own_ai_in_their_private_file() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("must start with http:// or https://"));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+    // A Claude API key instead: the Claude API, its model names, and the
+    // chain of models to ask when one declines.
+    let output = setup(
+        &["--provider", "claude", "--api-key-stdin"],
+        "sk-ant-cli-their-claude-key-9z8y\n",
+        &[],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    for expected in [
+        "[+] cloud service: the Claude API, with your Claude API key",
+        "[C] cloud triage   the Claude API, model: claude-opus-5-5",
+        "[R] research       model: claude-opus-5-5",
+        "If it declines    then claude-opus-4-6, then claude-opus-4-8",
+        "API key            set, ends in 9z8y (from your setup file)",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+    assert!(!text.contains("sk-ant-cli"), "{text}");
+    let output = setup(&["--fallback-models", "claude-opus-4-8"], "", &[]);
+    assert!(stdout(&output).contains("If it declines    then claude-opus-4-8\n"));
+    // With a Claude key in use, it is ANTHROPIC_API_KEY that the environment
+    // can supply; an OpenRouter key there is not sent to the Claude API.
+    let output = setup(
+        &["--show"],
+        "",
+        &[("ANTHROPIC_API_KEY", "sk-ant-env-key-0000-qqqq")],
+    );
+    assert!(
+        stdout(&output).contains("ends in qqqq (from the ANTHROPIC_API_KEY environment variable)"),
+        "{}",
+        stdout(&output)
+    );
+    let output = setup(
+        &["--show"],
+        "",
+        &[("OPENROUTER_API_KEY", "sk-or-env-key-0000-zzzz")],
+    );
+    assert!(stdout(&output).contains("ends in 9z8y (from your setup file)"));
+    assert_eq!(
+        setup(&["--provider", "other"], "", &[]).status.code(),
+        Some(2)
+    );
 
     // And the key can be removed again.
     let output = setup(&["--forget-key"], "", &[]);

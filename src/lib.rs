@@ -1,6 +1,7 @@
 //! `meow` library crate: modules shared by the binary and the test suite.
 
 pub mod ai;
+pub mod anthropic;
 pub mod checklist;
 pub mod cli;
 pub mod coordinator;

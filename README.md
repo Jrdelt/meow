@@ -165,10 +165,13 @@ From the HUD: `L`, `C` and `R`. From the map: the buttons on a host.
 
 - **L, local**: an OpenAI-compatible server on your machine
   (`http://localhost:1234/v1`). Free; nothing leaves.
-- **C, cloud triage** (OpenRouter): three short sections: risk and a
-  verification question, hardening, and a detection rule.
-- **R, grounded research** (OpenRouter web search): available once a hypothesis
-  has enough stack and route evidence. Sends public identifiers only.
+- **C, cloud triage**: three short sections: risk and a verification question,
+  hardening, and a detection rule.
+- **R, grounded research** (with web search): available once a hypothesis has
+  enough stack and route evidence. Sends public identifiers only.
+
+`C` and `R` run on the service you set up: the Claude API with your own Claude
+API key, or OpenRouter (or, for `C`, any other OpenAI-style service).
 
 Before any cloud request, addresses, internal names, paths, user names and
 secrets are replaced by placeholders such as `<<HOST_01>>`, and the request is
@@ -187,34 +190,54 @@ their own model server or adds their own API key:
 meow setup
 ```
 
-It shows the current setup and asks what to change:
+It shows the current setup and asks what to change. At every question, Enter
+keeps the value shown.
 
 - **A model on your machine**: it looks for LM Studio, Ollama and llama.cpp on
   their usual ports, lists the models the server offers, and lets you pick one
   or type another address.
-- **Your own cloud API key**: OpenRouter by default, or any OpenAI-compatible
-  service (`R` needs OpenRouter, for its web search). The key is hidden as you
-  type it.
-- **Remove the key**, or **check that it works**.
+- **Your Claude API key**: the Claude API is used directly, with
+  `claude-opus-5-5` for both `C` and `R`. Research uses Claude's own web
+  search.
+- **Your OpenRouter key**, or another OpenAI-style service by its address
+  (`R` needs OpenRouter or a Claude key, for the web search).
+- **Remove the key**, or **check that it works** (with a Claude key this also
+  checks that the key is offered every model you named).
 
-Your setup is kept in `~/.meow/ai.toml`, which only you can read. It is not
-part of any workspace or repository, a key is never printed (only its last
-four characters), and a session that is already running uses the new setup for
-its next request.
+A key is hidden as you type or paste it. Your setup is kept in
+`~/.meow/ai.toml`, which only you can read. It is not part of any workspace or
+repository, a key is never printed (only its last four characters), and a
+session that is already running uses the new setup for its next request.
+
+**When a model declines.** With a Claude key, a request that a model's safety
+filter declines is asked again on the next model of your chain, in order. The
+default is `claude-opus-5-5`, then `claude-opus-4-6`, then `claude-opus-4-8`.
+Change it with `--fallback-models`; an empty chain leaves the choice to the
+Claude API. If every model declines, meow says so and names them. Declined
+attempts count toward the daily budget.
+
+**Cost with a Claude key.** The Claude API reports tokens, not money, so meow
+works the cost out from the list prices built into it (as published on
+2026-11-03; a model it does not know is priced as the most expensive one) plus
+one cent per web search. Treat the daily budget as a close estimate there.
+OpenRouter reports the exact cost itself.
 
 The same without questions, for scripts:
 
 ```sh
+meow setup --provider claude --api-key-stdin < my-claude-key.txt
+meow setup --fallback-models claude-opus-4-6,claude-opus-4-8
+meow setup --provider openrouter --api-key-stdin < my-key.txt   # never as an argument
 meow setup --local-url http://localhost:11434/v1 --local-model llama3.2
-meow setup --api-key-stdin < my-key.txt      # never as an argument
 meow setup --show                            # what is set, and where the key comes from
-meow setup --check                           # try both, exit 1 if one fails
+meow setup --check                           # try it all, exit 1 if something fails
 meow setup --forget-key
 ```
 
-The `OPENROUTER_API_KEY` environment variable also works for the key and wins
-over the file; it is read when the session starts. Without any key, `C` answers
-with the local model and `R` is unavailable; the map and the HUD say so.
+A key in the environment also works and wins over the file: `ANTHROPIC_API_KEY`
+when the Claude API is in use, `OPENROUTER_API_KEY` otherwise. It is read when
+the session starts. Without any key, `C` answers with the local model and `R`
+is unavailable; the map and the HUD say so.
 
 ## Configuration
 
