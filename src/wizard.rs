@@ -32,17 +32,19 @@ use crate::setup;
 use crate::workspace::{validate_name, Config, MeowHome};
 
 /// Crisp 7-bit Cat + wordmark ASCII banner for `meow --help` and `--plain`.
-pub const CAT_CLI_BANNER: &str = "\
-   /\\_/\\    _ __ ___   ___  _____      __
-  ( o.o )  | '_ ` _ \\ / _ \\/ _ \\ \\ /\\ / /
-   > ^ <   | | | | | |  __/ (_) \\ V  V /
-  /|   |\\  |_| |_| |_|\\___|\\___/ \\_/\\_/
- (_|   |_)  local security triage, topology & audit shell";
+pub const CAT_CLI_BANNER: &str = concat!(
+    "   /\\_/\\    _ __ ___   ___  _____      __\n",
+    "  ( o.o )  | '_ ` _ \\ / _ \\/ _ \\ \\ /\\ / /\n",
+    "   > ^ <   | | | | | |  __/ (_) \\ V  V /\n",
+    "  /|   |\\  |_| |_| |_|\\___|\\___/ \\_/\\_/\n",
+    " (_|   |_)  local security triage, topology & audit shell"
+);
 
 /// Compact Cat ASCII header shown above `meow list` on an interactive TTY.
-pub const CAT_LIST_HEADER: &str = "\
-  /\\_/\\   meow :: workspaces  (tip: `meow setup` opens the interactive cat GUI)
- ( ^.^ )  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+pub const CAT_LIST_HEADER: &str = concat!(
+    "  /\\_/\\   meow :: workspaces  (tip: `meow setup` opens the interactive cat GUI)\n",
+    " ( ^.^ )  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n"
+);
 
 /// Mode-reactive 3-line Cat ASCII header printed when opening a session on a TTY.
 pub fn session_header(name: &str, mode: Mode, created: bool) -> String {
