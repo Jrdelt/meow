@@ -180,6 +180,7 @@ fn http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT * 3)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("security-audit-client")
         .build()
         .context("cannot create the HTTP client")
@@ -188,6 +189,9 @@ fn http() -> Result<reqwest::Client> {
 /// The models an OpenAI-compatible server offers (`GET <url>/models`).
 /// `Err` says why it could not be asked.
 pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
+    if key.is_some() {
+        crate::ai::validate_cloud_url(url)?;
+    }
     let mut request = http()?.get(format!("{}/models", url.trim_end_matches('/')));
     if let Some(key) = key {
         request = request.bearer_auth(key);
@@ -224,7 +228,7 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
 /// endpoint for exactly that (`/key`); other services are asked for their
 /// model list, which needs a valid key.
 pub async fn check_key(url: &str, key: &str) -> Result<()> {
-    let base = url.trim_end_matches('/');
+    let base = crate::ai::validate_cloud_url(url)?;
     let response = http()?
         .get(format!("{base}/key"))
         .bearer_auth(key)
@@ -359,7 +363,7 @@ fn apply(
         own.local_model = Some(model.trim().to_owned());
     }
     if let Some(url) = &args.cloud_url {
-        let url = checked_url(url)?;
+        let url = crate::ai::validate_cloud_url(url)?;
         changed.push(format!("cloud service: {url}"));
         // The address decides the protocol unless a provider was named.
         if args.provider.is_none() {
@@ -409,15 +413,27 @@ fn ask(prompt: &str) -> Result<Option<String>> {
     Ok((read > 0).then(|| line.trim().to_owned()))
 }
 
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    }
+}
+
 /// Reads a secret from the terminal without showing it. `None` if the user
 /// cancelled (Esc, Ctrl-C) or typed nothing.
 fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::crossterm::terminal;
 
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("cannot switch the terminal to hidden input (is this a TTY?)");
+    }
     // Echo goes off before the prompt shows: a key pasted the moment the
     // prompt appears must not be echoed by the terminal.
     terminal::enable_raw_mode().context("cannot switch the terminal to hidden input")?;
+    let raw_guard = RawModeGuard;
     print!("{prompt}");
     std::io::stdout().flush().ok();
     let mut secret = String::new();
@@ -440,7 +456,7 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
             Err(error) => break Err(error),
         }
     };
-    terminal::disable_raw_mode().ok();
+    drop(raw_guard);
     println!();
     let secret = outcome.context("cannot read from the terminal")?;
     Ok(secret
@@ -589,8 +605,8 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     ))?
     .unwrap_or_default();
     let url = match url.as_str() {
-        "" => proposed,
-        typed => checked_url(typed)?,
+        "" => crate::ai::validate_cloud_url(&proposed)?,
+        typed => crate::ai::validate_cloud_url(typed)?,
     };
     let Some(key) = ask_hidden(
         "Your API key (nothing shows as you type or paste; Enter to finish, Esc to cancel): ",
@@ -692,7 +708,7 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
         }
         println!("[+] Saved to {}", file.display());
     } else if !args.show && !args.check {
-        if std::io::stdin().is_terminal() {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             interactive(&settings, &file, &mut own)?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -871,6 +887,22 @@ mod tests {
         assert!(bad(url("ftp://models.example"), None).contains("must start with http://"));
         assert!(bad(url("localhost:1234"), None).contains("must start with http://"));
         assert!(bad(url("not a url"), None).contains("is not a URL"));
+        let cloud_http = SetupArgs {
+            cloud_url: Some("http://203.0.113.10/v1".into()),
+            ..SetupArgs::default()
+        };
+        assert!(bad(cloud_http, None).contains("must start with https://"));
+        let cloud_loopback = SetupArgs {
+            cloud_url: Some("http://127.0.0.1:8080/v1".into()),
+            ..SetupArgs::default()
+        };
+        assert!(apply(
+            &cloud_loopback,
+            &AiSettings::default(),
+            &mut AiOverrides::default(),
+            None
+        )
+        .is_ok());
         let empty_key = SetupArgs {
             api_key_stdin: true,
             ..SetupArgs::default()

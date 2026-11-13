@@ -1040,3 +1040,27 @@ fn version_and_help_succeed() {
         assert!(help.contains(word), "help is missing {word}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn session_observer_ignores_shadow_tools_in_cwd_and_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let marker = sandbox.project().join("hijacked");
+    let payload = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    for tool in [
+        "ifconfig", "netstat", "arp", "sysctl", "sw_vers", "ip", "ss", "route",
+    ] {
+        let fake = sandbox.project().join(tool);
+        std::fs::write(&fake, &payload).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let poisoned_path = format!("{}:.:/usr/bin:/bin", sandbox.project().display());
+    let output = sandbox.run(&["acme"], &[("PATH", poisoned_path.as_str())]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !marker.exists(),
+        "observer executed a shadow binary from CWD or PATH"
+    );
+}

@@ -305,4 +305,50 @@ fn hud_without_a_terminal_fails_with_a_clear_message() {
     assert_eq!(output.status.code(), Some(1));
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("cannot take over the terminal"), "{error}");
+
+    // Even inside a real PTY (/dev/tty present, stdin is a TTY), redirecting
+    // stdout must refuse HUD takeover and leave `meow setup` non-interactive.
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: ROWS as u16,
+            cols: COLS as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.args([
+        "-c",
+        "\"$MEOW_BIN\" hud --session acme > hud.out 2> hud.err; echo hud=$? > status; \
+         \"$MEOW_BIN\" setup > setup.out; echo setup=$? >> status",
+    ]);
+    command.cwd(tmp.path());
+    command.env("MEOW_BIN", env!("CARGO_BIN_EXE_meow"));
+    command.env("MEOW_HOME", tmp.path().join("meow-home"));
+    command.env_remove("MEOW_SESSION");
+    command.env_remove("MEOW_WORKSPACE");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let drain = thread::spawn(move || {
+        let _master = pair.master;
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+    assert!(child.wait().unwrap().success());
+    drain.join().unwrap();
+
+    let status = std::fs::read_to_string(tmp.path().join("status")).unwrap();
+    assert_eq!(status, "hud=1\nsetup=0\n", "{status}");
+    assert_eq!(std::fs::read(tmp.path().join("hud.out")).unwrap(), b"");
+    let hud_err = std::fs::read_to_string(tmp.path().join("hud.err")).unwrap();
+    assert!(
+        hud_err.contains("cannot take over the terminal"),
+        "{hud_err}"
+    );
+    let setup_out = std::fs::read_to_string(tmp.path().join("setup.out")).unwrap();
+    assert!(
+        setup_out.contains("Run `meow setup` in a terminal"),
+        "{setup_out}"
+    );
 }

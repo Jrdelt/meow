@@ -35,36 +35,33 @@ All three gates (`fmt`, `clippy`, `test`) must pass before every commit.
 
 Cold start (run before writing any code):
 
-1. Read `AGENTS.md` and `SPEC.md`.
+1. Read `AGENTS.md`, `SPEC.md`, and `issue/issues.md`.
 2. `git status` and `git log -n 5 --oneline`.
 3. `cargo test` to confirm baseline health.
 4. Continue from `Next Exact Action` below.
 
+Issue tracking (`issue/`):
+
+- Log any newly discovered bug or security finding in `issue/issues.md`.
+- Once a fix passes `fmt`, `clippy`, and `test`, move its entry from
+  `issue/issues.md` to `issue/fixed issues.md`.
+
 Before every push:
 
-1. `cargo fmt --check`
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test`
-4. Update `## Current Handoff State` in place.
-5. Stage source/doc files only, then
-   `git commit -m "feat(phaseX-stepY): <summary>"` and `git push -u origin HEAD`.
-6. If the push needs a hardware key touch or `origin` is missing, print the
+1. `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+2. Move resolved entries from `issue/issues.md` to `issue/fixed issues.md` and
+   update `## Current Handoff State` in place.
+3. Stage source/doc files only, then
+   `git commit -m "<type>(<scope>): <summary>"` and `git push -u origin HEAD`.
+4. If the push needs a hardware key touch or `origin` is missing, print the
    exact command and wait.
 
 ## Current Handoff State
 
-- **Active Phase & Step:** All four phases complete, plus `install.sh` (tools
-  and wordlist by default), `meow list`/`delete`/`setup`/`update`, the map.
-- **Last Verified Commit:** `fix(crawl)` — see `git log -n 1 --oneline`.
-- **Completed Files:** Phase 1 (`tap`, `cli`, `mode`, `workspace`, `lock`,
-  `pty`, `shims`, `main`, C filter); Phase 2 (`db`, `timeutil`, `evidence`,
-  `endpoint`, `graph`, `cpe`, `parsers/*`, `observer`, `cve`, `checklist`);
-  Phase 3 (`coordinator`, `ipc`, `queue`, `topology`, `webui`, `hud`,
-  `assets/`); Phase 4 (`vault`, `ai`, `report`, `setup`); `install.sh`.
-- **In-Progress / Partial Work:** None.
-- **Next Exact Action:** Wait for the owner's macOS results: `cargo test
-  --no-fail-fast`, the map and HUD, `meow setup` with a real Claude key (never
-  run against the real API). Unverified: real `katana`/`feroxbuster`, Windows.
+- **Active Phase & Step:** Security hardening (`ISS-001`..`ISS-011`) & cross-platform installers (`Formula/meow.rb`, `install.ps1`) complete.
+- **Last Verified Commit:** See `git log -n 1 --oneline`.
+- **In-Progress / Partial Work:** None (`323` tests passing).
+- **Next Exact Action:** Log any newly discovered issues in `issue/issues.md`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
@@ -94,6 +91,6 @@ Before every push:
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
     x86_64-pc-windows-gnu --all-targets -- -D warnings`). No CI: private repo.
-  - macOS (owner's machine): install, sessions, map and `nmap` recon work;
-    no full test run reported. Tests must not depend on the login name,
-    `/usr/bin/zsh`, bash >= 4.4 or unresolved temp paths.
+  - macOS (owner's machine): `fmt`, `clippy`, and `cargo test --no-fail-fast`
+    all pass. Tests must not depend on the login name, `/usr/bin/zsh`,
+    bash >= 4.4 or unresolved temp paths.

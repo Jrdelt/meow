@@ -15,9 +15,19 @@ set -eu
 
 MIN_RUST_MINOR=88
 RUSTUP_URL="https://sh.rustup.rs"
-# The SecLists web-content wordlist (about 4,700 entries), from GitHub.
-WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
-KATANA_GO="github.com/projectdiscovery/katana/cmd/katana@latest"
+# The SecLists web-content wordlist (about 4,700 entries), pinned to an immutable commit.
+WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
+WORDLIST_SHA256="${MEOW_WORDLIST_SHA256:-78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52}"
+KATANA_GO="github.com/projectdiscovery/katana/cmd/katana@v1.1.2"
+
+rustup_init=""
+wordlist_part=""
+cleanup() {
+    [ -n "$rustup_init" ] && rm -f "$rustup_init"
+    [ -n "$wordlist_part" ] && rm -f "$wordlist_part"
+    return 0
+}
+trap cleanup EXIT INT TERM
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -53,7 +63,7 @@ case "$(uname -s)" in
 Darwin) os=macos ;;
 Linux) os=linux ;;
 *)
-    die "This installer supports macOS and Linux. On Windows, install Rust from https://rustup.rs and the Visual Studio C++ build tools, then run: cargo install --path . --locked"
+    die "This installer supports macOS and Linux. On Windows, run .\install.ps1 in PowerShell (or install Rust from https://rustup.rs and the Visual Studio C++ build tools, then run: cargo install --path . --locked)"
     ;;
 esac
 
@@ -85,6 +95,9 @@ if [ "$os" = linux ] && [ "$(id -u)" -ne 0 ]; then
 fi
 
 pm_install() {
+    if [ "${MEOW_NO_SUDO:-0}" = 1 ] && [ -n "$sudo" ]; then
+        return 1
+    fi
     case "$pm" in
     apt-get)
         # $sudo is deliberately unquoted: it is empty when running as root.
@@ -159,6 +172,7 @@ for list in \
     /usr/share/dirb/wordlists/common.txt \
     /opt/homebrew/share/seclists/Discovery/Web-Content/common.txt \
     /usr/local/share/seclists/Discovery/Web-Content/common.txt \
+    /home/linuxbrew/.linuxbrew/share/seclists/Discovery/Web-Content/common.txt \
     "$wordlist_dir"/*.txt; do
     if [ -f "$list" ]; then
         need_wordlist=no
@@ -176,8 +190,24 @@ fetch() {
     if have curl; then
         curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"
     else
-        wget -q -O "$2" "$1"
+        wget --https-only -q -O "$2" "$1"
     fi
+}
+
+verify_sha256() {
+    file=$1
+    expected=$2
+    if have sha256sum; then
+        actual=$(sha256sum "$file" | sed 's/ .*//')
+    elif have shasum; then
+        actual=$(shasum -a 256 "$file" | sed 's/ .*//')
+    elif have openssl; then
+        actual=$(openssl dgst -sha256 "$file" | sed 's/.*= //')
+    else
+        warn "No SHA-256 tool (sha256sum, shasum, openssl) found; cannot verify wordlist digest."
+        return 1
+    fi
+    [ "$actual" = "$expected" ]
 }
 
 # --- The plan -------------------------------------------------------------
@@ -196,7 +226,7 @@ if [ "$need_fetcher" = yes ]; then
 fi
 if [ "$need_rust" = yes ]; then
     echo "  - install the Rust toolchain with rustup into $cargo_home and ~/.rustup"
-    echo "    (rustup adds $cargo_home/bin to PATH in your shell profile)"
+    echo "    (without modifying your shell profile; add $cargo_home/bin to PATH)"
 fi
 if [ "$update_rust" = yes ]; then
     echo "  - update Rust to the latest stable (meow needs 1.$MIN_RUST_MINOR or newer; found 1.$found_rust)"
@@ -273,17 +303,16 @@ fi
 if [ "$need_rust" = yes ]; then
     say "Installing Rust with rustup"
     rustup_init=$(mktemp)
-    trap 'rm -f "$rustup_init"' EXIT
     # Downloaded to a file first: a failed download must not run as an
     # empty script.
     if have curl; then
         curl --proto '=https' --tlsv1.2 -sSf -o "$rustup_init" "$RUSTUP_URL" ||
             die "Could not download the Rust installer from $RUSTUP_URL."
     else
-        wget -q -O "$rustup_init" "$RUSTUP_URL" ||
+        wget --https-only -q -O "$rustup_init" "$RUSTUP_URL" ||
             die "Could not download the Rust installer from $RUSTUP_URL."
     fi
-    sh "$rustup_init" -y --profile minimal || die "The Rust installer failed."
+    sh "$rustup_init" -y --profile minimal --no-modify-path || die "The Rust installer failed."
     # shellcheck disable=SC1091
     . "$cargo_home/env"
 fi
@@ -353,13 +382,18 @@ fi
 if [ "$need_wordlist" = yes ]; then
     say "Downloading the wordlist"
     mkdir -p "$wordlist_dir"
-    part="$wordlist_dir/.common.txt.part"
-    if fetch "$WORDLIST_URL" "$part" && [ -s "$part" ] && ! grep -qi '<html' "$part"; then
-        mv "$part" "$wordlist_dir/common.txt"
+    wordlist_part=$(mktemp "$wordlist_dir/.common.txt.XXXXXX")
+    if fetch "$WORDLIST_URL" "$wordlist_part" &&
+        [ -s "$wordlist_part" ] &&
+        ! grep -qi '<html' "$wordlist_part" &&
+        verify_sha256 "$wordlist_part" "$WORDLIST_SHA256"; then
+        mv "$wordlist_part" "$wordlist_dir/common.txt"
+        wordlist_part=""
         say "Wordlist saved to $wordlist_dir/common.txt"
     else
-        rm -f "$part"
-        warn "Could not download the wordlist from $WORDLIST_URL. Put any .txt wordlist in $wordlist_dir and meow will use it."
+        rm -f "$wordlist_part"
+        wordlist_part=""
+        warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $wordlist_dir and meow will use it."
     fi
 fi
 

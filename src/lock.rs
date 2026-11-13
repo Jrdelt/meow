@@ -81,25 +81,49 @@ impl SessionLock {
             .map_err(LockError::Io)?;
         let mut lock = RwLock::new(file);
 
-        match lock.try_write() {
-            Ok(mut guard) => {
-                let written = guard
-                    .set_len(0)
-                    .and_then(|()| writeln!(guard, "{}", std::process::id()))
-                    .and_then(|()| guard.flush());
-                // Dropping the guard would unlock. Forgetting it keeps the
-                // lock tied to the open file, which `SessionLock` now owns.
-                std::mem::forget(guard);
-                written.map_err(LockError::Io)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(LockError::Held {
-                    pid: read_pid(path),
-                });
-            }
-            Err(error) => return Err(LockError::Io(error)),
+        for attempt in 0..3 {
+            match lock.try_write() {
+                Ok(mut guard) => {
+                    let written = guard
+                        .set_len(0)
+                        .and_then(|()| writeln!(guard, "{}", std::process::id()))
+                        .and_then(|()| guard.flush());
+                    // Dropping the guard would unlock. Forgetting it keeps the
+                    // lock tied to the open file, which `SessionLock` now owns.
+                    std::mem::forget(guard);
+                    written.map_err(LockError::Io)?;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    return Err(LockError::Held {
+                        pid: read_pid(path),
+                    });
+                }
+                Err(error) => return Err(LockError::Io(error)),
+            };
         }
         Ok(Self { file: lock })
+    }
+
+    /// True when an exclusive `SessionLock` is currently held on `path`.
+    /// Read-only: never creates, truncates or modifies `path`.
+    pub fn is_held(path: &Path) -> bool {
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        let lock = RwLock::new(file);
+        let held = match lock.try_read() {
+            Ok(guard) => {
+                drop(guard);
+                false
+            }
+            Err(error) => error.kind() == io::ErrorKind::WouldBlock,
+        };
+        held
     }
 }
 
@@ -155,9 +179,18 @@ mod tests {
     #[test]
     fn leftover_lock_file_from_a_dead_session_is_not_a_lock() {
         let (_dir, path) = lock_file();
+        assert!(!SessionLock::is_held(&path));
+        assert!(
+            !path.exists(),
+            "is_held must not create a missing lock file"
+        );
         fs::write(&path, "4242\n").unwrap();
-        let _lock = SessionLock::acquire(&path).unwrap();
+        assert!(!SessionLock::is_held(&path));
+        let held = SessionLock::acquire(&path).unwrap();
+        assert!(SessionLock::is_held(&path));
         assert_eq!(read_pid(&path), Some(std::process::id()));
+        drop(held);
+        assert!(!SessionLock::is_held(&path));
     }
 
     #[cfg(unix)]

@@ -91,10 +91,10 @@ static PANIC_HOOK: Once = Once::new();
 struct TerminalGuard;
 
 impl TerminalGuard {
-    /// Returns `None` when stdin is not a terminal (pipes, tests): input is
-    /// then forwarded as-is and no terminal state is touched.
+    /// Returns `None` when stdin or stdout is not a terminal (pipes, tests):
+    /// input is then forwarded as-is and no terminal state is touched.
     fn enter() -> Result<Option<Self>> {
-        if !io::stdin().is_terminal() {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(None);
         }
         PANIC_HOOK.call_once(|| {

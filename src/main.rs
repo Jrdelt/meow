@@ -354,7 +354,7 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
     }
     println!(
         "[+] Session shell: {} (exit the shell to leave)",
-        spec.program
+        meow::evidence::sanitize(&spec.program, 200)
     );
     if !launch.hooked() {
         println!(
@@ -394,7 +394,10 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
         .context("cannot start the async runtime")?;
     let summary = runtime.block_on(cve::ground_graph(&client, graph));
     for error in &summary.errors {
-        println!("[!] CVE lookup failed: {error}");
+        println!(
+            "[!] CVE lookup failed: {}",
+            meow::evidence::sanitize(error, 300)
+        );
     }
     if summary.dropped > 0 {
         println!(
@@ -429,7 +432,7 @@ fn offer_resume(state: &coordinator::State) -> Result<()> {
     }
     println!("[!] {} unfinished background task(s):", unfinished.len());
     for task in &unfinished {
-        println!("      {}", task.describe());
+        println!("      {}", meow::evidence::sanitize(&task.describe(), 200));
     }
     if !std::io::stdin().is_terminal() {
         println!(

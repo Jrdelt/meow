@@ -8,6 +8,7 @@
 //! be tested on any host; only [`observe`] is platform-specific.
 
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
@@ -98,12 +99,30 @@ fn canonical_destination(text: &str, ipv6: bool) -> Option<String> {
         .map(|n| n.to_string())
 }
 
+fn clean_if_name(name: &str) -> Option<String> {
+    let cleaned = crate::evidence::sanitize(name, 64);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn clean_mac(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 23 || !lower.contains(':') {
+        return None;
+    }
+    let groups_ok = lower
+        .split(':')
+        .all(|part| (1..=2).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_hexdigit()));
+    let count = lower.split(':').count();
+    (groups_ok && (6..=8).contains(&count)).then_some(lower)
+}
+
 fn listener_from(protocol: &str, local: &str) -> Option<Listener> {
+    let protocol = crate::graph::normalize_protocol(protocol)?;
     // `*:22` and `*.22` mean every address.
     let local = local.replace("*:", "0.0.0.0:").replace("[*]:", "[::]:");
     let endpoint = Endpoint::parse(&local)?;
     Some(Listener {
-        protocol: protocol.to_owned(),
+        protocol,
         address: endpoint.host.ip()?.to_string(),
         port: endpoint.port?,
     })
@@ -126,11 +145,11 @@ pub mod linux {
                 continue;
             };
             let name = name.trim_end_matches(':').split('@').next().unwrap_or("");
-            if name.is_empty() {
+            let Some(name) = clean_if_name(name) else {
                 continue;
-            }
+            };
             let up = flags.trim_matches(['<', '>']).split(',').any(|f| f == "UP");
-            interface(out, name).up = up;
+            interface(out, &name).up = up;
         }
     }
 
@@ -145,10 +164,10 @@ pub mod linux {
             let Ok(network) = IpNetwork::from_str(fields[3]) else {
                 continue;
             };
-            push_unique(
-                &mut interface(out, fields[1]).addresses,
-                network.to_string(),
-            );
+            let Some(name) = clean_if_name(fields[1]) else {
+                continue;
+            };
+            push_unique(&mut interface(out, &name).addresses, network.to_string());
         }
     }
 
@@ -171,9 +190,10 @@ pub mod linux {
                     .position(|f| *f == key)
                     .and_then(|i| fields.get(i + 1))
             };
-            let (Some(destination), Some(device)) =
-                (canonical_destination(first, ipv6), after("dev"))
-            else {
+            let (Some(destination), Some(interface)) = (
+                canonical_destination(first, ipv6),
+                after("dev").and_then(|d| clean_if_name(d)),
+            ) else {
                 continue;
             };
             push_unique(
@@ -181,7 +201,7 @@ pub mod linux {
                 Route {
                     destination,
                     gateway: after("via").and_then(|g| canonical_ip(g)),
-                    interface: (*device).to_owned(),
+                    interface,
                 },
             );
         }
@@ -197,10 +217,10 @@ pub mod linux {
                     .position(|f| *f == key)
                     .and_then(|i| fields.get(i + 1))
             };
-            let (Some(address), Some(device), Some(mac)) = (
+            let (Some(address), Some(interface), Some(mac)) = (
                 fields.first().and_then(|a| canonical_ip(a)),
-                after("dev"),
-                after("lladdr"),
+                after("dev").and_then(|d| clean_if_name(d)),
+                after("lladdr").and_then(|m| clean_mac(m)),
             ) else {
                 continue; // FAILED / INCOMPLETE entries have no lladdr
             };
@@ -208,8 +228,8 @@ pub mod linux {
                 out,
                 Neighbor {
                     address,
-                    mac: Some(mac.to_ascii_lowercase()),
-                    interface: (*device).to_owned(),
+                    mac: Some(mac),
+                    interface,
                 },
             );
         }
@@ -266,12 +286,16 @@ pub mod macos {
                 let Some((name, rest)) = line.split_once(": ") else {
                     continue;
                 };
+                let Some(name) = clean_if_name(name) else {
+                    current = None;
+                    continue;
+                };
                 let up = rest
                     .split_once('<')
                     .and_then(|(_, flags)| flags.split_once('>'))
                     .is_some_and(|(flags, _)| flags.split(',').any(|f| f == "UP"));
-                interface(out, name).up = up;
-                current = Some(name.to_owned());
+                interface(out, &name).up = up;
+                current = Some(name);
                 continue;
             }
             let Some(name) = &current else { continue };
@@ -354,7 +378,8 @@ pub mod macos {
             } else {
                 expand_destination(fields[0])
             };
-            let Some(destination) = destination else {
+            let (Some(destination), Some(interface)) = (destination, clean_if_name(fields[3]))
+            else {
                 continue;
             };
             push_unique(
@@ -363,7 +388,7 @@ pub mod macos {
                     destination,
                     // "link#4" and MAC addresses mean directly connected.
                     gateway: canonical_ip(fields[1]),
-                    interface: fields[3].to_owned(),
+                    interface,
                 },
             );
         }
@@ -387,18 +412,18 @@ pub mod macos {
                     .position(|f| *f == key)
                     .and_then(|i| fields.get(i + 1))
             };
-            let (Some(mac), Some(device)) = (after("at"), after("on")) else {
+            let (Some(mac), Some(interface)) = (
+                after("at").and_then(|m| clean_mac(m)),
+                after("on").and_then(|d| clean_if_name(d)),
+            ) else {
                 continue;
             };
-            if !mac.contains(':') {
-                continue; // (incomplete)
-            }
             push_unique(
                 out,
                 Neighbor {
                     address,
-                    mac: Some(mac.to_ascii_lowercase()),
-                    interface: (*device).to_owned(),
+                    mac: Some(mac),
+                    interface,
                 },
             );
         }
@@ -523,11 +548,14 @@ pub mod windows {
             if !is_mac || ip.is_multicast() || ip.is_broadcast() || *mac == "ff-ff-ff-ff-ff-ff" {
                 continue;
             }
+            let Some(clean) = clean_mac(&mac.replace('-', ":")) else {
+                continue;
+            };
             push_unique(
                 out,
                 Neighbor {
                     address: ip.to_string(),
-                    mac: Some(mac.replace('-', ":").to_ascii_lowercase()),
+                    mac: Some(clean),
                     interface: current.clone(),
                 },
             );
@@ -1123,38 +1151,133 @@ pub fn machine_report(local: &LocalNet) -> MachineReport {
 // Running the OS tools
 // ---------------------------------------------------------------------------
 
-/// Where system tools live when the PATH leaves them out (the `sbin`
-/// directories are not on every user's PATH).
-#[cfg(unix)]
+/// Trusted Unix directories for OS network and hardware inspection tools.
 const SYSTEM_DIRS: &[&str] = &["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
-#[cfg(not(unix))]
-const SYSTEM_DIRS: &[&str] = &[];
 
-/// Runs a read-only OS tool and returns its stdout. A tool that cannot be
-/// started, or that fails without printing anything, is recorded in `notes`:
-/// the table it feeds is then unread, which is not the same as empty.
+/// Builds the trusted `System32` directory path on Windows from `SystemRoot`,
+/// falling back to `C:\Windows\System32` if unset, relative, UNC, or malformed.
+fn windows_system32(system_root: Option<&str>) -> String {
+    const DEFAULT: &str = r"C:\Windows\System32";
+    let Some(raw) = system_root.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT.to_owned();
+    };
+    if raw.chars().any(|c| c.is_control()) {
+        return DEFAULT.to_owned();
+    }
+    let normalized = raw.replace('/', r"\");
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return DEFAULT.to_owned();
+    }
+    let rest = normalized[3..].trim_end_matches('\\');
+    if rest.is_empty()
+        || rest
+            .split('\\')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return DEFAULT.to_owned();
+    }
+    let drive = &normalized[..3];
+    format!(r"{drive}{rest}\System32")
+}
+
+fn trusted_system_dirs() -> Vec<String> {
+    if cfg!(windows) {
+        vec![windows_system32(
+            std::env::var("SystemRoot").ok().as_deref(),
+        )]
+    } else if cfg!(unix) {
+        SYSTEM_DIRS.iter().map(|dir| (*dir).to_owned()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_in_dirs(program: &str, dirs: &[&str], windows_exe: bool) -> Option<PathBuf> {
+    if program.is_empty()
+        || program == "."
+        || program == ".."
+        || program.contains(['/', '\\', ':', '\0'])
+    {
+        return None;
+    }
+    for dir in dirs {
+        if dir.is_empty() {
+            continue;
+        }
+        let base = Path::new(dir);
+        if !base.is_absolute() {
+            continue;
+        }
+        if windows_exe && !program.to_ascii_lowercase().ends_with(".exe") {
+            let exe = base.join(format!("{program}.exe"));
+            if is_executable_file(&exe) {
+                return Some(exe);
+            }
+        }
+        let candidate = base.join(program);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Runs a read-only OS tool from trusted system directories only (never via
+/// an untrusted `PATH` or the current working directory) and returns its
+/// stdout. A tool that cannot be started, or that fails without printing
+/// anything, is recorded in `notes`: the table it feeds is then unread, which
+/// is not the same as empty.
 fn run(program: &str, args: &[&str], notes: &mut Vec<String>) -> String {
-    run_from(program, args, SYSTEM_DIRS, notes)
+    let dirs = trusted_system_dirs();
+    let refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    run_from(program, args, &refs, notes)
+}
+
+fn push_note(notes: &mut Vec<String>, note: &str) {
+    let cleaned = crate::evidence::sanitize(note, 200);
+    if !cleaned.is_empty() {
+        push_unique(notes, cleaned);
+    }
 }
 
 fn run_from(program: &str, args: &[&str], dirs: &[&str], notes: &mut Vec<String>) -> String {
-    let start = |program: &std::path::Path| {
-        Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
+    let Some(resolved) = resolve_in_dirs(program, dirs, cfg!(windows)) else {
+        push_note(
+            notes,
+            &format!("`{program}` is not installed in the system directories"),
+        );
+        return String::new();
     };
-    let mut result = start(std::path::Path::new(program));
-    if matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
-        let elsewhere = dirs
-            .iter()
-            .map(|dir| std::path::Path::new(dir).join(program))
-            .find(|candidate| candidate.is_file());
-        if let Some(candidate) = elsewhere {
-            result = start(&candidate);
-        }
-    }
+    let safe_path = std::env::join_paths(
+        dirs.iter()
+            .filter(|dir| !dir.is_empty() && Path::new(dir).is_absolute()),
+    )
+    .unwrap_or_default();
+    let result = Command::new(&resolved)
+        .args(args)
+        .env("PATH", safe_path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
     let command = format!("{program} {}", args.join(" "));
     let command = command.trim();
     match result {
@@ -1164,20 +1287,22 @@ fn run_from(program: &str, args: &[&str], dirs: &[&str], notes: &mut Vec<String>
         Ok(output) => {
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             if text.trim().is_empty() && !output.status.success() {
-                let note = format!("`{command}` failed ({}) and printed nothing", output.status);
-                push_unique(notes, note);
+                push_note(
+                    notes,
+                    &format!("`{command}` failed ({}) and printed nothing", output.status),
+                );
             }
             text
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            push_unique(
+            push_note(
                 notes,
-                format!("`{program}` is not installed or not on the PATH"),
+                &format!("`{program}` is not installed in the system directories"),
             );
             String::new()
         }
         Err(error) => {
-            push_unique(notes, format!("`{command}` could not be run: {error}"));
+            push_note(notes, &format!("`{command}` could not be run: {error}"));
             String::new()
         }
     }
@@ -1216,7 +1341,7 @@ pub mod system {
         text.lines()
             .filter_map(|line| line.split_once(separator))
             .find(|(name, _)| name.trim() == key)
-            .map(|(_, value)| value.trim().trim_matches('"').to_owned())
+            .map(|(_, value)| crate::evidence::sanitize(value.trim().trim_matches('"'), 80))
             .unwrap_or_default()
     }
 
@@ -1265,7 +1390,7 @@ pub mod system {
         let version = text
             .split_once("[Version ")
             .and_then(|(_, rest)| rest.split_once(']'))
-            .map(|(version, _)| version.trim().to_owned())
+            .map(|(version, _)| crate::evidence::sanitize(version, 80))
             .unwrap_or_default();
         ("Windows".to_owned(), version)
     }
@@ -1884,7 +2009,7 @@ mod tests {
         assert_eq!(run("meow-no-such-tool", &["-b"], &mut notes), "");
         assert_eq!(
             notes,
-            ["`meow-no-such-tool` is not installed or not on the PATH"],
+            ["`meow-no-such-tool` is not installed in the system directories"],
             "one note per missing tool, however often it is called"
         );
 
@@ -1901,26 +2026,96 @@ mod tests {
         assert_eq!(run("sh", &["-c", "true"], &mut notes), "");
         assert!(notes.is_empty(), "{notes:?}");
 
-        // A tool that is installed but not on the PATH is still found in
-        // the system directories.
+        // Tools are resolved strictly from the explicit directory list, never
+        // from the caller's PATH or relative directories, and run with a
+        // scrubbed PATH containing only those trusted directories.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
         let tool = dir.path().join("meow-sbin-tool");
-        std::fs::write(&tool, "#!/bin/sh\necho \"from sbin: $1\"\n").unwrap();
+        std::fs::write(&tool, "#!/bin/sh\necho \"from sbin: $1 ($PATH)\"\n").unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let dirs = ["/nonexistent", dir.path().to_str().unwrap()];
+        let dirs = ["/nonexistent", ".", "relative/bin", dir_str];
         let mut notes = Vec::new();
         assert_eq!(
             run_from("meow-sbin-tool", &["-an"], &dirs, &mut notes),
-            "from sbin: -an\n"
+            format!("from sbin: -an (/nonexistent:{dir_str})\n")
         );
         assert!(notes.is_empty(), "{notes:?}");
+
+        // `cargo` is on PATH while `cargo test` runs, yet `run_from` must not
+        // consult PATH when it is absent from the trusted directories.
+        let mut notes = Vec::new();
+        assert_eq!(
+            run_from("cargo", &["--version"], &[dir_str], &mut notes),
+            ""
+        );
+        assert_eq!(
+            notes,
+            ["`cargo` is not installed in the system directories"]
+        );
+
+        // Non-executable files, directories, and path-traversal names are
+        // refused; `.exe` resolution works for Windows system tools.
+        let nonexec = dir.path().join("nonexec");
+        std::fs::write(&nonexec, "#!/bin/sh\necho no\n").unwrap();
+        std::fs::set_permissions(&nonexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(resolve_in_dirs("nonexec", &[dir_str], false), None);
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        assert_eq!(resolve_in_dirs("subdir", &[dir_str], false), None);
+        for bad in [
+            "", ".", "..", "../sh", "/bin/sh", r"..\cmd", "C:cmd", "sh\0",
+        ] {
+            assert_eq!(resolve_in_dirs(bad, SYSTEM_DIRS, false), None, "{bad:?}");
+        }
+        let win_tool = dir.path().join("route.exe");
+        std::fs::write(&win_tool, "").unwrap();
+        std::fs::set_permissions(&win_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_in_dirs("route", &[dir_str], true),
+            Some(win_tool.clone())
+        );
+        assert_eq!(
+            resolve_in_dirs("route.exe", &[dir_str], true),
+            Some(win_tool)
+        );
 
         // The real observation never fails, whatever this machine has.
         let local = observe(&[]);
         assert!(!local.observed_utc.is_empty());
         if local.interfaces.is_empty() {
             assert!(!local.notes.is_empty(), "nothing read, and nothing said");
+        }
+    }
+
+    #[test]
+    fn windows_system32_accepts_only_clean_drive_roots() {
+        assert_eq!(windows_system32(None), r"C:\Windows\System32");
+        assert_eq!(windows_system32(Some("")), r"C:\Windows\System32");
+        assert_eq!(windows_system32(Some("  ")), r"C:\Windows\System32");
+        assert_eq!(
+            windows_system32(Some(r"C:\Windows")),
+            r"C:\Windows\System32"
+        );
+        assert_eq!(windows_system32(Some(r"D:\WINNT\")), r"D:\WINNT\System32");
+        assert_eq!(windows_system32(Some("c:/windows")), r"c:\windows\System32");
+        for untrusted in [
+            r".\evil",
+            r"..\evil",
+            r"C:relative",
+            r"C:\",
+            r"C:\\\",
+            r"\\192.0.2.9\share",
+            r"\\?\C:\Windows",
+            r"C:\Windows\..\Users\evil",
+            r"C:\Windows\.\Temp",
+            "C:\\Windows\0evil",
+        ] {
+            assert_eq!(
+                windows_system32(Some(untrusted)),
+                r"C:\Windows\System32",
+                "accepted untrusted SystemRoot {untrusted:?}"
+            );
         }
     }
 
@@ -2286,5 +2481,57 @@ mod tests {
                 assert!(IpNetwork::from_str(address).is_ok(), "{address}");
             }
         }
+    }
+
+    #[test]
+    fn control_sequences_in_observer_tables_and_os_fields_are_stripped() {
+        let mut local = LocalNet::default();
+        linux::links(
+            "2: eth0\x1b]52;c;abc\x07: <BROADCAST,UP> mtu 1500\n\
+             3: \x1b\x07: <BROADCAST,UP> mtu 1500\n",
+            &mut local.interfaces,
+        );
+        linux::addresses(
+            "2: eth0\x1b]52;c;abc\x07    inet 192.0.2.10/24 scope global\n",
+            &mut local.interfaces,
+        );
+        linux::routes(
+            "default via 192.0.2.1 dev eth0\x1b]52;c;abc\x07\n",
+            false,
+            &mut local.routes,
+        );
+        linux::neighbors(
+            "192.0.2.1 dev eth0 lladdr 00:11:22:33:44:55\x1b[2J REACHABLE\n\
+             192.0.2.2 dev eth0\x1b[31m lladdr aa:bb:cc:dd:ee:ff REACHABLE\n",
+            &mut local.neighbors,
+        );
+        macos::ifconfig(
+            "utun4\x1b[32m: flags=8051<UP,POINTOPOINT,RUNNING>\n\
+             \tinet 198.51.100.4 --> 198.51.100.4 netmask 0xffffffff\n",
+            &mut local.interfaces,
+        );
+        windows::neighbors(
+            "Interface: 192.0.2.10 --- 0x4\n  192.0.2.9   aa-bb-cc-dd-ee-\x1b[   dynamic\n",
+            &mut local.neighbors,
+        );
+        assert_eq!(local.neighbors.len(), 1, "{:?}", local.neighbors);
+        assert_eq!(local.neighbors[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(local.neighbors[0].interface, "eth0[31m");
+
+        let (os, ver) =
+            system::os_release("NAME=\"Ubuntu\x1b]0;pwn\x07\"\nVERSION_ID=\"24.04\x1b[2J\"\n");
+        assert_eq!(os, "Ubuntu]0;pwn");
+        assert_eq!(ver, "24.04[2J");
+        let (_, win_ver) = system::windows_ver("Microsoft Windows [Version 10.0\x1b(B\u{202e}]");
+        assert_eq!(win_ver, "10.0(B");
+        local.system = SystemInfo {
+            kind: "Laptop".into(),
+            os,
+            version: ver,
+        };
+
+        let serialized = serde_json::to_string(&machine_report(&local)).unwrap();
+        assert!(!serialized.contains('\x1b') && !serialized.contains('\x07'));
+        assert!(!summary(&local).chars().any(char::is_control));
     }
 }

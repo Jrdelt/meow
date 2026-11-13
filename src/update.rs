@@ -38,9 +38,102 @@ fn is_meow_checkout(dir: &Path) -> bool {
         && dir.join(".git").exists()
 }
 
-/// Runs git in `dir` and returns its trimmed standard output.
+#[cfg(unix)]
+const TRUSTED_GIT_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/run/current-system/sw/bin",
+];
+
+fn resolve_git() -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        for dir in TRUSTED_GIT_DIRS {
+            let candidate = Path::new(dir).join("git");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        bail!("cannot find git in trusted system directories (/usr/bin, /bin, /opt/homebrew/bin, /usr/local/bin)")
+    }
+    #[cfg(windows)]
+    {
+        let mut dirs = Vec::new();
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            dirs.push(PathBuf::from(root).join("System32"));
+        }
+        dirs.push(PathBuf::from(r"C:\Program Files\Git\cmd"));
+        dirs.push(PathBuf::from(r"C:\Program Files\Git\bin"));
+        for dir in dirs {
+            let candidate = dir.join("git.exe");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        Ok(PathBuf::from("git.exe"))
+    }
+}
+
+fn resolve_sh() -> PathBuf {
+    for candidate in ["/bin/sh", "/usr/bin/sh"] {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return path.to_path_buf();
+        }
+    }
+    PathBuf::from("/bin/sh")
+}
+
+fn is_scp_git_url(url: &str) -> bool {
+    if url.contains("://") || url.contains("::") {
+        return false;
+    }
+    let Some((user_host, path)) = url.split_once(':') else {
+        return false;
+    };
+    let Some((user, host)) = user_host.split_once('@') else {
+        return false;
+    };
+    !user.is_empty()
+        && !host.is_empty()
+        && !path.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Validates the upstream git remote URL before fetching. Returns `Ok(true)`
+/// if it is a verified local directory (allowed only with explicit `--source`).
+fn validate_remote_url(dir: &Path, remote_url: &str, allow_local: bool) -> Result<bool> {
+    let url = remote_url.trim();
+    if url.is_empty() || url.starts_with('-') {
+        bail!("refusing unsafe git remote URL '{url}'");
+    }
+    if url.starts_with("https://") || url.starts_with("ssh://") || is_scp_git_url(url) {
+        return Ok(false);
+    }
+    if allow_local
+        && !url.contains("://")
+        && !url.contains("::")
+        && (Path::new(url).is_dir() || dir.join(url).is_dir())
+    {
+        return Ok(true);
+    }
+    bail!("refusing untrusted git remote URL '{url}' (must use https:// or ssh://)")
+}
+
+/// Runs git in `dir` with hooks disabled and returns its trimmed standard output.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = Command::new(resolve_git()?)
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -59,8 +152,19 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// Like [`git`], but git talks to the terminal (credential prompts,
 /// progress) and nothing is captured.
-fn git_live(dir: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
+fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
+    let file_policy = if local_remote {
+        "protocol.file.allow=always"
+    } else {
+        "protocol.file.allow=never"
+    };
+    let status = Command::new(resolve_git()?)
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
+        .arg("-c")
+        .arg(file_policy)
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -100,9 +204,16 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
     )
     .context("the checked-out branch does not track a branch on GitHub")?;
+    let remote_name = upstream.split('/').next().unwrap_or("origin");
+    let remote_url = git(
+        &dir,
+        &["config", "--get", &format!("remote.{remote_name}.url")],
+    )
+    .with_context(|| format!("cannot read remote URL for {remote_name}"))?;
+    let local_remote = validate_remote_url(&dir, &remote_url, args.source.is_some())?;
 
     println!("[+] Checking {upstream} for changes");
-    git_live(&dir, &["fetch", "--quiet"])?;
+    git_live(&dir, local_remote, &["fetch", "--quiet"])?;
     let incoming = git(&dir, &["log", "--oneline", "--no-decorate", "HEAD..@{u}"])?;
     let head = git(&dir, &["rev-parse", "HEAD"])?;
     let behind_checkout = !BUILT_COMMIT.is_empty() && BUILT_COMMIT != head;
@@ -133,7 +244,7 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     }
 
     if !incoming.is_empty() {
-        git_live(&dir, &["pull", "--ff-only", "--quiet"])
+        git_live(&dir, local_remote, &["pull", "--ff-only", "--quiet"])
             .context("the pull could not fast-forward; the folder's branch has its own commits")?;
     }
 
@@ -146,9 +257,10 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     println!("[+] Rebuilding with install.sh");
-    let status = Command::new("sh")
+    let status = Command::new(resolve_sh())
         .arg("install.sh")
         .arg("--yes")
+        .env("MEOW_NO_SUDO", "1")
         .current_dir(&dir)
         .status()
         .context("cannot run install.sh")?;

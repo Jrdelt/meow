@@ -95,52 +95,116 @@ impl CveSettings {
 // Versions
 // ---------------------------------------------------------------------------
 
-/// Loose version ordering: digit runs compare numerically, letter runs
-/// alphabetically, and a longer version sorts after its own prefix
-/// (`8.2` < `8.2p1` < `8.10`).
+/// Loose version ordering: digit runs compare numerically, pre-release
+/// tags (`alpha`, `beta`, `rc`, `pre`, `dev`) sort before the release they
+/// precede (`1.20.1-rc1` < `1.20.1`), patch suffixes sort after their base
+/// (`8.2` < `8.2p1` < `8.10`, `1.1.1` < `1.1.1k`), trailing `.0` numeric
+/// segments are equivalent (`1.0.0` == `1.0`), and distribution revision
+/// suffixes (`2.4.52-1ubuntu4`) compare by their upstream version (`2.4.52`).
 pub fn cmp_versions(a: &str, b: &str) -> Ordering {
-    fn tokens(text: &str) -> Vec<Result<u64, String>> {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum VerToken {
+        Pre(String),
+        Num(u64),
+        Patch(String),
+    }
+
+    fn is_prerelease_tag(tag: &str) -> bool {
+        matches!(tag, "alpha" | "beta" | "rc" | "pre" | "dev" | "preview")
+    }
+
+    fn strip_distro_revision(text: &str) -> &str {
+        let Some((base, rev)) = text.split_once('-') else {
+            return text;
+        };
+        if base.is_empty() {
+            return text;
+        }
+        let lower = rev.to_ascii_lowercase();
+        let is_distro = lower.starts_with(|c: char| c.is_ascii_digit())
+            || lower.contains("ubuntu")
+            || lower.contains("deb")
+            || lower.contains("el")
+            || lower.contains("redhat")
+            || lower.contains("centos")
+            || lower.contains("amzn")
+            || (lower.starts_with('r') && lower[1..].starts_with(|c: char| c.is_ascii_digit()));
+        if is_distro {
+            base
+        } else {
+            text
+        }
+    }
+
+    fn tokens(text: &str) -> Vec<VerToken> {
         let mut out = Vec::new();
         let mut current = String::new();
         let mut digits = false;
+        let mut preceded_by_dash = false;
+        let mut token_after_dash = false;
         for ch in text.chars().chain(std::iter::once('.')) {
             let is_digit = ch.is_ascii_digit();
             let is_alpha = ch.is_ascii_alphabetic();
             let boundary = (!is_digit && !is_alpha) || is_digit != digits;
             if boundary && !current.is_empty() {
-                out.push(if digits {
-                    Ok(current.parse::<u64>().unwrap_or(u64::MAX))
+                if digits {
+                    out.push(VerToken::Num(current.parse::<u64>().unwrap_or(u64::MAX)));
                 } else {
-                    Err(current.to_ascii_lowercase())
-                });
+                    let lower = current.to_ascii_lowercase();
+                    if is_prerelease_tag(&lower)
+                        || (token_after_dash && matches!(lower.as_str(), "a" | "b"))
+                    {
+                        out.push(VerToken::Pre(lower));
+                    } else {
+                        out.push(VerToken::Patch(lower));
+                    }
+                }
                 current.clear();
+                token_after_dash = false;
             }
             if is_digit || is_alpha {
+                if current.is_empty() {
+                    token_after_dash = preceded_by_dash;
+                }
                 digits = is_digit;
                 current.push(ch);
+                preceded_by_dash = false;
+            } else {
+                preceded_by_dash = matches!(ch, '-' | '_' | '~');
             }
         }
         out
     }
+
     // "v2.0" and "2.0" are the same version.
     fn unprefixed(text: &str) -> &str {
         text.strip_prefix(['v', 'V'])
             .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
             .unwrap_or(text)
     }
-    let (a, b) = (tokens(unprefixed(a)), tokens(unprefixed(b)));
-    for (left, right) in a.iter().zip(&b) {
-        let order = match (left, right) {
-            (Ok(l), Ok(r)) => l.cmp(r),
-            (Err(l), Err(r)) => l.cmp(r),
-            (Ok(_), Err(_)) => Ordering::Greater,
-            (Err(_), Ok(_)) => Ordering::Less,
+
+    let a = tokens(strip_distro_revision(unprefixed(a.trim())));
+    let b = tokens(strip_distro_revision(unprefixed(b.trim())));
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let order = match (a.get(i), b.get(i)) {
+            (Some(VerToken::Num(l)), Some(VerToken::Num(r))) => l.cmp(r),
+            (Some(VerToken::Pre(l)), Some(VerToken::Pre(r))) => l.cmp(r),
+            (Some(VerToken::Patch(l)), Some(VerToken::Patch(r))) => l.cmp(r),
+            (Some(VerToken::Pre(_)), _) => Ordering::Less,
+            (_, Some(VerToken::Pre(_))) => Ordering::Greater,
+            (Some(VerToken::Num(_)), Some(VerToken::Patch(_))) => Ordering::Greater,
+            (Some(VerToken::Patch(_)), Some(VerToken::Num(_))) => Ordering::Less,
+            (Some(VerToken::Num(0)), None) | (None, Some(VerToken::Num(0))) => Ordering::Equal,
+            (Some(VerToken::Num(_) | VerToken::Patch(_)), None) => Ordering::Greater,
+            (None, Some(VerToken::Num(_) | VerToken::Patch(_))) => Ordering::Less,
+            (None, None) => Ordering::Equal,
         };
         if order != Ordering::Equal {
             return order;
         }
     }
-    a.len().cmp(&b.len())
+    Ordering::Equal
 }
 
 /// A version range of one product, from an NVD CPE match or a CNA
@@ -688,7 +752,9 @@ pub fn plan(host: &Host) -> Vec<Lookup> {
                 version,
                 port: key.clone(),
             });
-            keyworded = true;
+            if parts.part == 'a' {
+                keyworded = true;
+            }
         }
         if !keyworded {
             if let (Some(product), Some(version)) =
@@ -723,6 +789,9 @@ pub fn plan(host: &Host) -> Vec<Lookup> {
     }
     // Package URLs the operator wrote into notes.
     for fact in &host.facts {
+        if fact.record.source != Source::ManualNote {
+            continue;
+        }
         for found in PURL.find_iter(&fact.claim) {
             push(Lookup::Package {
                 package: Package {
@@ -762,8 +831,44 @@ pub struct CveClient {
     nvd_gate: tokio::sync::Mutex<Option<Instant>>,
 }
 
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const NVD_PAGE_SIZE: usize = 200;
+const NVD_MAX_PAGES: usize = 5;
+
 fn cache_key(kind: &str, value: &str) -> String {
     format!("{kind}:{}", value.to_ascii_lowercase())
+}
+
+async fn read_json_bounded(mut response: reqwest::Response, label: &str) -> Result<Value> {
+    if let Some(len) = response.content_length() {
+        if len > MAX_HTTP_BODY_BYTES as u64 {
+            bail!("{label} response exceeds {MAX_HTTP_BODY_BYTES} bytes");
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed reading {label} response"))?
+    {
+        if bytes.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
+            bail!("{label} response exceeds {MAX_HTTP_BODY_BYTES} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("{label} sent invalid JSON"))
+}
+
+fn validate_osv_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("refusing invalid OSV vulnerability id '{id}'");
+    }
+    Ok(())
 }
 
 impl CveClient {
@@ -830,35 +935,56 @@ impl CveClient {
         {
             return Ok(found);
         }
-        let body = {
-            let mut last = self.nvd_gate.lock().await;
-            if let Some(sent) = *last {
-                tokio::time::sleep(self.nvd_pace.saturating_sub(sent.elapsed())).await;
+        let mut found = Vec::new();
+        let mut start_index = 0usize;
+        for _ in 0..NVD_MAX_PAGES {
+            let body = {
+                let mut last = self.nvd_gate.lock().await;
+                if let Some(sent) = *last {
+                    tokio::time::sleep(self.nvd_pace.saturating_sub(sent.elapsed())).await;
+                }
+                let mut request = self
+                    .http
+                    .get(&self.settings.nvd_url)
+                    .query(&[(param, value), ("resultsPerPage", "200")]);
+                if start_index > 0 {
+                    let start = start_index.to_string();
+                    request = request.query(&[("startIndex", start.as_str())]);
+                }
+                if param == "cpeName" {
+                    // Leave out records that name the product only as the
+                    // platform something else runs on.
+                    request = request.query(&[("isVulnerable", "")]);
+                }
+                if let Some(api_key) = self.settings.api_key() {
+                    request = request.header("apiKey", api_key);
+                }
+                let response = request.send().await;
+                *last = Some(Instant::now());
+                let response = response.context("NVD request failed")?;
+                if !response.status().is_success() {
+                    bail!("NVD answered HTTP {}", response.status());
+                }
+                read_json_bounded(response, "NVD").await?
+            };
+            let page_items = body
+                .get("vulnerabilities")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let total = body
+                .get("totalResults")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            for cve in parse_nvd(&body) {
+                if !found.iter().any(|existing: &NvdCve| existing.id == cve.id) {
+                    found.push(cve);
+                }
             }
-            let mut request = self
-                .http
-                .get(&self.settings.nvd_url)
-                .query(&[(param, value), ("resultsPerPage", "200")]);
-            if param == "cpeName" {
-                // Leave out records that name the product only as the
-                // platform something else runs on.
-                request = request.query(&[("isVulnerable", "")]);
+            start_index += page_items;
+            if page_items < NVD_PAGE_SIZE || start_index >= total {
+                break;
             }
-            if let Some(api_key) = self.settings.api_key() {
-                request = request.header("apiKey", api_key);
-            }
-            let response = request.send().await;
-            *last = Some(Instant::now());
-            let response = response.context("NVD request failed")?;
-            if !response.status().is_success() {
-                bail!("NVD answered HTTP {}", response.status());
-            }
-            response
-                .json::<Value>()
-                .await
-                .context("NVD sent invalid JSON")?
-        };
-        let found = parse_nvd(&body);
+        }
         self.store(&key, &serde_json::to_string(&found)?);
         Ok(found)
     }
@@ -885,7 +1011,7 @@ impl CveClient {
             if !response.status().is_success() {
                 bail!("HTTP {}", response.status());
             }
-            Ok(response.json::<Value>().await?)
+            read_json_bounded(response, "CISA KEV").await
         }
         .await;
         match fetched {
@@ -950,7 +1076,7 @@ impl CveClient {
             if !response.status().is_success() {
                 bail!("OSV answered HTTP {}", response.status());
             }
-            let body: Value = response.json().await.context("OSV sent invalid JSON")?;
+            let body: Value = read_json_bounded(response, "OSV").await?;
             let results = body
                 .get("results")
                 .and_then(Value::as_array)
@@ -979,6 +1105,7 @@ impl CveClient {
 
     /// Full OSV record for one id (cached for a day).
     pub async fn osv_details(&self, id: &str) -> Result<Value> {
+        validate_osv_id(id)?;
         let key = cache_key("osv", id);
         if let Some(found) = self
             .cached(&key, DAY)
@@ -999,7 +1126,7 @@ impl CveClient {
         if !response.status().is_success() {
             bail!("OSV answered HTTP {} for {id}", response.status());
         }
-        let body: Value = response.json().await.context("OSV sent invalid JSON")?;
+        let body: Value = read_json_bounded(response, "OSV").await?;
         self.store(&key, &body.to_string());
         Ok(body)
     }
@@ -1402,9 +1529,14 @@ mod tests {
             ("1.9", "1.10", Less),
             ("8.2", "8.2p1", Less),
             ("8.2p1", "8.10", Less),
+            ("1.1.1", "1.1.1k", Less),
             ("2.4.41", "2.4.9", Greater),
-            ("1.0.0", "1.0", Greater),
+            ("1.0.0", "1.0", Equal),
+            ("1.20.1-rc1", "1.20.1", Less),
+            ("1.20.1-alpha", "1.20.1-beta", Less),
             ("1.2.3-beta", "1.2.3-rc", Less),
+            ("2.4.52-1ubuntu4", "2.4.52", Equal),
+            ("8.2p1-4ubuntu0.5", "8.2p1", Equal),
             ("v2.0", "2.0", Equal),
             ("10", "9.99.99", Greater),
         ] {
@@ -2120,5 +2252,108 @@ mod tests {
         let ids = broken.kev().await.unwrap();
         assert!(ids.contains("CVE-2026-1111"));
         assert_eq!(mock.kev.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn purl_only_from_manual_notes_osv_id_validation_and_os_cpe_fallback() {
+        let mut graph = Graph::default();
+        // Port with an OS CPE that has a version AND a product/version on the port:
+        // the `:o:` CPE must not suppress the port's own product keyword lookup.
+        graph.apply(Observation::Port {
+            address: "192.0.2.50".into(),
+            port: 80,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: Some("nginx".into()),
+            version: Some("1.18.0".into()),
+            extra_info: None,
+            cpes: vec!["cpe:2.3:o:linux:linux_kernel:5.4:*:*:*:*:*:*:*".into()],
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        // A PURL inside a scraped HTTP header or banner fact must NOT trigger an OSV lookup.
+        graph.apply(Observation::Http {
+            address: "192.0.2.50".into(),
+            port: 80,
+            scheme: "http".into(),
+            server: Some("banner pkg:npm/evil-canary@1.0.0".into()),
+            location: None,
+            record: EvidenceRecord::observed(Source::HttpHeader, Confidence::Medium, "x"),
+        });
+        let host = &graph.hosts["192.0.2.50"];
+        let lookups = plan(host);
+        assert!(
+            lookups.iter().any(|l| matches!(
+                l,
+                Lookup::Keyword {
+                    product,
+                    version,
+                    ..
+                } if product == "nginx" && version == "1.18.0"
+            )),
+            "OS CPE must not suppress port.product keyword lookup: {lookups:?}"
+        );
+        assert!(
+            !lookups.iter().any(|l| matches!(l, Lookup::Package { .. })),
+            "non-ManualNote facts must not produce PURL lookups: {lookups:?}"
+        );
+
+        let (base, _mock) = mock_server().await;
+        let client = client(&base, None);
+        for bad_id in [
+            "",
+            "../etc/passwd",
+            "GHSA-1234/../../x",
+            "CVE-2024-1?foo=bar",
+        ] {
+            assert!(
+                client.osv_details(bad_id).await.is_err(),
+                "osv_details should reject {bad_id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nvd_query_follows_start_index_pagination() {
+        let app = Router::new().route(
+            "/nvd",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let start = query
+                    .get("startIndex")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let items: Vec<Value> = if start == 0 {
+                    (0..200)
+                        .map(|i| {
+                            json!({ "cve": {
+                                "id": format!("CVE-2025-{i:04}"),
+                                "vulnStatus": "Analyzed",
+                                "descriptions": [{ "lang": "en", "value": "page 1" }]
+                            }})
+                        })
+                        .collect()
+                } else {
+                    vec![json!({ "cve": {
+                        "id": "CVE-2025-9999",
+                        "vulnStatus": "Analyzed",
+                        "descriptions": [{ "lang": "en", "value": "page 2" }]
+                    }})]
+                };
+                Json(json!({
+                    "totalResults": 201,
+                    "vulnerabilities": items,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = client(&base, Some("k")).with_nvd_pace(Duration::from_millis(1));
+        let found = client
+            .nvd_by_cpe("cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*")
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 201);
+        assert_eq!(found.last().unwrap().id, "CVE-2025-9999");
     }
 }

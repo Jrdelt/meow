@@ -57,6 +57,137 @@ fn code(text: &str) -> String {
     format!("`{}`", text.replace('`', "'").replace(['\n', '\r'], " "))
 }
 
+fn clean_chat_line(line: &str) -> String {
+    line.chars()
+        .filter_map(|ch| match ch {
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+fn find_closing_ticks(bytes: &[u8], from: usize, count: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            if i - start == count {
+                return Some(start);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn escape_html_outside_inline_code(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let leading_spaces = bytes.iter().take(3).take_while(|&&b| b == b' ').count();
+    if bytes.get(leading_spaces) == Some(&b'>')
+        && matches!(bytes.get(leading_spaces + 1), None | Some(b' '))
+    {
+        out.push_str(&line[..=leading_spaces]);
+        i = leading_spaces + 1;
+    }
+    while i < line.len() {
+        if bytes[i] == b'`' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            let tick_len = i - start;
+            if let Some(close_at) = find_closing_ticks(bytes, i, tick_len) {
+                let end = close_at + tick_len;
+                out.push_str(&line[start..end]);
+                i = end;
+            } else {
+                out.push_str(&line[start..i]);
+            }
+            continue;
+        }
+        let ch = line[i..].chars().next().expect("i < line.len()");
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn fence_opening(line: &str) -> Option<(u8, usize)> {
+    let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line.as_bytes()[indent..];
+    let marker = *rest.first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let len = rest.iter().take_while(|&&b| b == marker).count();
+    if len < 3 {
+        return None;
+    }
+    if marker == b'`' && rest[len..].contains(&b'`') {
+        return None;
+    }
+    Some((marker, len))
+}
+
+fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
+    let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line.as_bytes()[indent..];
+    let len = rest.iter().take_while(|&&b| b == marker).count();
+    len >= min_len && rest[len..].iter().all(|&b| b == b' ')
+}
+
+fn render_chat_markdown(out: &mut String, text: &str) {
+    let mut in_fence: Option<(u8, usize)> = None;
+    for raw_line in text.lines() {
+        let line = clean_chat_line(raw_line);
+        if let Some((marker, min_len)) = in_fence {
+            if is_fence_closing(&line, marker, min_len) {
+                in_fence = None;
+            }
+            out.push_str(&line);
+            out.push('\n');
+            continue;
+        }
+        if let Some(fence) = fence_opening(&line) {
+            in_fence = Some(fence);
+            out.push_str(&line);
+            out.push('\n');
+            continue;
+        }
+        // Nest the file's own headings below this section.
+        if line.starts_with('#') {
+            out.push_str("###");
+        }
+        out.push_str(&escape_html_outside_inline_code(&line));
+        out.push('\n');
+    }
+    if let Some((marker, len)) = in_fence {
+        out.extend(std::iter::repeat_n(marker as char, len));
+        out.push('\n');
+    }
+}
+
 fn status_of(advisory: &Advisory) -> VerificationStatus {
     advisory.record.verification_status
 }
@@ -95,7 +226,7 @@ fn fact_line(fact: &Fact) -> String {
         fact.record.source.as_str(),
         fact.record.confidence,
         fact.record.verification_status,
-        fact.record.timestamp_utc
+        md(&fact.record.timestamp_utc)
     )
 }
 
@@ -124,7 +255,7 @@ fn render_host(out: &mut String, host: &Host) {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} | {} | {} |",
-                port.key(),
+                md(&port.key()),
                 md(&port.state),
                 cell(&port.service),
                 cell(&port.product),
@@ -143,7 +274,7 @@ fn render_host(out: &mut String, host: &Host) {
         if paths.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "Paths on {}:\n", port.key());
+        let _ = writeln!(out, "Paths on {}:\n", md(&port.key()));
         for (path, node) in paths.iter().take(MAX_PATHS_PER_PORT) {
             let status = node.status.map(|s| format!(" ({s})")).unwrap_or_default();
             let _ = writeln!(out, "- {}{status}", code(path));
@@ -187,7 +318,7 @@ fn render_host(out: &mut String, host: &Host) {
                 out,
                 "- {} _({})_",
                 md(&note.claim),
-                note.record.timestamp_utc
+                md(&note.record.timestamp_utc)
             );
         }
         out.push('\n');
@@ -206,7 +337,7 @@ pub fn render(inputs: &Inputs) -> String {
     let _ = writeln!(
         out,
         "Generated {} by meow {} from local workspace files (no AI, no network). Mode: {}.\n",
-        inputs.generated_utc,
+        md(&inputs.generated_utc),
         env!("CARGO_PKG_VERSION"),
         inputs.mode
     );
@@ -278,7 +409,11 @@ pub fn render(inputs: &Inputs) -> String {
         if advisory.kev {
             out.push_str("- Listed in the CISA Known Exploited Vulnerabilities catalog\n");
         }
-        let _ = writeln!(out, "- Port: {}", advisory.port.as_deref().unwrap_or("-"));
+        let _ = writeln!(
+            out,
+            "- Port: {}",
+            md(advisory.port.as_deref().unwrap_or("-"))
+        );
         let _ = writeln!(out, "- Matched on: {}", code(&advisory.matched));
         if let Some(fixed) = &advisory.fixed_in {
             let _ = writeln!(out, "- Fixed in: {}", md(fixed));
@@ -290,7 +425,7 @@ pub fn render(inputs: &Inputs) -> String {
             "- Source: {} ({:?} confidence), matched {}",
             advisory.record.source.as_str(),
             advisory.record.confidence,
-            advisory.record.timestamp_utc
+            md(&advisory.record.timestamp_utc)
         );
         let _ = writeln!(out, "- Evidence: {}", code(&advisory.record.evidence));
         for reference in &advisory.references {
@@ -319,7 +454,7 @@ pub fn render(inputs: &Inputs) -> String {
                 md(&advisory.id),
                 md(&severity(advisory)),
                 if advisory.kev { "yes" } else { "-" },
-                advisory.port.as_deref().unwrap_or("-"),
+                md(advisory.port.as_deref().unwrap_or("-")),
                 if list.research_ready() { "yes" } else { "no" },
                 md(&advisory.title)
             );
@@ -356,7 +491,7 @@ pub fn render(inputs: &Inputs) -> String {
                 "- {} _({}, {})_",
                 md(&note.claim),
                 note.record.source.as_str(),
-                note.record.timestamp_utc
+                md(&note.record.timestamp_utc)
             );
             if note.record.source == Source::GitDiff {
                 let _ = writeln!(
@@ -383,7 +518,7 @@ pub fn render(inputs: &Inputs) -> String {
                 "| {} | {} | {} |",
                 code(&secret.token),
                 code(&secret.preview),
-                secret.first_seen_utc
+                md(&secret.first_seen_utc)
             );
         }
         out.push('\n');
@@ -446,14 +581,7 @@ pub fn render(inputs: &Inputs) -> String {
     }
     for (name, text) in &inputs.chats {
         let _ = writeln!(out, "### From chats/{}\n", md(name));
-        for line in text.lines() {
-            // Nest the file's own headings below this section.
-            if line.starts_with('#') {
-                out.push_str("###");
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
+        render_chat_markdown(&mut out, text);
         out.push('\n');
     }
     out
@@ -766,6 +894,36 @@ mod tests {
         );
         assert_eq!(md("a|b\n<c>&"), "a\\|b &lt;c&gt;&amp;");
         assert_eq!(code("x`y\nz"), "`x'y z`");
+
+        // Untrusted advisory.port and raw HTML in chats/*.md are escaped,
+        // while inline code spans, fenced code blocks, and unclosed fences are
+        // handled cleanly.
+        let mut custom = inputs();
+        custom.graph.hosts.get_mut("10.10.10.5").unwrap().advisories[1].port =
+            Some("443/tcp | <img src=x>".into());
+        custom.chats = vec![
+            (
+                "192.0.2.1.md".into(),
+                "# Heading <script>alert(1)</script>\n\
+                 > Quote with <b>html</b> and `<raw>` span\n\
+                 ```sh\n\
+                 # shell comment stays a comment\n\
+                 curl -s https://example.com | grep '<title>'\n\
+                 ```\n\
+                 ```html\n\
+                 <div>unclosed fence"
+                    .into(),
+            ),
+            ("192.0.2.2.md".into(), "## Next chat\nClean text.\n".into()),
+        ];
+        let rendered = render(&custom);
+        assert!(rendered.contains("| 443/tcp \\| &lt;img src=x&gt; |"));
+        assert!(rendered.contains("#### Heading &lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(rendered.contains("> Quote with &lt;b&gt;html&lt;/b&gt; and `<raw>` span"));
+        assert!(rendered.contains("```sh\n# shell comment stays a comment\n"));
+        assert!(rendered.contains("grep '<title>'"));
+        assert!(rendered.contains("<div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
+        assert!(rendered.contains("##### Next chat"));
     }
 
     #[test]

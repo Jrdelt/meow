@@ -7,3 +7,4 @@ runtime.json
 session.lock
 tmp/
 .env*
+.DS_Store

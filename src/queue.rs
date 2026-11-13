@@ -203,6 +203,7 @@ const STANDARD_WORDLISTS: &[&str] = &[
     "/usr/share/dirb/wordlists/common.txt",
     "/opt/homebrew/share/seclists/Discovery/Web-Content/common.txt",
     "/usr/local/share/seclists/Discovery/Web-Content/common.txt",
+    "/home/linuxbrew/.linuxbrew/share/seclists/Discovery/Web-Content/common.txt",
 ];
 
 /// The configured wordlist if it exists, else the first standard one found,
@@ -264,14 +265,299 @@ pub fn is_privileged() -> bool {
 }
 
 const HIGH_RATE_FLAGS: &[&str] = &["-T4", "-T5", "-A"];
+const MAX_NMAP_FLAGS: usize = 32;
+const SAFE_SERVICE_SCRIPTS: &[&str] = &[
+    "ssl-cert",
+    "http-server-header",
+    "http-title",
+    "ssh-hostkey",
+    "banner",
+];
 
-/// Which of `flags` are high-rate (`-T4`, `-T5`, `-A`).
+/// Which of `flags` are high-rate (`-T4`, `-T5`, "-A").
 pub fn high_rate_flags(flags: &[String]) -> Vec<&str> {
     flags
         .iter()
         .map(String::as_str)
         .filter(|flag| HIGH_RATE_FLAGS.contains(flag))
         .collect()
+}
+
+fn is_port_spec(val: &str) -> bool {
+    if val.is_empty() || val.len() > 256 {
+        return false;
+    }
+    if val == "-" {
+        return true;
+    }
+    if val.starts_with('-') {
+        return false;
+    }
+    val.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b',' | b'-' | b':' | b'_'))
+}
+
+fn is_uint_in(val: &str, min: u32, max: u32) -> bool {
+    !val.is_empty()
+        && val.bytes().all(|b| b.is_ascii_digit())
+        && val.parse::<u32>().is_ok_and(|n| (min..=max).contains(&n))
+}
+
+fn is_nmap_duration(val: &str) -> bool {
+    let digits = val
+        .strip_suffix("ms")
+        .or_else(|| val.strip_suffix(['s', 'm', 'h']))
+        .unwrap_or(val);
+    !digits.is_empty()
+        && digits.len() <= 12
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits.parse::<u64>().is_ok()
+}
+
+fn is_exclude_list(val: &str) -> bool {
+    !val.is_empty()
+        && val.len() <= 512
+        && val
+            .split(',')
+            .all(|item| !item.is_empty() && Target::parse(item).is_some())
+}
+
+fn is_safe_service_script_list(val: &str) -> bool {
+    !val.is_empty()
+        && val
+            .split(',')
+            .all(|script| SAFE_SERVICE_SCRIPTS.contains(&script))
+}
+
+fn is_scan_technique_flag(flag: &str) -> bool {
+    if matches!(flag, "-sn" | "-sP" | "-sO") {
+        return true;
+    }
+    if !flag.starts_with("-s") || flag.starts_with("--") || !(3..=5).contains(&flag.len()) {
+        return false;
+    }
+    flag[2..].chars().all(|c| {
+        matches!(
+            c,
+            'S' | 'T' | 'U' | 'A' | 'W' | 'M' | 'N' | 'F' | 'X' | 'Y' | 'Z' | 'V'
+        )
+    })
+}
+
+fn is_host_probe_flag(flag: &str) -> bool {
+    if matches!(flag, "-Pn" | "-P0" | "-PE" | "-PP" | "-PM") {
+        return true;
+    }
+    for prefix in ["-PS", "-PA", "-PU", "-PY"] {
+        if flag == prefix {
+            return true;
+        }
+        if let Some(ports) = flag.strip_prefix(prefix) {
+            return !ports.starts_with('-') && is_port_spec(ports);
+        }
+    }
+    false
+}
+
+fn validate_flags_inner(flags: &[String], allow_service_scripts: bool) -> Result<()> {
+    if flags.len() > MAX_NMAP_FLAGS {
+        bail!("too many nmap flags (at most {MAX_NMAP_FLAGS} allowed)");
+    }
+    let mut i = 0;
+    while i < flags.len() {
+        let arg = flags[i].as_str();
+        if arg.is_empty() || arg.chars().any(|c| c.is_control()) {
+            bail!("invalid nmap flag {arg:?}");
+        }
+        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+            bail!("unexpected nmap argument '{arg}': only safe nmap option flags are allowed");
+        }
+
+        if matches!(
+            arg,
+            "-O" | "-F"
+                | "-r"
+                | "-n"
+                | "-R"
+                | "-4"
+                | "-6"
+                | "-v"
+                | "-vv"
+                | "-d"
+                | "-dd"
+                | "-p-"
+                | "--open"
+                | "--reason"
+                | "--system-dns"
+                | "--osscan-limit"
+                | "--osscan-guess"
+                | "--fuzzy"
+                | "--version-light"
+                | "--version-all"
+                | "--defeat-rst-ratelimit"
+                | "--defeat-icmp-ratelimit"
+                | "-T0"
+                | "-T1"
+                | "-T2"
+                | "-T3"
+                | "-T4"
+                | "-T5"
+        ) || is_scan_technique_flag(arg)
+            || is_host_probe_flag(arg)
+        {
+            i += 1;
+            continue;
+        }
+
+        if let Some(inline) = arg.strip_prefix("-p") {
+            if !arg.starts_with("--") {
+                if inline.is_empty() {
+                    let Some(val) = flags.get(i + 1).map(String::as_str) else {
+                        bail!("nmap flag '-p' requires a port range");
+                    };
+                    if !is_port_spec(val) {
+                        bail!("invalid port specification '{val}' for '-p'");
+                    }
+                    i += 2;
+                    continue;
+                } else if is_port_spec(inline) {
+                    i += 1;
+                    continue;
+                } else {
+                    bail!("invalid port specification '{inline}' in '{arg}'");
+                }
+            }
+        }
+        if arg == "-T" {
+            let Some(val) = flags.get(i + 1).map(String::as_str) else {
+                bail!("nmap flag '-T' requires a timing template (0-5)");
+            };
+            if !is_uint_in(val, 0, 5) {
+                bail!("invalid timing template '{val}' for '-T' (expected 0-5)");
+            }
+            i += 2;
+            continue;
+        }
+
+        if arg.starts_with("--") {
+            let (name, inline_val) = match arg.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (arg, None),
+            };
+            let take_val = |i: &mut usize| -> Result<&str> {
+                if let Some(v) = inline_val {
+                    *i += 1;
+                    Ok(v)
+                } else if let Some(v) = flags.get(*i + 1).map(String::as_str) {
+                    if v.is_empty() || v.chars().any(|c| c.is_control()) {
+                        bail!("invalid value for nmap flag '{name}'");
+                    }
+                    *i += 2;
+                    Ok(v)
+                } else {
+                    bail!("nmap flag '{name}' requires a value");
+                }
+            };
+
+            match name {
+                "--ports" | "--exclude-ports" => {
+                    let val = take_val(&mut i)?;
+                    if !is_port_spec(val) || val == "-" {
+                        bail!("invalid port specification '{val}' for '{name}'");
+                    }
+                    continue;
+                }
+                "--top-ports" => {
+                    let val = take_val(&mut i)?;
+                    if !is_uint_in(val, 1, 65535) {
+                        bail!("invalid value '{val}' for '--top-ports' (expected 1..65535)");
+                    }
+                    continue;
+                }
+                "--version-intensity" => {
+                    let val = take_val(&mut i)?;
+                    if !is_uint_in(val, 0, 9) {
+                        bail!("invalid value '{val}' for '--version-intensity' (expected 0..9)");
+                    }
+                    continue;
+                }
+                "--max-retries" => {
+                    let val = take_val(&mut i)?;
+                    if !is_uint_in(val, 0, 30) {
+                        bail!("invalid value '{val}' for '--max-retries' (expected 0..30)");
+                    }
+                    continue;
+                }
+                "--min-rate" | "--max-rate" => {
+                    let val = take_val(&mut i)?;
+                    if !is_uint_in(val, 1, 1_000_000) {
+                        bail!("invalid value '{val}' for '{name}'");
+                    }
+                    continue;
+                }
+                "--min-parallelism"
+                | "--max-parallelism"
+                | "--min-hostgroup"
+                | "--max-hostgroup" => {
+                    let val = take_val(&mut i)?;
+                    if !is_uint_in(val, 1, 10_000) {
+                        bail!("invalid value '{val}' for '{name}'");
+                    }
+                    continue;
+                }
+                "--host-timeout"
+                | "--scan-delay"
+                | "--max-scan-delay"
+                | "--min-rtt-timeout"
+                | "--max-rtt-timeout"
+                | "--initial-rtt-timeout" => {
+                    let val = take_val(&mut i)?;
+                    if !is_nmap_duration(val) {
+                        bail!("invalid duration '{val}' for '{name}'");
+                    }
+                    continue;
+                }
+                "--exclude" => {
+                    let val = take_val(&mut i)?;
+                    if !is_exclude_list(val) {
+                        bail!("invalid target list '{val}' for '--exclude'");
+                    }
+                    continue;
+                }
+                "--script" if allow_service_scripts => {
+                    let val = take_val(&mut i)?;
+                    if !is_safe_service_script_list(val) {
+                        bail!(
+                            "nmap '--script' in service presets may only name built-in header/TLS scripts ({})",
+                            SAFE_SERVICE_SCRIPTS.join(", ")
+                        );
+                    }
+                    continue;
+                }
+                _ => bail!(
+                    "nmap flag '{name}' is not allowed in recon (scripts, file outputs, and target files are refused)"
+                ),
+            }
+        }
+
+        bail!(
+            "nmap flag '{arg}' is not allowed in recon (scripts, file outputs, and target files are refused)"
+        );
+    }
+    Ok(())
+}
+
+/// Validates extra operator `nmap` flags passed to `meow recon <target> -- ...`.
+pub fn validate_nmap_flags(flags: &[String]) -> Result<()> {
+    validate_flags_inner(flags, false)
+}
+
+/// Validates `nmap_ports` and `nmap_services` preset lists from `config.toml`
+/// and `profile.toml`.
+pub fn validate_preset_nmap_flags(ports: &[String], services: &[String]) -> Result<()> {
+    validate_flags_inner(ports, false).context("invalid recon nmap_ports preset")?;
+    validate_flags_inner(services, true).context("invalid recon nmap_services preset")?;
+    Ok(())
 }
 
 /// Adapts nmap flags to an unprivileged process: `-sS` (raw SYN scan)
@@ -331,7 +617,12 @@ pub fn ports_command(
     if ipv6 && !args.iter().any(|a| a == "-6") {
         args.push("-6".to_owned());
     }
-    args.extend(["-oX".to_owned(), path_arg(output), target.to_string()]);
+    args.extend([
+        "-oX".to_owned(),
+        path_arg(output),
+        "--".to_owned(),
+        target.to_string(),
+    ]);
     (
         ToolCommand {
             program: settings.nmap.clone(),
@@ -361,6 +652,7 @@ pub fn services_command(
         ports.join(","),
         "-oX".to_owned(),
         path_arg(output),
+        "--".to_owned(),
         address.to_owned(),
     ]);
     (
@@ -642,6 +934,7 @@ impl TaskRow {
 }
 
 pub fn enqueue(db: &Db, target: &str, mode: Mode, extra_flags: &[String]) -> Result<i64> {
+    validate_nmap_flags(extra_flags)?;
     let conn = db.conn();
     conn.execute(
         "INSERT INTO tasks (target, mode, extra_flags, created_utc) VALUES (?1, ?2, ?3, ?4)",
@@ -863,6 +1156,7 @@ async fn run_stage(
 ) -> Result<StageEnd> {
     let settings = state.config.recon.clone();
     let preset = settings.preset(task.mode, &state.profile_recon());
+    validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services)?;
     let limits = settings.limits();
     let tmp = state.workspace_dir().join("tmp");
     let privileged = is_privileged();
@@ -870,6 +1164,7 @@ async fn run_stage(
 
     match stage {
         Stage::Ports => {
+            validate_nmap_flags(&task.extra_flags)?;
             let (command, notices) = ports_command(
                 &settings,
                 &preset,
@@ -1164,7 +1459,7 @@ mod tests {
         assert_eq!(command.program, "nmap");
         assert_eq!(
             args(&command),
-            "-sS -T3 --top-ports 1000 -oX /w/tmp/nmap_ports_7.xml 10.0.0.0/24"
+            "-sS -T3 --top-ports 1000 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.0/24"
         );
         assert!(notices.is_empty());
 
@@ -1173,7 +1468,7 @@ mod tests {
             ports_command(&settings, &mild, &target("10.0.0.5"), &extra, false, out);
         assert_eq!(
             args(&command),
-            "-sT -T3 --top-ports 1000 -p 80,443 -oX /w/tmp/nmap_ports_7.xml 10.0.0.5"
+            "-sT -T3 --top-ports 1000 -p 80,443 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
         );
         assert_eq!(notices.len(), 2);
 
@@ -1188,7 +1483,7 @@ mod tests {
         );
         assert_eq!(
             args(&command),
-            "-sS -T4 -p- -O -6 -oX /w/tmp/nmap_ports_7.xml 2001:db8::/64"
+            "-sS -T4 -p- -O -6 -oX /w/tmp/nmap_ports_7.xml -- 2001:db8::/64"
         );
     }
 
@@ -1207,7 +1502,7 @@ mod tests {
         assert_eq!(
             args(&command),
             "-sV --version-intensity 5 -T3 --script ssl-cert,http-server-header,http-title \
-             -p 22,443,8080 -oX /t/svc.xml 10.0.0.5"
+             -p 22,443,8080 -oX /t/svc.xml -- 10.0.0.5"
         );
         let (command, _) = services_command(
             &settings,
@@ -1217,7 +1512,109 @@ mod tests {
             true,
             Path::new("/t/svc.xml"),
         );
-        assert!(args(&command).contains("-6 -p 80 "));
+        assert!(args(&command).contains("-6 -p 80 -oX /t/svc.xml -- 2001:db8::a"));
+    }
+
+    #[test]
+    fn nmap_flag_allowlist_permits_tuning_and_blocks_scripts_files_and_targets() {
+        for allowed in [
+            &[][..],
+            &["-Pn", "-p", "22,80,443", "-T4", "--open"],
+            &["-p-", "-sU", "--top-ports=100", "--max-retries", "2"],
+            &["-p80-90", "-PS22,443", "-PA", "-n", "--reason"],
+            &[
+                "--min-rate",
+                "100",
+                "--max-rate=500",
+                "--host-timeout",
+                "5m",
+                "--scan-delay=200ms",
+                "--exclude",
+                "192.0.2.1,198.51.100.0/24",
+            ],
+            &["-T", "3", "--exclude-ports=9100,515"],
+        ] {
+            validate_nmap_flags(&strings(allowed))
+                .unwrap_or_else(|e| panic!("rejected safe flags {allowed:?}: {e:#}"));
+        }
+
+        for mode in [Mode::Mild, Mode::Aggressive] {
+            let preset = Preset::builtin(mode);
+            validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services).unwrap();
+        }
+
+        for blocked in [
+            &["--script=/tmp/evil.nse"][..],
+            &["--script", "ssl-cert"],
+            &["--script-args", "foo=bar"],
+            &["--script-args-file=/etc/passwd"],
+            &["-sC"],
+            &["-sSC"],
+            &["-A"],
+            &["-oN", "/tmp/out.txt"],
+            &["-oX", "/tmp/out.xml"],
+            &["-oG", "-"],
+            &["-oA", "/tmp/base"],
+            &["--append-output"],
+            &["--resume", "/tmp/scan.gnmap"],
+            &["--datadir", "/tmp"],
+            &["--servicedb", "/tmp/services"],
+            &["--stylesheet", "https://example.invalid/x.xsl"],
+            &["-iL", "/etc/hosts"],
+            &["-iR", "50"],
+            &["--excludefile", "/etc/hosts"],
+            &["--proxies", "http://192.0.2.9:8080"],
+            &["-D", "192.0.2.2"],
+            &["-S", "192.0.2.2"],
+            &["-e", "en0"],
+            &["192.0.2.99"],
+            &["--", "192.0.2.99"],
+            &["-"],
+            &[""],
+            &["-p"],
+            &["-p", "-oN"],
+            &["--top-ports"],
+            &["--top-ports=0"],
+            &["--top-ports=70000"],
+            &["--exclude", "-iL"],
+            &["-p", "80\n443"],
+        ] {
+            assert!(
+                validate_nmap_flags(&strings(blocked)).is_err(),
+                "accepted unsafe flags {blocked:?}"
+            );
+        }
+
+        let too_many: Vec<String> = vec!["-n".to_owned(); MAX_NMAP_FLAGS + 1];
+        assert!(validate_nmap_flags(&too_many).is_err());
+
+        // Service presets may name only the known safe built-in NSE scripts,
+        // never arbitrary script names or file paths.
+        assert!(validate_preset_nmap_flags(
+            &strings(&["-sS"]),
+            &strings(&["-sV", "--script", "/tmp/evil.nse"])
+        )
+        .is_err());
+        assert!(validate_preset_nmap_flags(
+            &strings(&["-sS"]),
+            &strings(&["-sV", "--script=vuln"])
+        )
+        .is_err());
+        assert!(validate_preset_nmap_flags(
+            &strings(&["--script", "ssl-cert"]),
+            &strings(&["-sV"])
+        )
+        .is_err());
+
+        // `enqueue` enforces the same gate at persistence time.
+        let db = Db::open_in_memory().unwrap();
+        assert!(enqueue(
+            &db,
+            "192.0.2.10",
+            Mode::Mild,
+            &strings(&["--script=/tmp/evil.nse"])
+        )
+        .is_err());
     }
 
     #[test]

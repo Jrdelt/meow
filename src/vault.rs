@@ -107,12 +107,12 @@ static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
 static URL_CREDENTIALS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"://([^/\s:@]{1,64}):([^/\s@]{1,128})@").expect("valid regex"));
 static JWT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
+    Regex::new(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?")
         .expect("valid regex")
 });
 static KNOWN_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{35}|ssh-(?:rsa|ed25519|dss) [A-Za-z0-9+/=]{40,})",
+        r"\b(?:AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-ant-[A-Za-z0-9_-]{10,}|sk-or-v1-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{35}|ssh-(?:rsa|ed25519|dss) [A-Za-z0-9+/=]{40,})",
     )
     .expect("valid regex")
 });
@@ -237,6 +237,24 @@ pub struct Vault {
     /// Internal base domains: every name under one of them is masked.
     suffixes: BTreeSet<String>,
     store: Option<Arc<Mutex<Db>>>,
+}
+
+fn extract_redirect_host(location: &str) -> Option<String> {
+    let trimmed = location.trim();
+    let candidate = if let Some(rest) = trimmed.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        trimmed.to_owned()
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    match parsed.host()? {
+        url::Host::Domain(name) => Some(name.to_owned()),
+        url::Host::Ipv4(ip) => Some(ip.to_string()),
+        url::Host::Ipv6(ip) => Some(ip.to_string()),
+    }
 }
 
 fn preview(value: &str) -> String {
@@ -385,6 +403,19 @@ impl Vault {
             for port in host.ports.values() {
                 for san in &port.tls_sans {
                     domain(self, san);
+                }
+                if let Some(host_or_ip) = port
+                    .http
+                    .as_ref()
+                    .and_then(|http| http.location.as_deref())
+                    .and_then(extract_redirect_host)
+                {
+                    match host_or_ip.parse::<IpAddr>() {
+                        Ok(_) => {
+                            self.register(Kind::Host, &host_or_ip);
+                        }
+                        Err(_) => domain(self, &host_or_ip),
+                    }
                 }
             }
             if let Some(mac) = &host.mac {
@@ -957,5 +988,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(exposed, 1);
+    }
+
+    #[test]
+    fn http_redirect_hostnames_and_expanded_api_keys_are_vaulted() {
+        let mut graph = Graph::default();
+        let rec = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x");
+        graph.apply(Observation::Port {
+            address: "198.51.100.10".into(),
+            port: 443,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("https".into()),
+            product: Some("nginx".into()),
+            version: Some("1.18.0".into()),
+            extra_info: None,
+            cpes: vec![],
+            record: rec,
+        });
+        graph
+            .hosts
+            .get_mut("198.51.100.10")
+            .unwrap()
+            .ports
+            .get_mut("443/tcp")
+            .unwrap()
+            .http = Some(crate::graph::HttpInfo {
+            scheme: "https".into(),
+            server: None,
+            location: Some("https://sso.example.net/login".into()),
+        });
+
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+        let masked_redirect = vault
+            .mask_text("HTTP 302 Location: https://sso.example.net/login and auth.example.net");
+        assert!(
+            !masked_redirect.contains("sso.example.net")
+                && !masked_redirect.contains("auth.example.net"),
+            "redirect domain and sibling domain should be vaulted: {masked_redirect}"
+        );
+
+        for secret in [
+            "sk-ant-api03-short_key_token_1234",
+            "sk-or-v1-a1b2c3d4e5f6a1b2c3d4",
+            "sk-proj-a1b2c3d4e5f6a1b2c3d4",
+            "ghp_shorttoken1234567890abcd",
+            "glpat-short_gitlab_pat_12345",
+        ] {
+            let masked = vault.mask_text(&format!("using {secret} in output"));
+            assert!(
+                !masked.contains(secret) && masked.contains("<<SEC_"),
+                "secret {secret} was not masked: {masked}"
+            );
+        }
     }
 }

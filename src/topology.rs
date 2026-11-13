@@ -710,7 +710,9 @@ impl Topology {
     /// A Mermaid flowchart of the topology.
     pub fn mermaid(&self) -> String {
         fn label(text: &str) -> String {
-            text.replace('"', "'")
+            crate::evidence::sanitize(text, 200)
+                .replace('\\', "/")
+                .replace('"', "'")
                 .replace(['[', ']', '{', '}', '<', '>', '|', '`'], " ")
         }
         let mut out = String::from("graph LR\n");
@@ -1367,14 +1369,16 @@ mod tests {
             .get_mut("10.10.10.9")
             .unwrap()
             .hostnames
-            .insert("we\"ird[x]".into());
+            .insert("we\"ird[x]\\".into());
+        graph.local.interfaces[0].name = "lo\x1b]0;pwn\x07\\".into();
         let text = Topology::build(&graph).mermaid();
         assert!(text.starts_with("graph LR\n"));
         assert!(text.contains("    n0([\"this machine\"])\n"), "{text}");
         assert!(text.contains("[/\"tun0 10.10.14.3/23\"/]"), "{text}");
         assert!(text.contains("{{\"gateway 10.10.14.1\"}}"), "{text}");
         assert!(text.contains("-->|routed|"), "{text}");
-        assert!(text.contains("10.10.10.9 (we'ird x )"), "{text}");
+        assert!(text.contains("10.10.10.9 (we'ird x /)"), "{text}");
+        assert!(!text.contains('\\') && !text.contains('\x1b'), "{text}");
         for line in text.lines().skip(1) {
             assert!(line.starts_with("    n"), "{line}");
         }

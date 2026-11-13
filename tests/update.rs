@@ -164,3 +164,53 @@ fn a_folder_that_is_not_a_meow_checkout_is_refused() {
     assert!(!output.status.success());
     assert!(shown.contains("is not a meow git checkout"), "{shown}");
 }
+
+#[test]
+fn hooks_are_disabled_and_untrusted_remotes_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repos = Repos::new();
+    repos.push_change("safe.txt");
+
+    // Plant a git hook in clone/.git/hooks/post-merge; core.hooksPath=/dev/null must ignore it.
+    let hooks_dir = repos.path("clone/.git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let marker = repos.path("hook-ran");
+    let hook = hooks_dir.join("post-merge");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho pwned > \"{}\"\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = repos.update(&[]);
+    let shown = text(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        !marker.exists(),
+        "git hook should not execute when core.hooksPath=/dev/null"
+    );
+
+    // An untrusted plaintext HTTP or ext:: remote URL must be refused before fetching.
+    for bad_remote in [
+        "http://example.com/meow.git",
+        "ext::sh -c touch% /tmp/pwn",
+        "-oProxyCommand=sh",
+    ] {
+        git(
+            &repos.path("clone"),
+            &["remote", "set-url", "--", "origin", bad_remote],
+        );
+        let output = repos.update(&[]);
+        let shown = text(&output);
+        assert!(
+            !output.status.success(),
+            "should reject {bad_remote}: {shown}"
+        );
+        assert!(
+            shown.contains("refusing") && shown.contains("git remote URL"),
+            "unexpected error for {bad_remote}: {shown}"
+        );
+    }
+}

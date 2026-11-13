@@ -128,7 +128,13 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
             if state != "open" && state != "open|filtered" {
                 continue;
             }
-            let protocol = attr(port, "protocol").unwrap_or_else(|| "tcp".to_owned());
+            let protocol = match attr(port, "protocol") {
+                Some(raw_proto) => match crate::graph::normalize_protocol(&raw_proto) {
+                    Some(valid) => valid,
+                    None => continue,
+                },
+                None => "tcp".to_owned(),
+            };
             let service = child(port, "service");
             let tls = service.is_some_and(|s| s.attribute("tunnel") == Some("ssl"));
             let service_name = service.and_then(|s| attr(s, "name")).map(|name| {
@@ -381,5 +387,40 @@ mod tests {
         ]><nmaprun><host><address addr="&h;" addrtype="ipv4"/></host></nmaprun>"#;
         // Either rejected or parsed without producing a host; never a hang.
         assert!(parse(bomb).map(|o| o.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn invalid_or_escape_injected_port_protocols_are_skipped() {
+        let xml = r#"<?xml version="1.0"?>
+<nmaprun scanner="nmap">
+  <host>
+    <status state="up"/>
+    <address addr="192.0.2.15" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp&#x9d;52;c;abc&#x9c;" portid="80">
+        <state state="open"/>
+        <service name="http" product="nginx"/>
+      </port>
+      <port protocol="evil" portid="8080">
+        <state state="open"/>
+      </port>
+      <port portid="22">
+        <state state="open"/>
+        <service name="ssh" product="OpenSSH"/>
+      </port>
+      <port protocol="SCTP" portid="3868">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>"#;
+        let observations = parse(xml).unwrap();
+        let mut graph = Graph::default();
+        graph.apply_all(observations);
+        let host = &graph.hosts["192.0.2.15"];
+        assert_eq!(
+            host.ports.keys().collect::<Vec<_>>(),
+            ["22/tcp", "3868/sctp"]
+        );
     }
 }

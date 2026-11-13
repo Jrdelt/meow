@@ -48,6 +48,46 @@ fn uninteresting(ip: IpAddr) -> bool {
         || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
 }
 
+fn split_service_info(raw: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (None, None, None);
+    }
+    let (head, extra_info) = match trimmed.strip_suffix(')') {
+        Some(without_close) => match without_close.rfind(" (") {
+            Some(pos) => {
+                let extra = without_close[pos + 2..].trim();
+                (
+                    without_close[..pos].trim(),
+                    (!extra.is_empty()).then(|| extra.to_owned()),
+                )
+            }
+            None => (trimmed, None),
+        },
+        None => (trimmed, None),
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let version_start = words.iter().enumerate().skip(1).find_map(|(idx, word)| {
+        let starts_ver = word.starts_with(|c: char| c.is_ascii_digit())
+            || (word.starts_with(['v', 'V'])
+                && word[1..].starts_with(|c: char| c.is_ascii_digit()))
+            || word.to_ascii_lowercase().starts_with("for_windows_");
+        starts_ver.then_some(idx)
+    });
+    match version_start {
+        Some(idx) => (
+            Some(words[..idx].join(" ")),
+            Some(words[idx..].join(" ")),
+            extra_info,
+        ),
+        None => (
+            (!head.is_empty()).then(|| head.to_owned()),
+            None,
+            extra_info,
+        ),
+    }
+}
+
 pub struct TextParser {
     source: Source,
     /// Host named by the last "Nmap scan report for" line.
@@ -106,15 +146,19 @@ impl TextParser {
 
         if let (Some(host), Some(found)) = (&self.scan_host, NMAP_PORT.captures(line)) {
             if let Ok(port) = found[1].parse::<u16>() {
+                let (product, version, extra_info) = found
+                    .get(5)
+                    .map(|m| split_service_info(m.as_str()))
+                    .unwrap_or((None, None, None));
                 out.push(Observation::Port {
                     address: host.clone(),
                     port,
                     protocol: found[2].to_owned(),
                     state: found[3].to_owned(),
                     service: Some(found[4].to_owned()).filter(|s| s != "unknown"),
-                    product: found.get(5).map(|m| m.as_str().trim().to_owned()),
-                    version: None,
-                    extra_info: None,
+                    product,
+                    version,
+                    extra_info,
                     cpes: Vec::new(),
                     record: self.record(Confidence::Medium, line),
                 });
@@ -277,9 +321,11 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
         );
         let ssh = &app.ports["22/tcp"];
         assert_eq!(ssh.service.as_deref(), Some("ssh"));
+        assert_eq!(ssh.product.as_deref(), Some("OpenSSH"));
+        assert_eq!(ssh.version.as_deref(), Some("8.2p1 Ubuntu 4ubuntu0.5"));
         assert_eq!(
-            ssh.product.as_deref(),
-            Some("OpenSSH 8.2p1 Ubuntu 4ubuntu0.5 (Ubuntu Linux; protocol 2.0)")
+            ssh.extra_info.as_deref(),
+            Some("Ubuntu Linux; protocol 2.0")
         );
         assert_eq!(ssh.facts[0].record.source, Source::PtyRegex);
         assert_eq!(ssh.facts[0].record.confidence, Confidence::Medium);

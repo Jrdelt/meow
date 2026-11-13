@@ -159,6 +159,7 @@ fn request(http: &reqwest::Client, base: &str, key: &str, body: &Value) -> reqwe
 /// Sends the request and turns anything but a success into a message a
 /// person can act on.
 async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::Response> {
+    crate::ai::validate_cloud_url(base)?;
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("cannot connect to the Claude API at {base}"),

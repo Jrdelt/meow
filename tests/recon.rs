@@ -202,14 +202,14 @@ fn four_stages_run_in_order_one_at_a_time_and_fill_the_graph() {
     assert_eq!(
         calls[0],
         format!(
-            "start nmap {scan} -T3 --top-ports 1000 -p 1-1000 -oX {}/nmap_ports_{id}.xml 10.0.0.0/24",
+            "start nmap {scan} -T3 --top-ports 1000 -p 1-1000 -oX {}/nmap_ports_{id}.xml -- 10.0.0.0/24",
             tmp_dir.display()
         )
     );
     assert!(
         calls[2].contains(" -sV ")
             && calls[2].contains(" -p 22,443,80 ")
-            && calls[2].ends_with(" 10.0.0.5"),
+            && calls[2].ends_with(" -- 10.0.0.5"),
         "{}",
         calls[2]
     );
@@ -302,6 +302,28 @@ fn light_mode_refuses_recon_and_bad_targets_are_rejected() {
         assert!(
             error.contains("not a host name, an IP address or a CIDR range"),
             "{bad}: {error}"
+        );
+    }
+    for unsafe_flags in [
+        &["--script=/tmp/evil.nse"][..],
+        &["-sC"],
+        &["-oN", "/tmp/out.txt"],
+        &["-iL", "/etc/hosts"],
+        &["192.0.2.99"],
+        &["-p"],
+    ] {
+        let error = state
+            .execute(Command::Recon {
+                target: "192.0.2.10".to_owned(),
+                flags: unsafe_flags.iter().map(|s| (*s).to_owned()).collect(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not allowed")
+                || error.contains("unexpected nmap argument")
+                || error.contains("requires a port range"),
+            "{unsafe_flags:?}: {error}"
         );
     }
     assert!(

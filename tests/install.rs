@@ -83,7 +83,8 @@ impl Machine {
             .unwrap()
     }
 
-    /// A `curl` that serves `body` for every download.
+    /// A `curl` that serves `body` for every download, paired with a stand-in
+    /// `sha256sum` matching the pinned wordlist digest unless overridden.
     fn with_curl(&self, body: &str) -> &Self {
         self.tool(
             "curl",
@@ -91,6 +92,10 @@ impl Machine {
                 "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
                  printf '%s' '{body}' > \"$out\""
             ),
+        )
+        .tool(
+            "sha256sum",
+            "echo '78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52  $1'",
         )
     }
 
@@ -128,8 +133,8 @@ fn bare_machine_plan_lists_compiler_and_rust() {
         "{text}"
     );
     assert!(
-        text.contains("rustup adds"),
-        "the profile change is announced: {text}"
+        text.contains("without modifying your shell profile"),
+        "the non-destructive PATH behavior is announced: {text}"
     );
     let target = format!("install it to {}/.cargo/bin/meow", machine.home().display());
     assert!(text.contains(&target), "{text}");
@@ -331,5 +336,104 @@ fn minimum_rust_version_matches_the_manifest() {
     assert!(
         manifest.contains(&format!("rust-version = \"1.{minor}\"")),
         "install.sh requires Rust 1.{minor} but Cargo.toml says otherwise"
+    );
+}
+
+#[test]
+fn supply_chain_and_shell_profile_hardening_in_install_script() {
+    let script = std::fs::read_to_string(SCRIPT).unwrap();
+    assert!(
+        script.contains("--no-modify-path"),
+        "rustup-init must be called with --no-modify-path"
+    );
+    assert!(
+        script.contains("wget --https-only"),
+        "wget must enforce --https-only"
+    );
+    assert!(
+        !script.contains("@latest"),
+        "katana go install must be pinned to a release tag"
+    );
+    assert!(
+        !script.contains("/SecLists/master/"),
+        "WORDLIST_URL must be pinned to a commit hash"
+    );
+    assert!(
+        script.contains("trap cleanup EXIT INT TERM"),
+        "cleanup trap must cover EXIT INT TERM"
+    );
+
+    // Mismatched SHA-256 digest rejects the wordlist and leaves no temp file.
+    let machine = Machine::bare();
+    machine
+        .with_compiler()
+        .with_rust(90)
+        .with_curl("tampered\n")
+        .tool(
+            "sha256sum",
+            "echo '0000000000000000000000000000000000000000000000000000000000000000  $1'",
+        );
+    let output = machine.run(&["--yes"]);
+    assert!(output.status.success(), "{}", err(&output));
+    assert!(
+        err(&output).contains("Could not download the wordlist"),
+        "{}",
+        err(&output)
+    );
+    assert!(!machine.wordlist().exists());
+    let dir = machine.wordlist().parent().unwrap().to_path_buf();
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+}
+
+#[test]
+fn homebrew_formula_and_windows_installer_match_unix_installer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let unix = std::fs::read_to_string(SCRIPT).unwrap();
+    let formula = std::fs::read_to_string(root.join("Formula/meow.rb")).unwrap();
+    let windows = std::fs::read_to_string(root.join("install.ps1")).unwrap();
+
+    let extract = |prefix: &str| -> String {
+        unix.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .unwrap()
+            .trim_matches('"')
+            .to_owned()
+    };
+    let wordlist_url = extract("WORDLIST_URL=");
+    let katana_go = extract("KATANA_GO=");
+    let sha256 = "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52";
+
+    assert!(
+        formula.contains(&wordlist_url),
+        "Formula/meow.rb must use pinned WORDLIST_URL"
+    );
+    assert!(
+        formula.contains(sha256),
+        "Formula/meow.rb must verify WORDLIST_SHA256"
+    );
+    assert!(
+        formula.contains("std_cargo_args"),
+        "Formula/meow.rb must install via cargo"
+    );
+
+    assert!(
+        windows.contains(&wordlist_url),
+        "install.ps1 must use pinned WORDLIST_URL"
+    );
+    assert!(
+        windows.contains(sha256),
+        "install.ps1 must verify WORDLIST_SHA256"
+    );
+    assert!(
+        windows.contains(&katana_go),
+        "install.ps1 must use pinned KATANA_GO"
+    );
+    assert!(
+        windows.contains("--no-modify-path"),
+        "install.ps1 must pass --no-modify-path to rustup-init"
+    );
+    assert!(
+        windows.contains("MIN_RUST_MINOR = 88"),
+        "install.ps1 must require MSRV 1.88"
     );
 }

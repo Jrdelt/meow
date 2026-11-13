@@ -10,9 +10,10 @@
 //! This is a separate process from the PTY host, so reading terminal events
 //! with crossterm is fine here.
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -27,7 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::ai::{Budget, Tier};
 use crate::checklist;
-use crate::coordinator::{AiStatus, Command, Notice, RuntimeInfo};
+use crate::coordinator::{AiStatus, Command, Notice};
 use crate::cve;
 use crate::db::Db;
 use crate::evidence::{sanitize, VerificationStatus};
@@ -175,9 +176,16 @@ impl Model {
                 // Keep the selection on the same host across updates.
                 let selected = self.selected_host().map(|h| h.address.clone());
                 match serde_json::from_value::<Snapshot>(message["state"].clone()) {
-                    Ok(snapshot) => self.snapshot = Some(snapshot),
+                    Ok(mut snapshot) => {
+                        snapshot.session = sanitize(&snapshot.session, 80);
+                        snapshot.graph.sanitize_loaded();
+                        self.snapshot = Some(snapshot);
+                    }
                     Err(error) => {
-                        self.status = format!("unreadable state from the session: {error}")
+                        self.status = format!(
+                            "unreadable state from the session: {}",
+                            sanitize(&error.to_string(), 200)
+                        )
                     }
                 }
                 if let Some(address) = selected {
@@ -783,7 +791,7 @@ fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
             .iter()
             .filter(|t| t.target == task.target)
             .count();
-        let mut spans = vec![Span::raw(format!("recon {} ", task.target))];
+        let mut spans = vec![Span::raw(format!("recon {} ", sanitize(&task.target, 120)))];
         if runs > 1 {
             spans.push(Span::styled(format!("(+{} earlier) ", runs - 1), DIM));
         }
@@ -795,7 +803,7 @@ fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
                 _ => DIM,
             };
             spans.push(Span::styled(
-                format!("{}:{} ", stage.stage.as_str(), stage.status),
+                format!("{}:{} ", stage.stage.as_str(), sanitize(&stage.status, 32)),
                 style,
             ));
         }
@@ -996,7 +1004,8 @@ pub fn draw(frame: &mut Frame, model: &Model) {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(info: &RuntimeInfo) -> Option<Socket> {
+async fn connect(workspace: &Workspace) -> Option<Socket> {
+    let info = crate::ipc::runtime_info(workspace)?;
     let url = format!("ws://127.0.0.1:{}/ws?token={}", info.port, info.token);
     let attempt = tokio::time::timeout(
         Duration::from_secs(3),
@@ -1075,26 +1084,34 @@ async fn event_loop(
     Ok(())
 }
 
+/// Restores the terminal when the panel exits or unwinds.
+struct TerminalRestore;
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
 /// Runs the panel until the operator quits.
 pub fn run(workspace: &Workspace) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("cannot take over the terminal (is this a TTY?)");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("cannot start the async runtime")?;
     runtime.block_on(async {
-        let socket = match RuntimeInfo::read(&workspace.runtime_path()) {
-            Some(info) => connect(&info).await,
-            None => None,
-        };
+        let socket = connect(workspace).await;
         let mut model = Model::new(socket.is_some());
         if socket.is_none() {
             model.snapshot = Some(Snapshot::offline(workspace)?);
         }
         let mut terminal =
             ratatui::try_init().context("cannot take over the terminal (is this a TTY?)")?;
-        let result = event_loop(&mut terminal, &mut model, socket).await;
-        ratatui::restore();
-        result
+        let _restore = TerminalRestore;
+        event_loop(&mut terminal, &mut model, socket).await
     })
 }
 
@@ -1636,5 +1653,104 @@ mod tests {
         for (width, height) in [(20, 5), (1, 1), (200, 60)] {
             screen(&model(), width, height);
         }
+    }
+
+    #[test]
+    fn websocket_state_messages_strip_escape_sequences_before_rendering() {
+        let mut hud_model = Model::new(true);
+        let hostile = serde_json::json!({
+            "type": "state",
+            "state": {
+                "session": "lab\u{001b}]52;c;abc\u{0007}",
+                "mode": "mild",
+                "graph": {
+                    "version": crate::graph::GRAPH_VERSION,
+                    "updated_utc": "2026-11-12T00:00:00Z",
+                    "hosts": {
+                        "192.0.2.50": {
+                            "address": "192.0.2.50",
+                            "ports": {
+                                "80/tcp": {
+                                    "number": 80,
+                                    "protocol": "tcp",
+                                    "state": "open",
+                                    "product": "nginx\u{001b}[31m"
+                                }
+                            },
+                            "advisories": [{
+                                "id": "CVE-2024-7777\u{001b}]0;pwn\u{0007}",
+                                "title": "bad\u{001b}[2Jtitle",
+                                "matched": "nginx\u{001b}",
+                                "port": "80/tcp\u{001b}",
+                                "source": "nvd_api",
+                                "timestamp_utc": "2026-11-12T00:00:00Z",
+                                "confidence": "Medium",
+                                "evidence": "ev\u{001b}",
+                                "verification_status": "UnverifiedHypothesis"
+                            }]
+                        }
+                    }
+                },
+                "tasks": [{
+                    "id": 1,
+                    "target": "192.0.2.0/24\u{001b}[2J",
+                    "mode": "mild",
+                    "extra_flags": [],
+                    "created_utc": "",
+                    "stages": [{ "stage": "ports", "status": "done\u{001b}", "detail": "ok\u{001b}" }]
+                }],
+                "notices": [{ "at": "2026-11-12T09:00:00Z", "text": "alert\u{001b}]52;c;x\u{0007}" }]
+            }
+        });
+        hud_model.apply_message(&hostile.to_string());
+        let rendered = screen(&hud_model, 160, 50);
+        assert!(!rendered.contains('\x1b') && !rendered.contains('\x07'));
+        assert!(rendered.contains("192.0.2.50"));
+        assert!(rendered.contains("CVE-2024-7777]0;pwn"));
+    }
+
+    #[test]
+    fn connect_ignores_stale_runtime_without_sending_token() {
+        use crate::coordinator::RuntimeInfo;
+        use crate::workspace::MeowHome;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        std::fs::write(workspace.lock_path(), "99999\n").unwrap();
+        std::fs::write(
+            workspace.runtime_path(),
+            serde_json::to_vec(&RuntimeInfo {
+                pid: 99999,
+                port,
+                token: "secret_ws_token".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let connected = rt.block_on(connect(&workspace));
+        if listener.accept().is_ok() {
+            hits_srv.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(connected.is_none());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "HUD must not open a WebSocket to a stale runtime.json port when session.lock is unheld"
+        );
     }
 }

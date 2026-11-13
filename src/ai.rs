@@ -450,7 +450,6 @@ pub fn research_prompt(host: &Host) -> Prompt {
             "product": port.product,
             "version": port.version,
             "cpes": port.cpes,
-            "http_server": port.http.as_ref().and_then(|h| h.server.clone()),
         });
         if !stack.contains(&entry) {
             stack.push(entry);
@@ -606,11 +605,40 @@ fn lock_db(db: &Arc<Mutex<Db>>) -> std::sync::MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Validates a cloud AI endpoint URL: must use `https://`, or `http://` only
+/// when the host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
+pub fn validate_cloud_url(raw: &str) -> Result<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
+    let Some(host) = parsed.host() else {
+        bail!("'{raw}' must start with https://");
+    };
+    match parsed.scheme() {
+        "https" => Ok(url.to_owned()),
+        "http" => {
+            let is_loopback = match host {
+                url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(ip) => ip.is_loopback(),
+                url::Host::Ipv6(ip) => ip.is_loopback(),
+            };
+            if is_loopback {
+                Ok(url.to_owned())
+            } else {
+                bail!(
+                    "cloud URL '{raw}' must start with https:// (http:// is only allowed for localhost/loopback)"
+                )
+            }
+        }
+        _ => bail!("'{raw}' must start with https://"),
+    }
+}
+
 impl AiEngine {
     pub fn new(settings: AiSettings, db: Arc<Mutex<Db>>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("security-audit-client")
             .build()
             .context("cannot create the HTTP client")?;
@@ -635,6 +663,9 @@ impl AiEngine {
         body: &Value,
         mut on_delta: impl FnMut(&str),
     ) -> Result<(String, Usage)> {
+        if api_key.is_some() {
+            validate_cloud_url(base)?;
+        }
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
         let mut request = self
             .http
@@ -1180,6 +1211,8 @@ mod tests {
             "/admin",
             SECRET_JWT,
             "tun0",
+            INJECTION,
+            "http_server",
         ] {
             assert!(
                 !text.contains(private),
@@ -1866,5 +1899,31 @@ mod tests {
         }
         assert_eq!(chat_file_name("fe80::1%eth0"), "fe80__1_eth0.md");
         assert_eq!(chat_file_name("../../etc/passwd"), "_.._etc_passwd.md");
+    }
+
+    #[tokio::test]
+    async fn cloud_url_rejects_non_loopback_plaintext_http() {
+        assert!(validate_cloud_url("https://openrouter.ai/api/v1").is_ok());
+        assert!(validate_cloud_url("http://127.0.0.1:8080/v1").is_ok());
+        assert!(validate_cloud_url("http://localhost:11434/v1").is_ok());
+        assert!(validate_cloud_url("http://[::1]:8080/v1").is_ok());
+        assert!(validate_cloud_url("http://203.0.113.10/v1").is_err());
+        assert!(validate_cloud_url("http://openrouter.example.com/v1").is_err());
+
+        if !no_env_key() {
+            return;
+        }
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let settings = AiSettings {
+            cloud_url: "http://203.0.113.10/v1".into(),
+            openrouter_api_key: Some("sk-or-test".into()),
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(settings, db).unwrap();
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let err = format!("{:#}", outcome.unwrap_err());
+        assert!(err.contains("must start with https://"), "{err}");
     }
 }

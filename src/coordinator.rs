@@ -69,7 +69,13 @@ pub struct RuntimeInfo {
 
 impl RuntimeInfo {
     pub fn read(path: &Path) -> Option<Self> {
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+        let info: Self = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let valid_token = !info.token.is_empty()
+            && info
+                .token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        (info.port != 0 && valid_token).then_some(info)
     }
 
     pub fn base_url(&self) -> String {
@@ -242,13 +248,17 @@ impl State {
 
     /// Adds a line to the notice log shown in the HUD.
     pub fn notice(&self, text: impl Into<String>) {
+        let text = crate::evidence::sanitize(&text.into(), 300);
+        if text.is_empty() {
+            return;
+        }
         let mut notices = lock(&self.notices);
         if notices.len() >= MAX_NOTICES {
             notices.pop_front();
         }
         notices.push_back(Notice {
             at: now_rfc3339(),
-            text: text.into(),
+            text,
         });
         drop(notices);
         self.touch();
@@ -413,6 +423,9 @@ impl State {
                 let parsed = Target::parse(&target).with_context(|| {
                     format!("'{target}' is not a host name, an IP address or a CIDR range")
                 })?;
+                queue::validate_nmap_flags(&flags)?;
+                let preset = self.config.recon.preset(mode, &self.profile_recon());
+                queue::validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services)?;
                 let id = queue::enqueue(&self.db_lock(), &parsed.to_string(), mode, &flags)?;
                 let risky = queue::high_rate_flags(&flags).join(" ");
                 if mode == Mode::Mild && !risky.is_empty() {
@@ -1023,6 +1036,7 @@ impl Drop for Coordinator {
 mod tests {
     use super::*;
     use crate::ipc;
+    use crate::lock::SessionLock;
     use crate::workspace::MeowHome;
     use axum::routing::post;
     use futures_util::{SinkExt, StreamExt};
@@ -1031,6 +1045,7 @@ mod tests {
 
     struct Fixture {
         _tmp: tempfile::TempDir,
+        lock: Option<SessionLock>,
         workspace: Workspace,
         coordinator: Coordinator,
     }
@@ -1040,11 +1055,13 @@ mod tests {
         let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
         let (workspace, _) =
             Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        let lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
         let mut config = Config::default();
         config.cve.enabled = false;
         let coordinator = Coordinator::start(workspace.clone(), config).unwrap();
         Fixture {
             _tmp: tmp,
+            lock: Some(lock),
             workspace,
             coordinator,
         }
@@ -1383,7 +1400,7 @@ mod tests {
 
     #[test]
     fn helpers_reach_a_live_session_and_fall_back_when_there_is_none() {
-        let fx = fixture();
+        let mut fx = fixture();
         let result = ipc::send(
             &fx.workspace,
             &Command::SetMode {
@@ -1409,6 +1426,7 @@ mod tests {
 
         let workspace = fx.workspace.clone();
         fx.coordinator.shutdown();
+        drop(fx.lock.take());
         assert_eq!(ipc::send(&workspace, &Command::State).unwrap(), None);
 
         // A stale runtime.json (crashed session) also means "offline".
@@ -1474,6 +1492,35 @@ mod tests {
         let checklist = &snapshot["checklists"]["10.0.0.5"]["CVE-2021-23017"];
         assert_eq!(checklist["items"].as_array().unwrap().len(), 6);
         assert!(snapshot["notices"].as_array().unwrap().len() >= 2);
+
+        // Deserialized IPC Observations cannot smuggle Confirmed banners.
+        let forged_cmd: Command = serde_json::from_value(json!({
+            "cmd": "observations",
+            "ground": false,
+            "items": [{
+                "kind": "http",
+                "address": "192.0.2.44",
+                "port": 8080,
+                "scheme": "http",
+                "server": "Apache/2.4.49",
+                "location": null,
+                "record": {
+                    "source": "http_header",
+                    "timestamp_utc": "2026-11-12T00:00:00Z",
+                    "confidence": "High",
+                    "evidence": "Server: Apache/2.4.49",
+                    "verification_status": "Confirmed"
+                }
+            }]
+        }))
+        .unwrap();
+        state.execute(forged_cmd).unwrap();
+        assert_eq!(
+            state.graph().hosts["192.0.2.44"].ports["8080/tcp"].facts[0]
+                .record
+                .verification_status,
+            VerificationStatus::Observed
+        );
 
         let path = fx.workspace.graph_path();
         fx.coordinator.shutdown();

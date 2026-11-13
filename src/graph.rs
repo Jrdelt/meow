@@ -24,6 +24,15 @@ pub const GRAPH_VERSION: u32 = 2;
 const MAX_FACTS: usize = 200;
 const MAX_PATH_NODES: usize = 5000;
 const MAX_FIELD: usize = 200;
+const MAX_REFERENCE_LEN: usize = 512;
+const MAX_REFERENCES: usize = 16;
+const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HOSTS: usize = 4096;
+const MAX_PORTS_PER_HOST: usize = 1024;
+const MAX_HOSTNAMES_PER_HOST: usize = 128;
+const MAX_CPES_PER_PORT: usize = 64;
+const MAX_TLS_SANS_PER_PORT: usize = 128;
+const MAX_ADVISORIES_PER_HOST: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fact {
@@ -74,11 +83,17 @@ pub struct PathNode {
     pub record: Option<EvidenceRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub children: BTreeMap<String, PathNode>,
+    #[serde(skip)]
+    total_nodes: usize,
 }
 
 impl PathNode {
     pub fn count(&self) -> usize {
-        self.children.values().map(|c| 1 + c.count()).sum()
+        if self.total_nodes > 0 || self.children.is_empty() {
+            self.total_nodes
+        } else {
+            self.children.values().map(|c| 1 + c.count()).sum()
+        }
     }
 
     /// Every path in the tree, depth first, with a trailing `/` on nodes
@@ -192,19 +207,30 @@ impl Port {
                 *mine = theirs;
             }
         }
-        self.cpes.extend(other.cpes);
-        self.tls_sans.extend(other.tls_sans);
+        for cpe in other.cpes {
+            if self.cpes.len() >= MAX_CPES_PER_PORT {
+                break;
+            }
+            self.cpes.insert(cpe);
+        }
+        for san in other.tls_sans {
+            if self.tls_sans.len() >= MAX_TLS_SANS_PER_PORT {
+                break;
+            }
+            self.tls_sans.insert(san);
+        }
         if other.http.is_some() {
             self.http = other.http;
         }
-        merge_paths(&mut self.paths, other.paths);
+        let mut budget = MAX_PATH_NODES.saturating_sub(self.paths.count());
+        merge_paths(&mut self.paths, other.paths, &mut budget);
         for fact in other.facts {
             push_fact(&mut self.facts, fact);
         }
     }
 }
 
-fn merge_paths(into: &mut PathNode, from: PathNode) {
+fn merge_paths(into: &mut PathNode, from: PathNode, budget: &mut usize) {
     if from.status.is_some() {
         into.status = from.status;
     }
@@ -212,12 +238,76 @@ fn merge_paths(into: &mut PathNode, from: PathNode) {
         into.record = from.record;
     }
     for (name, child) in from.children {
-        merge_paths(into.children.entry(name).or_default(), child);
+        if !into.children.contains_key(&name) {
+            if *budget == 0 {
+                continue;
+            }
+            *budget -= 1;
+        }
+        let old_child_total = into
+            .children
+            .get(&name)
+            .map_or(0, |existing| 1 + existing.total_nodes);
+        let entry = into.children.entry(name).or_default();
+        merge_paths(entry, child, budget);
+        let new_child_total = 1 + entry.total_nodes;
+        into.total_nodes = into.total_nodes - old_child_total + new_child_total;
     }
+}
+
+fn insert_path(
+    node: &mut PathNode,
+    segments: &[String],
+    budget: &mut usize,
+    status: Option<u16>,
+    record: EvidenceRecord,
+) -> Option<bool> {
+    let Some((first, rest)) = segments.split_first() else {
+        let changed = node.record.is_none() || (status.is_some() && node.status != status);
+        if status.is_some() {
+            node.status = status;
+        }
+        if node.record.is_none() {
+            node.record = Some(record);
+        }
+        return Some(changed);
+    };
+    let is_new = !node.children.contains_key(first);
+    if is_new {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+    }
+    let old_child_total = node
+        .children
+        .get(first)
+        .map_or(0, |child| 1 + child.total_nodes);
+    let child = node.children.entry(first.clone()).or_default();
+    let result = insert_path(child, rest, budget, status, record);
+    let new_child_total = 1 + child.total_nodes;
+    node.total_nodes = node.total_nodes - old_child_total + new_child_total;
+    result
 }
 
 pub fn port_key(number: u16, protocol: &str) -> String {
     format!("{number}/{protocol}")
+}
+
+/// Normalizes a transport/IP protocol token to a known safe lowercase keyword.
+pub fn normalize_protocol(protocol: &str) -> Option<String> {
+    let lower = protocol.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "tcp" | "udp" | "sctp" | "dccp" | "ip" => Some(lower),
+        _ => None,
+    }
+}
+
+fn normalize_port_key(key: &str) -> Option<String> {
+    let (number, protocol) = key.trim().split_once('/')?;
+    let number = number.parse::<u16>().ok()?;
+    let protocol = normalize_protocol(protocol)?;
+    Some(port_key(number, &protocol))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -459,7 +549,143 @@ fn clean_opt(text: Option<String>) -> Option<String> {
     text.map(|t| clean(&t)).filter(|t| !t.is_empty())
 }
 
-fn push_fact(facts: &mut Vec<Fact>, fact: Fact) -> bool {
+fn clean_reference(url: &str) -> Option<String> {
+    let cleaned = sanitize(url, MAX_REFERENCE_LEN);
+    let valid_scheme = cleaned.starts_with("https://") || cleaned.starts_with("http://");
+    if !valid_scheme || cleaned.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(cleaned)
+}
+
+fn sanitize_advisory(mut advisory: Advisory, is_new: bool) -> Option<Advisory> {
+    advisory.id = sanitize(&advisory.id, 64);
+    if advisory.id.is_empty() {
+        return None;
+    }
+    advisory.title = clean(&advisory.title);
+    advisory.severity = advisory
+        .severity
+        .map(|s| sanitize(&s, 32))
+        .filter(|s| !s.is_empty());
+    advisory.cvss = advisory
+        .cvss
+        .filter(|score| score.is_finite() && (0.0..=10.0).contains(score));
+    advisory.matched = clean(&advisory.matched);
+    advisory.port = advisory.port.as_deref().and_then(normalize_port_key);
+    advisory.fixed_in = clean_opt(advisory.fixed_in);
+    advisory.last_affected = clean_opt(advisory.last_affected);
+    let mut refs = Vec::new();
+    for reference in advisory.references {
+        if refs.len() >= MAX_REFERENCES {
+            break;
+        }
+        if let Some(clean_ref) = clean_reference(&reference) {
+            if !refs.contains(&clean_ref) {
+                refs.push(clean_ref);
+            }
+        }
+    }
+    advisory.references = refs;
+    if is_new {
+        advisory.record.normalize_new_advisory();
+    } else {
+        advisory.record.normalize_loaded_advisory();
+    }
+    Some(advisory)
+}
+
+fn sanitize_path_node(node: &mut PathNode, budget: &mut usize) {
+    if let Some(record) = &mut node.record {
+        record.normalize_observed();
+    }
+    node.total_nodes = 0;
+    let children = std::mem::take(&mut node.children);
+    for (name, mut child) in children {
+        let name = clean(&name);
+        if name.is_empty() {
+            continue;
+        }
+        if !node.children.contains_key(&name) {
+            if *budget == 0 {
+                continue;
+            }
+            *budget -= 1;
+        }
+        sanitize_path_node(&mut child, budget);
+        match node.children.get_mut(&name) {
+            Some(existing) => {
+                let old_total = 1 + existing.total_nodes;
+                merge_paths(existing, child, budget);
+                let new_total = 1 + existing.total_nodes;
+                node.total_nodes = node.total_nodes - old_total + new_total;
+            }
+            None => {
+                node.total_nodes += 1 + child.total_nodes;
+                node.children.insert(name, child);
+            }
+        }
+    }
+}
+
+fn sanitize_local_net(local: &mut LocalNet) {
+    local.observed_utc = sanitize(&local.observed_utc, 64);
+    local.interfaces.retain_mut(|iface| {
+        iface.name = sanitize(&iface.name, 64);
+        iface.kind = sanitize(&iface.kind, 32);
+        iface.addresses = std::mem::take(&mut iface.addresses)
+            .into_iter()
+            .map(|a| sanitize(&a, 64))
+            .filter(|a| !a.is_empty())
+            .collect();
+        !iface.name.is_empty()
+    });
+    local.routes.retain_mut(|route| {
+        route.destination = sanitize(&route.destination, 64);
+        route.gateway = route
+            .gateway
+            .take()
+            .map(|g| sanitize(&g, 64))
+            .filter(|g| !g.is_empty());
+        route.interface = sanitize(&route.interface, 64);
+        !route.destination.is_empty() && !route.interface.is_empty()
+    });
+    local.neighbors.retain_mut(|neighbor| {
+        neighbor.address = sanitize(&neighbor.address, 64);
+        neighbor.mac = neighbor
+            .mac
+            .take()
+            .map(|m| sanitize(&m, 32))
+            .filter(|m| !m.is_empty());
+        neighbor.interface = sanitize(&neighbor.interface, 64);
+        !neighbor.address.is_empty()
+    });
+    local.listeners.retain_mut(|listener| {
+        let Some(protocol) = normalize_protocol(&listener.protocol) else {
+            return false;
+        };
+        listener.protocol = protocol;
+        listener.address = sanitize(&listener.address, 64);
+        !listener.address.is_empty()
+    });
+    local.warnings = std::mem::take(&mut local.warnings)
+        .into_iter()
+        .map(|w| sanitize(&w, 300))
+        .filter(|w| !w.is_empty())
+        .collect();
+    local.system.kind = sanitize(&local.system.kind, 80);
+    local.system.os = sanitize(&local.system.os, 80);
+    local.system.version = sanitize(&local.system.version, 80);
+    local.notes = std::mem::take(&mut local.notes)
+        .into_iter()
+        .map(|n| sanitize(&n, 300))
+        .filter(|n| !n.is_empty())
+        .collect();
+}
+
+fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
+    fact.claim = sanitize(&fact.claim, crate::evidence::EVIDENCE_MAX);
+    fact.record.normalize_observed();
     let duplicate = facts
         .iter()
         .any(|f| f.claim == fact.claim && f.record.source == fact.record.source);
@@ -488,11 +714,21 @@ impl Observation {
 impl Graph {
     /// Loads `graph.json`; a missing file is an empty graph.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
+        if meta.len() > MAX_GRAPH_BYTES {
+            bail!(
+                "{} is {} bytes, exceeding the {} byte limit",
+                path.display(),
+                meta.len(),
+                MAX_GRAPH_BYTES
+            );
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
         let mut graph: Graph =
             serde_json::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
         if graph.version > GRAPH_VERSION {
@@ -502,6 +738,7 @@ impl Graph {
                 graph.version
             );
         }
+        graph.sanitize_loaded();
         if graph.version < 2 {
             // Before version 2 a crawl of an IP address followed links to
             // other sites and stored them as hosts.
@@ -518,6 +755,124 @@ impl Graph {
         }
         graph.version = GRAPH_VERSION;
         Ok(graph)
+    }
+
+    /// Sanitizes all text fields and protocol keys on a deserialized graph so
+    /// tampered offline `graph.json` files or snapshots cannot inject terminal
+    /// escape sequences.
+    pub fn sanitize_loaded(&mut self) {
+        self.updated_utc = sanitize(&self.updated_utc, 64);
+        sanitize_local_net(&mut self.local);
+
+        let mut notes = Vec::new();
+        for fact in std::mem::take(&mut self.notes) {
+            push_fact(&mut notes, fact);
+        }
+        self.notes = notes;
+
+        let mut hosts: BTreeMap<String, Host> = BTreeMap::new();
+        for (map_key, mut host) in std::mem::take(&mut self.hosts) {
+            if hosts.len() >= MAX_HOSTS {
+                break;
+            }
+            let Some(addr) = HostAddr::parse(&host.address).or_else(|| HostAddr::parse(&map_key))
+            else {
+                continue;
+            };
+            let key = addr.canonical();
+            let hostnames: BTreeSet<String> = std::mem::take(&mut host.hostnames)
+                .into_iter()
+                .filter_map(|name| match HostAddr::parse(&name) {
+                    Some(HostAddr::Name(clean_name)) if clean_name != key => Some(clean_name),
+                    _ => None,
+                })
+                .take(MAX_HOSTNAMES_PER_HOST)
+                .collect();
+            let mut ports: BTreeMap<String, Port> = BTreeMap::new();
+            for (_port_key, mut port) in std::mem::take(&mut host.ports) {
+                if ports.len() >= MAX_PORTS_PER_HOST {
+                    break;
+                }
+                let Some(protocol) = normalize_protocol(&port.protocol) else {
+                    continue;
+                };
+                port.protocol = protocol;
+                let state = clean(&port.state.to_ascii_lowercase());
+                port.state = if state.is_empty() {
+                    "unverified".to_owned()
+                } else {
+                    state
+                };
+                port.service = clean_opt(port.service);
+                port.product = clean_opt(port.product);
+                port.version = clean_opt(port.version);
+                port.extra_info = clean_opt(port.extra_info);
+                port.cpes = std::mem::take(&mut port.cpes)
+                    .into_iter()
+                    .map(|c| clean(&c))
+                    .filter(|c| !c.is_empty())
+                    .take(MAX_CPES_PER_PORT)
+                    .collect();
+                port.tls_sans = std::mem::take(&mut port.tls_sans)
+                    .into_iter()
+                    .map(|s| clean(&s.to_ascii_lowercase()))
+                    .filter(|s| !s.is_empty())
+                    .take(MAX_TLS_SANS_PER_PORT)
+                    .collect();
+                port.http = port.http.map(|mut http| {
+                    http.scheme = if http.scheme.eq_ignore_ascii_case("https") {
+                        "https".to_owned()
+                    } else {
+                        "http".to_owned()
+                    };
+                    http.server = clean_opt(http.server);
+                    http.location = clean_opt(http.location);
+                    http
+                });
+                let mut path_budget = MAX_PATH_NODES;
+                sanitize_path_node(&mut port.paths, &mut path_budget);
+                let mut port_facts = Vec::new();
+                for fact in std::mem::take(&mut port.facts) {
+                    push_fact(&mut port_facts, fact);
+                }
+                port.facts = port_facts;
+                let pkey = port.key();
+                match ports.get_mut(&pkey) {
+                    Some(existing) => existing.absorb(port),
+                    None => {
+                        ports.insert(pkey, port);
+                    }
+                }
+            }
+            let mut facts = Vec::new();
+            for fact in std::mem::take(&mut host.facts) {
+                push_fact(&mut facts, fact);
+            }
+            let mut advisories: Vec<Advisory> = Vec::new();
+            for advisory in std::mem::take(&mut host.advisories) {
+                if advisories.len() >= MAX_ADVISORIES_PER_HOST {
+                    break;
+                }
+                if let Some(clean_adv) = sanitize_advisory(advisory, false) {
+                    if !advisories.iter().any(|a| a.id == clean_adv.id) {
+                        advisories.push(clean_adv);
+                    }
+                }
+            }
+            hosts.insert(
+                key.clone(),
+                Host {
+                    address: key,
+                    hostnames,
+                    os: clean_opt(host.os),
+                    mac: clean_opt(host.mac),
+                    ports,
+                    facts,
+                    advisories,
+                },
+            );
+        }
+        self.hosts = hosts;
     }
 
     /// Atomically replaces `graph.json`.
@@ -544,6 +899,9 @@ impl Graph {
     fn host_entry(&mut self, address: &str) -> Option<&mut Host> {
         let addr = HostAddr::parse(address)?;
         let key = self.resolve(&addr);
+        if !self.hosts.contains_key(&key) && self.hosts.len() >= MAX_HOSTS {
+            return None;
+        }
         Some(self.hosts.entry(key.clone()).or_insert_with(|| Host {
             address: key,
             ..Host::default()
@@ -551,18 +909,18 @@ impl Graph {
     }
 
     fn port_entry(&mut self, address: &str, number: u16, protocol: &str) -> Option<&mut Port> {
+        let protocol = normalize_protocol(protocol)?;
+        let pkey = port_key(number, &protocol);
         let host = self.host_entry(address)?;
-        let protocol = protocol.to_ascii_lowercase();
-        Some(
-            host.ports
-                .entry(port_key(number, &protocol))
-                .or_insert_with(|| Port {
-                    number,
-                    protocol,
-                    state: "unverified".to_owned(),
-                    ..Port::default()
-                }),
-        )
+        if !host.ports.contains_key(&pkey) && host.ports.len() >= MAX_PORTS_PER_HOST {
+            return None;
+        }
+        Some(host.ports.entry(pkey).or_insert_with(|| Port {
+            number,
+            protocol,
+            state: "unverified".to_owned(),
+            ..Port::default()
+        }))
     }
 
     pub fn host(&self, address: &str) -> Option<&Host> {
@@ -583,15 +941,25 @@ impl Graph {
         if key == name {
             return false;
         }
+        if !host.hostnames.contains(&name) && host.hostnames.len() >= MAX_HOSTNAMES_PER_HOST {
+            return false;
+        }
         let added = host.hostnames.insert(name.clone());
         if let Some(named) = self.hosts.remove(&name) {
             let host = self.hosts.get_mut(&key).expect("host was just created");
-            host.hostnames.extend(named.hostnames);
+            for extra in named.hostnames {
+                if host.hostnames.len() >= MAX_HOSTNAMES_PER_HOST {
+                    break;
+                }
+                host.hostnames.insert(extra);
+            }
             for (port_key, port) in named.ports {
                 match host.ports.get_mut(&port_key) {
                     Some(existing) => existing.absorb(port),
                     None => {
-                        host.ports.insert(port_key, port);
+                        if host.ports.len() < MAX_PORTS_PER_HOST {
+                            host.ports.insert(port_key, port);
+                        }
                     }
                 }
             }
@@ -599,6 +967,9 @@ impl Graph {
                 push_fact(&mut host.facts, fact);
             }
             for advisory in named.advisories {
+                if host.advisories.len() >= MAX_ADVISORIES_PER_HOST {
+                    break;
+                }
                 if !host.advisories.iter().any(|a| a.id == advisory.id) {
                     host.advisories.push(advisory);
                 }
@@ -705,7 +1076,11 @@ impl Graph {
                 let Some(entry) = self.port_entry(&address, port, "tcp") else {
                     return false;
                 };
-                if san.is_empty() || !entry.tls_sans.insert(san.clone()) {
+                if san.is_empty()
+                    || (!entry.tls_sans.contains(&san)
+                        && entry.tls_sans.len() >= MAX_TLS_SANS_PER_PORT)
+                    || !entry.tls_sans.insert(san.clone())
+                {
                     return false;
                 }
                 entry.state = "open".to_owned();
@@ -770,7 +1145,7 @@ impl Graph {
                 scheme,
                 path,
                 status,
-                record,
+                mut record,
             } => {
                 let Some(entry) = self.port_entry(&address, port, "tcp") else {
                     return false;
@@ -793,30 +1168,18 @@ impl Graph {
                 if answered {
                     entry.state = "open".to_owned();
                 }
-                let segments = path_segments(&path);
+                let segments: Vec<String> = path_segments(&path)
+                    .into_iter()
+                    .map(clean)
+                    .filter(|segment| !segment.is_empty())
+                    .collect();
                 if segments.is_empty() {
                     return false;
                 }
                 let mut budget = MAX_PATH_NODES.saturating_sub(entry.paths.count());
-                let mut node = &mut entry.paths;
-                for segment in segments {
-                    let segment = clean(segment);
-                    if !node.children.contains_key(&segment) {
-                        if budget == 0 {
-                            return false;
-                        }
-                        budget -= 1;
-                    }
-                    node = node.children.entry(segment).or_default();
-                }
-                let changed = node.record.is_none() || (status.is_some() && node.status != status);
-                if status.is_some() {
-                    node.status = status;
-                }
-                if node.record.is_none() {
-                    node.record = Some(record);
-                }
-                changed
+                record.normalize_observed();
+                insert_path(&mut entry.paths, &segments, &mut budget, status, record)
+                    .unwrap_or(false)
             }
             Observation::Note {
                 address,
@@ -848,11 +1211,13 @@ impl Graph {
 
     /// Attaches an advisory to a host. An advisory already present keeps its
     /// verification status; only its descriptive fields are refreshed.
-    pub fn add_advisory(&mut self, address: &str, mut advisory: Advisory) -> bool {
+    pub fn add_advisory(&mut self, address: &str, advisory: Advisory) -> bool {
+        let Some(advisory) = sanitize_advisory(advisory, true) else {
+            return false;
+        };
         let Some(host) = self.host_entry(address) else {
             return false;
         };
-        advisory.title = clean(&advisory.title);
         match host.advisories.iter_mut().find(|a| a.id == advisory.id) {
             Some(existing) => {
                 let before = existing.clone();
@@ -865,6 +1230,9 @@ impl Graph {
                 existing.fixed_in = advisory.fixed_in.or(existing.fixed_in.take());
                 existing.last_affected = advisory.last_affected.or(existing.last_affected.take());
                 for reference in advisory.references {
+                    if existing.references.len() >= MAX_REFERENCES {
+                        break;
+                    }
                     if !existing.references.contains(&reference) {
                         existing.references.push(reference);
                     }
@@ -872,6 +1240,9 @@ impl Graph {
                 *existing != before
             }
             None => {
+                if host.advisories.len() >= MAX_ADVISORIES_PER_HOST {
+                    return false;
+                }
                 host.advisories.push(advisory);
                 true
             }
@@ -1309,5 +1680,284 @@ mod tests {
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
             0o600
         );
+    }
+
+    #[test]
+    fn invalid_protocols_are_rejected_and_advisory_fields_are_sanitized() {
+        for valid in ["tcp", "TCP", " udp ", "sctp", "dccp", "ip"] {
+            assert!(normalize_protocol(valid).is_some(), "{valid:?}");
+        }
+        for bad in [
+            "",
+            "tcp\x1b]52;c;abc\x07",
+            "tcp\x1b[2J",
+            "http",
+            "tcp/udp",
+            "icmp",
+        ] {
+            assert_eq!(normalize_protocol(bad), None, "{bad:?}");
+        }
+
+        let mut graph = Graph::default();
+        assert!(!graph.apply(Observation::Port {
+            address: "192.0.2.10".into(),
+            port: 80,
+            protocol: "tcp\x1b]52;c;abc\x07".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: None,
+            version: None,
+            extra_info: None,
+            cpes: vec![],
+            record: rec(Source::NmapXml),
+        }));
+        assert!(
+            !graph.hosts.contains_key("192.0.2.10"),
+            "rejected port must not create an empty host"
+        );
+
+        assert!(graph.apply(port("192.0.2.10", 443, "https", Some("nginx"))));
+        assert!(!graph.add_advisory(
+            "192.0.2.10",
+            Advisory {
+                id: "\x1b\x07".into(),
+                ..advisory("CVE-2024-0001")
+            }
+        ));
+
+        let mut hostile_record = rec(Source::NvdApi);
+        hostile_record.verification_status = VerificationStatus::UnverifiedHypothesis;
+        hostile_record.evidence = "raw\x1b]0;title\x07\nline".into();
+        hostile_record.timestamp_utc = "2026-11-12T00:00:00Z\x1b[2J".into();
+
+        assert!(graph.add_advisory(
+            "192.0.2.10",
+            Advisory {
+                id: "CVE-2024-9999\x1b]52;c;abc\x07".into(),
+                title: "Evil\x1b[31m\u{202e} title".into(),
+                severity: Some("CRITICAL\x1b[0m".into()),
+                cvss: Some(f64::NAN),
+                kev: true,
+                matched: "nginx\x1b[2J@1.18.0".into(),
+                port: Some("443/tcp\x1b]0;pwn\x07".into()),
+                references: vec![
+                    "https://example.com/adv\x1b\x07".into(),
+                    "javascript:alert(1)".into(),
+                    "https://example.com/bad space".into(),
+                    "  https://example.org/clean  ".into(),
+                ],
+                fixed_in: Some("1.20.1\x1b[32m".into()),
+                last_affected: Some("1.20.0\x07".into()),
+                record: hostile_record,
+            },
+        ));
+        let stored = &graph.hosts["192.0.2.10"].advisories[0];
+        assert!(!stored.id.chars().any(char::is_control));
+        assert_eq!(stored.title, "Evil[31m title");
+        assert_eq!(stored.severity.as_deref(), Some("CRITICAL[0m"));
+        assert_eq!(stored.cvss, None);
+        assert_eq!(stored.matched, "nginx[2J@1.18.0");
+        assert_eq!(
+            stored.port, None,
+            "malformed port key must be dropped rather than kept raw"
+        );
+        assert_eq!(stored.fixed_in.as_deref(), Some("1.20.1[32m"));
+        assert_eq!(stored.last_affected.as_deref(), Some("1.20.0"));
+        assert_eq!(
+            stored.references,
+            ["https://example.com/adv", "https://example.org/clean"]
+        );
+        assert!(!stored.record.evidence.chars().any(char::is_control));
+        assert!(!stored.record.timestamp_utc.chars().any(char::is_control));
+
+        // Valid port keys with uppercase protocol normalize cleanly.
+        let mut second = advisory("CVE-2024-1000");
+        second.port = Some("443/TCP".into());
+        assert!(graph.add_advisory("192.0.2.10", second));
+        assert_eq!(
+            graph.hosts["192.0.2.10"].advisories[1].port.as_deref(),
+            Some("443/tcp")
+        );
+    }
+
+    #[test]
+    fn load_sanitizes_tampered_graph_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        let tampered = serde_json::json!({
+            "version": GRAPH_VERSION,
+            "updated_utc": "2026-11-12T00:00:00Z\u{001b}[2J",
+            "local": {
+                "observed_utc": "2026-11-12T00:00:00Z\u{001b}\u{0007}",
+                "interfaces": [{
+                    "name": "eth0\u{001b}]0;pwn\u{0007}",
+                    "kind": "ethernet\u{001b}",
+                    "up": true,
+                    "addresses": ["192.0.2.5/24\u{001b}"]
+                }],
+                "routes": [{
+                    "destination": "0.0.0.0/0",
+                    "gateway": "192.0.2.1\u{001b}",
+                    "interface": "eth0\u{001b}"
+                }],
+                "neighbors": [{
+                    "address": "192.0.2.1",
+                    "mac": "00:11:22:33:44:55\u{001b}",
+                    "interface": "eth0\u{001b}"
+                }],
+                "listeners": [
+                    { "protocol": "tcp\u{001b}", "address": "0.0.0.0", "port": 80 },
+                    { "protocol": "TCP", "address": "0.0.0.0\u{001b}", "port": 22 }
+                ],
+                "warnings": ["warn\u{001b}[31m"],
+                "system": {
+                    "kind": "Laptop\u{001b}",
+                    "os": "Linux\u{001b}",
+                    "version": "24.04\u{001b}"
+                },
+                "notes": ["note\u{001b}[2J"]
+            },
+            "hosts": {
+                "192.0.2.20": {
+                    "address": "192.0.2.20",
+                    "os": "Ubuntu\u{001b}]52;c;abc\u{0007}",
+                    "ports": {
+                        "80/evil\u{001b}": {
+                            "number": 80,
+                            "protocol": "evil\u{001b}",
+                            "state": "open"
+                        },
+                        "443/TCP": {
+                            "number": 443,
+                            "protocol": "TCP",
+                            "state": "open\u{001b}",
+                            "product": "nginx\u{001b}[31m",
+                            "facts": [{
+                                "claim": "443/tcp open\u{001b}",
+                                "source": "nmap_xml",
+                                "timestamp_utc": "2026-11-12T00:00:00Z",
+                                "confidence": "High",
+                                "evidence": "raw\u{001b}snippet",
+                                "verification_status": "Observed"
+                            }]
+                        }
+                    },
+                    "advisories": [{
+                        "id": "CVE-2024-2222\u{001b}",
+                        "title": "adv\u{001b}",
+                        "matched": "nginx\u{001b}",
+                        "port": "443/tcp\u{001b}",
+                        "references": ["https://example.com/\u{001b}"],
+                        "source": "nvd_api",
+                        "timestamp_utc": "2026-11-12T00:00:00Z",
+                        "confidence": "Medium",
+                        "evidence": "ev\u{001b}",
+                        "verification_status": "UnverifiedHypothesis"
+                    }]
+                }
+            },
+            "notes": [{
+                "claim": "ws\u{001b}note",
+                "source": "manual_note",
+                "timestamp_utc": "2026-11-12T00:00:00Z",
+                "confidence": "Medium",
+                "evidence": "ev\u{001b}",
+                "verification_status": "Observed"
+            }]
+        });
+        std::fs::write(&file, serde_json::to_vec(&tampered).unwrap()).unwrap();
+
+        let loaded = Graph::load(&file).unwrap();
+        let dumped = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !dumped.contains('\x1b') && !dumped.contains('\x07'),
+            "control chars survived load: {dumped}"
+        );
+        assert_eq!(loaded.local.listeners.len(), 1);
+        assert_eq!(loaded.local.listeners[0].protocol, "tcp");
+        let host = &loaded.hosts["192.0.2.20"];
+        assert_eq!(host.ports.keys().collect::<Vec<_>>(), ["443/tcp"]);
+        assert_eq!(host.advisories[0].port, None);
+    }
+
+    #[test]
+    fn observations_and_loaded_graphs_cannot_smuggle_confirmed_banners() {
+        let mut graph = Graph::default();
+        let forged_port: Observation = serde_json::from_value(serde_json::json!({
+            "kind": "port",
+            "address": "192.0.2.30",
+            "port": 80,
+            "protocol": "tcp",
+            "state": "open",
+            "service": "http",
+            "product": "nginx",
+            "version": "1.18.0",
+            "cpes": [],
+            "record": {
+                "source": "nmap_xml",
+                "timestamp_utc": "2026-11-12T00:00:00Z",
+                "confidence": "High",
+                "evidence": "<port portid=\"80\"/>",
+                "verification_status": "Confirmed"
+            }
+        }))
+        .unwrap();
+        let forged_path: Observation = serde_json::from_value(serde_json::json!({
+            "kind": "path",
+            "address": "192.0.2.30",
+            "port": 80,
+            "scheme": "http",
+            "path": "/admin",
+            "status": 200,
+            "record": {
+                "source": "ferox_json",
+                "timestamp_utc": "2026-11-12T00:00:00Z",
+                "confidence": "High",
+                "evidence": "{}",
+                "verification_status": "Confirmed"
+            }
+        }))
+        .unwrap();
+        assert!(graph.apply(forged_port));
+        assert!(graph.apply(forged_path));
+        let port_entry = &graph.hosts["192.0.2.30"].ports["80/tcp"];
+        assert_eq!(
+            port_entry.facts[0].record.verification_status,
+            VerificationStatus::Observed
+        );
+        assert_eq!(
+            port_entry.paths.children["admin"]
+                .record
+                .as_ref()
+                .unwrap()
+                .verification_status,
+            VerificationStatus::Observed
+        );
+
+        let mut forged_adv = advisory("CVE-2024-3333");
+        forged_adv.record.verification_status = VerificationStatus::Confirmed;
+        assert!(graph.add_advisory("192.0.2.30", forged_adv));
+        assert_eq!(
+            graph.hosts["192.0.2.30"].advisories[0]
+                .record
+                .verification_status,
+            VerificationStatus::UnverifiedHypothesis
+        );
+    }
+
+    #[test]
+    fn path_count_and_collection_bounds_stay_consistent() {
+        let mut graph = Graph::default();
+        assert!(graph.apply(path("192.0.2.40", 443, "/a/b/c", 200)));
+        assert_eq!(graph.hosts["192.0.2.40"].ports["443/tcp"].paths.count(), 3);
+        assert!(graph.apply(path("192.0.2.40", 443, "/a/b/d", 200)));
+        assert_eq!(graph.hosts["192.0.2.40"].ports["443/tcp"].paths.count(), 4);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.save(&file).unwrap();
+        let loaded = Graph::load(&file).unwrap();
+        assert_eq!(loaded.hosts["192.0.2.40"].ports["443/tcp"].paths.count(), 4);
+        assert_eq!(loaded, graph);
     }
 }

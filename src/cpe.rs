@@ -154,18 +154,24 @@ pub fn parts(cpe: &str) -> Option<CpeParts> {
     })
 }
 
-/// The numeric version inside a decorated one: `for_windows_9.5` is `9.5`.
-/// A version that already starts with a digit, or holds none, is kept.
+/// The numeric version inside a decorated one: `for_windows_9.5` is `9.5`,
+/// and underscore-separated numeric segments (`openssl_1_1_1k`) become `1.1.1k`.
+/// A version that already starts with a digit and has no underscore-separated
+/// numeric segments, or holds no digits at all, is kept.
 pub fn clean_version(version: &str) -> String {
     let starts_numeric = |text: &str| text.starts_with(|c: char| c.is_ascii_digit());
-    if starts_numeric(version) {
+    let pieces: Vec<&str> = version.split('_').filter(|p| !p.is_empty()).collect();
+    let Some(first_num) = pieces.iter().position(|piece| starts_numeric(piece)) else {
         return version.to_owned();
+    };
+    let tail = &pieces[first_num..];
+    if tail.len() == 1 {
+        return tail[0].to_owned();
     }
-    version
-        .rsplit('_')
-        .find(|piece| starts_numeric(piece))
-        .unwrap_or(version)
-        .to_owned()
+    if tail.iter().any(|piece| piece.contains('.')) {
+        return tail.join("_");
+    }
+    tail.join(".")
 }
 
 /// The same CPE name with another version.
@@ -265,5 +271,10 @@ mod tests {
                 version: None,
             }
         );
+        assert_eq!(clean_version("for_windows_9.5"), "9.5");
+        assert_eq!(clean_version("openssl_1_1_1"), "1.1.1");
+        assert_eq!(clean_version("openssl_1_1_1k"), "1.1.1k");
+        assert_eq!(clean_version("1_1_1"), "1.1.1");
+        assert_eq!(clean_version("1.18.0"), "1.18.0");
     }
 }

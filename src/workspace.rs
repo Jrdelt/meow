@@ -34,7 +34,8 @@ const LOCAL_DIR: &str = ".meow";
 const CONFIG_FILE: &str = "config.toml";
 const PROFILE_FILE: &str = "profile.toml";
 const AI_FILE: &str = "ai.toml";
-const LOCK_FILE: &str = "session.lock";
+/// Exclusive session lock file inside a workspace.
+pub const LOCK_FILE: &str = "session.lock";
 /// Port and token of the running session; present only while one is open.
 pub const RUNTIME_FILE: &str = "runtime.json";
 const NAME_MAX: usize = 64;

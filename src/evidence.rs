@@ -52,6 +52,15 @@ impl Source {
             Source::LocalNet => "local_net",
         }
     }
+
+    /// Sources that can originate vulnerability advisories rather than raw
+    /// network/banner/log observations.
+    pub fn is_advisory_source(self) -> bool {
+        matches!(
+            self,
+            Source::NvdApi | Source::OsvApi | Source::CisaKev | Source::ManualNote
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -176,6 +185,42 @@ impl EvidenceRecord {
         }
         self.verification_status = to;
         Ok(())
+    }
+
+    /// Strips terminal control sequences and bounds field lengths on a record
+    /// that may have been deserialized from IPC or `graph.json`.
+    pub fn sanitize_fields(&mut self) {
+        self.timestamp_utc = sanitize(&self.timestamp_utc, 64);
+        self.evidence = match self.source {
+            Source::GitDiff => sanitize_block(&self.evidence, EVIDENCE_MAX),
+            _ => sanitize(&self.evidence, EVIDENCE_MAX),
+        };
+    }
+
+    /// Enforces the observation invariant: raw observations and facts are
+    /// always `Observed` and carry sanitized, bounded fields.
+    pub fn normalize_observed(&mut self) {
+        self.sanitize_fields();
+        self.verification_status = VerificationStatus::Observed;
+    }
+
+    /// Enforces the new-advisory invariant: newly matched advisories always
+    /// enter as `UnverifiedHypothesis` until an operator verdict transitions them.
+    pub fn normalize_new_advisory(&mut self) {
+        self.sanitize_fields();
+        self.verification_status = VerificationStatus::UnverifiedHypothesis;
+    }
+
+    /// Enforces advisory state-machine bounds when loading `graph.json` or
+    /// snapshots: advisories are never `Observed`, and automated banner/scan
+    /// sources cannot hold a verdict (`Confirmed` or `FalsePositive`).
+    pub fn normalize_loaded_advisory(&mut self) {
+        self.sanitize_fields();
+        if self.verification_status == VerificationStatus::Observed
+            || !self.source.is_advisory_source()
+        {
+            self.verification_status = VerificationStatus::UnverifiedHypothesis;
+        }
     }
 }
 
@@ -331,5 +376,64 @@ mod tests {
         let capped = sanitize(&long, EVIDENCE_MAX);
         assert_eq!(capped.len(), EVIDENCE_MAX);
         assert!(capped.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn sanitize_fields_cleans_deserialized_records_preserving_diff_newlines() {
+        let mut single: EvidenceRecord = serde_json::from_value(serde_json::json!({
+            "source": "http_header",
+            "timestamp_utc": "2026-11-12T00:00:00Z\x1b]0;pwn\x07",
+            "confidence": "High",
+            "evidence": "Server:\x1b[31m nginx\r\nX-Test: 1",
+            "verification_status": "Observed"
+        }))
+        .unwrap();
+        single.sanitize_fields();
+        assert_eq!(single.timestamp_utc, "2026-11-12T00:00:00Z]0;pwn");
+        assert_eq!(single.evidence, "Server:[31m nginx X-Test: 1");
+
+        let mut diff: EvidenceRecord = serde_json::from_value(serde_json::json!({
+            "source": "git_diff",
+            "timestamp_utc": "2026-11-12T00:00:00Z",
+            "confidence": "High",
+            "evidence": "@@ -1 +1 @@\n-\x1b]52;c;abc\x07old\n+new",
+            "verification_status": "Observed"
+        }))
+        .unwrap();
+        diff.sanitize_fields();
+        assert_eq!(diff.evidence, "@@ -1 +1 @@\n-]52;c;abcold\n+new");
+    }
+
+    #[test]
+    fn deserialized_records_cannot_bypass_state_machine_bounds() {
+        let mut forged_obs: EvidenceRecord = serde_json::from_value(serde_json::json!({
+            "source": "nmap_xml",
+            "timestamp_utc": "2026-11-12T00:00:00Z",
+            "confidence": "High",
+            "evidence": "<port portid=\"80\"/>",
+            "verification_status": "Confirmed"
+        }))
+        .unwrap();
+        forged_obs.normalize_observed();
+        assert_eq!(forged_obs.verification_status, Observed);
+
+        let mut forged_new_adv = forged_obs.clone();
+        forged_new_adv.source = Source::NvdApi;
+        forged_new_adv.verification_status = Confirmed;
+        forged_new_adv.normalize_new_advisory();
+        assert_eq!(forged_new_adv.verification_status, UnverifiedHypothesis);
+
+        // Loaded advisories keep legitimate operator verdicts on advisory sources,
+        // but clamp Observed or banner/scanner sources back to UnverifiedHypothesis.
+        let mut legitimate_verdict =
+            EvidenceRecord::hypothesis(Source::NvdApi, Confidence::High, "{}");
+        legitimate_verdict.transition(Confirmed).unwrap();
+        legitimate_verdict.normalize_loaded_advisory();
+        assert_eq!(legitimate_verdict.verification_status, Confirmed);
+
+        let mut banner_verdict = forged_obs;
+        banner_verdict.verification_status = Confirmed;
+        banner_verdict.normalize_loaded_advisory();
+        assert_eq!(banner_verdict.verification_status, UnverifiedHypothesis);
     }
 }
