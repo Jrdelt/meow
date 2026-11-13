@@ -391,6 +391,171 @@ impl Config {
         config.recon.wordlist_dir = Some(home.root().join("wordlists"));
         Ok(config)
     }
+
+    /// Updates `default_mode` and `[cve]` (`enabled`, `nvd_api_key`) in
+    /// `config.toml` atomically while preserving comments and other sections.
+    pub fn save_setup_preferences(
+        home: &MeowHome,
+        default_mode: Mode,
+        cve_enabled: bool,
+        nvd_api_key: Option<&str>,
+    ) -> Result<()> {
+        let _ = Self::load_or_create(home)?;
+        let path = home.config_path();
+        let existing =
+            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let clean_key = nvd_api_key.map(str::trim).filter(|k| !k.is_empty());
+        let updated = update_config_toml(&existing, default_mode, cve_enabled, clean_key)?;
+        let parsed: Config = toml::from_str(&updated)
+            .with_context(|| format!("refusing to write invalid {}", path.display()))?;
+        if parsed.default_mode != default_mode
+            || parsed.cve.enabled != cve_enabled
+            || parsed.cve.nvd_api_key.as_deref() != clean_key
+        {
+            bail!(
+                "refusing to write {}: updated preferences did not round-trip cleanly",
+                path.display()
+            );
+        }
+        write_private_atomic(&path, updated.as_bytes())
+    }
+}
+
+fn is_toml_key(trimmed: &str, key: &str) -> bool {
+    trimmed
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.starts_with([' ', '\t', '=']))
+}
+
+/// Extracts `name` from `[name]` or `[[name]]`, stripping any trailing `#` comment.
+fn toml_section_header(trimmed: &str) -> Option<&str> {
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let without_comment = trimmed.split('#').next()?.trim_end();
+    if let Some(inner) = without_comment
+        .strip_prefix("[[")
+        .and_then(|s| s.strip_suffix("]]"))
+    {
+        return Some(inner.trim());
+    }
+    without_comment
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .map(str::trim)
+}
+
+fn update_config_toml(
+    existing: &str,
+    default_mode: Mode,
+    cve_enabled: bool,
+    nvd_api_key: Option<&str>,
+) -> Result<String> {
+    let encoded_key = match nvd_api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => {
+            if key.chars().any(char::is_control) {
+                bail!("NVD API key must not contain control characters");
+            }
+            Some(toml::Value::String(key.to_owned()).to_string())
+        }
+        None => None,
+    };
+    let mode_line = format!("default_mode = \"{}\"", default_mode.as_str());
+    let enabled_line = format!("enabled = {cve_enabled}");
+
+    let mut out: Vec<String> = Vec::new();
+    let mut section = String::new();
+    let mut wrote_mode = false;
+    let mut saw_cve = false;
+    let mut wrote_enabled = false;
+    let mut wrote_nvd_key = false;
+
+    let flush_section = |sec: &str,
+                         out: &mut Vec<String>,
+                         wrote_mode: &mut bool,
+                         wrote_enabled: &mut bool,
+                         wrote_nvd_key: &mut bool| {
+        if sec.is_empty() && !*wrote_mode {
+            out.push(mode_line.clone());
+            *wrote_mode = true;
+        } else if sec == "cve" {
+            if !*wrote_enabled {
+                out.push(enabled_line.clone());
+                *wrote_enabled = true;
+            }
+            if !*wrote_nvd_key {
+                if let Some(encoded) = &encoded_key {
+                    out.push(format!("nvd_api_key = {encoded}"));
+                }
+                *wrote_nvd_key = true;
+            }
+        }
+    };
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if let Some(header_name) = toml_section_header(trimmed) {
+            flush_section(
+                &section,
+                &mut out,
+                &mut wrote_mode,
+                &mut wrote_enabled,
+                &mut wrote_nvd_key,
+            );
+            section = header_name.to_owned();
+            if section == "cve" && !trimmed.starts_with("[[") {
+                saw_cve = true;
+            }
+            out.push(line.to_owned());
+            continue;
+        }
+        if section.is_empty() && is_toml_key(trimmed, "default_mode") {
+            if !wrote_mode {
+                out.push(mode_line.clone());
+                wrote_mode = true;
+            }
+            continue;
+        }
+        if section == "cve" && is_toml_key(trimmed, "enabled") {
+            if !wrote_enabled {
+                out.push(enabled_line.clone());
+                wrote_enabled = true;
+            }
+            continue;
+        }
+        if section == "cve" && is_toml_key(trimmed, "nvd_api_key") {
+            if !wrote_nvd_key {
+                if let Some(encoded) = &encoded_key {
+                    out.push(format!("nvd_api_key = {encoded}"));
+                }
+                wrote_nvd_key = true;
+            }
+            continue;
+        }
+        out.push(line.to_owned());
+    }
+
+    flush_section(
+        &section,
+        &mut out,
+        &mut wrote_mode,
+        &mut wrote_enabled,
+        &mut wrote_nvd_key,
+    );
+    if !saw_cve {
+        if !out.last().is_some_and(String::is_empty) {
+            out.push(String::new());
+        }
+        out.push("[cve]".to_owned());
+        out.push(enabled_line);
+        if let Some(encoded) = &encoded_key {
+            out.push(format!("nvd_api_key = {encoded}"));
+        }
+    }
+
+    let mut text = out.join("\n");
+    text.push('\n');
+    Ok(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,5 +1467,42 @@ mod tests {
         );
         assert!(format_listing(&[], now).contains("No workspaces yet"));
         assert_eq!(format_age(Duration::from_secs(7300)), "2h ago");
+    }
+
+    #[test]
+    fn setup_preferences_update_config_preserving_comments_and_sections() {
+        let fx = fixture();
+        Config::save_setup_preferences(&fx.home, Mode::Mild, false, Some("nvd-key-\"quoted\""))
+            .unwrap();
+        let cfg = Config::load_or_create(&fx.home).unwrap();
+        assert_eq!(cfg.default_mode, Mode::Mild);
+        assert!(!cfg.cve.enabled);
+        assert_eq!(cfg.cve.nvd_api_key.as_deref(), Some("nvd-key-\"quoted\""));
+        let raw = fs::read_to_string(fx.home.config_path()).unwrap();
+        assert!(raw.contains("# meow global configuration."), "{raw}");
+        assert!(raw.contains("[recon]"), "{raw}");
+
+        // Clearing the NVD key removes the active key line while keeping comments.
+        Config::save_setup_preferences(&fx.home, Mode::Aggressive, true, None).unwrap();
+        let cfg = Config::load_or_create(&fx.home).unwrap();
+        assert_eq!(cfg.default_mode, Mode::Aggressive);
+        assert!(cfg.cve.enabled);
+        assert!(cfg.cve.nvd_api_key.is_none());
+
+        // Inline comments on section headers still bound sections cleanly.
+        fs::write(
+            fx.home.config_path(),
+            "default_mode = \"light\"\n\n[cve] # advisories\nenabled = true\n\n[recon] # custom\noutput_cap_mb = 25\n",
+        )
+        .unwrap();
+        Config::save_setup_preferences(&fx.home, Mode::Mild, true, Some("nvd-9999")).unwrap();
+        let cfg = Config::load_or_create(&fx.home).unwrap();
+        assert_eq!(cfg.cve.nvd_api_key.as_deref(), Some("nvd-9999"));
+        assert_eq!(cfg.recon.output_cap_mb, 25);
+
+        // Control characters in keys are rejected before touching disk.
+        assert!(
+            Config::save_setup_preferences(&fx.home, Mode::Light, true, Some("bad\nkey")).is_err()
+        );
     }
 }

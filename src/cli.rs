@@ -18,8 +18,9 @@ use crate::workspace::validate_name;
     name = "meow",
     version,
     about,
+    before_help = crate::wizard::CAT_CLI_BANNER,
     args_conflicts_with_subcommands = true,
-    after_help = "Run `meow list` (or `meow` with no arguments) to list saved workspaces."
+    after_help = "Run `meow` on a fresh install (or `meow setup` anytime) for the interactive cat setup GUI."
 )]
 pub struct Cli {
     /// Workspace to create or resume (~/.meow/workspaces/<NAME>/)
@@ -39,7 +40,7 @@ pub enum Command {
     /// List every saved workspace and whether its session is running
     #[command(visible_alias = "ls")]
     List,
-    /// Set up your own AI: a local model server or your own cloud API key
+    /// Set up your own AI, discovery mode & CVE preferences (opens the interactive Cat GUI on a TTY)
     Setup {
         /// Show the current setup (a key is never printed)
         #[arg(long)]
@@ -47,6 +48,9 @@ pub enum Command {
         /// Try the local model server and the cloud key, and say what happened
         #[arg(long)]
         check: bool,
+        /// Use the plain line-by-line text menu instead of the full-screen Cat TUI
+        #[arg(long)]
+        plain: bool,
         /// OpenAI-compatible model server on this machine, e.g. http://localhost:11434/v1
         #[arg(long, value_name = "URL")]
         local_url: Option<String>,

@@ -347,15 +347,16 @@ fn delete_asks_first_and_keeps_the_workspace_on_anything_but_yes() {
     assert!(!dir.exists());
 }
 
-/// `meow setup` on a terminal: the menu, a Claude API key that is typed
-/// without ever appearing on screen, and the switch to another service.
+/// `meow setup --plain` on a terminal: the cat header, the line menu, a Claude
+/// API key that is typed without ever appearing on screen, and the switch to
+/// another service.
 #[test]
 fn setup_asks_on_the_terminal_and_never_shows_the_key() {
     const CLAUDE_KEY: &str = "sk-ant-pty-their-secret-key-77";
     const OTHER_KEY: &str = "sk-or-pty-another-secret-key-42";
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("meow-home").join("ai.toml");
-    let mut hosted = Hosted::spawn_args(&["setup"], tmp);
+    let mut hosted = Hosted::spawn_args(&["setup", "--plain"], tmp);
     let expect = |hosted: &mut Hosted, needle: &str| {
         assert!(
             hosted.wait_for(needle.as_bytes(), PATIENCE),
@@ -363,6 +364,7 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
             hosted.dump()
         );
     };
+    expect(&mut hosted, "/\\_/\\");
     expect(&mut hosted, "meow setup: your own AI for meow.");
     expect(&mut hosted, "API key            not set");
     expect(&mut hosted, "  2  Use my Claude API key");
@@ -480,8 +482,8 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
         assert_eq!(mode, 0o600);
     }
 
-    // Removing the key again, from the menu.
-    let mut hosted = Hosted::spawn_args(&["setup"], tmp);
+    // Removing the key again, from the plain menu.
+    let mut hosted = Hosted::spawn_args(&["setup", "--plain"], tmp);
     expect(&mut hosted, "> ");
     hosted.send("4\r");
     expect(&mut hosted, "[+] Saved.");
@@ -490,4 +492,119 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
     let (code, _, _tmp) = hosted.finish_keeping_files();
     assert_eq!(code, 0);
     assert!(!std::fs::read_to_string(&file).unwrap().contains("api_key"));
+}
+
+/// Default `meow setup` on a terminal opens the full-screen Cat TUI wizard,
+/// hides API keys while typing, writes `config.toml` + `ai.toml` (`0600`),
+/// and cleanly restores the terminal on exit.
+#[test]
+fn setup_gui_wizard_renders_cat_headers_and_saves_without_showing_key() {
+    const GUI_SECRET: &str = "sk-ant-gui-secret-key-9911";
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp.path().join("meow-home");
+    let ai_file = home_dir.join("ai.toml");
+    let cfg_file = home_dir.join("config.toml");
+
+    let mut hosted = Hosted::spawn_args(&["setup"], tmp);
+    assert!(
+        hosted.wait_for(b"MEOW :: INTERACTIVE SETUP WIZARD", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    assert!(
+        hosted.wait_for(b"SLEEPING & LISTENING (LIGHT)", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+
+    // Move down to Mild mode -> cat header switches to CURIOUS WHISKERS (MILD), Enter selects & advances
+    hosted.send("\x1b[B");
+    assert!(
+        hosted.wait_for(b"CURIOUS WHISKERS (MILD)", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send("\r");
+    assert!(
+        hosted.wait_for(b"LOCAL PURR-CESSOR [L]", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+
+    // Switch to Step 3 (Cloud AI), move down 3 rows to Cloud API Key, press Enter, type secret + Enter
+    hosted.send("3");
+    assert!(
+        hosted.wait_for(b"CLOUD WHISKERS [C]/[R]", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send("jjj\r");
+    assert!(
+        hosted.wait_for(b"chars, hidden", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send(&format!("{GUI_SECRET}\r"));
+    assert!(
+        hosted.wait_for(b"ends in 9911", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+
+    // Save with 's'
+    hosted.send("s");
+    let (code, output, _tmp) = hosted.finish_keeping_files();
+    let rendered = text(&output);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(rendered.contains("[+] Saved to "), "{rendered}");
+    for leaked in [GUI_SECRET, "sk-ant-gui"] {
+        assert!(
+            !rendered.contains(leaked),
+            "GUI leaked secret {leaked:?} in PTY stream!"
+        );
+    }
+
+    let saved_ai = std::fs::read_to_string(&ai_file).unwrap();
+    assert!(saved_ai.contains(&format!("api_key = \"{GUI_SECRET}\"")));
+    assert!(saved_ai.contains("cloud_provider = \"anthropic\""));
+    let saved_cfg = std::fs::read_to_string(&cfg_file).unwrap();
+    assert!(saved_cfg.contains("default_mode = \"mild\""), "{saved_cfg}");
+}
+
+/// First-run bare `meow` on a fresh terminal opens the Interactive First-Time
+/// Cat Setup GUI, lets the user name their first workspace on Launchpad, and
+/// transitions cleanly into the live session shell.
+#[test]
+fn first_run_bare_meow_opens_cat_setup_gui_and_launches_first_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut hosted = Hosted::spawn_args(&[], tmp);
+    assert!(
+        hosted.wait_for(b"MEOW :: INTERACTIVE FIRST-TIME SETUP", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+
+    // Jump to Step 5 (Launchpad), move up to row 0 (First Workspace), enter "catlab", then save ('s')
+    hosted.send("5");
+    assert!(hosted.wait_for(b"purrr~", PATIENCE), "{}", hosted.dump());
+    hosted.send("k\rcatlab\r");
+    assert!(hosted.wait_for(b"catlab", PATIENCE), "{}", hosted.dump());
+    hosted.send("s");
+
+    // Child `meow catlab` session launches with clean raw-mode stdin!
+    assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
+    hosted.send("echo purr-$((4+5))\r");
+    assert!(hosted.wait_for(b"purr-9", PATIENCE), "{}", hosted.dump());
+    hosted.send("exit 0\r");
+    let (code, output, tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0, "{}", text(&output));
+    assert!(
+        text(&output).contains("[+] Session 'catlab' closed"),
+        "{}",
+        text(&output)
+    );
+    assert!(tmp
+        .path()
+        .join("meow-home/workspaces/catlab/profile.toml")
+        .is_file());
 }

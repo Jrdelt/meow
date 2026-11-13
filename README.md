@@ -1,5 +1,13 @@
 # meow
 
+```text
+   /\_/\    _ __ ___   ___  _____      __
+  ( o.o )  | '_ ` _ \ / _ \/ _ \ \ /\ / /
+   > ^ <   | | | | | |  __/ (_) \ V  V /
+  /|   |\  |_| |_| |_|\___|\___/ \_/\_/
+ (_|   |_)  local security triage, topology & audit shell
+```
+
 A local security triage shell, live topology mapper and grounded audit
 workspace for authorized defensive work. Rust with a small C11 stream filter.
 
@@ -13,10 +21,23 @@ coding agents are in [`AGENTS.md`](AGENTS.md).
 
 ## Install
 
-On macOS or Linux, from a clone of this repository:
+With Homebrew (macOS and Linuxbrew):
+
+```sh
+brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
+brew install --HEAD meow
+```
+
+Or on macOS / Linux, from a clone of this repository:
 
 ```sh
 ./install.sh
+```
+
+Or on Windows (PowerShell):
+
+```powershell
+.\install.ps1
 ```
 
 The script checks what is missing, shows what it will do, asks once, and then
@@ -232,11 +253,15 @@ Nothing about anyone's AI is built in. Each person who uses meow points it at
 their own model server or adds their own API key:
 
 ```sh
-meow setup
+meow setup            # full-screen Cat TUI wizard (on first bare `meow` too!)
+meow setup --plain    # plain line-by-line terminal menu
 ```
 
-It shows the current setup and asks what to change. At every question, Enter
-keeps the value shown.
+Running `meow` with no arguments on a brand-new install (or running `meow setup`
+anytime) opens the interactive Cat-themed setup GUI: pick your default discovery
+mode, sniff local model servers (`p`), paste a cloud or optional NVD API key
+with hidden input, check scanner/wordlist readiness, test endpoints (`t`), and
+optionally launch straight into your first workspace.
 
 - **A model on your machine**: it looks for LM Studio, Ollama and llama.cpp on
   their usual ports, lists the models the server offers, and lets you pick one

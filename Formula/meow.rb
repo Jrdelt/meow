@@ -25,6 +25,14 @@ class Meow < Formula
     end
   end
 
+  def caveats
+    <<~EOS
+         /\\_/\\   meow is installed!
+        ( ^w^ )  Run `meow` (or `meow setup`) in a terminal for the interactive
+         > ^ <   first-time Cat Setup GUI, or `meow <name>` to open a session.
+    EOS
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/meow --version")
   end

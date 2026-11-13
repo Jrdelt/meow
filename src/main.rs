@@ -27,6 +27,7 @@ use meow::setup;
 use meow::shims;
 use meow::update;
 use meow::webui;
+use meow::wizard::{self, WizardOutcome};
 use meow::workspace::{
     self, format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config,
     MeowHome, SessionEnv, SessionState, Workspace,
@@ -60,8 +61,62 @@ fn print_listing(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCo
             SessionState::Closed
         };
     }
+    if std::io::stdout().is_terminal() {
+        print!("{}", wizard::CAT_LIST_HEADER);
+    }
     print!("{}", format_listing(&workspaces, SystemTime::now()));
     Ok(ExitCode::SUCCESS)
+}
+
+/// True on a brand-new installation in an interactive terminal before
+/// `config.toml`, `ai.toml` or any workspace exists.
+fn should_run_first_setup(home: &MeowHome, cwd: &Path) -> Result<bool> {
+    if !wizard::can_run_tui() {
+        return Ok(false);
+    }
+    if home.config_path().exists() || home.ai_path().exists() {
+        return Ok(false);
+    }
+    Ok(list_workspaces(home, cwd)?.is_empty())
+}
+
+/// Handles a bare `meow` invocation: launches the Interactive First-Time Cat
+/// Setup GUI on a brand-new terminal setup, or lists saved workspaces.
+fn open_bare(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCode> {
+    if should_run_first_setup(home, cwd)? {
+        match wizard::run_first_time(home)? {
+            WizardOutcome::Cancelled => {}
+            WizardOutcome::Saved {
+                launch_workspace: Some(name),
+            } => {
+                // Spawn a fresh `meow <name>` process so the PTY host process
+                // has never initialized `crossterm::event::read()`.
+                let exe = std::env::current_exe().context("cannot locate the meow binary")?;
+                let status = std::process::Command::new(exe)
+                    .arg(&name)
+                    .current_dir(cwd)
+                    .status()
+                    .with_context(|| format!("cannot launch session '{name}'"))?;
+                let code = status
+                    .code()
+                    .and_then(|c| u8::try_from(c).ok())
+                    .unwrap_or(1);
+                return Ok(ExitCode::from(code));
+            }
+            WizardOutcome::Saved {
+                launch_workspace: None,
+            } => {
+                println!(
+                    "[+] Setup saved to {} & {}",
+                    home.config_path().display(),
+                    home.ai_path().display()
+                );
+                println!("[+] Ready to prowl! Start a session with: meow <name>");
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+    }
+    print_listing(home, cwd, env)
 }
 
 /// `meow delete`: says what would go, asks, then removes the workspace.
@@ -123,7 +178,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let Some(command) = &cli.command else {
         return match &cli.name {
-            None => print_listing(&home, &cwd, &env),
+            None => open_bare(&home, &cwd, &env),
             Some(name) => start_session(&home, &cwd, name, cli.local),
         };
     };
@@ -135,6 +190,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Command::Setup {
                 show,
                 check,
+                plain,
                 local_url,
                 local_model,
                 cloud_url,
@@ -149,6 +205,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &setup::SetupArgs {
                     show: *show,
                     check: *check,
+                    plain: *plain,
                     local_url: local_url.clone(),
                     local_model: local_model.clone(),
                     cloud_url: cloud_url.clone(),
@@ -325,6 +382,12 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
             .unwrap_or_else(|| cwd.to_path_buf()),
         env,
     };
+    if std::io::stdout().is_terminal() {
+        print!(
+            "{}",
+            wizard::session_header(&workspace.name, workspace.profile.mode, created)
+        );
+    }
     println!(
         "[+] {} workspace '{}' at {} (mode: {})",
         if created { "Created" } else { "Resumed" },

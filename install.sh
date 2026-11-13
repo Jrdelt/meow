@@ -212,6 +212,13 @@ verify_sha256() {
 
 # --- The plan -------------------------------------------------------------
 
+printf '%s\n' \
+    '   /\_/\    _ __ ___   ___  _____      __' \
+    "  ( o.o )  | '_ \` _ \\ / _ \\/ _ \\ \\ /\\ / /" \
+    '   > ^ <   | | | | | |  __/ (_) \ V  V /' \
+    '  /|   |\  |_| |_| |_|\___|\___/ \_/\_/' \
+    ' (_|   |_)  local security triage & topology shell' \
+    ''
 say "meow installer for $os"
 echo "This will:"
 if [ "$need_compiler" = yes ]; then
@@ -398,8 +405,8 @@ if [ "$need_wordlist" = yes ]; then
 fi
 
 case ":$original_path:" in
-*":$cargo_home/bin:"*) say "Ready. Start with: meow <name>" ;;
+*":$cargo_home/bin:"*) say "Ready. Run 'meow' for the interactive setup GUI, or 'meow <name>' to open a session" ;;
 *)
-    say "Ready. Open a new terminal (or run: . \"$cargo_home/env\"), then start with: meow <name>"
+    say "Ready. Open a new terminal (or run: . \"$cargo_home/env\"), then run 'meow' for the interactive setup GUI or 'meow <name>'"
     ;;
 esac

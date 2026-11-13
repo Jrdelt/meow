@@ -632,7 +632,7 @@ fn machine_lines(report: &MachineReport) -> Vec<Line<'static>> {
 fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     let Some(snapshot) = &model.snapshot else {
         frame.render_widget(
-            Paragraph::new(" meow hud: waiting for the session ..."),
+            Paragraph::new(" =^..^= meow hud: waiting for the session ..."),
             area,
         );
         return;
@@ -649,7 +649,7 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         Span::styled("read-only (no session running)", WARN)
     };
     let line = Line::from(vec![
-        Span::styled(" meow hud ", TITLE),
+        Span::styled(" =^..^= meow hud ", TITLE),
         Span::raw(format!("| {} | mode ", snapshot.session)),
         Span::styled(snapshot.mode.as_str(), mode_style),
         Span::raw({

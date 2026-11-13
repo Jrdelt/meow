@@ -133,6 +133,12 @@ if (Test-Path -LiteralPath $WordlistDir) {
 }
 $NeedWordlist = $InstallTools -and ($ExistingWordlists.Count -eq 0)
 
+Write-Host "   /\_/\    _ __ ___   ___  _____      __" -ForegroundColor Cyan
+Write-Host "  ( o.o )  | '_ `` _ \ / _ \/ _ \ \ /\ / /" -ForegroundColor Cyan
+Write-Host "   > ^ <   | | | | | |  __/ (_) \ V  V /" -ForegroundColor Cyan
+Write-Host "  /|   |\  |_| |_| |_|\___|\___/ \_/\_/" -ForegroundColor Cyan
+Write-Host " (_|   |_)  local security triage & topology shell" -ForegroundColor Cyan
+Write-Host ""
 Say "meow installer for windows"
 Write-Host "This will:"
 if ($NeedCompiler) {
@@ -287,7 +293,7 @@ try {
         }
     }
 
-    Say "Ready. Start with: meow <name>"
+    Say "Ready. Run 'meow' for the interactive setup GUI, or 'meow <name>' to open a session"
 } finally {
     if ($RustupInit -and (Test-Path -LiteralPath $RustupInit)) {
         Remove-Item -LiteralPath $RustupInit -Force -ErrorAction SilentlyContinue

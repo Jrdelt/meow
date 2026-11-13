@@ -21,7 +21,7 @@ use crate::anthropic;
 use crate::workspace::{Config, MeowHome};
 
 /// Where model servers usually listen on the machine they run on.
-const LOCAL_SERVERS: &[(&str, &str)] = &[
+pub(crate) const LOCAL_SERVERS: &[(&str, &str)] = &[
     ("http://localhost:1234/v1", "LM Studio"),
     ("http://localhost:11434/v1", "Ollama"),
     ("http://localhost:8080/v1", "llama.cpp"),
@@ -33,6 +33,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct SetupArgs {
     pub show: bool,
     pub check: bool,
+    /// Use the plain line-mode prompt instead of the full-screen Cat TUI.
+    pub plain: bool,
     pub local_url: Option<String>,
     pub local_model: Option<String>,
     pub cloud_url: Option<String>,
@@ -69,7 +71,7 @@ impl SetupArgs {
 
 /// An `http://` or `https://` address of an OpenAI-compatible API, without a
 /// trailing slash.
-fn checked_url(raw: &str) -> Result<String> {
+pub(crate) fn checked_url(raw: &str) -> Result<String> {
     let url = raw.trim().trim_end_matches('/');
     let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -79,7 +81,7 @@ fn checked_url(raw: &str) -> Result<String> {
 }
 
 /// A key is shown by its last four characters only.
-fn masked(key: &str) -> String {
+pub(crate) fn masked(key: &str) -> String {
     let tail: String = key
         .chars()
         .rev()
@@ -88,9 +90,10 @@ fn masked(key: &str) -> String {
         .into_iter()
         .rev()
         .collect();
+    let safe_tail = crate::evidence::sanitize(&tail, 16);
     match key.chars().count() {
         0..=8 => "set".to_owned(),
-        _ => format!("set, ends in {tail}"),
+        _ => format!("set, ends in {safe_tail}"),
     }
 }
 
@@ -168,7 +171,7 @@ fn use_openai_style(own: &mut AiOverrides, current: &AiSettings, url: Option<Str
 }
 
 /// `a, b` as a fallback chain; `none` or nothing is an empty one.
-fn parse_chain(text: &str) -> Vec<String> {
+pub(crate) fn parse_chain(text: &str) -> Vec<String> {
     text.split(',')
         .map(str::trim)
         .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("none"))
@@ -258,7 +261,7 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T> {
 /// Tries the local server and, if there is a key, the cloud service, and
 /// says in plain words what happened. Returns whether everything set up
 /// works.
-fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> {
+pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> {
     let effective = settings.effective();
     let mut works = true;
     match block_on(list_models(&effective.local_url, None))? {
@@ -479,25 +482,37 @@ fn choose(prompt: &str, options: &[String], default: Option<&str>) -> Result<Opt
     }
 }
 
-fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
-    println!("Looking for model servers on this machine ...");
-    let current = settings.effective().local_url;
-    let mut candidates: Vec<(String, &str)> = vec![(current.clone(), "current setting")];
+/// Probes `current_url` plus the well-known local server ports (`:1234`,
+/// `:11434`, `:8080`) and returns `(url, label, models)` for each server
+/// that answered.
+pub(crate) fn probe_local_servers(current_url: &str) -> Result<Vec<(String, String, Vec<String>)>> {
+    let mut candidates: Vec<(String, &str)> = vec![(current_url.to_owned(), "current setting")];
     for (url, name) in LOCAL_SERVERS {
         if !candidates.iter().any(|(known, _)| known == url) {
             candidates.push(((*url).to_owned(), name));
         }
     }
-    let mut found: Vec<(String, Vec<String>)> = Vec::new();
-    for (url, name) in &candidates {
-        if let Ok(models) = block_on(list_models(url, None))? {
-            println!(
-                "  {}  {url}  ({name}, {} model(s))",
-                found.len() + 1,
-                models.len()
-            );
-            found.push((url.clone(), models));
+    let mut found = Vec::new();
+    for (url, name) in candidates {
+        if let Ok(models) = block_on(list_models(&url, None))? {
+            found.push((url, name.to_owned(), models));
         }
+    }
+    Ok(found)
+}
+
+fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
+    println!("Looking for model servers on this machine ...");
+    let current = settings.effective().local_url;
+    let probed = probe_local_servers(&current)?;
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
+    for (url, name, models) in probed {
+        println!(
+            "  {}  {url}  ({name}, {} model(s))",
+            found.len() + 1,
+            models.len()
+        );
+        found.push((url, models));
     }
     let urls: Vec<String> = found.iter().map(|(url, _)| url.clone()).collect();
     let prompt = if found.is_empty() {
@@ -641,8 +656,9 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     Ok(true)
 }
 
-/// The menu shown by a bare `meow setup` on a terminal.
+/// The line-mode menu shown by `meow setup --plain` (or `TERM=dumb`).
 fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Result<()> {
+    println!("{}\n", crate::wizard::CAT_CLI_BANNER);
     println!("meow setup: your own AI for meow. Nothing here is shared with anyone else.\n");
     loop {
         print!("{}", describe(settings, file));
@@ -687,6 +703,30 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
 
 /// Runs `meow setup`.
 pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
+    if !args.changes_something()
+        && !args.show
+        && !args.check
+        && !args.plain
+        && crate::wizard::can_run_tui()
+    {
+        match crate::wizard::run_setup(home)? {
+            crate::wizard::WizardOutcome::Saved { .. } => {
+                let settings = Config::load_or_create(home)?.ai;
+                let file = home.ai_path();
+                println!(
+                    "[+] Saved to {} & {}. A running session uses it for its next request.",
+                    home.config_path().display(),
+                    file.display()
+                );
+                print!("{}", describe(&settings, &file));
+            }
+            crate::wizard::WizardOutcome::Cancelled => {
+                println!("[+] Nothing changed.");
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let settings = Config::load_or_create(home)?.ai;
     let file = home.ai_path();
     let mut own = AiOverrides::load(&file)?;
