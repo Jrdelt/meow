@@ -40,6 +40,10 @@ const MIN_ZOOM: f64 = 2.0;
 const MAX_ZOOM: f64 = 12.0;
 /// The circle is this share of the round map across: it nearly fills it.
 const CIRCLE_SHARE: f64 = 0.8;
+/// A click on the map zooms this many levels closer (4 times), never past
+/// `CLOSEST_ZOOM`, where the satellite pictures run out of detail.
+pub const CLOSER_ZOOM: f64 = 2.0;
+const CLOSEST_ZOOM: f64 = 14.0;
 /// Web Mercator stops here; the poles are infinitely far away.
 const MAX_LATITUDE: f64 = 85.051_128_78;
 const EQUATOR_M: f64 = 40_075_016.686;
@@ -75,6 +79,9 @@ pub struct MapView {
     /// The credit the pictures' licence asks for, shown with the map.
     pub credit: String,
     pub credit_url: Option<String>,
+    /// The same place `CLOSER_ZOOM` levels closer, shown on a click.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closer: Option<Box<MapView>>,
 }
 
 /// A fetched tile, kept in memory and served to the map page.
@@ -134,9 +141,22 @@ fn span(from: f64, length: f64) -> std::ops::RangeInclusive<i64> {
     first..=last
 }
 
-/// The map around a place: which tiles, and where each one is drawn.
+/// The map around a place: which tiles, and where each one is drawn, with
+/// the closer view a click shows.
 pub fn view(latitude: f64, longitude: f64, template: &str) -> MapView {
-    let shown = shown_zoom(latitude);
+    let mut view = view_at(latitude, longitude, template, 0.0);
+    view.closer = Some(Box::new(view_at(
+        latitude,
+        longitude,
+        template,
+        CLOSER_ZOOM,
+    )));
+    view
+}
+
+/// The map `closer` zoom levels in from the one that shows the rough area.
+fn view_at(latitude: f64, longitude: f64, template: &str, closer: f64) -> MapView {
+    let shown = (shown_zoom(latitude) + closer).min(CLOSEST_ZOOM);
     let zoom = tile_zoom(shown);
     // CSS pixels per tile pixel: from a half up to (not quite) one.
     let scale = 2f64.powf(shown - f64::from(zoom));
@@ -175,6 +195,7 @@ pub fn view(latitude: f64, longitude: f64, template: &str) -> MapView {
         radius_m: ROUGH_RADIUS_M,
         credit,
         credit_url,
+        closer: None,
     }
 }
 
@@ -360,6 +381,12 @@ mod tests {
             assert_eq!(view.radius_m, ROUGH_RADIUS_M);
         }
         assert_eq!(tile_zoom(shown_zoom(0.0)), 9);
+        // A click goes four times closer, with tiles of its own.
+        let near = view(47.6588, -117.426, TILES_URL);
+        let closer = near.closer.as_deref().unwrap();
+        assert_eq!(closer.tiles[0].z, tile_zoom(shown_zoom(47.6588) + 2.0));
+        assert!((closer.radius / near.radius - 4.0).abs() < 0.01);
+        assert!(closer.closer.is_none() && closer.tiles.len() <= 12);
         assert!(
             (shown_zoom(47.6588) - 8.40).abs() < 0.01,
             "{}",

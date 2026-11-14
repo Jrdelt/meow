@@ -232,12 +232,19 @@ pub async fn map_for(
     if !settings.map {
         return None;
     }
-    let view = tiles::view(place.latitude, place.longitude, &settings.tiles);
-    Some(
-        tiles::fetch(&settings.tiles, &view)
-            .await
-            .map(|pictures| (view, pictures)),
-    )
+    let mut view = tiles::view(place.latitude, place.longitude, &settings.tiles);
+    let mut pictures = match tiles::fetch(&settings.tiles, &view).await {
+        Ok(pictures) => pictures,
+        Err(error) => return Some(Err(error)),
+    };
+    // The closer view is a bonus: without its pictures the map still shows.
+    if let Some(closer) = &view.closer {
+        match tiles::fetch(&settings.tiles, closer).await {
+            Ok(more) => pictures.extend(more),
+            Err(_) => view.closer = None,
+        }
+    }
+    Some(Ok((view, pictures)))
 }
 
 /// The host part of `url`, to say where an estimate came from.

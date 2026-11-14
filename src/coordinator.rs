@@ -1263,9 +1263,15 @@ mod tests {
                 );
                 assert_eq!(map["credit"], "Map pictures from 127.0.0.1");
                 assert!(location.get("map_error").is_none(), "{location}");
-                let tiles = map["tiles"].as_array().unwrap();
-                assert!(!tiles.is_empty());
-                for tile in tiles {
+                let tiles: Vec<Value> = map["tiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(map["closer"]["tiles"].as_array().unwrap())
+                    .cloned()
+                    .collect();
+                assert!(tiles.len() > 4, "both views have pictures");
+                for tile in &tiles {
                     let (z, x, y) = (
                         tile["z"].as_u64().unwrap(),
                         tile["x"].as_u64().unwrap(),

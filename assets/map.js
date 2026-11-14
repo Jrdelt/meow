@@ -488,6 +488,7 @@
   // pictures; this page fetches nothing from anywhere else.
   var SVG_NS = 'http://www.w3.org/2000/svg';
   var whereDrawn = '';
+  var mapCloser = false;   // the reader clicked the round map to zoom in
   function svg(tag, attrs, parent) {
     var node = document.createElementNS(SVG_NS, tag);
     Object.keys(attrs).forEach(function (key) { node.setAttribute(key, attrs[key]); });
@@ -543,11 +544,21 @@
   // at the estimate; the place and its coordinates under it. The details
   // stay in the tooltip.
   function satellite(where) {
-    var view = where.map, place = where.place;
+    var closer = mapCloser && where.map.closer;
+    var view = closer || where.map, place = where.place;
     var card = el('div', 'satellite');
     card.title = 'Rough area: within about ' + Math.round(view.radius_m / 1000) + ' km of the pin. ' +
       estimatedFrom(where);
     var picture = card.appendChild(el('div', 'picture'));
+    // A click zooms in around the pin, and out again.
+    if (where.map.closer) {
+      picture.className = 'picture ' + (closer ? 'zoom-out' : 'zoom-in');
+      picture.title = closer ? 'Click to zoom out' : 'Click to zoom in';
+      picture.addEventListener('click', function () {
+        mapCloser = !mapCloser;
+        renderWhere();
+      });
+    }
     picture.style.width = view.width + 'px';
     picture.style.height = view.height + 'px';
     picture.setAttribute('role', 'img');
@@ -603,7 +614,7 @@
     var vpn = (state.machine && state.machine.vpn) || [];
     var where = state.location;
     // Drawn again only when something changed, so the pictures load once.
-    var key = JSON.stringify([vpn, where]);
+    var key = JSON.stringify([vpn, where, mapCloser]);
     if (key === whereDrawn) { return; }
     whereDrawn = key;
     // Top right: a blue pill when a VPN is up, the round map under it.
