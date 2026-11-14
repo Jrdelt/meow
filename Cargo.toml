@@ -42,7 +42,7 @@ url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Console-mode access for VT input/output; same crate crossterm uses.
