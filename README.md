@@ -21,18 +21,23 @@ coding agents are in [`AGENTS.md`](AGENTS.md).
 
 ## Install
 
-With Homebrew (macOS and Linuxbrew):
+On Linux (Kali, Debian, Ubuntu, Fedora, Arch, ...) and macOS, from a clone of
+this repository. No Homebrew is needed on Linux: the script uses the system's
+package manager.
+
+```sh
+git clone https://github.com/Jrdelt/meow.git
+cd meow
+./install.sh
+```
+
+Or with Homebrew, on macOS (or Linux where Homebrew is already installed;
+Kali and most distributions do not have it):
 
 ```sh
 brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
 brew trust Jrdelt/meow        # required once on Homebrew 7+
 brew install meow             # tagged release (or `brew install --HEAD meow`)
-```
-
-Or on macOS / Linux, from a clone of this repository:
-
-```sh
-./install.sh
 ```
 
 Or on Windows (PowerShell):
