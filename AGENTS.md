@@ -84,9 +84,9 @@ Before every push:
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system and
     user startup files load natively. Never keep it on the shim after that.
   - Map page: a dashboard of cards; no inline scripts, no `innerHTML`; checked
-    by hand in Chromium (Playwright). `topology::Role` picks a node's icon and
-    carries the reason; the cloud and neighbour clients are drawn only, never
-    hosts. `observer::machine_report` words "this machine" for map and HUD.
+    by hand in Chromium (Playwright). The topology is a star of lines (one per
+    interface, `link` colours it); `topology::Role` carries the reason; the
+    Internet and neighbour clients are drawn only, never hosts. `observer::machine_report` words "this machine" for map and HUD.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target

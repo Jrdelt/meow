@@ -120,18 +120,20 @@ terminal, add `--session <name>` or `--local`.
 
 ## The map
 
-`meow map` draws the network the way it is sketched on a whiteboard, left to
-right: the Internet cloud, routers, firewalls, servers, network segments and
-clients, with this machine marked as "You".
+`meow map` draws a star of lines: you in the middle, one straight line out
+per network this machine is on, and the devices on that network as stops
+along it, nearest first.
 
-| Drawn as | Because |
+| On the map | What it means |
 |---|---|
-| Internet cloud | The routing table has a default route. Nothing is sent there. |
-| Router | It is a gateway in the routing table, or its OS guess or a service banner says so. |
-| Firewall, switch | Its OS guess or a service banner names one. |
-| Server | A port on it was seen open, or a service on it was mentioned. |
-| Client | Nothing is known to listen on it. Devices in the neighbour table (ARP, NDP) are drawn as clients without becoming hosts: reading that table sends nothing. |
-| Network segment | One per active interface: the LAN, Wi-Fi or VPN this machine is attached to. Crowded segments stack their devices in rows above and below the line. |
+| Line colour | Grey: Wi-Fi or Ethernet. Cyan: a VPN. Purple: a virtual network on this machine. Dashed grey: hosts this machine has no route to. |
+| Stop colour | Green: scanned, nothing to check. Amber: advisories to verify. Red: confirmed findings (a double ring when one is known exploited). Grey: not scanned, e.g. a device only seen in the neighbour table. |
+| A branch off a stop | What lies behind a router: the Internet (the default route) and hosts routed through it. Behind a VPN gateway the line simply carries on. |
+| `+N more` | A busy network folds after 7 stops; click to unfold, then "show fewer". |
+
+The picture is drawn from this machine's own tables (interfaces, routes,
+neighbours) and from scans; reading the tables sends nothing. Click any stop
+for its cards.
 
 A name that only appeared in text (a URL printed in the session shell, such
 as `curl https://example.com/install.sh`) is not drawn: nothing was seen on
@@ -154,10 +156,8 @@ rows of label and value:
 
 Only cards that have something to say are shown.
 
-The picture is a drawing hint, not a finding. Click any node to read what it
-was derived from. A host with hypotheses to verify gets an amber marker, one
-with a confirmed finding a red one, and a dashed red frame means a match is in
-the CISA known-exploited catalog.
+The picture is a drawing hint, not a finding. Click any stop to read what it
+was derived from.
 
 ## This machine
 
