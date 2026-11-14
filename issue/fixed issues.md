@@ -125,3 +125,9 @@ Verified fixes moved here from `issue/issues.md` after passing `cargo fmt --chec
   - Added `split_service_info` in `src/parsers/text.rs` to split Nmap service banners into `product`, `version`, and `extra_info`.
   - Added unit and mock-server pagination tests in `src/cve.rs`, `src/cpe.rs`, and `src/parsers/text.rs`.
 - **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --no-fail-fast` passed (`322` tests, `0` failures).
+
+### `ISS-012` [Low / Usability] — API Key Prompts Swallowed Ctrl+V and Hid Whether a Paste Arrived
+- **Locations Fixed:** `src/setup.rs` (`ask_hidden`, `PASTE_HINT`), `src/wizard.rs` (`EditState::paste_hint`, `on_key`, `draw_footer`), `tests/pty.rs`, `src/wizard.rs` tests
+- **Problem:** Reported on Kali: "meow setup doesn't let me paste the key". In a terminal Ctrl+V sends a control key, not the clipboard. Both key prompts stored it as a literal `v`, so the saved key was wrong and the Claude API answered `invalid x-api-key`. The plain prompt also echoed nothing at all, so a paste that worked looked the same as one that did not.
+- **Resolution:** Ctrl+V (and other Ctrl/Alt chords) no longer add characters; both prompts say to paste with Ctrl+Shift+V or right-click. The plain prompt enables bracketed paste and prints one `*` per character received (the wizard already did); the wizard's edit box names the paste keys.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux).

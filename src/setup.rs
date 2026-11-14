@@ -28,6 +28,11 @@ pub(crate) const LOCAL_SERVERS: &[(&str, &str)] = &[
 ];
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Said when Ctrl+V is pressed at a key prompt: terminals paste with other
+/// keys, and Ctrl+V itself would only add a "v".
+pub const PASTE_HINT: &str =
+    "Ctrl+V does not paste in a terminal: use Ctrl+Shift+V, or right-click and choose Paste.";
+
 /// What `meow setup` was asked to do without asking questions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetupArgs {
@@ -427,8 +432,11 @@ impl Drop for RawModeGuard {
 /// Reads a secret from the terminal without showing it. `None` if the user
 /// cancelled (Esc, Ctrl-C) or typed nothing.
 fn ask_hidden(prompt: &str) -> Result<Option<String>> {
-    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use ratatui::crossterm::terminal;
+    use ratatui::crossterm::event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    };
+    use ratatui::crossterm::{execute, terminal};
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("cannot switch the terminal to hidden input (is this a TTY?)");
@@ -437,28 +445,52 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     // prompt appears must not be echoed by the terminal.
     terminal::enable_raw_mode().context("cannot switch the terminal to hidden input")?;
     let raw_guard = RawModeGuard;
+    let mut out = std::io::stdout();
+    // A paste then arrives whole, as one event.
+    let _ = execute!(out, EnableBracketedPaste);
     print!("{prompt}");
-    std::io::stdout().flush().ok();
+    out.flush().ok();
     let mut secret = String::new();
+    // One `*` per character, so a paste that worked can be seen to have
+    // worked; the key itself never shows.
+    let add = |secret: &mut String, text: &str| {
+        let before = secret.chars().count();
+        secret.extend(text.chars().filter(|c| !c.is_control()));
+        print!("{}", "*".repeat(secret.chars().count() - before));
+        std::io::stdout().flush().ok();
+    };
     let outcome = loop {
         match event::read() {
-            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => match key.code {
-                KeyCode::Enter => break Ok(Some(secret)),
-                KeyCode::Esc => break Ok(None),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Ok(None)
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Enter => break Ok(Some(secret)),
+                    KeyCode::Esc => break Ok(None),
+                    KeyCode::Char('c') if ctrl => break Ok(None),
+                    KeyCode::Char('v') if ctrl => {
+                        print!(
+                            "\r\n{PASTE_HINT}\r\n{prompt}{}",
+                            "*".repeat(secret.chars().count())
+                        );
+                        out.flush().ok();
+                    }
+                    KeyCode::Char(_) if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {}
+                    KeyCode::Backspace => {
+                        if secret.pop().is_some() {
+                            print!("\x08 \x08");
+                            out.flush().ok();
+                        }
+                    }
+                    KeyCode::Char(ch) => add(&mut secret, &ch.to_string()),
+                    _ => {}
                 }
-                KeyCode::Backspace => {
-                    secret.pop();
-                }
-                KeyCode::Char(ch) => secret.push(ch),
-                _ => {}
-            },
-            Ok(Event::Paste(text)) => secret.push_str(&text),
+            }
+            Ok(Event::Paste(text)) => add(&mut secret, &text),
             Ok(_) => {}
             Err(error) => break Err(error),
         }
     };
+    let _ = execute!(out, DisableBracketedPaste);
     drop(raw_guard);
     println!();
     let secret = outcome.context("cannot read from the terminal")?;
