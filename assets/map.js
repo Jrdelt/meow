@@ -9,22 +9,24 @@
   var selected = null;
   var drawn = '';
 
-  // The map is a top-down network diagram: the Internet and whatever lies
-  // beyond a gateway at the top, gateways below that, one bar per network
-  // this machine is on, and the devices on each network underneath its bar.
-  var PITCH = 112;      // between devices side by side
-  var ROW = 104;        // between rows of devices
-  var PER_ROW = 6;      // devices per row under a bar
-  var MAX_DEVICES = 12; // a busier network folds the rest into "+N more"
-  var GAP = 120;        // between networks
-  var Y_BEYOND = -330, Y_GATEWAY = -200, Y_BAR = -90, Y_DEVICES = 10;
+  // The map is drawn like a home-network illustration: the router (or
+  // access point) in the middle, the Internet cloud off to the top right,
+  // and the devices on your network around the router. Devices on Wi-Fi
+  // have no line (waves around the router say they are wireless); wired
+  // ones hang off orthogonal lines. A VPN leaves through the cloud.
+  var RING1 = { rx: 300, ry: 205 }, RING2 = { rx: 470, ry: 320 };
+  // Slots around the router, in degrees (0 = right, 90 = down), most
+  // wanted first. The top right is left free for the cloud.
+  var SLOTS1 = [20, 160, 200, 125, 235, 90, 55, 268];
+  var SLOTS2 = [180, 145, 215, 112, 248, 80, 40, 285, 165, 195];
+  var MAX_DEVICES = SLOTS1.length + SLOTS2.length - 2;  // "you" and "+N more" take a slot
+  var CLOUD = { x: 360, y: -230 };
   var expanded = {};    // networks the reader unfolded, by network id
 
-  // Bar colour by the kind of connection.
-  var LINE = { wifi: '#8d939b', ethernet: '#8d939b', other: '#8d939b', vpn: '#39c5cf',
-    virtual: '#9d8ce0', unknown: '#6b7178' };
-  var TEXT = '#e7e9ec';
-  var FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+  var LINE = { wifi: '#9aa3ad', ethernet: '#9aa3ad', other: '#9aa3ad', vpn: '#1aa6b3',
+    virtual: '#8a73d6', unknown: '#9aa3ad' };
+  var TEXT = '#2b2f36';
+  var FONT = 'system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
 
   // role, how the detail panel names it
   var ROLES = [
@@ -37,6 +39,7 @@
     ['client', 'a client'],
     ['you', 'you']
   ];
+  var PICTURES = ROLES.map(function (role) { return role[0]; }).concat(['printer', 'waves']);
 
   function icon(role) {
     return '/assets/icon-' + role + '.svg?token=' + encodeURIComponent(token);
@@ -44,45 +47,49 @@
 
   var cy = cytoscape({
     container: document.getElementById('cy'),
-    maxZoom: 2,
+    maxZoom: 2.2,
     minZoom: 0.2,
     style: [
       { selector: 'node', style: {
-        'shape': 'round-rectangle', 'width': 46, 'height': 46,
-        'background-color': '#16191d', 'border-width': 2, 'border-color': '#3a3f47',
-        'background-fit': 'contain', 'background-width': '70%', 'background-height': '70%',
-        'label': 'data(text)', 'font-family': FONT, 'font-size': 11, 'color': TEXT, 'line-height': 1.25,
-        'text-wrap': 'wrap', 'text-max-width': PITCH + 40, 'text-valign': 'bottom', 'text-halign': 'center',
-        'text-margin-y': 6, 'text-background-color': '#111316', 'text-background-opacity': 0.9,
-        'text-background-padding': 2, 'overlay-padding': 6, 'overlay-opacity': 0 } }
-    ].concat(ROLES.map(function (role) {
-      return { selector: 'node[icon = "' + role[0] + '"]', style: { 'background-image': icon(role[0]) } };
+        'shape': 'rectangle', 'width': 76, 'height': 60, 'background-opacity': 0, 'border-width': 0,
+        'background-fit': 'contain', 'background-clip': 'none',
+        'label': 'data(text)', 'font-family': FONT, 'font-size': 13, 'color': TEXT, 'line-height': 1.3,
+        'text-wrap': 'wrap', 'text-max-width': 200, 'text-valign': 'bottom', 'text-halign': 'center',
+        'text-margin-y': 6, 'text-background-color': '#ffffff', 'text-background-opacity': 0.92,
+        'text-background-padding': 2, 'underlay-shape': 'ellipse', 'underlay-padding': 14, 'underlay-opacity': 0,
+        'overlay-padding': 8, 'overlay-opacity': 0, 'z-index': 10 } }
+    ].concat(PICTURES.map(function (name) {
+      return { selector: 'node[icon = "' + name + '"]', style: { 'background-image': icon(name) } };
     })).concat([
-      // What a device asks of you: nothing, to verify, confirmed; grey is not scanned.
-      { selector: 'node.ok', style: { 'border-color': '#3fb950' } },
-      { selector: 'node.warn', style: { 'border-color': '#e3b341', 'border-width': 3 } },
-      { selector: 'node.bad', style: { 'border-color': '#f85149', 'border-width': 3 } },
-      { selector: 'node.kev', style: { 'border-style': 'double', 'border-width': 6 } },
-      { selector: 'node.you', style: { 'border-color': '#c8f02b', 'border-width': 3, 'color': '#c8f02b', 'font-weight': 700 } },
-      { selector: 'node.internet', style: { 'width': 64, 'height': 52, 'border-width': 1 } },
-      { selector: 'node.bar', style: {
-        'shape': 'round-rectangle', 'height': 8, 'width': 'data(width)', 'border-width': 0,
-        'background-color': 'data(color)', 'background-image': 'none', 'label': '' } },
+      // What a device asks of you: a soft glow behind it, amber or red.
+      { selector: 'node.warn', style: { 'underlay-color': '#f2b84b', 'underlay-opacity': 0.45 } },
+      { selector: 'node.bad', style: { 'underlay-color': '#e5534b', 'underlay-opacity': 0.45 } },
+      { selector: 'node.kev', style: { 'underlay-opacity': 0.7, 'underlay-padding': 20 } },
+      { selector: 'node.none', style: { 'color': '#6b7178' } },
+      { selector: 'node.you', style: { 'font-weight': 700, 'color': '#1f6fb2' } },
+      { selector: 'node.hub', style: { 'width': 104, 'height': 80, 'font-size': 14 } },
+      { selector: 'node.cloud', style: {
+        'width': 170, 'height': 118, 'text-valign': 'center', 'text-margin-y': 8, 'font-size': 17, 'font-weight': 700,
+        'color': '#1f2d3d' } },
+      { selector: 'node.waves', style: { 'width': 330, 'height': 216, 'events': 'no', 'label': '', 'z-index': 1 } },
       { selector: 'node.title', style: {
-        'width': 1, 'height': 1, 'border-width': 0, 'background-opacity': 0, 'events': 'no',
-        'text-valign': 'top', 'text-halign': 'right', 'text-margin-y': -8, 'text-margin-x': 0,
-        'font-weight': 700, 'font-size': 12, 'color': 'data(color)', 'text-max-width': 320 } },
-      { selector: 'node.anchor', style: {
-        'width': 1, 'height': 1, 'border-width': 0, 'background-opacity': 0, 'background-image': 'none',
-        'overlay-opacity': 0, 'events': 'no', 'label': '' } },
+        'width': 1, 'height': 1, 'events': 'no', 'text-valign': 'top', 'text-halign': 'right',
+        'text-margin-y': 0, 'font-weight': 700, 'font-size': 13, 'color': 'data(color)', 'text-max-width': 360 } },
       { selector: 'node.more', style: {
-        'height': 28, 'width': 80, 'border-style': 'dashed', 'border-width': 1, 'background-image': 'none',
-        'text-valign': 'center', 'text-margin-y': 0, 'color': '#8d939b' } },
-      { selector: 'node:selected', style: { 'overlay-color': '#c8f02b', 'overlay-opacity': 0.2 } },
-      { selector: 'edge', style: { 'curve-style': 'straight', 'width': 2, 'line-color': '#4a4f57', 'target-arrow-shape': 'none' } },
-      { selector: 'edge.uplink', style: { 'width': 2.5, 'line-color': '#8d939b' } },
-      { selector: 'edge.tunnel', style: { 'width': 2.5, 'line-color': 'data(color)', 'line-style': 'dashed', 'line-dash-pattern': [7, 5],
-        'curve-style': 'taxi', 'taxi-direction': 'horizontal', 'taxi-turn': '100%' } }
+        'shape': 'round-rectangle', 'width': 96, 'height': 34, 'background-opacity': 1, 'background-color': '#ffffff',
+        'border-width': 1.5, 'border-style': 'dashed', 'border-color': '#9aa3ad',
+        'text-valign': 'center', 'text-margin-y': 0, 'color': '#4a5260' } },
+      { selector: 'node:selected', style: { 'overlay-color': '#1f6fb2', 'overlay-opacity': 0.14 } },
+      { selector: 'edge', style: {
+        'curve-style': 'taxi', 'taxi-direction': 'horizontal', 'taxi-turn': '50%', 'width': 2.2,
+        'line-color': 'data(color)', 'target-arrow-shape': 'none', 'z-index': 5,
+        'label': 'data(text)', 'font-family': FONT, 'font-size': 12, 'color': 'data(color)',
+        'text-background-color': '#ffffff', 'text-background-opacity': 0.9, 'text-background-padding': 3 } },
+      { selector: 'edge.down', style: { 'taxi-direction': 'vertical' } },
+      // To a network below the rings: across only after clearing them.
+      { selector: 'edge.low', style: { 'taxi-turn': '92%' } },
+      { selector: 'edge.thin', style: { 'curve-style': 'straight', 'width': 1.4 } },
+      { selector: 'edge.dashed', style: { 'line-style': 'dashed', 'line-dash-pattern': [8, 6], 'width': 2.6 } }
     ])
   });
 
@@ -183,7 +190,7 @@
     });
   }
 
-  // Turns the session's nodes and links into the diagram.
+  // Turns the session's nodes and links into the illustration.
   function status(d) {
     if (d.kind !== 'host') { return 'none'; }
     if (d.confirmed) { return 'bad'; }
@@ -191,9 +198,10 @@
     return 'ok';
   }
   var SEVERITY = { bad: 0, warn: 1, ok: 2, none: 3 };
+  var PRINTER = /(^|[\s,])(9100|515|631)\/tcp|ipp|printer|jetdirect/i;
 
   function plan(nodes, edges) {
-    var data = {}, out = {}, pos = {}, classes = {}, texts = {}, elements = [], wires = [], placed = {};
+    var data = {}, out = {}, pos = {}, classes = {}, elements = [], lines = [], placed = {}, networkOf = {};
     nodes.forEach(function (node) { data[node.data.id] = node.data; out[node.data.id] = []; });
     edges.forEach(function (edge) {
       var e = edge.data;
@@ -209,11 +217,14 @@
       var ka = sortKey(data[a]), kb = sortKey(data[b]);
       return ka < kb ? -1 : (ka > kb ? 1 : 0);
     }
-    function iconFor(d) {
+    function picture(d) {
       if (d.id === 'local') { return 'you'; }
-      if (d.kind === 'gateway') { return 'router'; }
-      if (d.kind === 'neighbour') { return 'client'; }
-      return d.role === 'segment' ? 'client' : (d.role || 'client');
+      if (d.id === 'internet') { return 'internet'; }
+      if (d.kind === 'gateway' || d.role === 'router') { return 'router'; }
+      if (d.kind === 'interface') { return 'segment'; }
+      if (PRINTER.test(d.ports_line || '')) { return 'printer'; }
+      if (d.role === 'firewall') { return 'firewall'; }
+      return d.role === 'server' ? 'server' : 'client';
     }
     function caption(id) {
       var d = data[id], parts = [];
@@ -221,6 +232,8 @@
         parts.push('You');
         var mine = d.caption && d.caption.split('\n')[1];
         if (mine) { parts.push(mine); }
+      } else if (id === 'internet') {
+        parts.push('Internet');
       } else if (d.kind === 'host') {
         parts.push(d.address || d.label);
         var counts = [];
@@ -228,37 +241,38 @@
         if (d.hypotheses) { counts.push(d.hypotheses + ' to verify'); }
         if (counts.length) { parts.push(counts.join(' · ')); }
       } else if (d.kind === 'gateway') {
-        parts.push((internetVia.indexOf(id) >= 0 ? 'router ' : 'gateway ') + d.label);
+        parts.push((internetVia.indexOf(id) >= 0 ? 'Router ' : 'Gateway ') + d.label);
+      } else if (d.kind === 'interface') {
+        parts.push((d.caption || d.label).split('\n')[0]);
       } else {
         parts.push(d.label);
       }
       return parts.join('\n');
     }
     function put(id, x, y, extra) {
-      var d = data[id] || {};
+      var d = data[id];
       pos[id] = { x: x, y: y };
       classes[id] = [status(d)].concat(extra || []).join(' ');
-      // Only devices carry a picture: not bars, labels or "+N more".
-      var plain = (extra || []).some(function (c) { return c === 'bar' || c === 'more'; }) || d.kind === 'more';
-      if (!plain) { d.icon = d.icon || iconFor(d); }
+      if (!d.icon && d.kind !== 'more' && d.kind !== 'title') { d.icon = picture(d); }
       placed[id] = true;
     }
-    function wire(from, to, kind, color) {
-      wires.push({ group: 'edges', data: { id: 'w:' + from + '>' + to, source: from, target: to, color: color || '#4a4f57' }, classes: kind || '' });
+    function link(from, to, color, kind, text) {
+      lines.push({ group: 'edges', classes: kind || '',
+        data: { id: 'l:' + from + '>' + to, source: from, target: to, color: color || '#9aa3ad', text: text || '' } });
     }
-    // A point on a bar right above or below `x`, so wires meet it upright.
-    function anchor(bar, x, y) {
-      var id = 'a:' + bar + ':' + Math.round(x);
-      if (!pos[id]) {
-        data[id] = { id: id, kind: 'anchor' };
-        pos[id] = { x: x, y: y };
-        classes[id] = 'anchor';
-      }
+    function title(id, text, x, y, color) {
+      data[id] = { id: id, kind: 'title', label: text, color: color };
+      pos[id] = { x: x, y: y };
+      classes[id] = 'title';
+    }
+    function more(key, hidden, unfolded) {
+      var id = 'more:' + key;
+      data[id] = { id: id, kind: 'more', label: unfolded ? 'show fewer' : '+' + hidden + ' more' };
       return id;
     }
-    // Ids spread evenly around `cx` on one row.
-    function spread(ids, cx, y, extra) {
-      ids.forEach(function (id, i) { put(id, cx + (i - (ids.length - 1) / 2) * PITCH, y, extra); });
+    // Ids on one row starting at x, `step` apart.
+    function row(ids, x, y, step) {
+      ids.forEach(function (id, i) { put(id, x + i * step, y); });
     }
 
     var internetVia = linked('internet', ['internet']);
@@ -266,116 +280,117 @@
     function leadsOut(id) {
       return internetVia.indexOf(id) >= 0 || linked(id, ['gateway']).some(function (g) { return internetVia.indexOf(g) >= 0; });
     }
-    networks.sort(function (a, b) {
-      var ra = leadsOut(a) ? 0 : (data[a].link === 'vpn' ? 1 : (data[a].link === 'virtual' ? 3 : 2));
-      var rb = leadsOut(b) ? 0 : (data[b].link === 'vpn' ? 1 : (data[b].link === 'virtual' ? 3 : 2));
-      return ra - rb || (a < b ? -1 : 1);
-    });
-    var lost = linked('local', ['unknown']);
+    var home = networks.filter(leadsOut)[0] ||
+      networks.filter(function (n) { return ['vpn', 'virtual'].indexOf(data[n].link) < 0; })[0];
+    var vpns = networks.filter(function (n) { return n !== home && data[n].link === 'vpn'; });
+    var others = networks.filter(function (n) { return n !== home && vpns.indexOf(n) < 0; });
 
-    // Lay the networks out left to right, each as wide as its widest row.
-    var x = 0, youAt = null;
-    networks.forEach(function (net, n) {
-      var color = LINE[data[net].link] || LINE.other;
-      var gateways = linked(net, ['gateway']).sort(bySeverity);
-      var devices = linked(net, ['neighbour', 'direct']).filter(function (id) {
-        return gateways.indexOf(id) < 0 && !placed[id];
-      }).sort(bySeverity);
-      var hidden = 0;
-      if (devices.length > MAX_DEVICES && !expanded[net]) {
-        devices.slice(MAX_DEVICES - 1).forEach(function (id) { placed[id] = true; });
-        hidden = devices.length - (MAX_DEVICES - 1);
-        devices = devices.slice(0, MAX_DEVICES - 1);
+    // Your home network: the router in the middle, devices around it.
+    var hub = null;
+    if (home) {
+      var gateways = linked(home, ['gateway']).sort(bySeverity);
+      hub = gateways[0] || home;
+      put(hub, 0, 0, ['hub']);
+      var wireless = data[home].link === 'wifi';
+      if (wireless) {
+        data.waves = { id: 'waves', kind: 'waves', label: '', icon: 'waves' };
+        pos.waves = { x: 0, y: 22 };
+        classes.waves = 'waves';
       }
-      // You sit on the first network, at the right end of its first row,
-      // next to the networks you also belong to.
-      var row = devices.slice();
-      if (n === 0) { row.splice(Math.min(row.length, PER_ROW - 1), 0, 'local'); }
-      if (hidden) {
-        var more = 'more:' + net;
-        data[more] = { id: more, kind: 'more', label: '+' + hidden + ' more', caption: '+' + hidden + ' more' };
-        row.push(more);
-      } else if (devices.length >= MAX_DEVICES) {
-        var fewer = 'more:' + net;
-        data[fewer] = { id: fewer, kind: 'more', label: 'show fewer', caption: 'show fewer' };
-        row.push(fewer);
+      // The network's name goes under the router's own.
+      networkOf[hub] = caption(home) + (data[home].network ? ' · ' + data[home].network : '');
+      var devices = gateways.slice(1).concat(linked(home, ['neighbour', 'direct']).filter(function (id) {
+        return id !== hub && !placed[id];
+      }).sort(bySeverity));
+      var hidden = 0, unfolded = devices.length > MAX_DEVICES && expanded[home];
+      if (devices.length > MAX_DEVICES && !expanded[home]) {
+        devices.slice(MAX_DEVICES).forEach(function (id) { placed[id] = true; });
+        hidden = devices.length - MAX_DEVICES;
+        devices = devices.slice(0, MAX_DEVICES);
       }
-      var beyond = [];
-      gateways.forEach(function (g) {
-        if (internetVia.indexOf(g) >= 0 && !placed.internet && data.internet) { beyond.push('internet'); }
-        linked(g, ['routed']).sort(bySeverity).forEach(function (h) { if (beyond.indexOf(h) < 0) { beyond.push(h); } });
+      var around = ['local'].concat(devices);
+      if (hidden || unfolded) { around.push(more(home, hidden, unfolded)); }
+      var slots = SLOTS1.map(function (a) { return [a, RING1]; }).concat(SLOTS2.map(function (a) { return [a, RING2]; }));
+      // Unfolded: further rings, as many as it takes.
+      for (var ring = 3; slots.length < around.length; ring++) {
+        for (var a = 0; a < 360; a += 360 / (8 + ring * 4)) {
+          slots.push([a, { rx: RING2.rx + (ring - 2) * 170, ry: RING2.ry + (ring - 2) * 120 }]);
+        }
+      }
+      around.forEach(function (id, i) {
+        var angle = slots[i][0] * Math.PI / 180, r = slots[i][1];
+        put(id, Math.cos(angle) * r.rx, Math.sin(angle) * r.ry, id === 'local' ? ['you'] : []);
+        if (id.indexOf('more:') === 0) { classes[id] = 'none more'; }
+        if (!wireless && id.indexOf('more:') !== 0) { link(hub, id, LINE.ethernet); }
       });
-      var perRow = Math.min(Math.max(row.length, 1), PER_ROW);
-      var stagger = row.length > PER_ROW ? 0.5 : 0;  // later rows sit between the ones above
-      var width = (Math.max(perRow, gateways.length, beyond.length, 2) + stagger) * PITCH;
-      var cx = x + width / 2;
-
-      // The bar and its name.
-      data[net].width = width - PITCH * 0.3;
-      data[net].color = color;
-      put(net, cx, Y_BAR, ['bar']);
-      var title = 'title:' + net;
-      data[title] = { id: title, kind: 'title', label: data[net].caption.replace('\n', '  ·  '), color: color };
-      pos[title] = { x: x + PITCH * 0.15, y: Y_BAR };
-      classes[title] = 'title';
-
-      // Devices underneath, row by row.
-      for (var r = 0; r * PER_ROW < row.length; r++) {
-        var slice = row.slice(r * PER_ROW, (r + 1) * PER_ROW);
-        // Rows after the first sit half a step over, so their wires up to
-        // the bar pass between the devices above them.
-        var shift = r % 2 === 1 ? PITCH / 2 : (stagger ? -PITCH / 4 : 0);
-        spread(slice, cx + shift, Y_DEVICES + r * ROW, []);
-        slice.forEach(function (id) {
-          if (id === 'local') { classes[id] += ' you'; youAt = id; }
-          if (id.indexOf('more:') === 0) { classes[id] = 'none more'; }
-          wire(id, anchor(net, pos[id].x, Y_BAR));
+      // The Internet, joined to the router like a modem, and what was
+      // reached there beside it.
+      if (data.internet && internetVia.length) {
+        put('internet', CLOUD.x, CLOUD.y, ['cloud']);
+        link(hub, 'internet', LINE.ethernet);
+        var outside = [];
+        internetVia.forEach(function (g) {
+          linked(g, ['routed']).forEach(function (h) { if (!placed[h] && outside.indexOf(h) < 0) { outside.push(h); } });
         });
+        outside.sort(bySeverity).slice(0, 4).forEach(function (h, i) {
+          put(h, CLOUD.x + 190 + i * 130, CLOUD.y - 20);
+          link('internet', h, LINE.ethernet, 'thin');
+        });
+        outside.slice(4).forEach(function (h) { placed[h] = true; });
       }
-      // Gateways above the bar, and what lies beyond them above that.
-      spread(gateways, cx, Y_GATEWAY, []);
-      gateways.forEach(function (g) { wire(g, anchor(net, pos[g].x, Y_BAR), 'uplink'); });
-      spread(beyond, cx, Y_BEYOND, []);
-      beyond.forEach(function (b) {
-        if (b === 'internet') { classes[b] += ' internet'; }
-        var via = gateways.filter(function (g) {
-          return (b === 'internet' && internetVia.indexOf(g) >= 0) || linked(g, ['routed']).indexOf(b) >= 0;
-        })[0];
-        if (via) { wire(b, via, 'uplink'); }
+    } else {
+      put('local', 0, 0, ['you']);
+    }
+
+    // Each VPN leaves through the cloud: its gateway, then what is behind it.
+    vpns.forEach(function (vpn, j) {
+      var gw = linked(vpn, ['gateway']).sort(bySeverity)[0] || vpn;
+      var x = CLOUD.x + 260 + j * 260, y = 20;
+      put(gw, x, y, ['hub']);
+      var label = caption(vpn) + (data[vpn].network ? ' · ' + data[vpn].network : '');
+      link(placed.internet ? 'internet' : 'local', gw, LINE.vpn, 'dashed down', label);
+      var behind = linked(gw, ['routed']).concat(linked(vpn, ['neighbour', 'direct']))
+        .filter(function (id) { return !placed[id]; }).sort(bySeverity);
+      behind.slice(0, 6).forEach(function (h, i) {
+        put(h, x + (i % 2 ? 70 : -70) * (i > 0 ? 1 : 0), y + 170 + Math.floor((i + 1) / 2) * 140);
+        link(gw, h, LINE.vpn, 'down');
       });
-      x += width + GAP;
+      behind.slice(6).forEach(function (h) { placed[h] = true; });
     });
 
-    // Your own connection to every other network: a dashed line from you.
-    if (!youAt) {
-      put('local', x + PITCH / 2, Y_DEVICES, ['you']);
-      x += PITCH + GAP;
-    }
-    networks.slice(youAt ? 1 : 0).forEach(function (net) {
-      var left = pos[net].x - data[net].width / 2;
-      wire('local', anchor(net, left + 4, Y_BAR), 'tunnel', data[net].color);
+    // Your other networks (virtual ones, a second LAN): a switch each, in
+    // a row below, joined to you.
+    others.forEach(function (net, k) {
+      var color = LINE[data[net].link] || LINE.other;
+      var x = -RING2.rx + 40, y = RING2.ry + 250 + k * 210;
+      put(net, x, y, ['hub']);
+      networkOf[net] = data[net].network || '';
+      link('local', net, color, 'dashed down low');
+      var members = linked(net, ['gateway', 'neighbour', 'direct']).filter(function (id) { return !placed[id]; }).sort(bySeverity);
+      members.slice(0, 6).forEach(function (h, i) {
+        put(h, x + 180 + i * 150, y);
+        link(net, h, color);
+      });
+      members.slice(6).forEach(function (h) { placed[h] = true; });
     });
+
     // Hosts this machine has no route to, in a group of their own.
-    var rest = lost.concat(nodes.map(function (n) { return n.data.id; }))
-      .filter(function (id, i, all) { return !placed[id] && all.indexOf(id) === i && data[id].kind !== 'anchor'; });
+    var rest = nodes.map(function (n) { return n.data.id; }).filter(function (id) {
+      return !placed[id] && ['interface', 'internet'].indexOf(data[id].kind) < 0;
+    }).sort(bySeverity);
     if (rest.length) {
-      var title2 = 'title:unknown';
-      data[title2] = { id: title2, kind: 'title', label: 'Route not known', color: LINE.unknown };
-      pos[title2] = { x: x + PITCH * 0.15, y: Y_BAR };
-      classes[title2] = 'title';
-      for (var k = 0; k * PER_ROW < rest.length; k++) {
-        var part = rest.slice(k * PER_ROW, (k + 1) * PER_ROW);
-        var w = Math.min(rest.length, PER_ROW) * PITCH;
-        spread(part, x + w / 2, Y_DEVICES + k * ROW, []);
-      }
+      var y0 = RING2.ry + 250 + others.length * 210;
+      title('title:unknown', 'Route not known', -RING2.rx - 50, y0 - 62, '#6b7178');
+      rest.forEach(function (h, i) { put(h, -RING2.rx + (i % 6) * 150, y0 + Math.floor(i / 6) * 140); });
     }
 
     Object.keys(pos).forEach(function (id) {
       var d = Object.assign({}, data[id]);
-      d.text = d.kind === 'title' ? d.label : (texts[id] || (d.kind === 'more' ? d.label : caption(id)));
+      d.text = d.kind === 'title' || d.kind === 'more' ? d.label : (d.kind === 'waves' ? '' : caption(id));
+      if (networkOf[id]) { d.text += '\n' + networkOf[id]; }
       elements.push({ group: 'nodes', data: d, classes: classes[id] });
     });
-    return { elements: elements.concat(wires), positions: pos };
+    return { elements: elements.concat(lines), positions: pos };
   }
 
   function renderGraph() {
@@ -394,17 +409,19 @@
 
   function renderLegend() {
     var legend = byId('legend');
-    [['ok', 'nothing to check'], ['warn', 'to verify'], ['bad', 'confirmed'], ['none', 'not scanned']].forEach(function (key) {
+    [['warn', 'to verify'], ['bad', 'confirmed']].forEach(function (key) {
       var item = legend.appendChild(el('span', 'item'));
-      item.appendChild(el('span', 'dot ' + key[0]));
+      item.appendChild(el('span', 'glow ' + key[0]));
       item.appendChild(el('span', null, key[1]));
     });
-    [['net', 'Wi-Fi / Ethernet', LINE.wifi], ['vpn', 'VPN', LINE.vpn], ['virtual', 'virtual', LINE.virtual]].forEach(function (key) {
+    [['solid', 'wired', LINE.ethernet], ['dashed', 'VPN', LINE.vpn], ['dashed', 'virtual network', LINE.virtual]].forEach(function (key) {
       var item = legend.appendChild(el('span', 'item'));
-      var bar = item.appendChild(el('span', 'bar'));
-      bar.style.background = key[2];
+      var bar = item.appendChild(el('span', 'bar ' + key[0]));
+      bar.style.borderColor = key[2];
       item.appendChild(el('span', null, key[1]));
     });
+    var waves = legend.appendChild(el('span', 'item'));
+    waves.appendChild(el('span', null, '))) Wi-Fi: no line'));
   }
 
   // Why a node is drawn the way it is. A hint, not a finding.

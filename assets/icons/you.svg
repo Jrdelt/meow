@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="#c9d1d9" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80" viewBox="0 0 100 80">
 <!-- meow map icon: this machine (a laptop). Original artwork, same licence as the project. -->
-<rect x="10" y="11" width="28" height="19" rx="2"/><path d="M5 35h38l-3 4H8z"/>
+<rect x="16" y="8" width="68" height="46" rx="3" fill="#3c4a5c"/><rect x="20" y="12" width="60" height="38" fill="#dbe9f6"/>
+<path d="M6 58h88l-6 12H12z" fill="#5a6b7f"/><path d="M18 62h64M20 66h60" stroke="#c7d2de" stroke-width="1.6"/>
 </svg>

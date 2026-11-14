@@ -120,18 +120,19 @@ terminal, add `--session <name>` or `--local`.
 
 ## The map
 
-`meow map` draws a top-down network diagram: the Internet and anything
-reached through a gateway at the top, gateways (routers) below that, one bar
-per network this machine is on, and the devices on each network underneath
-its bar, with you among them.
+`meow map` draws your network like a home-network illustration: your router
+(or access point) in the middle, the Internet cloud joined to it at the top
+right, and the devices on your network around the router, you among them.
 
 | On the map | What it means |
 |---|---|
-| Bar colour | Grey: Wi-Fi or Ethernet. Cyan: a VPN. Purple: a virtual network on this machine. You join every network besides the first with a dashed line in its colour. |
-| Device frame | Green: scanned, nothing to check. Amber: advisories to verify. Red: confirmed findings (a double frame when one is known exploited). Grey: not scanned, e.g. a device only seen in the neighbour table. |
-| Device picture | Router, server (a service seen), client (none seen), firewall, the Internet; a laptop for you. |
-| `+N more` | A busy network shows 11 devices in two rows; click to unfold, then "show fewer". |
-| Route not known | Hosts this machine has no route to, in a group of their own. |
+| Waves around the router | Your connection to it is Wi-Fi, so devices are drawn without lines. On Ethernet each device hangs off an orthogonal line. |
+| Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
+| Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
+| Dashed cyan line | A VPN: it leaves through the cloud to its gateway, with what is behind it underneath. |
+| Dashed purple line | Another network of yours (e.g. a virtual one), its switch and devices below. |
+| `+N more` | More than 16 devices fold away; click to unfold, then "show fewer". |
+| Route not known | Hosts this machine has no route to, in a group at the bottom. |
 
 The picture is drawn from this machine's own tables (interfaces, routes,
 neighbours) and from scans; reading the tables sends nothing. Click any device

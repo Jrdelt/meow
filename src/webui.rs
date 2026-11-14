@@ -21,6 +21,9 @@ const ICONS: &[(&str, &str)] = &[
     ("firewall", include_str!("../assets/icons/firewall.svg")),
     ("server", include_str!("../assets/icons/server.svg")),
     ("client", include_str!("../assets/icons/client.svg")),
+    // Not roles: the map picks these from what it knows about a device.
+    ("printer", include_str!("../assets/icons/printer.svg")),
+    ("waves", include_str!("../assets/icons/waves.svg")),
 ];
 
 fn with_type(content_type: &'static str, body: String) -> Response {
