@@ -8,3 +8,11 @@ session.lock
 tmp/
 .env*
 .DS_Store
+# Keys and credentials never belong in this public repository.
+ai.toml
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+.git-credentials

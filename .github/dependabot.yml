@@ -1,0 +1,13 @@
+# Weekly pull requests for dependency and Action updates. Each one has to
+# pass the checks workflow and be merged by hand.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

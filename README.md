@@ -17,7 +17,9 @@ against public vulnerability databases, and keeps every raw observation apart
 from every conclusion. Nothing leaves your machine unless you ask for it.
 
 The full specification is in [`SPEC.md`](SPEC.md). Notes for contributors and
-coding agents are in [`AGENTS.md`](AGENTS.md).
+coding agents are in [`AGENTS.md`](AGENTS.md). Report security problems
+privately, as [`SECURITY.md`](SECURITY.md) describes. MIT licensed
+([`LICENSE`](LICENSE)).
 
 ## Install
 

@@ -90,7 +90,8 @@ Before every push:
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
-    x86_64-pc-windows-gnu --all-targets -- -D warnings`). No CI: private repo.
+    x86_64-pc-windows-gnu --all-targets -- -D warnings`). Public repo: CI in
+    `.github/workflows/checks.yml` (gates, Windows lint, `cargo audit`).
   - macOS (owner's machine): `fmt`, `clippy`, and `cargo test --no-fail-fast`
     all pass. Tests must not depend on the login name, `/usr/bin/zsh`,
     bash >= 4.4 or unresolved temp paths.
