@@ -27,18 +27,18 @@ const EOX_URL: &str = "https://cloudless.eox.at";
 /// the lookup services do not say how sure they are.
 pub const ROUGH_RADIUS_M: f64 = 25_000.0;
 
-/// The map's size on the page, in CSS pixels; the estimate is its middle.
-pub const VIEW_WIDTH: u32 = 192;
-pub const VIEW_HEIGHT: u32 = 120;
+/// The map's size on the page, in CSS pixels (drawn round); the estimate
+/// is its middle.
+pub const VIEW_WIDTH: u32 = 200;
+pub const VIEW_HEIGHT: u32 = 200;
 
 const TILE_PIXELS: f64 = 256.0;
-/// Tiles come from one zoom level closer than the map is shown at and are
-/// drawn at half their size, so the picture stays sharp on dense screens.
-const DRAWN_PIXELS: f64 = TILE_PIXELS / 2.0;
-/// Zoom levels the map may be shown at.
-const MIN_ZOOM: u8 = 2;
-const MAX_ZOOM: u8 = 12;
-/// The circle is at most this share of the map's height across.
+/// Zoom levels the map may be shown at; between whole levels the tiles are
+/// drawn smaller. They come from the next whole level up, so they are drawn
+/// at half to full size and stay sharp on dense screens.
+const MIN_ZOOM: f64 = 2.0;
+const MAX_ZOOM: f64 = 12.0;
+/// The circle is this share of the round map across: it nearly fills it.
 const CIRCLE_SHARE: f64 = 0.8;
 /// Web Mercator stops here; the poles are infinitely far away.
 const MAX_LATITUDE: f64 = 85.051_128_78;
@@ -110,13 +110,17 @@ pub fn metres_per_pixel(latitude: f64, zoom: u8) -> f64 {
     EQUATOR_M * clamp_latitude(latitude).to_radians().cos() / world_pixels(zoom)
 }
 
-/// The closest zoom the map can be shown at with the whole rough area on it.
-pub fn shown_zoom(latitude: f64) -> u8 {
-    let room = CIRCLE_SHARE * f64::from(VIEW_HEIGHT);
-    (MIN_ZOOM..=MAX_ZOOM)
-        .rev()
-        .find(|&zoom| 2.0 * ROUGH_RADIUS_M / metres_per_pixel(latitude, zoom) <= room)
-        .unwrap_or(MIN_ZOOM)
+/// The zoom, with a fraction, at which the rough area is `CIRCLE_SHARE` of
+/// the map's height across.
+pub fn shown_zoom(latitude: f64) -> f64 {
+    let across = CIRCLE_SHARE * f64::from(VIEW_HEIGHT);
+    let across_at_zero = 2.0 * ROUGH_RADIUS_M / metres_per_pixel(latitude, 0);
+    (across / across_at_zero).log2().clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// The whole zoom level the tiles for a shown zoom come from.
+fn tile_zoom(shown: f64) -> u8 {
+    shown.floor() as u8 + 1
 }
 
 fn round_to(value: f64, step: f64) -> f64 {
@@ -132,9 +136,10 @@ fn span(from: f64, length: f64) -> std::ops::RangeInclusive<i64> {
 
 /// The map around a place: which tiles, and where each one is drawn.
 pub fn view(latitude: f64, longitude: f64, template: &str) -> MapView {
-    let zoom = shown_zoom(latitude) + 1;
-    // CSS pixels per tile pixel.
-    let scale = DRAWN_PIXELS / TILE_PIXELS;
+    let shown = shown_zoom(latitude);
+    let zoom = tile_zoom(shown);
+    // CSS pixels per tile pixel: from a half up to (not quite) one.
+    let scale = 2f64.powf(shown - f64::from(zoom));
     let (centre_x, centre_y) = world_point(latitude, longitude, zoom);
     let width = f64::from(VIEW_WIDTH) / scale;
     let height = f64::from(VIEW_HEIGHT) / scale;
@@ -152,8 +157,8 @@ pub fn view(latitude: f64, longitude: f64, template: &str) -> MapView {
                 // Past the date line the map goes on round the world.
                 x: column.rem_euclid(columns) as u32,
                 y: row as u32,
-                left: round_to((column as f64 * TILE_PIXELS - left) * scale, 0.01),
-                top: round_to((row as f64 * TILE_PIXELS - top) * scale, 0.01),
+                left: round_to((column as f64 * TILE_PIXELS - left) * scale, 0.001),
+                top: round_to((row as f64 * TILE_PIXELS - top) * scale, 0.001),
             });
         }
     }
@@ -161,7 +166,7 @@ pub fn view(latitude: f64, longitude: f64, template: &str) -> MapView {
     MapView {
         width: VIEW_WIDTH,
         height: VIEW_HEIGHT,
-        tile_size: DRAWN_PIXELS,
+        tile_size: round_to(TILE_PIXELS * scale, 0.001),
         tiles,
         radius: round_to(
             ROUGH_RADIUS_M / metres_per_pixel(latitude, zoom) * scale,
@@ -341,25 +346,25 @@ mod tests {
         ] {
             let view = view(latitude, 10.0, TILES_URL);
             let across = 2.0 * view.radius;
-            // The whole area is on the map with room around it, and one
-            // zoom level closer it would not be: never a speck.
+            // The circle fills the map the same at every latitude.
             assert!(
-                across <= CIRCLE_SHARE * height + 0.2,
+                (across - CIRCLE_SHARE * height).abs() < 0.2,
                 "{latitude}: {across}"
             );
             assert!(
-                across > CIRCLE_SHARE * height / 2.0 - 0.2,
-                "{latitude}: {across}"
-            );
-            assert!(
-                !view.tiles.is_empty() && view.tiles.len() <= 6,
+                !view.tiles.is_empty() && view.tiles.len() <= 12,
                 "{latitude}"
             );
+            assert!((0.5..1.0).contains(&(view.tile_size / TILE_PIXELS)));
             assert!(view.tiles.iter().all(|tile| tile.y < 1 << tile.z));
             assert_eq!(view.radius_m, ROUGH_RADIUS_M);
         }
-        assert_eq!(shown_zoom(0.0), 8);
-        assert_eq!(shown_zoom(47.6588), 7);
+        assert_eq!(tile_zoom(shown_zoom(0.0)), 9);
+        assert!(
+            (shown_zoom(47.6588) - 8.40).abs() < 0.01,
+            "{}",
+            shown_zoom(47.6588)
+        );
     }
 
     #[test]
@@ -369,7 +374,7 @@ mod tests {
             assert!(view
                 .tiles
                 .iter()
-                .all(|tile| tile.z == shown_zoom(latitude) + 1));
+                .all(|tile| tile.z == tile_zoom(shown_zoom(latitude))));
             for y in (0..VIEW_HEIGHT).step_by(5) {
                 for x in (0..VIEW_WIDTH).step_by(5) {
                     assert!(
@@ -390,7 +395,7 @@ mod tests {
                 .unwrap()
         };
         assert!(left_of(0) > left_of(last));
-        assert!(covered(&fiji, 0.0, 0.0) && covered(&fiji, 191.0, 119.0));
+        assert!(covered(&fiji, 0.0, 0.0) && covered(&fiji, 199.0, 199.0));
     }
 
     #[test]

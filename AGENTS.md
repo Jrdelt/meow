@@ -86,7 +86,7 @@ Before every push:
   - Map page: cards, no inline scripts, no `innerHTML`; checked in Chromium.
     Topology: top-down tree (cloud, router, one row of devices, you last;
     solid wired / dotted Wi-Fi from `link`) scrolling sideways; VPN and
-    virtual networks below you. Location card and VPN note (`location.rs`,
+    virtual networks below you. Round location map and VPN pill (`location.rs`,
     `tiles.rs` satellite tiles from memory, compass fallback) only after
     `locate`. Internet and neighbour clients are drawn only, never hosts.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run

@@ -503,7 +503,7 @@
     return Math.abs(value).toFixed(2) + '° ' + (value >= 0 ? positive : negative);
   }
   function placeName(place) {
-    return [place.city, place.region, place.country].filter(Boolean).join(', ') || 'Unnamed place';
+    return [place.city, place.region].filter(Boolean).join(', ') || place.country || 'Unnamed place';
   }
   function placeWords(box, where) {
     var place = where.place;
@@ -515,36 +515,43 @@
     return 'Estimated from ' + (place.public_address || 'your public address') +
       (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source + '.';
   }
-  // The pictures' licence asks for its credit as given, with its link.
+  // The pictures' licence asks for its credit, with its link, in the map:
+  // a short one in the corner, the full wording in its tooltip.
   function credit(view) {
-    var line = el('span', 'dim credit', 'Imagery: ');
-    var at = view.credit_url ? view.credit.indexOf(view.credit_url) : -1;
-    if (at < 0) {
-      line.appendChild(document.createTextNode(view.credit));
-      return line;
+    var box = el('span', 'attribution');
+    box.title = view.credit;
+    if (!view.credit_url) {
+      box.textContent = view.credit;
+      return box;
     }
-    line.appendChild(document.createTextNode(view.credit.slice(0, at)));
-    var link = line.appendChild(el('a', null, view.credit_url));
+    var link = box.appendChild(el('a', null, '\u00a9 EOX Sentinel-2'));
     link.href = view.credit_url;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
-    line.appendChild(document.createTextNode(view.credit.slice(at + view.credit_url.length)));
-    return line;
+    return box;
   }
+
+  // The satellite map: the picture with the rough area circled and a pin
+  // at the estimate, and one line under it: the place and where it is.
+  // The details stay in the tooltip; the picture's credit sits in its
+  // corner, as its licence asks.
   function satellite(where) {
-    var view = where.map;
+    var view = where.map, place = where.place;
     var card = el('div', 'satellite');
+    card.title = 'Rough area: within about ' + Math.round(view.radius_m / 1000) + ' km of the pin. ' +
+      estimatedFrom(where);
     var picture = card.appendChild(el('div', 'picture'));
     picture.style.width = view.width + 'px';
     picture.style.height = view.height + 'px';
     picture.setAttribute('role', 'img');
-    picture.setAttribute('aria-label', 'Satellite picture around ' + placeName(where.place) +
+    picture.setAttribute('aria-label', 'Satellite picture around ' + placeName(place) +
       ', with a pin at the estimate and its rough area circled');
     view.tiles.forEach(function (tile) {
       var img = picture.appendChild(el('img', 'tile'));
       img.alt = '';
-      img.width = view.tile_size;
-      img.height = view.tile_size;
+      // A hair larger, so no seam shows between tiles.
+      img.width = view.tile_size + 0.5;
+      img.height = view.tile_size + 0.5;
       img.style.left = tile.left + 'px';
       img.style.top = tile.top + 'px';
       img.src = '/map/tile/' + tile.z + '/' + tile.x + '/' + tile.y + '?token=' + encodeURIComponent(token);
@@ -552,22 +559,23 @@
     var x = view.width / 2, y = view.height / 2;
     var marks = svg('svg', { 'class': 'marks', width: view.width, height: view.height,
       viewBox: '0 0 ' + view.width + ' ' + view.height, 'aria-hidden': 'true' }, picture);
-    svg('circle', { cx: x, cy: y, r: view.radius, fill: 'rgba(80, 160, 255, .22)',
-      stroke: '#a9d4ff', 'stroke-width': 1.6 }, marks);
+    svg('circle', { cx: x, cy: y, r: view.radius, fill: 'rgba(160, 210, 90, .30)',
+      stroke: '#111418', 'stroke-width': 2.5 }, marks);
     // A pin whose tip is the estimate.
-    var pin = svg('g', { transform: 'translate(' + x + ' ' + y + ')' }, marks);
+    var pin = svg('g', { transform: 'translate(' + x + ' ' + y + ') scale(1.15)' }, marks);
     svg('ellipse', { cx: 0, cy: 0, rx: 4.5, ry: 1.8, fill: 'rgba(0, 0, 0, .35)' }, pin);
     svg('path', { d: 'M0 0 C-1.8 -5 -8 -8.6 -8 -15 A8 8 0 1 1 8 -15 C8 -8.6 1.8 -5 0 0 Z',
-      fill: '#e5534b', stroke: '#ffffff', 'stroke-width': 1.4 }, pin);
-    svg('circle', { cx: 0, cy: -15, r: 3, fill: '#ffffff' }, pin);
-    var words = card.appendChild(el('div', 'words'));
-    placeWords(words, where);
-    words.appendChild(el('span', 'dim', 'Circle: rough area, about ' + Math.round(view.radius_m / 1000) +
-      ' km around the pin.'));
-    words.appendChild(el('span', 'dim', estimatedFrom(where)));
-    words.appendChild(credit(view));
+      fill: '#5b82d9', stroke: '#3c5fae', 'stroke-width': 1 }, pin);
+    svg('circle', { cx: 0, cy: -15, r: 3.2, fill: '#ffffff' }, pin);
+    picture.appendChild(credit(view));
+    var line = card.appendChild(el('div', 'place'));
+    line.appendChild(el('strong', null, placeName(place)));
+    line.appendChild(el('span', null, ' · ' + degrees(place.latitude, 'N', 'S') + ', ' +
+      degrees(place.longitude, 'E', 'W')));
+    line.title = card.title;
     return card;
   }
+
   // The drawing starts just below the note and the location card, so
   // neither covers part of it: only the canvas' empty margin is under them.
   function fitStage() {
@@ -590,17 +598,17 @@
     var key = JSON.stringify([vpn, where]);
     if (key === whereDrawn) { return; }
     whereDrawn = key;
-    var box = clear(byId('where'));
+    // Top right: a blue pill when a VPN is up, the round map under it.
+    var box = clear(byId('where')).appendChild(el('div', 'where-side'));
     if (vpn.length) {
-      var names = vpn.map(function (line) { return line.split(':')[0]; }).join(', ');
+      var names = vpn.map(function (line) { return line.split(' ')[0]; }).join(', ');
       var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
         return /default route|all IPv4/.test(line);
       });
-      var note = box.appendChild(el('div', 'vpn-note'));
-      note.appendChild(el('strong', null, 'VPN detected'));
-      note.appendChild(el('span', null, ' ' + names + (all
-        ? ': it carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
-        : ': it carries only some networks, so the location shown is your own connection\'s.')));
+      var pill = box.appendChild(el('span', 'vpn-pill', 'VPN ' + names + (all ? ' \u00b7 location hidden' : '')));
+      pill.title = vpn.join('\n') + '\n' + (all
+        ? 'It carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
+        : 'It carries only some networks, so the location shown is your own connection\'s.');
     }
     if (where && where.status === 'found' && where.map) {
       box.appendChild(satellite(where));
@@ -609,8 +617,7 @@
       card.appendChild(compass());
       var words = card.appendChild(el('div', 'words'));
       placeWords(words, where);
-      words.appendChild(el('span', 'dim', estimatedFrom(where)));
-      if (where.map_error) { words.appendChild(el('span', 'dim', 'No map: ' + where.map_error)); }
+      card.title = estimatedFrom(where) + (where.map_error ? ' No map: ' + where.map_error : '');
     } else if (where && where.status === 'unavailable') {
       var off = box.appendChild(el('div', 'compass off'));
       off.appendChild(compass());

@@ -1259,7 +1259,7 @@ mod tests {
                 let map = &location["map"];
                 assert_eq!(
                     (map["width"].as_u64(), map["height"].as_u64()),
-                    (Some(192), Some(120))
+                    (Some(200), Some(200))
                 );
                 assert_eq!(map["credit"], "Map pictures from 127.0.0.1");
                 assert!(location.get("map_error").is_none(), "{location}");

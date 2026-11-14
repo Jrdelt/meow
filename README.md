@@ -135,8 +135,8 @@ device on your network in one row below the router, you last.
 | Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
 | Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
 | A long row | Every device is drawn. A row wider than the card scrolls left and right (trackpad, Shift + mouse wheel, the scrollbar, or drag the background); it opens on the router. A tall drawing makes the card taller rather than too small to read. |
-| VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
-| Location (top right) | Where this machine roughly is, estimated from its public address (see below): a small satellite picture with a pin and a circle for the rough area (about 25 km), or a compass when there is no picture. |
+| Blue VPN pill (top right) | A VPN is up; "location hidden" when it carries all traffic. Hover it for which networks it carries. |
+| Round map (top right) | Where this machine roughly is, estimated from its public address (see below): a round satellite picture with a pin and a circle for the rough area (about 25 km), and the city, state and coordinates on one line under it (hover for the details). A compass when there is no picture. |
 | Route not known | Hosts this machine has no route to, in a group at the bottom. |
 
 A private address such as 192.168.0.81 has no location, so the estimate needs
