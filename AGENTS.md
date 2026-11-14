@@ -84,11 +84,11 @@ Before every push:
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system and
     user startup files load natively. Never keep it on the shim after that.
   - Map page: cards, no inline scripts, no `innerHTML`; checked in Chromium.
-    Topology: router centre, devices on rings (solid wired / dotted Wi-Fi from
-    `link`), cloud top right, VPN and virtual networks below you. Location
-    card and VPN note (`location.rs`; satellite tiles from `tiles.rs`, served
-    from memory, compass fallback) only after `locate`. Internet and
-    neighbour clients are drawn only, never hosts.
+    Topology: top-down tree (cloud, router, one row of devices, you last;
+    solid wired / dotted Wi-Fi from `link`) scrolling sideways; VPN and
+    virtual networks below you. Location card and VPN note (`location.rs`,
+    `tiles.rs` satellite tiles from memory, compass fallback) only after
+    `locate`. Internet and neighbour clients are drawn only, never hosts.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target

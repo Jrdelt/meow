@@ -123,19 +123,18 @@ terminal, add `--session <name>` or `--local`.
 
 ## The map
 
-`meow map` draws your network like a home-network illustration: your router
-(or access point) in the middle, the Internet cloud joined to it at the top
-right, and the devices on your network around the router on straight lines,
-you among them.
+`meow map` draws your network top-down, like a home-network diagram: the
+Internet cloud at the top, your router (or access point) under it, and every
+device on your network in one row below the router, you last.
 
 | On the map | What it means |
 |---|---|
-| Line to the router | Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
+| Lines from the router | One line down to a bar, then one down to each device. Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
 | Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
 | Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
 | Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
 | Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
-| `+N more` | More than 14 devices fold away (13 with a VPN or virtual network below you); click to unfold, then "show fewer". |
+| A long row | Every device is drawn. A row wider than the card scrolls left and right (trackpad, Shift + mouse wheel, the scrollbar, or drag the background); it opens on the router. A tall drawing makes the card taller rather than too small to read. |
 | VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
 | Location (top right) | Where this machine roughly is, estimated from its public address (see below): a small satellite picture with a pin and a circle for the rough area (about 25 km), or a compass when there is no picture. |
 | Route not known | Hosts this machine has no route to, in a group at the bottom. |
