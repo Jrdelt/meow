@@ -1,5 +1,7 @@
 # Builds meow for macOS, Linux and Windows when a version tag (v1.2.3) is
-# pushed, and publishes the files on that tag's GitHub Release: a .pkg
+# pushed, or when the workflow is run by hand (Actions -> release -> Run
+# workflow) for the version in Cargo.toml: GitHub then makes the tag itself
+# when it publishes. The files go on that version's GitHub Release: a .pkg
 # installer for macOS, plus .tar.gz / .zip archives that `meow update`
 # fetches, each with a .sha256 file. Only the pinned checkout action is
 # used; uploads go through the gh CLI the runners carry.
@@ -8,6 +10,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,28 +25,41 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The tag matches Cargo.toml
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "The tag is $GITHUB_REF_NAME but Cargo.toml says $version." >&2
-            exit 1
-          fi
-      - name: Draft
+      - name: The version to release
+        id: version
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A release made on github.com first (which also makes the tag) is
-          # kept; the builds are added to it.
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$tag" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag is $GITHUB_REF_NAME but Cargo.toml says $version." >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" != push ] &&
+            [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "$tag is released already: raise the version in Cargo.toml first." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+      - name: Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # A release made already (on github.com, or by an earlier run that
+          # stopped half-way) is kept; the builds are added to it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "The release exists already; adding the builds to it."
           else
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
-              --title "meow $GITHUB_REF_NAME" --notes-file .github/release-notes.md
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+              --title "meow $TAG" --notes-file .github/release-notes.md
           fi
 
   build:
@@ -83,8 +99,9 @@ jobs:
       - name: Package and upload
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${TAG#v}
           name="meow-$version-${{ matrix.name }}"
           out="target/${{ matrix.target }}/release"
           case "${{ matrix.name }}" in
@@ -114,13 +131,13 @@ jobs:
             else
               shasum -a 256 "$file" >"$file.sha256"
             fi
-            gh release upload "$GITHUB_REF_NAME" "$file" "$file.sha256" \
+            gh release upload "$TAG" "$file" "$file.sha256" \
               --repo "$GITHUB_REPOSITORY" --clobber
           done
 
   publish:
     name: publish the release
-    needs: build
+    needs: [draft, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -129,5 +146,7 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
         run: |
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          # Publishing makes the tag, at the commit that was built.
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

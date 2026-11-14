@@ -43,7 +43,8 @@ the map use (nmap, katana and feroxbuster, the wordlist, the location
 database); `meow tools` does the same any time. `meow update` later downloads
 and installs newer releases by itself, after checking each download against
 its `.sha256`. Releases are built by GitHub
-(`.github/workflows/release.yml`) when a version tag is pushed.
+(`.github/workflows/release.yml`) when a version tag is pushed, or when the
+workflow is run by hand from the Actions tab (it then makes the tag itself).
 
 ### From source
 
