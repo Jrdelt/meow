@@ -25,6 +25,7 @@ use meow::queue;
 use meow::report;
 use meow::setup;
 use meow::shims;
+use meow::tools;
 use meow::update;
 use meow::webui;
 use meow::wizard::{self, WizardOutcome};
@@ -217,6 +218,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     forget_key: *forget_key,
                 },
             ),
+            Command::Tools { yes } => {
+                let config = Config::load_or_create(&home)?;
+                tools::run(&config.recon, *yes)?;
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Update { check, source } => update::run(&update::UpdateArgs {
                 check: *check,
                 source: source.clone(),
@@ -228,7 +234,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     match command {
-        Command::List | Command::Delete { .. } | Command::Setup { .. } | Command::Update { .. } => {
+        Command::List
+        | Command::Delete { .. }
+        | Command::Setup { .. }
+        | Command::Update { .. }
+        | Command::Tools { .. } => {
             unreachable!(
                 "`list`, `delete`, `setup` and `update` are not session helpers and returned above"
             )
@@ -296,18 +306,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Recon {
-            target, nmap_flags, ..
+            target,
+            nmap_flags,
+            install_tools,
+            ..
         } => {
+            let needs_session = || {
+                anyhow!(
+                    "`meow recon` needs a live session: start `meow {}` first; \
+                     the scan runs in the background of that session",
+                    workspace.name
+                )
+            };
+            if ipc::send(&workspace, &Request::Ping)?.is_none() {
+                return Err(needs_session());
+            }
+            // Light mode refuses recon anyway; otherwise say now what is
+            // missing and offer to install it, before any stage starts.
+            if workspace.profile.mode != meow::mode::Mode::Light {
+                let config = Config::load_or_create(&home)?;
+                tools::offer(&config.recon, *install_tools)?;
+            }
             let request = Request::Recon {
                 target: target.clone(),
                 flags: nmap_flags.clone(),
             };
             let Some(result) = ipc::send(&workspace, &request)? else {
-                bail!(
-                    "`meow recon` needs a live session: start `meow {}` first; \
-                     the scan runs in the background of that session",
-                    workspace.name
-                );
+                return Err(needs_session());
             };
             let ahead = match result["ahead"].as_u64().unwrap_or(0) {
                 0 => String::new(),

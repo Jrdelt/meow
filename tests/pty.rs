@@ -608,3 +608,38 @@ fn first_run_bare_meow_opens_cat_setup_gui_and_launches_first_session() {
         .join("meow-home/workspaces/catlab/profile.toml")
         .is_file());
 }
+
+/// `meow tools` on a terminal asks before installing anything, and "n"
+/// leaves the machine as it was.
+#[test]
+fn tools_ask_before_installing_and_no_installs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("meow-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[recon]\nkatana = \"meow-no-such-katana\"\nferoxbuster = \"meow-no-such-ferox\"\n",
+    )
+    .unwrap();
+    let mut hosted = Hosted::spawn_args(&["tools"], tmp);
+    for needle in [
+        "[!] meow-no-such-katana not installed",
+        "meow-no-such-katana without it meow skips the web crawl",
+        "[?] Install them now? [Y/n] ",
+    ] {
+        assert!(
+            hosted.wait_for(needle.as_bytes(), PATIENCE),
+            "no {needle:?} in: {}",
+            hosted.dump()
+        );
+    }
+    hosted.send("n\r");
+    let (code, output, _tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0, "{}", text(&output));
+    assert!(
+        text(&output).contains("[+] Going ahead without them; `meow tools` installs them later."),
+        "{}",
+        text(&output)
+    );
+    assert!(!text(&output).contains("Installing"), "{}", text(&output));
+}

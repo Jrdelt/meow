@@ -58,7 +58,7 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** `v0.1.0` release: Cat Setup GUI (`src/wizard.rs`), hardening (`ISS-001`..`ISS-011`), installers & GitHub/local sync complete.
+- **Active Phase & Step:** `v0.1.0` release: Cat Setup GUI (`src/wizard.rs`), hardening (`ISS-001`..`ISS-011`), installers & GitHub/local sync complete; `meow tools` (recon checks and offers to install its tools).
 - **Last Verified Commit:** See `git log -n 1 --oneline`.
 - **In-Progress / Partial Work:** None (`330` tests passing).
 - **Next Exact Action:** Log any newly discovered issues in `issue/issues.md`.

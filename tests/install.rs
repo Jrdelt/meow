@@ -103,6 +103,37 @@ impl Machine {
         self.home().join(".meow/wordlists/common.txt")
     }
 
+    /// Runs the meow binary itself on this machine's PATH.
+    fn meow(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_meow"))
+            .args(args)
+            .env_clear()
+            .env("PATH", self.bin())
+            .env("HOME", self.home())
+            .env("MEOW_HOME", self.home().join(".meow"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// The system package manager, as a stand-in that "installs" a program
+    /// by writing it into bin. `sudo` just runs the command.
+    fn with_package_manager(&self) -> &Self {
+        let bin = self.bin();
+        let body = format!(
+            "for name in \"$@\"; do case \"$name\" in -*|install|update) ;; *)\n\
+             printf '#!/bin/sh\\nexit 0\\n' > '{bin}'/\"$name\"; chmod +x '{bin}'/\"$name\"\n\
+             echo \"$name\" >> \"$HOME/installed\" ;; esac; done",
+            bin = bin.display()
+        );
+        let manager = if cfg!(target_os = "macos") {
+            "brew"
+        } else {
+            "apt-get"
+        };
+        self.tool(manager, &body).tool("sudo", "exec \"$@\"")
+    }
+
     fn cargo_calls(&self) -> String {
         std::fs::read_to_string(self.home().join("cargo-calls")).unwrap_or_default()
     }
@@ -436,4 +467,50 @@ fn homebrew_formula_and_windows_installer_match_unix_installer() {
         windows.contains("MIN_RUST_MINOR = 88"),
         "install.ps1 must require MSRV 1.88"
     );
+}
+
+#[test]
+fn meow_tools_lists_what_recon_lacks_and_installs_it_on_request() {
+    let machine = Machine::bare();
+    machine.with_curl("admin\n");
+
+    // Without a terminal and without --yes: only the list, nothing installed.
+    let output = machine.meow(&["tools"]);
+    let text = out(&output);
+    assert!(output.status.success(), "{text}{}", err(&output));
+    for line in [
+        "[!] nmap         not installed",
+        "[!] katana       not installed",
+        "[!] feroxbuster  not installed",
+        "without it meow skips the web crawl",
+        "Not on a terminal, so nothing is installed",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in {text}");
+    }
+    assert!(!machine.home().join("installed").exists());
+
+    // --yes runs meow's own copy of the installer for the tools alone.
+    machine.with_package_manager();
+    let output = machine.meow(&["tools", "--yes"]);
+    let text = out(&output);
+    assert!(output.status.success(), "{text}{}", err(&output));
+    let installed = std::fs::read_to_string(machine.home().join("installed")).unwrap();
+    assert_eq!(
+        installed.split_whitespace().collect::<Vec<_>>(),
+        ["nmap", "katana", "feroxbuster"]
+    );
+    assert!(
+        text.contains("Every tool recon uses is installed."),
+        "{text}"
+    );
+    assert!(!text.contains("build meow"), "only the tools: {text}");
+    assert!(machine.cargo_calls().is_empty(), "meow is not rebuilt");
+    assert_eq!(
+        std::fs::read_to_string(machine.wordlist()).unwrap(),
+        "admin\n"
+    );
+
+    // Nothing left to do.
+    let text = out(&machine.meow(&["tools"]));
+    assert!(!text.contains("not installed"), "{text}");
 }

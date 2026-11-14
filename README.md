@@ -62,6 +62,7 @@ that cannot be installed is reported and skipped; meow works without it.
 | `--dry-run` | Only show the plan. |
 | `--yes` | Do not ask before starting. |
 | `--no-tools` | Leave out the scanners and the wordlist. |
+| `--tools-only` | Only the scanners and the wordlist; meow is not rebuilt. |
 
 ### Updating
 
@@ -104,6 +105,7 @@ cargo test                   # the full test suite
 | `meow add <file>` | Imports an Nmap XML, JSON Lines, log or `git diff` file. `--no-cve` skips the vulnerability lookups. |
 | `meow report` | Writes `REPORT.md` into the workspace. No AI, no network. |
 | `meow setup` | Opens the interactive Cat Setup GUI (`--plain` for the line-by-line terminal menu): default discovery mode, local model server, cloud AI key, live CVE grounding / optional NVD key, scanner readiness and live endpoint check. See [Your own AI](#your-own-ai-meow-setup). |
+| `meow tools` | Shows which of the tools `meow recon` uses are installed, and offers to install the missing ones (`--yes` installs without asking). |
 | `meow update` | Pulls the latest meow from GitHub and rebuilds it, with every tool it uses. `--check` only shows what is new. See [Updating](#updating). |
 
 Inside a session the helper commands find it by themselves. From another
@@ -196,8 +198,12 @@ not that there is nothing there.
 
 Recon stages: port inventory, service inventory on the open ports only, web
 crawl (`katana`, kept on the host being crawled: links to other sites are
-neither followed nor stored), directory inventory (`feroxbuster`). A missing tool or
-wordlist skips its stage, and the map and HUD say how to add it. A wordlist
+neither followed nor stored), directory inventory (`feroxbuster`). Before a
+recon is queued, meow checks that `nmap`, `katana`, `feroxbuster` and a
+wordlist are there. If any is missing it lists them with the stage each one
+is needed for, and asks whether to install them now (`--install-tools`
+installs without asking). Whatever is still missing skips its stage, and the
+map and HUD say so. `meow tools` does the same check at any time. A wordlist
 is looked for in `recon.wordlist_path`, then in the usual system places, then
 in `~/.meow/wordlists/` (the first `.txt` file there). Without root, `-sS` becomes `-sT` and `-O` is dropped.
 Each tool has a time limit and a 50 MB output cap, and is killed with
