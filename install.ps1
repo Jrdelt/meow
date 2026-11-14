@@ -28,7 +28,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$MIN_RUST_MINOR = 88
+$MIN_RUST_MINOR = 89
 $RUSTUP_URL = "https://win.rustup.rs/x86_64"
 $WORDLIST_URL = "https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
 $WORDLIST_SHA256 = if ($env:MEOW_WORDLIST_SHA256) {
