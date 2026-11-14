@@ -407,6 +407,10 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
             .unwrap_or_else(|| cwd.to_path_buf()),
         env,
     };
+    // Once per machine: offer the scanners, wordlist and location database.
+    if let Err(error) = tools::first_run_offer(home.root(), &config.recon) {
+        println!("[!] Could not offer the extras: {error:#}");
+    }
     if std::io::stdout().is_terminal() {
         print!(
             "{}",

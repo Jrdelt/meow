@@ -17,7 +17,7 @@
 
 set -eu
 
-MIN_RUST_MINOR=88
+MIN_RUST_MINOR=89
 RUSTUP_URL="https://sh.rustup.rs"
 # The SecLists web-content wordlist (about 4,700 entries), pinned to an immutable commit.
 WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"

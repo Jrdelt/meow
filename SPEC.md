@@ -1,6 +1,6 @@
 # Project Specification: `meow` — Local Security Triage Shell, Topology Mapper & Grounded Audit Workspace
 
-`meow` is a cross-platform (macOS, Linux, Windows) local-only CLI wrapper, live network topology mapper, and grounded defensive security audit workspace written in **Rust (MSRV 1.88+) + C11 (via FFI)**.
+`meow` is a cross-platform (macOS, Linux, Windows) local-only CLI wrapper, live network topology mapper, and grounded defensive security audit workspace written in **Rust (MSRV 1.89+) + C11 (via FFI)**.
 
 ## Strict Execution & Multi-Agent Continuity Rules
 1. **Proceed one phase and one file/step at a time.** Never dump the entire codebase at once or leave `// TODO` placeholders.

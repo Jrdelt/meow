@@ -1,5 +1,6 @@
-//! `meow update`: pulls the latest meow from GitHub into the folder it was
-//! built from, then runs that folder's `install.sh`, which rebuilds meow and
+//! `meow update`: for a meow installed from a GitHub Release, downloads the
+//! newest release (`release.rs`). Otherwise pulls the latest meow from
+//! GitHub into the folder it was built from, then runs that folder's `install.sh`, which rebuilds meow and
 //! adds any tool it now needs. Nothing is pulled while the folder has local
 //! changes, and only fast-forward pulls are made.
 
@@ -181,6 +182,13 @@ fn short(commit: &str) -> &str {
 }
 
 pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
+    // Installed from a GitHub Release: download the newest release instead,
+    // unless a checkout to update was named.
+    let named =
+        args.source.is_some() || std::env::var_os(SOURCE_ENV).is_some_and(|v| !v.is_empty());
+    if crate::release::BUILD.is_some() && !named {
+        return crate::release::run(args.check);
+    }
     let dir = source_dir(args.source.as_deref());
     if !is_meow_checkout(&dir) {
         bail!(

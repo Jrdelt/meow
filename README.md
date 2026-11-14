@@ -26,6 +26,27 @@ privately, as [`SECURITY.md`](SECURITY.md) describes. MIT licensed
 
 ## Install
 
+### Download (nothing to build)
+
+Get the file for your computer from the
+[latest release](https://github.com/Jrdelt/meow/releases/latest):
+
+| Computer | File | Then |
+|---|---|---|
+| Mac with Apple silicon (M1 and newer) | `meow-<version>-macos-arm64.pkg` | Double-click it. macOS warns that it is from an unidentified developer (it is not signed with a paid Apple account), so the first time right-click it, choose **Open**, then **Open**. meow goes to `/usr/local/bin/meow`. |
+| Intel Mac | `meow-<version>-macos-x86_64.pkg` | The same. |
+| Linux / Kali | `meow-<version>-linux-x86_64.tar.gz` (or `-linux-arm64`) | `tar -xzf meow-*.tar.gz && sudo install -m 0755 meow /usr/local/bin/meow` |
+| Windows | `meow-<version>-windows-x86_64.zip` | Unzip it and put `meow.exe` in a folder on your PATH. |
+
+Then run `meow`. The first session offers to install what `meow recon` and
+the map use (nmap, katana and feroxbuster, the wordlist, the location
+database); `meow tools` does the same any time. `meow update` later downloads
+and installs newer releases by itself, after checking each download against
+its `.sha256`. Releases are built by GitHub
+(`.github/workflows/release.yml`) when a version tag is pushed.
+
+### From source
+
 On Linux (Kali, Debian, Ubuntu, Fedora, Arch, ...) and macOS, from a clone of
 this repository. No Homebrew is needed on Linux: the script uses the system's
 package manager.
@@ -56,7 +77,7 @@ does it, all in one go:
 
 - a C compiler if there is none (the Xcode Command Line Tools on macOS, the
   distribution's compiler package on Linux);
-- the Rust toolchain through `rustup` if there is none or it is older than 1.88;
+- the Rust toolchain through `rustup` if there is none or it is older than 1.89;
 - meow itself, built and installed as `~/.cargo/bin/meow`;
 - the scanners `meow recon` drives: `nmap`, `katana` and `feroxbuster`, with
   Homebrew on macOS or the system package manager on Linux (`feroxbuster` is
@@ -77,11 +98,15 @@ that cannot be installed is reported and skipped; meow works without it.
 ### Updating
 
 ```sh
-meow update            # pull the latest from GitHub, rebuild, add new tools
+meow update            # install the newest version
 meow update --check    # only show what is new
 ```
 
-`meow update` works in the folder meow was installed from (or `--source
+A meow installed from a release download asks GitHub for the newest
+release, downloads the file for this computer, checks its SHA-256 and puts it
+in place of the running one (with `sudo` when it lives in `/usr/local/bin`).
+
+A meow built from source works in the folder it was installed from (or `--source
 <folder>`). It pulls only when that folder has no local changes and the pull is
 a fast-forward, then runs `./install.sh --yes` there (on Windows, where a
 running executable cannot overwrite itself, it prints the `.\install.ps1 -Yes`
@@ -94,7 +119,7 @@ Linux with `apt`, `dnf`, `yum`, `pacman`, `zypper` or `apk`, and on Windows
 via `.\install.ps1` (`winget` or `scoop` for Visual Studio Build Tools and
 scanners, or manual Rust from <https://rustup.rs> + `cargo install --path . --locked`).
 
-To build by hand instead (Rust 1.88 or newer and a C compiler):
+To build by hand instead (Rust 1.89 or newer and a C compiler):
 
 ```sh
 cargo build --release        # binary: target/release/meow

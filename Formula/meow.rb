@@ -5,7 +5,7 @@ class Meow < Formula
   #   brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
   #   brew trust Jrdelt/meow   # Homebrew 7+
   #   brew install meow        # or `brew install --HEAD meow`
-  url Pathname.new(__dir__).parent.realpath.to_s, using: :git, tag: "v0.1.0"
+  url Pathname.new(__dir__).parent.realpath.to_s, using: :git, tag: "v0.1.1"
   license "MIT"
   head Pathname.new(__dir__).parent.realpath.to_s, using: :git, branch: "main"
 

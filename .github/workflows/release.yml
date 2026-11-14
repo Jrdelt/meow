@@ -1,0 +1,127 @@
+# Builds meow for macOS, Linux and Windows when a version tag (v1.2.3) is
+# pushed, and publishes the files on that tag's GitHub Release: a .pkg
+# installer for macOS, plus .tar.gz / .zip archives that `meow update`
+# fetches, each with a .sha256 file. Only the pinned checkout action is
+# used; uploads go through the gh CLI the runners carry.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  draft:
+    name: draft the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag is $GITHUB_REF_NAME but Cargo.toml says $version." >&2
+            exit 1
+          fi
+      - name: Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "meow $GITHUB_REF_NAME" --notes-file .github/release-notes.md
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
+          - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Build
+        env:
+          # Tells meow it is a release build, and which file is its own,
+          # so `meow update` downloads releases instead of pulling code.
+          MEOW_RELEASE_BUILD: ${{ matrix.name }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          name="meow-$version-${{ matrix.name }}"
+          out="target/${{ matrix.target }}/release"
+          case "${{ matrix.name }}" in
+          windows-*)
+            cp "$out/meow.exe" meow.exe
+            pwsh -NoProfile -Command "Compress-Archive -Path meow.exe -DestinationPath $name.zip"
+            files="$name.zip"
+            ;;
+          *)
+            tar -czf "$name.tar.gz" -C "$out" meow
+            files="$name.tar.gz"
+            ;;
+          esac
+          case "${{ matrix.name }}" in
+          macos-*)
+            # Double-click installer: puts meow in /usr/local/bin.
+            mkdir -p pkgroot/usr/local/bin
+            cp "$out/meow" pkgroot/usr/local/bin/meow
+            pkgbuild --root pkgroot --identifier io.github.jrdelt.meow \
+              --version "$version" --install-location / "$name.pkg"
+            files="$files $name.pkg"
+            ;;
+          esac
+          for file in $files; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$file" >"$file.sha256"
+            else
+              shasum -a 256 "$file" >"$file.sha256"
+            fi
+            gh release upload "$GITHUB_REF_NAME" "$file" "$file.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

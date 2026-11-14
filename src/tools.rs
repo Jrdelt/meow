@@ -1,7 +1,8 @@
-//! The external tools `meow recon` drives (nmap, katana, feroxbuster) and
-//! its wordlist: checked before a recon is queued, and installed on request
+//! The external tools `meow recon` drives (nmap, katana, feroxbuster), its
+//! wordlist, and the map's location database: checked before a recon is
+//! queued and offered once on the first session, and installed on request
 //! with the tool part of `install.sh`, of which meow carries its own copy so
-//! no source folder is needed.
+//! no source folder (and no clone) is needed.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -77,7 +78,39 @@ pub fn gaps(settings: &ReconSettings) -> Vec<Gap> {
             stage: "the directory stage",
         });
     }
+    if !location_database_installed() {
+        out.push(Gap {
+            name: "the location database".to_owned(),
+            stage: "placing scanned servers on the map",
+        });
+    }
     out
+}
+
+/// Whether `install.sh` has put the location database in `~/.meow/geo`.
+fn location_database_installed() -> bool {
+    crate::workspace::MeowHome::from_env()
+        .map(|home| crate::geoip::GeoDb::new(&home.root().join(crate::geoip::DIR)).available())
+        .unwrap_or(false)
+}
+
+/// Marks that the first session on this machine has offered the extras.
+pub const OFFERED_FILE: &str = "extras-offered";
+
+/// The first session on a machine lists what recon and the map can use
+/// that is missing (scanners, wordlist, location database) and offers to
+/// install it, once. Later, `meow tools` does the same on request.
+pub fn first_run_offer(home: &Path, settings: &ReconSettings) -> Result<()> {
+    let marker = home.join(OFFERED_FILE);
+    if marker.exists() || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    crate::workspace::write_private_atomic(&marker, b"offered\n")?;
+    if gaps(settings).is_empty() {
+        return Ok(());
+    }
+    println!("[+] First session on this machine: meow recon and the map can use a few extras.");
+    offer(settings, false)
 }
 
 fn show(gaps: &[Gap]) {
@@ -139,12 +172,19 @@ pub fn offer(settings: &ReconSettings, assume_yes: bool) -> Result<()> {
         return Ok(());
     }
     install()?;
-    let still = gaps(settings);
-    if still.is_empty() {
+    let (map, recon): (Vec<Gap>, Vec<Gap>) = gaps(settings)
+        .into_iter()
+        .partition(|gap| gap.name == "the location database");
+    if recon.is_empty() {
         println!("[+] Every tool recon uses is installed.");
     } else {
-        show(&still);
+        show(&recon);
         println!("[!] Those stages will be skipped; the messages above say why.");
+    }
+    if !map.is_empty() {
+        println!(
+            "[!] The location database is not installed yet, so the map places only your own machine; `meow tools` tries again."
+        );
     }
     Ok(())
 }
@@ -163,6 +203,14 @@ pub fn run(settings: &ReconSettings, assume_yes: bool) -> Result<()> {
     ) {
         Some(path) => println!("[+] {:<12} {}", "wordlist", path.display()),
         None => println!("[!] {:<12} none found", "wordlist"),
+    }
+    if location_database_installed() {
+        println!("[+] {:<12} installed", "location db");
+    } else {
+        println!(
+            "[!] {:<12} not installed (the map places only your own machine)",
+            "location db"
+        );
     }
     offer(settings, assume_yes)
 }
@@ -209,6 +257,9 @@ mod tests {
         ];
         if !wordlist_installed {
             expected.push("a wordlist");
+        }
+        if !location_database_installed() {
+            expected.push("the location database");
         }
         assert_eq!(names, expected);
     }

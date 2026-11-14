@@ -21,6 +21,7 @@ pub mod observer;
 pub mod parsers;
 pub mod pty;
 pub mod queue;
+pub mod release;
 pub mod report;
 pub mod setup;
 pub mod shims;

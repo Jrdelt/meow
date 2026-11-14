@@ -124,7 +124,7 @@ impl Db {
             let tx = self.conn.transaction()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("migration {} failed", index + 1))?;
-            tx.pragma_update(None, "user_version", index + 1)?;
+            tx.pragma_update(None, "user_version", i64::try_from(index + 1)?)?;
             tx.commit()?;
         }
         Ok(())
