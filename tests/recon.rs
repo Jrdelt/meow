@@ -202,7 +202,7 @@ fn four_stages_run_in_order_one_at_a_time_and_fill_the_graph() {
     assert_eq!(
         calls[0],
         format!(
-            "start nmap {scan} -T3 --top-ports 1000 -p 1-1000 -oX {}/nmap_ports_{id}.xml -- 10.0.0.0/24",
+            "start nmap {scan} -T3 -p 1-1000 -oX {}/nmap_ports_{id}.xml -- 10.0.0.0/24",
             tmp_dir.display()
         )
     );

@@ -561,6 +561,20 @@ pub fn adapt_for_privilege(flags: Vec<String>, privileged: bool) -> (Vec<String>
             notices.push(
                 "not running as root: removed -O (OS detection needs raw sockets)".to_owned(),
             );
+        } else if is_scan_technique_flag(&flag) && flag[2..].contains('U') {
+            // A UDP scan needs raw sockets: nmap would refuse the whole run.
+            let rest: String = flag[2..]
+                .chars()
+                .filter(|&c| c != 'U')
+                .map(|c| if c == 'S' { 'T' } else { c })
+                .collect();
+            notices.push(format!(
+                "not running as root: left out the UDP scan in {flag} (it needs root; scan UDP \
+                 with `sudo nmap -sU -oX udp.xml <target>` and import it with `meow add udp.xml`)"
+            ));
+            if !rest.is_empty() {
+                out.push(format!("-s{rest}"));
+            }
         } else if flag.starts_with("-s") && !flag.starts_with("--") && flag[2..].contains('S') {
             notices.push(format!(
                 "not running as root: {flag} replaced with {} (connect scan)",
@@ -585,6 +599,35 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Flags that say which ports to scan.
+fn chooses_ports(flag: &str) -> bool {
+    flag == "-F"
+        || flag.starts_with("--top-ports")
+        || flag.starts_with("--port-ratio")
+        || (flag.starts_with("-p") && !flag.starts_with("--"))
+}
+
+/// The preset's flags without its own choice of ports (`--top-ports 1000`,
+/// `-p-`, `-F`). nmap applies `--top-ports` within any `-p` range, so an
+/// operator's `-p-` next to the preset's `--top-ports 1000` would still
+/// scan only 1,000 ports.
+fn without_port_choice(flags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(flags.len());
+    let mut flags = flags.into_iter();
+    while let Some(flag) = flags.next() {
+        if !chooses_ports(&flag) {
+            out.push(flag);
+            continue;
+        }
+        // `-p 80`, `--top-ports 1000`, `--port-ratio 0.1` take their value
+        // as the next argument; `-p-`, `-p80`, `--top-ports=1000` do not.
+        if matches!(flag.as_str(), "-p" | "--top-ports" | "--port-ratio") {
+            flags.next();
+        }
+    }
+    out
+}
+
 /// Stage 1: port inventory.
 pub fn ports_command(
     settings: &ReconSettings,
@@ -594,7 +637,12 @@ pub fn ports_command(
     privileged: bool,
     output: &Path,
 ) -> (ToolCommand, Vec<String>) {
-    let mut flags = preset.nmap_ports.clone();
+    // Ports the operator names replace the preset's choice of ports.
+    let mut flags = if extra.iter().any(|flag| chooses_ports(flag)) {
+        without_port_choice(preset.nmap_ports.clone())
+    } else {
+        preset.nmap_ports.clone()
+    };
     flags.extend(extra.iter().cloned());
     let (mut args, notices) = adapt_for_privilege(flags, privileged);
     let ipv6 = match target {
@@ -1433,6 +1481,18 @@ mod tests {
         assert_eq!(notices.len(), 3);
         assert!(notices[0].contains("-sS replaced with -sT"));
         assert!(notices[1].contains("removed -O"));
+
+        // UDP needs root: left out, with a way to do it by hand.
+        let (user, notices) = adapt_for_privilege(strings(&["-sU", "-sSU", "-T3"]), false);
+        assert_eq!(user, strings(&["-sT", "-T3"]));
+        assert_eq!(notices.len(), 2);
+        assert!(
+            notices[0].contains("left out the UDP scan in -sU"),
+            "{notices:?}"
+        );
+        assert!(notices[0].contains("meow add udp.xml"), "{notices:?}");
+        let (root, notices) = adapt_for_privilege(strings(&["-sU"]), true);
+        assert_eq!((root, notices.len()), (strings(&["-sU"]), 0));
     }
 
     #[test]
@@ -1450,14 +1510,38 @@ mod tests {
         );
         assert!(notices.is_empty());
 
+        // Ports the operator names replace the preset's --top-ports, which
+        // nmap would otherwise apply within them (verified with nmap 7.94:
+        // `--top-ports 1000 -p-` scans 1000 ports, `-p-` alone 65535).
         let extra = strings(&["-p", "80,443", "-O"]);
         let (command, notices) =
             ports_command(&settings, &mild, &target("10.0.0.5"), &extra, false, out);
         assert_eq!(
             args(&command),
-            "-sT -T3 --top-ports 1000 -p 80,443 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
+            "-sT -T3 -p 80,443 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
         );
         assert_eq!(notices.len(), 2);
+        for (extra, expected) in [
+            (vec!["-p-"], "-sS -T3 -p-"),
+            (vec!["-p1-10000"], "-sS -T3 -p1-10000"),
+            (vec!["--top-ports", "100"], "-sS -T3 --top-ports 100"),
+            (vec!["-F"], "-sS -T3 -F"),
+            (vec!["-Pn"], "-sS -T3 --top-ports 1000 -Pn"),
+        ] {
+            let (command, _) = ports_command(
+                &settings,
+                &mild,
+                &target("10.0.0.5"),
+                &strings(&extra),
+                true,
+                out,
+            );
+            assert_eq!(
+                args(&command),
+                format!("{expected} -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"),
+                "{extra:?}"
+            );
+        }
 
         let aggressive = settings.preset(Mode::Aggressive, &PresetOverride::default());
         let (command, _) = ports_command(

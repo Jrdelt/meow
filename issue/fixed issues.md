@@ -131,3 +131,9 @@ Verified fixes moved here from `issue/issues.md` after passing `cargo fmt --chec
 - **Problem:** Reported on Kali: "meow setup doesn't let me paste the key". In a terminal Ctrl+V sends a control key, not the clipboard. Both key prompts stored it as a literal `v`, so the saved key was wrong and the Claude API answered `invalid x-api-key`. The plain prompt also echoed nothing at all, so a paste that worked looked the same as one that did not.
 - **Resolution:** Ctrl+V (and other Ctrl/Alt chords) no longer add characters; both prompts say to paste with Ctrl+Shift+V or right-click. The plain prompt enables bracketed paste and prints one `*` per character received (the wizard already did); the wizard's edit box names the paste keys.
 - **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux).
+
+### `ISS-013` [Medium / Coverage] — Operator Port Ranges Were Silently Capped at 1,000 Ports; UDP Failed Without Root
+- **Locations Fixed:** `src/queue.rs` (`chooses_ports`, `without_port_choice`, `ports_command`, `adapt_for_privilege`), `tests/recon.rs`
+- **Problem:** The mild preset passes `--top-ports 1000`, and extra flags were appended after it. nmap applies `--top-ports` within any `-p` range, so `meow recon <host> -- -p-` or `-- -p 1-10000` still scanned only 1,000 ports (verified with nmap 7.94: `--top-ports 1000 -p-` reports `numservices="1000"`, `-p-` alone `65535`). Ports outside the top 1,000 were missed without any sign. Separately, `-sU` without root made nmap refuse the whole port stage.
+- **Resolution:** A port choice in the operator's flags (`-p…`, `--top-ports`, `-F`, `--port-ratio`) now replaces the preset's. Without root, the UDP part of a scan-technique flag is left out with a notice saying how to run it with `sudo` and import the result.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux).
