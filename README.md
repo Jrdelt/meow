@@ -124,16 +124,17 @@ terminal, add `--session <name>` or `--local`.
 
 `meow map` draws your network like a home-network illustration: your router
 (or access point) in the middle, the Internet cloud joined to it at the top
-right, and the devices on your network around the router, you among them.
+right, and the devices on your network around the router on straight lines,
+you among them.
 
 | On the map | What it means |
 |---|---|
-| Waves around the router | Your connection to it is Wi-Fi, so devices are drawn without lines. On Ethernet each device hangs off an orthogonal line. |
+| Line to the router | Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
 | Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
 | Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
 | Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
 | Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
-| `+N more` | More than 16 devices fold away; click to unfold, then "show fewer". |
+| `+N more` | More than 14 devices fold away (13 with a VPN or virtual network below you); click to unfold, then "show fewer". |
 | VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
 | Compass | Where this machine roughly is, estimated from its public address (see below). |
 

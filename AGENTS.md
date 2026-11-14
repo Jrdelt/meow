@@ -83,12 +83,11 @@ Before every push:
     OpenAI-style one. A refusal walks the user's fallback chain in order.
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system and
     user startup files load natively. Never keep it on the shim after that.
-  - Map page: a dashboard of cards; no inline scripts, no `innerHTML`; checked
-    by hand in Chromium (Playwright). The topology is a home-network illustration
-    (router centre, devices on rings, cloud top right, VPN and virtual
-    networks below you; `link` picks Wi-Fi); the compass/VPN note come from
-    `location.rs`, asked only after the page sends `locate`; `topology::Role` carries the reason; the
-    Internet and neighbour clients are drawn only, never hosts. `observer::machine_report` words "this machine" for map and HUD.
+  - Map page: cards, no inline scripts, no `innerHTML`; checked in Chromium.
+    Topology: router centre, devices on rings (solid wired / dotted Wi-Fi from
+    `link`), cloud top right, VPN and virtual networks below you. Compass and
+    VPN note: `location.rs`, only after the page sends `locate`. Internet and
+    neighbour clients are drawn only, never hosts.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target

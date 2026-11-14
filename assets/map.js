@@ -11,17 +11,20 @@
 
   // The map is drawn like a home-network illustration: the router (or
   // access point) in the middle, the Internet cloud off to the top right,
-  // and the devices on your network around the router. Devices on Wi-Fi
-  // have no line (waves around the router say they are wireless); wired
-  // ones hang off orthogonal lines. A VPN leaves through the cloud.
+  // and the devices on your network around the router, each on a straight
+  // line to it: solid when wired, dotted when on Wi-Fi. meow can only see
+  // how this machine connects, so the other devices are drawn the same way
+  // (the legend says so). What only this machine uses (a VPN, a virtual
+  // network) hangs below you.
   var RING1 = { rx: 300, ry: 205 }, RING2 = { rx: 470, ry: 320 };
   // Slots around the router, in degrees (0 = right, 90 = down), most
   // wanted first. The top right is left free for the cloud.
+  // The outer ring sits between the inner ring's places, so every straight
+  // line from the router passes between devices, not through them.
   var SLOTS1 = [20, 160, 200, 125, 235, 90, 55, 268];
-  var SLOTS2 = [180, 145, 215, 112, 248, 80, 40, 285, 165, 195];
+  var SLOTS2 = [180, 142, 218, 108, 252, 72, 40, 285];
   // With networks of your own below you, the lower right stays theirs.
   var BUSY_BELOW_YOU = [40];
-  var MAX_DEVICES = SLOTS1.length + SLOTS2.length - 2;  // "you" and "+N more" take a slot
   var CLOUD = { x: 360, y: -230 };
   var expanded = {};    // networks the reader unfolded, by network id
   var askedWhere = false;
@@ -42,7 +45,7 @@
     ['client', 'a client'],
     ['you', 'you']
   ];
-  var PICTURES = ROLES.map(function (role) { return role[0]; }).concat(['printer', 'waves']);
+  var PICTURES = ROLES.map(function (role) { return role[0]; }).concat(['printer']);
 
   function icon(role) {
     return '/assets/icon-' + role + '.svg?token=' + encodeURIComponent(token);
@@ -74,7 +77,6 @@
       { selector: 'node.cloud', style: {
         'width': 170, 'height': 118, 'text-valign': 'center', 'text-margin-y': 8, 'font-size': 17, 'font-weight': 700,
         'color': '#1f2d3d' } },
-      { selector: 'node.waves', style: { 'width': 330, 'height': 216, 'events': 'no', 'label': '', 'z-index': 1 } },
       { selector: 'node.title', style: {
         'width': 1, 'height': 1, 'events': 'no', 'text-valign': 'top', 'text-halign': 'right',
         'text-margin-y': 0, 'font-weight': 700, 'font-size': 13, 'color': 'data(color)', 'text-max-width': 360 } },
@@ -93,6 +95,9 @@
         'label': 'data(text)', 'font-family': FONT, 'font-size': 12, 'color': 'data(color)',
         'text-background-color': '#ffffff', 'text-background-opacity': 0.9, 'text-background-padding': 3 } },
       { selector: 'edge.down', style: { 'taxi-direction': 'vertical' } },
+      // From the router to each device: straight, solid when wired, dotted on Wi-Fi.
+      { selector: 'edge.spoke', style: { 'curve-style': 'straight', 'width': 2.2 } },
+      { selector: 'edge.wifi', style: { 'line-style': 'dotted', 'width': 2.6 } },
       // To a network below the rings: across only after clearing them.
       { selector: 'edge.low', style: { 'taxi-turn': '92%' } },
       { selector: 'edge.thin', style: { 'curve-style': 'straight', 'width': 1.4 } },
@@ -304,30 +309,32 @@
       var gateways = linked(home, ['gateway']).sort(bySeverity);
       hub = gateways[0] || home;
       put(hub, 0, 0, ['hub']);
+      // Only this machine's own link is known; the others are drawn alike.
       var wireless = data[home].link === 'wifi';
-      if (wireless) {
-        data.waves = { id: 'waves', kind: 'waves', label: '', icon: 'waves' };
-        pos.waves = { x: 0, y: 22 };
-        classes.waves = 'waves';
-      }
       // The network's name goes under the router's own.
       networkOf[hub] = caption(home) + (data[home].network ? ' · ' + data[home].network : '');
       var devices = gateways.slice(1).concat(linked(home, ['neighbour', 'direct']).filter(function (id) {
         return id !== hub && !placed[id];
       }).sort(bySeverity));
-      var hidden = 0, unfolded = devices.length > MAX_DEVICES && expanded[home];
-      if (devices.length > MAX_DEVICES && !expanded[home]) {
-        devices.slice(MAX_DEVICES).forEach(function (id) { placed[id] = true; });
-        hidden = devices.length - MAX_DEVICES;
-        devices = devices.slice(0, MAX_DEVICES);
+      var outer = own.length ? SLOTS2.filter(function (a) { return BUSY_BELOW_YOU.indexOf(a) < 0; }) : SLOTS2;
+      var slots = SLOTS1.map(function (a) { return [a, RING1]; }).concat(outer.map(function (a) { return [a, RING2]; }));
+      // Two rings hold you, the devices and, when there are more, the
+      // "+N more" in the last place.
+      var cap = slots.length - 2;
+      var hidden = 0, unfolded = devices.length > cap && expanded[home];
+      if (devices.length > cap && !expanded[home]) {
+        devices.slice(cap).forEach(function (id) { placed[id] = true; });
+        hidden = devices.length - cap;
+        devices = devices.slice(0, cap);
       }
       var around = ['local'].concat(devices);
       if (hidden || unfolded) { around.push(more(home, hidden, unfolded)); }
-      var outer = own.length ? SLOTS2.filter(function (a) { return BUSY_BELOW_YOU.indexOf(a) < 0; }) : SLOTS2;
-      var slots = SLOTS1.map(function (a) { return [a, RING1]; }).concat(outer.map(function (a) { return [a, RING2]; }));
-      // Unfolded: further rings, as many as it takes.
+      // Unfolded: further rings, as many as it takes, clear of the cloud
+      // and of what hangs below you.
       for (var ring = 3; slots.length < around.length; ring++) {
-        for (var a = 0; a < 360; a += 360 / (8 + ring * 4)) {
+        var step = 360 / (8 + ring * 4);
+        for (var a = step / 2; a < 360; a += step) {
+          if ((a > 292 && a < 358) || (own.length && a > 5 && a < 85)) { continue; }
           slots.push([a, { rx: RING2.rx + (ring - 2) * 170, ry: RING2.ry + (ring - 2) * 120 }]);
         }
       }
@@ -335,7 +342,8 @@
         var angle = slots[i][0] * Math.PI / 180, r = slots[i][1];
         put(id, Math.cos(angle) * r.rx, Math.sin(angle) * r.ry, id === 'local' ? ['you'] : []);
         if (id.indexOf('more:') === 0) { classes[id] = 'none more'; }
-        if (!wireless && id.indexOf('more:') !== 0) { link(hub, id, LINE.ethernet); }
+        // Every device, and the "+N more" standing for the rest, on its line.
+        link(hub, id, LINE.ethernet, wireless ? 'spoke wifi' : 'spoke');
       });
       // The Internet, joined to the router like a modem, and what was
       // reached there beside it.
@@ -419,7 +427,7 @@
     Object.keys(pos).forEach(function (id) {
       var d = Object.assign({}, data[id]);
       d.text = d.kind === 'title' || d.kind === 'more' ? d.label
-        : (['waves', 'bar', 'anchor'].indexOf(d.kind) >= 0 ? '' : caption(id));
+        : (['bar', 'anchor'].indexOf(d.kind) >= 0 ? '' : caption(id));
       if (networkOf[id]) { d.text += '\n' + networkOf[id]; }
       elements.push({ group: 'nodes', data: d, classes: classes[id] });
     });
@@ -505,14 +513,14 @@
       item.appendChild(el('span', 'glow ' + key[0]));
       item.appendChild(el('span', null, key[1]));
     });
-    [['solid', 'wired', LINE.ethernet], ['dashed', 'VPN', LINE.vpn], ['dashed', 'virtual network', LINE.virtual]].forEach(function (key) {
+    [['solid', 'wired', LINE.ethernet], ['dotted', 'Wi-Fi', LINE.ethernet],
+     ['dashed', 'VPN', LINE.vpn], ['dashed', 'virtual network', LINE.virtual]].forEach(function (key) {
       var item = legend.appendChild(el('span', 'item'));
       var bar = item.appendChild(el('span', 'bar ' + key[0]));
       bar.style.borderColor = key[2];
       item.appendChild(el('span', null, key[1]));
     });
-    var waves = legend.appendChild(el('span', 'item'));
-    waves.appendChild(el('span', null, '))) Wi-Fi: no line'));
+    legend.appendChild(el('span', 'item note', 'Other devices are drawn connected the way you are (assumed: meow only sees your own link).'));
   }
 
   // Why a node is drawn the way it is. A hint, not a finding.
