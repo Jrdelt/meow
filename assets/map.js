@@ -969,16 +969,34 @@
   function hostCards(host, data) {
     var cards = [];
 
+    // Each open port and its service; then the software that answered on
+    // each (the versions); then what the scan tried that was not open.
     var ports = card('Open Ports');
-    var closed = [];
-    Object.keys(host.ports).forEach(function (key) {
+    var versions = [], closed = [];
+    Object.keys(host.ports).sort(function (a, b) {
+      return host.ports[a].number - host.ports[b].number || (a < b ? -1 : 1);
+    }).forEach(function (key) {
       var port = host.ports[key];
       if (port.state !== 'open') { closed.push(key + ' (' + port.state + ')'); return; }
-      var what = [port.service, port.product, port.version].filter(Boolean).join(' ');
-      ports.appendChild(row(key, marked(what || 'open', 'ok')));
+      var name = String(port.number) + (port.protocol === 'tcp' ? '' : '/' + port.protocol);
+      var service = /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || 'open');
+      ports.appendChild(row(name, marked(service.toUpperCase(), 'ok')));
+      var software = [port.product, port.version].filter(Boolean).join(' ');
+      if (software) {
+        versions.push([name, software + (port.extra_info ? ' (' + port.extra_info + ')' : '')]);
+      }
     });
     if (!data.open_ports) { ports.appendChild(el('p', 'note', 'None seen open.')); }
-    if (closed.length) { ports.appendChild(el('p', 'note', 'Not seen open: ' + closed.join(', '))); }
+    if (versions.length) {
+      ports.appendChild(el('h3', null, 'Versions'));
+      versions.forEach(function (version) { ports.appendChild(row(version[0], version[1])); });
+    }
+    if (closed.length) { ports.appendChild(el('p', 'note', 'Seen before, not open now: ' + closed.join(', '))); }
+    Object.keys(host.not_open || {}).forEach(function (key) {
+      var group = host.not_open[key];
+      ports.appendChild(el('p', 'note', 'Tried and ' + group.state + ' (' + group.count + ' ' + group.protocol +
+        (group.count === 1 ? ' port' : ' ports') + ')' + (group.ports ? ': ' + group.ports.split(',').join(', ') : '.')));
+    });
     cards.push(ports);
 
     // What the web ports gave away: server headers, certificate names, paths.

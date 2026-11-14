@@ -326,6 +326,42 @@ pub struct Host {
     pub facts: Vec<Fact>,
     #[serde(default)]
     pub advisories: Vec<Advisory>,
+    /// Ports the latest scan tried that were not open, by `<protocol> <state>`.
+    #[serde(default)]
+    pub not_open: BTreeMap<String, NotOpen>,
+}
+
+/// Ports a scan tried that did not answer as open.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotOpen {
+    pub protocol: String,
+    pub state: String,
+    pub count: u32,
+    /// Port numbers and ranges, e.g. `1-21,23,25-79` (shortened when long).
+    pub ports: String,
+}
+
+/// The longest port list kept for one group of ports that were not open.
+const NOT_OPEN_MAX: usize = 600;
+
+/// A port list with nothing but numbers, commas and dashes, shortened to
+/// `NOT_OPEN_MAX` at a comma and ending in `,…` when anything was cut.
+fn clean_port_list(text: &str) -> String {
+    let mut list: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == ',' || *c == '-')
+        .collect();
+    let cut = list.len() > NOT_OPEN_MAX || text.ends_with('…');
+    if list.len() > NOT_OPEN_MAX {
+        let at = list[..NOT_OPEN_MAX].rfind(',').unwrap_or(0);
+        list.truncate(at);
+    }
+    let list = list.trim_end_matches(',').to_owned();
+    if cut && !list.is_empty() {
+        format!("{list},…")
+    } else {
+        list
+    }
 }
 
 impl Host {
@@ -480,6 +516,16 @@ pub enum Observation {
     Note {
         address: Option<String>,
         text: String,
+        record: EvidenceRecord,
+    },
+    /// Ports a scan tried that did not answer as open, by protocol and state
+    /// (`closed`, `filtered`...): how many, and which (`1-21,23,25-79`).
+    NotOpen {
+        address: String,
+        protocol: String,
+        state: String,
+        count: u32,
+        ports: String,
         record: EvidenceRecord,
     },
     /// What an nmap script reported, about one port or (`port: None`) about
@@ -716,6 +762,7 @@ impl Observation {
             | Observation::TlsSan { address, .. }
             | Observation::Http { address, .. }
             | Observation::Path { address, .. }
+            | Observation::NotOpen { address, .. }
             | Observation::Script { address, .. } => Some(address),
             Observation::Note { address, .. } => address.as_deref(),
         }
@@ -880,6 +927,25 @@ impl Graph {
                     ports,
                     facts,
                     advisories,
+                    not_open: host
+                        .not_open
+                        .into_values()
+                        .filter_map(|group| {
+                            let protocol = normalize_protocol(&group.protocol)?;
+                            let state = clean(&group.state);
+                            let ports = clean_port_list(&group.ports);
+                            Some((
+                                format!("{protocol} {state}"),
+                                NotOpen {
+                                    protocol,
+                                    state,
+                                    count: group.count,
+                                    ports,
+                                },
+                            ))
+                        })
+                        .take(16)
+                        .collect(),
                 },
             );
         }
@@ -1192,6 +1258,32 @@ impl Graph {
                 insert_path(&mut entry.paths, &segments, &mut budget, status, record)
                     .unwrap_or(false)
             }
+            Observation::NotOpen {
+                address,
+                protocol,
+                state,
+                count,
+                ports,
+                record: _,
+            } => {
+                let Some(protocol) = normalize_protocol(&protocol) else {
+                    return false;
+                };
+                let state = clean(&state.to_ascii_lowercase());
+                let Some(host) = self.host_entry(&address) else {
+                    return false;
+                };
+                let ports = clean_port_list(&ports);
+                let group = NotOpen {
+                    protocol: protocol.clone(),
+                    state: state.clone(),
+                    count,
+                    ports,
+                };
+                // The latest scan says which ports are not open now.
+                let key = format!("{protocol} {state}");
+                host.not_open.insert(key, group.clone()) != Some(group)
+            }
             Observation::Script {
                 address,
                 port,
@@ -1409,6 +1501,41 @@ mod tests {
         );
         assert_eq!(graph.hosts["2001:db8::a"].ports.len(), 2);
         assert!(!graph.apply(port("not a host!", 1, "x", None)));
+    }
+
+    #[test]
+    fn the_latest_scan_says_which_ports_are_not_open() {
+        let not_open = |state: &str, count: u32, ports: &str| Observation::NotOpen {
+            address: "10.0.0.5".into(),
+            protocol: "TCP".into(),
+            state: state.into(),
+            count,
+            ports: ports.into(),
+            record: rec(Source::NmapXml),
+        };
+        let mut graph = Graph::default();
+        assert!(graph.apply(not_open("closed", 3, "21,23,<b>25</b>")));
+        assert!(!graph.apply(not_open("closed", 3, "21,23,25")));
+        assert_eq!(
+            graph.hosts["10.0.0.5"].not_open["tcp closed"].ports,
+            "21,23,25"
+        );
+        // A newer scan replaces the list; a long one is cut at a comma.
+        let long: Vec<String> = (1..2000).step_by(2).map(|n| n.to_string()).collect();
+        assert!(graph.apply(not_open("closed", 1000, &long.join(","))));
+        let ports = &graph.hosts["10.0.0.5"].not_open["tcp closed"].ports;
+        assert!(
+            ports.len() <= NOT_OPEN_MAX + 4 && ports.ends_with(",…"),
+            "{ports}"
+        );
+        assert!(!graph.apply(Observation::NotOpen {
+            address: "10.0.0.5".into(),
+            protocol: "icmp".into(),
+            state: "closed".into(),
+            count: 1,
+            ports: "1".into(),
+            record: rec(Source::NmapXml),
+        }));
     }
 
     #[test]

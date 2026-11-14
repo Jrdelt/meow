@@ -175,7 +175,9 @@ rows of label and value:
   verify, informational notes and false positives each fold open. An entry
   unfolds into its verification checklist and the buttons to confirm it, mark
   it a false positive or reopen it. Without a selection it covers every host.
-- For a selected host: **Open Ports**, **Web** (server headers, certificate
+- For a selected host: **Open Ports** (each port and its service, a
+  **Versions** section with the software that answered, and the ports the
+  last scan tried that were closed or filtered), **Web** (server headers, certificate
   names and paths, when there are any), **Ask AI**, **Evidence**, **Add a note**.
 - **Hosts** (click one to select it), **Routes**, **Neighbours**,
   **All interfaces**, **Background Tasks** and **Notices**.

@@ -568,7 +568,9 @@ fn observation_address(observation: &Observation) -> Option<String> {
         | Observation::Http { address, .. }
         | Observation::Path { address, .. } => Some(address.clone()),
         Observation::Note { address, .. } => address.clone(),
-        Observation::Script { address, .. } => Some(address.clone()),
+        Observation::Script { address, .. } | Observation::NotOpen { address, .. } => {
+            Some(address.clone())
+        }
     }
 }
 
