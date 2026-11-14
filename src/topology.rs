@@ -513,7 +513,15 @@ impl Topology {
                     .and_then(|i| routable_address(i).or(i.addresses.first().map(String::as_str)))
                     .and_then(|address| IpNetwork::from_str(address).ok())
                     .map(|n| format!("{}/{}", n.network(), n.prefix()));
-                let mut caption = format!("{word} {name}");
+                // Windows names connections "Wi-Fi" or "Ethernet" already.
+                let says_it = [word, "wi-fi", "wlan", "ethernet", "vpn"]
+                    .iter()
+                    .any(|w| name.to_lowercase().contains(&w.to_lowercase()));
+                let mut caption = if says_it {
+                    name.to_owned()
+                } else {
+                    format!("{word} {name}")
+                };
                 if let Some(network) = &network {
                     caption.push('\n');
                     caption.push_str(network);
@@ -579,6 +587,17 @@ impl Topology {
                 });
                 if let Some(network) = network {
                     data["network"] = json!(network);
+                }
+                // The connection kind colours a network's line on the map.
+                if node.kind == NodeKind::Interface {
+                    let name = node.id.strip_prefix("if:").unwrap_or(&node.id);
+                    let link = graph
+                        .local
+                        .interfaces
+                        .iter()
+                        .find(|i| i.name == name)
+                        .map_or("other", |i| i.kind.as_str());
+                    data["link"] = json!(link);
                 }
                 let host = node
                     .id

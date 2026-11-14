@@ -39,11 +39,13 @@ use crate::db::Db;
 use crate::endpoint::Target;
 use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
 use crate::graph::{Graph, Host, LocalNet, Observation};
+use crate::location::{self, Location};
 use crate::mode::Mode;
 use crate::observer;
 use crate::parsers::text::TextParser;
 use crate::pty::LineSink;
 use crate::queue;
+use crate::tiles::Picture;
 use crate::timeutil::now_rfc3339;
 use crate::topology::Topology;
 use crate::vault::Vault;
@@ -56,6 +58,10 @@ const MAX_NOTICES: usize = 100;
 const TAP_QUEUE: usize = 4096;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 const OBSERVE_EVERY: Duration = Duration::from_secs(30);
+/// How often the location is checked against the network, and how long
+/// after a failed lookup it is tried again.
+const LOCATE_EVERY: Duration = Duration::from_secs(30);
+const LOCATE_RETRY: Duration = Duration::from_secs(15 * 60);
 const WS_MIN_INTERVAL: Duration = Duration::from_millis(400);
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -155,6 +161,9 @@ pub enum Command {
         tier: Tier,
         address: String,
     },
+    /// Starts estimating where this machine is (the map sends it when it
+    /// opens); does nothing once started.
+    Locate,
 }
 
 /// The AI request that is running, or the last one that finished.
@@ -189,6 +198,11 @@ pub struct State {
     vault: Mutex<Vault>,
     ai: AiEngine,
     ai_status: Mutex<AiStatus>,
+    /// Where this machine is estimated to be; `None` until the map asks.
+    location: Mutex<Option<Location>>,
+    locating: AtomicBool,
+    /// The location map's pictures, served to the page from memory.
+    pictures: Mutex<Vec<Picture>>,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
 }
@@ -325,6 +339,7 @@ impl State {
             "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
             "notices": &*lock(&self.notices),
             "ai": &*lock(&self.ai_status),
+            "location": &*lock(&self.location),
             "budget": self.ai.budget(),
         })
     }
@@ -441,6 +456,12 @@ impl State {
                 )
             }
             Command::Resume => Ok(json!({ "resumed": self.resume_unfinished()? })),
+            Command::Locate => {
+                if !self.locating.swap(true, Ordering::SeqCst) {
+                    self.handle.spawn(location_loop(Arc::clone(self)));
+                }
+                Ok(json!({ "locating": true }))
+            }
             Command::Ai { tier, address } => {
                 let (graph, host) = {
                     let graph = self.graph();
@@ -547,6 +568,7 @@ fn observation_address(observation: &Observation) -> Option<String> {
         | Observation::Http { address, .. }
         | Observation::Path { address, .. } => Some(address.clone()),
         Observation::Note { address, .. } => address.clone(),
+        Observation::Script { address, .. } => Some(address.clone()),
     }
 }
 
@@ -696,10 +718,31 @@ async fn asset(AxumPath(name): AxumPath<String>) -> Response {
     webui::asset(&name)
 }
 
+/// One picture of the location map, from memory: the page never fetches
+/// pictures from anywhere else, and this never fetches anything.
+async fn map_tile(
+    AxumState(state): AxumState<Shared>,
+    AxumPath((z, x, y)): AxumPath<(u8, u32, u32)>,
+) -> Response {
+    let pictures = lock(&state.pictures);
+    match pictures
+        .iter()
+        .find(|picture| (picture.z, picture.x, picture.y) == (z, x, y))
+    {
+        Some(picture) => (
+            [(header::CONTENT_TYPE, picture.media_type)],
+            picture.bytes.clone(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn router(state: Shared) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/{name}", get(asset))
+        .route("/map/tile/{z}/{x}/{y}", get(map_tile))
         .route("/api/state", get(get_state))
         .route("/api/command", post(post_command))
         .route("/ws", get(websocket))
@@ -759,6 +802,71 @@ async fn observe_loop(state: Shared) {
             state.notice(warning);
         }
         state.mark_dirty();
+    }
+}
+
+/// Keeps the location estimate in step with the network: looked up again
+/// only when the VPNs, the default gateway or this machine's address
+/// change, or a while after a failed lookup.
+async fn location_loop(state: Shared) {
+    let settings = state.config.location.clone();
+    let mut last_key: Option<String> = None;
+    let mut retry_at: Option<std::time::Instant> = None;
+    loop {
+        let (key, plan) = {
+            let graph = state.graph();
+            (
+                location::network_key(&graph.local),
+                location::plan(&settings, &graph.local),
+            )
+        };
+        let retry = retry_at.is_some_and(|at| std::time::Instant::now() >= at);
+        if last_key.as_deref() != Some(key.as_str()) || retry {
+            last_key = Some(key);
+            retry_at = None;
+            let found = match plan {
+                location::Plan::Off => Location::Off,
+                location::Plan::Hidden(vpn) => Location::HiddenByVpn { vpn },
+                location::Plan::Lookup { partial_vpns } => {
+                    match location::lookup(&settings.url).await {
+                        Ok(place) => {
+                            let (map, map_error) = match location::map_for(&settings, &place).await
+                            {
+                                Some(Ok((view, pictures))) => {
+                                    *lock(&state.pictures) = pictures;
+                                    (Some(Box::new(view)), None)
+                                }
+                                Some(Err(error)) => {
+                                    retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
+                                    (None, Some(format!("{error:#}")))
+                                }
+                                None => (None, None),
+                            };
+                            Location::Found {
+                                place,
+                                source: location::source(&settings.url),
+                                vpn: partial_vpns,
+                                map,
+                                map_error,
+                            }
+                        }
+                        Err(error) => {
+                            retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
+                            Location::Unavailable {
+                                reason: format!("{error:#}"),
+                            }
+                        }
+                    }
+                }
+            };
+            // Pictures of a place no longer shown are dropped.
+            if !matches!(found, Location::Found { map: Some(_), .. }) {
+                lock(&state.pictures).clear();
+            }
+            *lock(&state.location) = Some(found);
+            state.touch();
+        }
+        tokio::time::sleep(LOCATE_EVERY).await;
     }
 }
 
@@ -947,6 +1055,9 @@ impl Coordinator {
             vault: Mutex::new(vault),
             ai: engine,
             ai_status: Mutex::new(AiStatus::default()),
+            location: Mutex::new(None),
+            locating: AtomicBool::new(false),
+            pictures: Mutex::new(Vec::new()),
             handle: runtime.handle().clone(),
         });
 
@@ -1067,6 +1178,113 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_map_asks_once_and_the_estimate_lands_in_the_snapshot() {
+        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        // A stand-in lookup and map picture service on its own thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            block_on(async move {
+                let app = axum::Router::new()
+                    .route(
+                        "/json",
+                        axum::routing::get(|| async {
+                            axum::Json(json!({ "ip": "203.0.113.7", "city": "Spokane",
+                                "region": "Washington", "country": "US", "loc": "47.6588,-117.4260" }))
+                        }),
+                    )
+                    .route("/tiles/{z}/{x}/{y}", axum::routing::get(|| async { JPEG }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let address = rx.recv().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        config.location.url = format!("http://{address}/json");
+        config.location.tiles = format!("http://{address}/tiles/{{z}}/{{x}}/{{y}}");
+        let coordinator = Coordinator::start(workspace, config).unwrap();
+        let state = coordinator.state();
+        let info = coordinator.info();
+        // A map picture as the page asks for it: (status, type, bytes).
+        let picture = |z: u64, x: u64, y: u64| {
+            block_on(async {
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let response = client
+                    .get(format!(
+                        "{}/map/tile/{z}/{x}/{y}?token={}",
+                        info.base_url(),
+                        info.token
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let kind = response
+                    .headers()
+                    .get("content-type")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                (status, kind, response.bytes().await.unwrap().to_vec())
+            })
+        };
+
+        // Nothing is looked up until the map asks.
+        assert_eq!(state.snapshot()["location"], Value::Null);
+        state.execute(Command::Locate).unwrap();
+        state.execute(Command::Locate).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let location = loop {
+            let location = state.snapshot()["location"].clone();
+            if !location.is_null() || std::time::Instant::now() > deadline {
+                break location;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // This test machine may itself be on a VPN that takes all traffic.
+        match location["status"].as_str() {
+            Some("found") => {
+                assert_eq!(location["place"]["city"], "Spokane");
+                assert_eq!(location["place"]["latitude"], 47.6588);
+                assert_eq!(location["source"], "127.0.0.1");
+                // The map came with it, its pictures served from memory.
+                let map = &location["map"];
+                assert_eq!(
+                    (map["width"].as_u64(), map["height"].as_u64()),
+                    (Some(192), Some(120))
+                );
+                assert_eq!(map["credit"], "Map pictures from 127.0.0.1");
+                assert!(location.get("map_error").is_none(), "{location}");
+                let tiles = map["tiles"].as_array().unwrap();
+                assert!(!tiles.is_empty());
+                for tile in tiles {
+                    let (z, x, y) = (
+                        tile["z"].as_u64().unwrap(),
+                        tile["x"].as_u64().unwrap(),
+                        tile["y"].as_u64().unwrap(),
+                    );
+                    let (status, kind, bytes) = picture(z, x, y);
+                    assert_eq!((status, kind.as_deref()), (200, Some("image/jpeg")));
+                    assert_eq!(bytes, JPEG);
+                }
+                // Only those: nothing else is fetched or served.
+                assert_eq!(picture(1, 0, 0).0, 404);
+            }
+            Some("hidden_by_vpn") => {
+                assert!(location["vpn"].as_array().is_some());
+                assert_eq!(picture(8, 44, 89).0, 404);
+            }
+            other => panic!("unexpected location {other:?}: {location}"),
+        }
+        coordinator.shutdown();
+    }
+
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1150,7 +1368,7 @@ mod tests {
     fn every_route_needs_the_token() {
         let fx = fixture();
         let info = fx.coordinator.info();
-        for path in ["/api/state", "/", "/ws"] {
+        for path in ["/api/state", "/", "/ws", "/map/tile/8/44/89"] {
             let (status, _) = request(&info, "GET", path, &[], None);
             assert_eq!(status, 401, "{path} without a token");
             let (status, _) = request(&info, "GET", &format!("{path}?token=wrong"), &[], None);

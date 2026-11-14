@@ -60,7 +60,7 @@ Before every push:
 
 - **Active Phase & Step:** `v0.1.0` release: Cat Setup GUI (`src/wizard.rs`), hardening (`ISS-001`..`ISS-011`), installers & GitHub/local sync complete; `meow tools` (recon checks and offers to install its tools).
 - **Last Verified Commit:** See `git log -n 1 --oneline`.
-- **In-Progress / Partial Work:** None (`330` tests passing).
+- **In-Progress / Partial Work:** None (`351` tests passing).
 - **Next Exact Action:** Log any newly discovered issues in `issue/issues.md`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
@@ -83,14 +83,17 @@ Before every push:
     OpenAI-style one. A refusal walks the user's fallback chain in order.
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system and
     user startup files load natively. Never keep it on the shim after that.
-  - Map page: a dashboard of cards; no inline scripts, no `innerHTML`; checked
-    by hand in Chromium (Playwright). `topology::Role` picks a node's icon and
-    carries the reason; the cloud and neighbour clients are drawn only, never
-    hosts. `observer::machine_report` words "this machine" for map and HUD.
+  - Map page: cards, no inline scripts, no `innerHTML`; checked in Chromium.
+    Topology: router centre, devices on rings (solid wired / dotted Wi-Fi from
+    `link`), cloud top right, VPN and virtual networks below you. Location
+    card and VPN note (`location.rs`; satellite tiles from `tiles.rs`, served
+    from memory, compass fallback) only after `locate`. Internet and
+    neighbour clients are drawn only, never hosts.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target
-    x86_64-pc-windows-gnu --all-targets -- -D warnings`). No CI: private repo.
+    x86_64-pc-windows-gnu --all-targets -- -D warnings`). Public repo: CI in
+    `.github/workflows/checks.yml` (gates, Windows lint, `cargo audit`).
   - macOS (owner's machine): `fmt`, `clippy`, and `cargo test --no-fail-fast`
     all pass. Tests must not depend on the login name, `/usr/bin/zsh`,
     bash >= 4.4 or unresolved temp paths.

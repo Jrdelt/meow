@@ -170,6 +170,8 @@ impl EditField {
 pub struct EditState {
     pub field: EditField,
     pub buffer: String,
+    /// Ctrl+V was pressed: the edit box says how to paste instead.
+    pub paste_hint: bool,
 }
 
 /// Readiness of external recon scanners and wordlists on this machine.
@@ -441,6 +443,7 @@ impl Wizard {
         self.editing = Some(EditState {
             field,
             buffer: initial,
+            paste_hint: false,
         });
     }
 
@@ -587,6 +590,7 @@ impl Wizard {
         }
 
         if let Some(edit) = &mut self.editing {
+            let mut paste_hint = false;
             match key.code {
                 KeyCode::Esc => {
                     self.editing = None;
@@ -602,10 +606,23 @@ impl Wizard {
                 KeyCode::Delete => {
                     edit.buffer.clear();
                 }
+                // In a terminal Ctrl+V sends a control key, not the
+                // clipboard: say how to paste instead of typing a "v".
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    edit.paste_hint = true;
+                    paste_hint = true;
+                }
+                KeyCode::Char(_)
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
                 KeyCode::Char(ch) if !ch.is_control() => {
                     edit.buffer.push(ch);
                 }
                 _ => {}
+            }
+            if paste_hint {
+                self.set_status(setup::PASTE_HINT, true);
             }
             return WizardAction::None;
         }
@@ -1696,9 +1713,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, wizard: &Wizard) {
         } else {
             format!("{}_", sanitize(&edit.buffer, 200))
         };
+        let help = if edit.paste_hint {
+            Line::styled(format!(" {}", setup::PASTE_HINT), WARN)
+        } else {
+            Line::styled(
+                " Paste: Ctrl+Shift+V or right-click  |  Enter: confirm  |  Ctrl-U: clear  |  Esc: cancel",
+                DIM,
+            )
+        };
         let lines = vec![
             Line::from(vec![Span::styled(" > ", ACCENT), Span::raw(shown)]),
-            Line::styled(" Enter: confirm  |  Ctrl-U: clear  |  Esc: cancel", DIM),
+            help,
         ];
         frame.render_widget(
             Paragraph::new(lines).block(card(edit.field.label(), true)),
@@ -1908,6 +1933,14 @@ mod tests {
         wiz.on_key(key(KeyCode::Char('3')));
         wiz.cursors[Step::CloudAi.index()] = 3;
         wiz.on_key(key(KeyCode::Enter));
+        // Ctrl+V is not a paste in a terminal: a hint, and no "v" typed.
+        wiz.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(wiz.editing.as_ref().unwrap().buffer, "");
+        assert!(
+            render(&wiz, 120, 32).contains("Ctrl+V does not paste in a terminal"),
+            "{}",
+            render(&wiz, 120, 32)
+        );
         wiz.on_paste(SECRET_AI);
 
         // While editing, only '*' bullets appear -- NEVER the secret!

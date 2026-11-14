@@ -125,3 +125,33 @@ Verified fixes moved here from `issue/issues.md` after passing `cargo fmt --chec
   - Added `split_service_info` in `src/parsers/text.rs` to split Nmap service banners into `product`, `version`, and `extra_info`.
   - Added unit and mock-server pagination tests in `src/cve.rs`, `src/cpe.rs`, and `src/parsers/text.rs`.
 - **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --no-fail-fast` passed (`322` tests, `0` failures).
+
+### `ISS-012` [Low / Usability] — API Key Prompts Swallowed Ctrl+V and Hid Whether a Paste Arrived
+- **Locations Fixed:** `src/setup.rs` (`ask_hidden`, `PASTE_HINT`), `src/wizard.rs` (`EditState::paste_hint`, `on_key`, `draw_footer`), `tests/pty.rs`, `src/wizard.rs` tests
+- **Problem:** Reported on Kali: "meow setup doesn't let me paste the key". In a terminal Ctrl+V sends a control key, not the clipboard. Both key prompts stored it as a literal `v`, so the saved key was wrong and the Claude API answered `invalid x-api-key`. The plain prompt also echoed nothing at all, so a paste that worked looked the same as one that did not.
+- **Resolution:** Ctrl+V (and other Ctrl/Alt chords) no longer add characters; both prompts say to paste with Ctrl+Shift+V or right-click. The plain prompt enables bracketed paste and prints one `*` per character received (the wizard already did); the wizard's edit box names the paste keys.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux).
+
+### `ISS-013` [Medium / Coverage] — Operator Port Ranges Were Silently Capped at 1,000 Ports; UDP Failed Without Root
+- **Locations Fixed:** `src/queue.rs` (`chooses_ports`, `without_port_choice`, `ports_command`, `adapt_for_privilege`), `tests/recon.rs`
+- **Problem:** The mild preset passes `--top-ports 1000`, and extra flags were appended after it. nmap applies `--top-ports` within any `-p` range, so `meow recon <host> -- -p-` or `-- -p 1-10000` still scanned only 1,000 ports (verified with nmap 7.94: `--top-ports 1000 -p-` reports `numservices="1000"`, `-p-` alone `65535`). Ports outside the top 1,000 were missed without any sign. Separately, `-sU` without root made nmap refuse the whole port stage.
+- **Resolution:** A port choice in the operator's flags (`-p…`, `--top-ports`, `-F`, `--port-ratio`) now replaces the preset's. Without root, the UDP part of a scan-technique flag is left out with a notice saying how to run it with `sudo` and import the result. When nmap reports no host up (`<hosts up="0">`), the port stage now says that nothing answered the up check, so no ports were scanned, and suggests `-- -Pn` or other probes (`-- -PS22,445,3389`).
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux).
+
+### `ISS-014` [Medium / Coverage] — nmap Script Results Were Discarded; Operator Scripts Refused Outright
+- **Locations Fixed:** `src/parsers/nmap.rs` (`host_scripts`, port script loop), `src/graph.rs` (`Observation::Script`), `src/queue.rs` (`ReconFlags`, `split_recon_flags`, `script_expression`, `services_command`, `validate_flags_inner`), `README.md`, `SPEC.md`
+- **Problem:** The nmap parser kept only `ssl-cert`, `http-server-header` and `http-title`; every other port script and every host script (`<hostscript>`, e.g. `smb-os-discovery`) was dropped, so imported or recon scans with scripts lost their findings. Operators could not ask for OS/version/script coverage beyond the presets: `-sC`, `-A` and `--script` were refused (ISS-003), and `-sV` given to `meow recon` ran in the port stage against every scanned port.
+- **Resolution:** Every script's output is kept as an `Observed` fact on its port or host; `smb-os-discovery` sets the OS when no OS match exists. `meow recon` accepts `-sC`, `-A` and `--script` with categories `default`, `safe`, `vuln`, `discovery`, `version` (or the built-in script names) and routes them, with `--version-*`, to the service stage as one expression that always excludes `intrusive`, `external`, `brute`, `dos`, `exploit`, `fuzzer`, `malware` and `broadcast` (checked with `nmap --script-help`: 0 selected scripts in those categories). Script paths, `--script-args`, custom expressions and named scripts outside the built-in list stay refused; `config.toml` presets keep the old rule.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux).
+
+### `ISS-015` [Low / Accuracy] — A MacBook's Wi-Fi Was Labelled Ethernet
+- **Locations Fixed:** `src/observer.rs` (`macos::hardware_ports`, `observe`)
+- **Problem:** Interfaces were classified by name only, and every macOS `en*` interface counted as `ethernet`. On a MacBook `en0` is the Wi-Fi, so the HUD and map showed Wi-Fi (including an iPhone hotspot) as Ethernet.
+- **Resolution:** On macOS the observer also reads `networksetup -listallhardwareports` (local settings only, nothing is sent) and sets `wifi`, `ethernet` or `virtual` (Thunderbolt Bridge) from the hardware port macOS names for each device.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux; the macOS command's output format is taken from macOS documentation, not run here).
+
+### `ISS-016` [Medium / Accuracy] — Windows Connections Had No Name or Kind (No Wi-Fi, Ethernet or VPN); Linux Relied on Names
+- **Locations Fixed:** `src/observer.rs` (`windows::adapters`, `windows::name_interfaces`, `linux::mark_wireless`, `observe`)
+- **Problem:** On Windows the observer built interfaces from `route print` only, named them `if-<address>` and classified every one as `other`, so the map and HUD could not say Wi-Fi, Ethernet or VPN, and a Windows VPN was never flagged. On Linux Wi-Fi was recognised only by the `wl…` naming convention.
+- **Resolution:** Windows also reads `ipconfig /all` (System32, local settings only) and renames each `if-<address>` interface, its routes and its neighbours to the adapter's name, with its kind from the heading and description (English and common translations; blocks are recognised by shape and the untranslated "IPv4"). Linux marks an interface `wifi` when the kernel lists `/sys/class/net/<name>/wireless`.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (Linux and `x86_64-pc-windows-gnu`), and `cargo test` passed (Linux; Windows parsing tested against English and German `ipconfig /all` samples, not run on Windows).

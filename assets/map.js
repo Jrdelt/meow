@@ -9,42 +9,45 @@
   var selected = null;
   var drawn = '';
 
-  // Layout distances, in map units (one unit is one pixel at zoom 1).
-  var NODE_W = 84, NODE_H = 63;
-  var COLUMN = 172;     // between a node and the tier it fans out to
-  var SELF_UP = 46;     // room a node needs above its centre ...
-  var SELF_DOWN = 96;   // ... and below it, caption included
-  var BUS_PITCH = 124;  // between neighbours along a bus line
-  var BUS_DROP = 88;    // from the bus line to the first row above and below it
-  var ROW_PITCH = 130;  // between rows on the same side of a crowded bus
-  // A riser leaves the bus line in the middle of the gap between two devices.
-  var BUS_STUB = (BUS_PITCH - NODE_W) / 2;
+  // The map is drawn like a home-network illustration: the router (or
+  // access point) in the middle, the Internet cloud off to the top right,
+  // and the devices on your network around the router, each on a straight
+  // line to it: solid when wired, dotted when on Wi-Fi. meow can only see
+  // how this machine connects, so the other devices are drawn the same way
+  // (the legend says so). What only this machine uses (a VPN, a virtual
+  // network) hangs below you.
+  var RING1 = { rx: 300, ry: 205 }, RING2 = { rx: 470, ry: 320 };
+  // Slots around the router, in degrees (0 = right, 90 = down), most
+  // wanted first. The top right is left free for the cloud.
+  // The outer ring sits between the inner ring's places, so every straight
+  // line from the router passes between devices, not through them.
+  var SLOTS1 = [20, 160, 200, 125, 235, 90, 55, 268];
+  var SLOTS2 = [180, 142, 218, 108, 252, 72, 40, 285];
+  // With networks of your own below you, the lower right stays theirs.
+  var BUSY_BELOW_YOU = [40];
+  var CLOUD = { x: 360, y: -230 };
+  // Room kept around the fitted drawing, in screen pixels.
+  var FIT_PADDING = 40;
+  var expanded = {};    // networks the reader unfolded, by network id
+  var askedWhere = false;
 
-  // Rows on each side of a bus line: more as the segment gets crowded, so
-  // the drawing grows in both directions instead of into one long line.
-  function busRows(devices) {
-    return devices <= 10 ? 1 : (devices <= 28 ? 2 : 3);
-  }
+  var LINE = { wifi: '#9aa3ad', ethernet: '#9aa3ad', other: '#9aa3ad', vpn: '#1aa6b3',
+    virtual: '#8a73d6', unknown: '#9aa3ad' };
+  var TEXT = '#2b2f36';
+  var FONT = 'system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
 
-  // The map is drawn like a hand-sketched network diagram: an Internet cloud
-  // on the left, then routers, firewalls, servers, network segments and
-  // clients in tiers to the right. Which picture a node gets ("role") is
-  // decided by the session, together with the reason for it.
-  var INK = '#2e2e2e';
-  var HAND = '"Chalkboard SE", "Bradley Hand", "Segoe Print", "Comic Sans MS", cursive';
-  // role, how the legend names it, how the detail panel names it
+  // role, how the detail panel names it
   var ROLES = [
-    ['internet', 'Internet (default route)', 'the Internet'],
-    ['router', 'Router or gateway', 'a router'],
-    ['firewall', 'Firewall', 'a firewall'],
-    ['server', 'Server (offers a service)', 'a server'],
-    ['segment', 'Network segment', 'a network segment'],
-    ['switch', '', 'a switch'],
-    ['client', 'Client (no service seen)', 'a client'],
-    ['you', 'You (this machine)', 'you']
+    ['internet', 'the Internet'],
+    ['router', 'a router'],
+    ['firewall', 'a firewall'],
+    ['server', 'a server'],
+    ['segment', 'a network'],
+    ['switch', 'a switch'],
+    ['client', 'a client'],
+    ['you', 'you']
   ];
-  // Order among siblings: this machine first, clients last.
-  var RANK = { internet: -1, you: 0, router: 1, firewall: 2, segment: 3, 'switch': 4, server: 5, client: 6 };
+  var PICTURES = ROLES.map(function (role) { return role[0]; }).concat(['printer']);
 
   function icon(role) {
     return '/assets/icon-' + role + '.svg?token=' + encodeURIComponent(token);
@@ -52,45 +55,55 @@
 
   var cy = cytoscape({
     container: document.getElementById('cy'),
-    maxZoom: 1.6,
-    minZoom: 0.15,
+    maxZoom: 2.2,
+    minZoom: 0.2,
     style: [
       { selector: 'node', style: {
-        'shape': 'round-rectangle', 'width': NODE_W, 'height': NODE_H,
-        'background-opacity': 0, 'background-fit': 'contain', 'background-clip': 'none',
-        'border-width': 0, 'border-color': INK,
-        'label': 'data(text)', 'font-family': HAND, 'font-size': 14, 'color': INK, 'line-height': 1.1,
-        'text-wrap': 'wrap', 'text-max-width': BUS_PITCH - 8, 'text-valign': 'bottom', 'text-margin-y': 2,
-        'underlay-shape': 'ellipse', 'underlay-padding': 10, 'underlay-opacity': 0,
-        'overlay-shape': 'round-rectangle', 'overlay-padding': 7, 'overlay-opacity': 0 } }
-    ].concat(ROLES.map(function (role) {
-      return { selector: 'node[role = "' + role[0] + '"]', style: { 'background-image': icon(role[0]) } };
+        'shape': 'rectangle', 'width': 76, 'height': 60, 'background-opacity': 0, 'border-width': 0,
+        'background-fit': 'contain', 'background-clip': 'none',
+        'label': 'data(text)', 'font-family': FONT, 'font-size': 13, 'color': TEXT, 'line-height': 1.3,
+        'text-wrap': 'wrap', 'text-max-width': 200, 'text-valign': 'bottom', 'text-halign': 'center',
+        'text-margin-y': 6, 'text-background-color': '#ffffff', 'text-background-opacity': 0.92,
+        'text-background-padding': 2, 'underlay-shape': 'ellipse', 'underlay-padding': 14, 'underlay-opacity': 0,
+        'overlay-padding': 8, 'overlay-opacity': 0, 'z-index': 10 } }
+    ].concat(PICTURES.map(function (name) {
+      return { selector: 'node[icon = "' + name + '"]', style: { 'background-image': icon(name) } };
     })).concat([
-      { selector: 'node[role = "internet"]', style: {
-        'width': 156, 'height': 104, 'font-size': 18, 'text-valign': 'center', 'text-margin-y': 2 } },
-      { selector: 'node[role = "you"]', style: { 'font-size': 16 } },
-      // Devices above a bus line carry their caption on top, clear of the line.
-      { selector: 'node.above', style: { 'text-valign': 'top', 'text-margin-y': -3 } },
-      // A marker-pen blot behind a host that has something to look at.
-      { selector: 'node[hypotheses > 0]', style: { 'underlay-color': '#f2c14e', 'underlay-opacity': 0.6 } },
-      { selector: 'node[confirmed > 0]', style: { 'underlay-color': '#e2574c', 'underlay-opacity': 0.55 } },
-      { selector: 'node[?kev]', style: { 'border-width': 3, 'border-style': 'dashed', 'border-color': '#b83227' } },
-      { selector: 'node[kind = "host"][!reachable]', style: { 'background-image-opacity': 0.5, 'color': '#8f6200' } },
-      { selector: 'node:selected', style: { 'overlay-color': '#1f6fb2', 'overlay-opacity': 0.16 } },
+      // What a device asks of you: a soft glow behind it, amber or red.
+      { selector: 'node.warn', style: { 'underlay-color': '#f2b84b', 'underlay-opacity': 0.45 } },
+      { selector: 'node.bad', style: { 'underlay-color': '#e5534b', 'underlay-opacity': 0.45 } },
+      { selector: 'node.kev', style: { 'underlay-opacity': 0.7, 'underlay-padding': 20 } },
+      { selector: 'node.none', style: { 'color': '#6b7178' } },
+      { selector: 'node.you', style: { 'font-weight': 700, 'color': '#1f6fb2' } },
+      { selector: 'node.hub', style: { 'width': 104, 'height': 80, 'font-size': 14 } },
+      { selector: 'node.cloud', style: {
+        'width': 170, 'height': 118, 'text-valign': 'center', 'text-margin-y': 8, 'font-size': 17, 'font-weight': 700,
+        'color': '#1f2d3d' } },
+      { selector: 'node.title', style: {
+        'width': 1, 'height': 1, 'events': 'no', 'text-valign': 'top', 'text-halign': 'right',
+        'text-margin-y': 0, 'font-weight': 700, 'font-size': 13, 'color': 'data(color)', 'text-max-width': 360 } },
+      { selector: 'node.more', style: {
+        'shape': 'round-rectangle', 'width': 96, 'height': 34, 'background-opacity': 1, 'background-color': '#ffffff',
+        'border-width': 1.5, 'border-style': 'dashed', 'border-color': '#9aa3ad',
+        'text-valign': 'center', 'text-margin-y': 0, 'color': '#4a5260' } },
+      { selector: 'node.ownbar', style: {
+        'shape': 'round-rectangle', 'height': 4, 'width': 'data(width)', 'background-opacity': 1,
+        'background-color': '#9aa3ad', 'label': '', 'events': 'no' } },
+      { selector: 'node.anchor', style: { 'width': 1, 'height': 1, 'label': '', 'events': 'no' } },
+      { selector: 'node:selected', style: { 'overlay-color': '#1f6fb2', 'overlay-opacity': 0.14 } },
       { selector: 'edge', style: {
-        'width': 1.9, 'line-color': '#454545', 'line-cap': 'round',
-        'curve-style': 'straight', 'target-arrow-shape': 'none' } },
-      // A fan-out line is drawn freehand: very slightly S-shaped.
-      { selector: 'edge.fan', style: {
-        'curve-style': 'unbundled-bezier', 'control-point-distances': '5 -5', 'control-point-weights': '0.3 0.7' } },
-      // Out of a bus: along the line, then a short riser into the device.
-      { selector: 'edge.bus', style: {
-        'curve-style': 'taxi', 'taxi-direction': 'rightward', 'taxi-turn': -BUS_STUB, 'taxi-turn-min-distance': 2 } },
-      // The link to the Internet is the classic lightning bolt.
-      { selector: 'edge[kind = "internet"]', style: {
-        'curve-style': 'segments', 'segment-distances': '-13 13', 'segment-weights': '0.44 0.56', 'width': 2.1 } },
-      { selector: 'edge.extra', style: { 'line-style': 'dashed', 'width': 1.2, 'line-color': '#8c8c8c' } },
-      { selector: 'edge[kind = "unknown"]', style: { 'line-style': 'dotted', 'line-color': '#c9972c' } }
+        'curve-style': 'taxi', 'taxi-direction': 'horizontal', 'taxi-turn': '50%', 'width': 2.2,
+        'line-color': 'data(color)', 'target-arrow-shape': 'none', 'z-index': 5,
+        'label': 'data(text)', 'font-family': FONT, 'font-size': 12, 'color': 'data(color)',
+        'text-background-color': '#ffffff', 'text-background-opacity': 0.9, 'text-background-padding': 3 } },
+      { selector: 'edge.down', style: { 'taxi-direction': 'vertical' } },
+      // From the router to each device: straight, solid when wired, dotted on Wi-Fi.
+      { selector: 'edge.spoke', style: { 'curve-style': 'straight', 'width': 2.2 } },
+      { selector: 'edge.wifi', style: { 'line-style': 'dotted', 'width': 2.6 } },
+      // To a network below the rings: across only after clearing them.
+      { selector: 'edge.low', style: { 'taxi-turn': '92%' } },
+      { selector: 'edge.thin', style: { 'curve-style': 'straight', 'width': 1.4 } },
+      { selector: 'edge.dashed', style: { 'line-style': 'dashed', 'line-dash-pattern': [8, 6], 'width': 2.6 } }
     ])
   });
 
@@ -152,6 +165,11 @@
       if (message.type === 'state') {
         state = message.state;
         render();
+        // Where this machine is: asked once, when the map first opens.
+        if (!askedWhere) {
+          askedWhere = true;
+          send({ cmd: 'locate' });
+        }
       } else if (message.type === 'result' && !message.ok) {
         flash(message.error);
       }
@@ -191,151 +209,413 @@
     });
   }
 
-  // Turns the session's nodes and links into a drawing: a tree that grows
-  // to the right from the Internet cloud (or from this machine when there is
-  // no default route). A node with a few children fans out to the next tier;
-  // a network segment lines its devices up above and below a bus line, the
-  // way a hub is drawn, and whatever leads further sits at the end of it.
+  // Turns the session's nodes and links into the illustration.
+  function status(d) {
+    if (d.kind !== 'host') { return 'none'; }
+    if (d.confirmed) { return 'bad'; }
+    if (d.hypotheses) { return 'warn'; }
+    return 'ok';
+  }
+  var SEVERITY = { bad: 0, warn: 1, ok: 2, none: 3 };
+  var PRINTER = /(^|[\s,])(9100|515|631)\/tcp|ipp|printer|jetdirect/i;
+
   function plan(nodes, edges) {
-    var data = {}, links = {}, parent = {}, kids = {}, box = {}, pos = {}, above = {};
-    nodes.forEach(function (node) { data[node.data.id] = node.data; links[node.data.id] = []; });
+    var data = {}, out = {}, pos = {}, classes = {}, elements = [], lines = [], placed = {}, networkOf = {};
+    nodes.forEach(function (node) { data[node.data.id] = node.data; out[node.data.id] = []; });
     edges.forEach(function (edge) {
-      var link = edge.data;
-      if (links[link.source] && links[link.target]) {
-        links[link.source].push(link.target);
-        links[link.target].push(link.source);
-      }
+      var e = edge.data;
+      if (out[e.source] && data[e.target]) { out[e.source].push({ to: e.target, kind: e.kind }); }
     });
-    function before(a, b) {
-      var byRank = (RANK[data[a].role] || 0) - (RANK[data[b].role] || 0);
-      if (byRank) { return byRank; }
+    function linked(id, kinds) {
+      return (out[id] || []).filter(function (e) { return kinds.indexOf(e.kind) >= 0; })
+        .map(function (e) { return e.to; });
+    }
+    function bySeverity(a, b) {
+      var sa = SEVERITY[status(data[a])], sb = SEVERITY[status(data[b])];
+      if (sa !== sb) { return sa - sb; }
       var ka = sortKey(data[a]), kb = sortKey(data[b]);
       return ka < kb ? -1 : (ka > kb ? 1 : 0);
     }
-
-    // Breadth first, so every node sits as close to the root as its links allow.
-    var root = data.internet ? 'internet' : 'local';
-    var order = [root];
-    parent[root] = null;
-    for (var i = 0; i < order.length; i++) {
-      var id = order[i];
-      kids[id] = [];
-      links[id].slice().sort(before).forEach(function (next) {
-        if (!(next in parent)) {
-          parent[next] = order[i];
-          kids[order[i]].push(next);
-          order.push(next);
-        }
-      });
+    function picture(d) {
+      if (d.id === 'local') { return 'you'; }
+      if (d.id === 'internet') { return 'internet'; }
+      if (d.kind === 'gateway' || d.role === 'router') { return 'router'; }
+      if (d.kind === 'interface') { return 'segment'; }
+      if (PRINTER.test(d.ports_line || '')) { return 'printer'; }
+      if (d.role === 'firewall') { return 'firewall'; }
+      return d.role === 'server' ? 'server' : 'client';
     }
-    nodes.forEach(function (node) {  // nothing links it to the rest
-      if (!(node.data.id in parent)) {
-        parent[node.data.id] = root;
-        kids[root].push(node.data.id);
-        kids[node.data.id] = [];
+    function caption(id) {
+      var d = data[id], parts = [];
+      if (id === 'local') {
+        parts.push('You');
+        var mine = d.caption && d.caption.split('\n')[1];
+        if (mine) { parts.push(mine); }
+      } else if (id === 'internet') {
+        parts.push('Internet');
+      } else if (d.kind === 'host') {
+        parts.push(d.address || d.label);
+        var counts = [];
+        if (d.confirmed) { counts.push(d.confirmed + ' confirmed'); }
+        if (d.hypotheses) { counts.push(d.hypotheses + ' to verify'); }
+        if (counts.length) { parts.push(counts.join(' · ')); }
+      } else if (d.kind === 'gateway') {
+        parts.push((internetVia.indexOf(id) >= 0 ? 'Router ' : 'Gateway ') + d.label);
+      } else if (d.kind === 'interface') {
+        parts.push((d.caption || d.label).split('\n')[0]);
+      } else {
+        parts.push(d.label);
       }
-    });
-
-    // How much room each subtree needs above and below its own axis.
-    function measure(id) {
-      var leaves = [], branches = [];
-      kids[id].forEach(function (kid) {
-        measure(kid);
-        (kids[kid].length ? branches : leaves).push(kid);
-      });
-      var bus = leaves.length >= 2 && (data[id].role === 'segment' || leaves.length > 3);
-      var rows = busRows(leaves.length);
-      var reach = BUS_DROP + (rows - 1) * ROW_PITCH + SELF_DOWN;
-      var stack = bus ? branches : kids[id];
-      var offsets = [], total = 0;
-      stack.forEach(function (kid) {
-        offsets.push(total + box[kid].up);
-        total += box[kid].up + box[kid].down;
-      });
-      var axis = stack.length ? (offsets[0] + offsets[offsets.length - 1]) / 2 : 0;
-      var big = data[id].role === 'internet';
-      box[id] = {
-        bus: bus, rows: rows, leaves: leaves, stack: stack, offsets: offsets, axis: axis,
-        up: Math.max(bus ? reach : (big ? 70 : SELF_UP), axis),
-        down: Math.max(bus ? reach : (big ? 70 : SELF_DOWN), total - axis)
-      };
+      return parts.join('\n');
     }
-    function place(id, x, y) {
-      var b = box[id], next = x + COLUMN;
+    function put(id, x, y, extra) {
+      var d = data[id];
       pos[id] = { x: x, y: y };
-      if (b.bus) {
-        // Column by column, nearest row first, alternating above and below.
-        var perColumn = b.rows * 2;
-        b.leaves.forEach(function (leaf, n) {
-          var slot = n % perColumn;
-          var drop = BUS_DROP + Math.floor(slot / 2) * ROW_PITCH;
-          above[leaf] = slot % 2 === 0;
-          pos[leaf] = { x: x + BUS_PITCH * (Math.floor(n / perColumn) + 1), y: y + (above[leaf] ? -drop : drop) };
-        });
-        next = x + BUS_PITCH * (Math.ceil(b.leaves.length / perColumn) + 1);
-      }
-      b.stack.forEach(function (kid, n) { place(kid, next, y - b.axis + b.offsets[n]); });
+      classes[id] = [status(d)].concat(extra || []).join(' ');
+      if (!d.icon && d.kind !== 'more' && d.kind !== 'title') { d.icon = picture(d); }
+      placed[id] = true;
     }
-    measure(root);
-    place(root, 0, 0);
+    function link(from, to, color, kind, text) {
+      lines.push({ group: 'edges', classes: kind || '',
+        data: { id: 'l:' + from + '>' + to, source: from, target: to, color: color || '#9aa3ad', text: text || '' } });
+    }
+    function title(id, text, x, y, color) {
+      data[id] = { id: id, kind: 'title', label: text, color: color };
+      pos[id] = { x: x, y: y };
+      classes[id] = 'title';
+    }
+    function more(key, hidden, unfolded) {
+      var id = 'more:' + key;
+      data[id] = { id: id, kind: 'more', label: unfolded ? 'show fewer' : '+' + hidden + ' more' };
+      return id;
+    }
+    // Ids on one row starting at x, `step` apart.
+    function row(ids, x, y, step) {
+      ids.forEach(function (id, i) { put(id, x + i * step, y); });
+    }
 
-    var elements = nodes.map(function (node) {
-      var d = Object.assign({}, node.data);
-      var lines = [d.caption || d.label];
-      if (d.confirmed) { lines.push(d.confirmed + ' confirmed'); }
-      if (d.hypotheses) { lines.push(d.hypotheses + ' to verify'); }
-      if (d.kind === 'host' && !d.reachable) { lines.push(d.by_name ? 'address not known' : 'no route known'); }
-      d.text = lines.join('\n');
-      return { group: 'nodes', data: d, classes: above[d.id] ? 'above' : '' };
-    });
-    edges.forEach(function (edge) {
-      var d = Object.assign({}, edge.data), kind = 'extra';
-      if (parent[d.source] === d.target) {  // always drawn from parent to child
-        var swap = d.source;
-        d.source = d.target;
-        d.target = swap;
+    var internetVia = linked('internet', ['internet']);
+    var networks = nodes.filter(function (n) { return n.data.kind === 'interface'; }).map(function (n) { return n.data.id; });
+    function leadsOut(id) {
+      return internetVia.indexOf(id) >= 0 || linked(id, ['gateway']).some(function (g) { return internetVia.indexOf(g) >= 0; });
+    }
+    var home = networks.filter(leadsOut)[0] ||
+      networks.filter(function (n) { return ['vpn', 'virtual'].indexOf(data[n].link) < 0; })[0];
+    var vpns = networks.filter(function (n) { return n !== home && data[n].link === 'vpn'; });
+    var others = networks.filter(function (n) { return n !== home && vpns.indexOf(n) < 0; });
+    var own = vpns.concat(others);
+
+    // Your home network: the router in the middle, devices around it.
+    var hub = null;
+    if (home) {
+      var gateways = linked(home, ['gateway']).sort(bySeverity);
+      hub = gateways[0] || home;
+      put(hub, 0, 0, ['hub']);
+      // Only this machine's own link is known; the others are drawn alike.
+      var wireless = data[home].link === 'wifi';
+      // The network's name goes under the router's own.
+      networkOf[hub] = caption(home) + (data[home].network ? ' · ' + data[home].network : '');
+      var devices = gateways.slice(1).concat(linked(home, ['neighbour', 'direct']).filter(function (id) {
+        return id !== hub && !placed[id];
+      }).sort(bySeverity));
+      var outer = own.length ? SLOTS2.filter(function (a) { return BUSY_BELOW_YOU.indexOf(a) < 0; }) : SLOTS2;
+      var slots = SLOTS1.map(function (a) { return [a, RING1]; }).concat(outer.map(function (a) { return [a, RING2]; }));
+      // Two rings hold you, the devices and, when there are more, the
+      // "+N more" in the last place.
+      var cap = slots.length - 2;
+      var hidden = 0, unfolded = devices.length > cap && expanded[home];
+      if (devices.length > cap && !expanded[home]) {
+        devices.slice(cap).forEach(function (id) { placed[id] = true; });
+        hidden = devices.length - cap;
+        devices = devices.slice(0, cap);
       }
-      if (parent[d.target] === d.source) { kind = box[d.source].bus ? 'bus' : 'fan'; }
-      elements.push({ group: 'edges', data: d, classes: kind });
+      var around = ['local'].concat(devices);
+      if (hidden || unfolded) { around.push(more(home, hidden, unfolded)); }
+      // Unfolded: further rings, as many as it takes, clear of the cloud
+      // and of what hangs below you.
+      for (var ring = 3; slots.length < around.length; ring++) {
+        var step = 360 / (8 + ring * 4);
+        for (var a = step / 2; a < 360; a += step) {
+          if ((a > 292 && a < 358) || (own.length && a > 5 && a < 85)) { continue; }
+          slots.push([a, { rx: RING2.rx + (ring - 2) * 170, ry: RING2.ry + (ring - 2) * 120 }]);
+        }
+      }
+      around.forEach(function (id, i) {
+        var angle = slots[i][0] * Math.PI / 180, r = slots[i][1];
+        put(id, Math.cos(angle) * r.rx, Math.sin(angle) * r.ry, id === 'local' ? ['you'] : []);
+        if (id.indexOf('more:') === 0) { classes[id] = 'none more'; }
+        // Every device, and the "+N more" standing for the rest, on its line.
+        link(hub, id, LINE.ethernet, wireless ? 'spoke wifi' : 'spoke');
+      });
+      // The Internet, joined to the router like a modem, and what was
+      // reached there beside it.
+      if (data.internet && internetVia.length) {
+        put('internet', CLOUD.x, CLOUD.y, ['cloud']);
+        link(hub, 'internet', LINE.ethernet);
+        var outside = [];
+        internetVia.forEach(function (g) {
+          linked(g, ['routed']).forEach(function (h) { if (!placed[h] && outside.indexOf(h) < 0) { outside.push(h); } });
+        });
+        outside.sort(bySeverity).slice(0, 4).forEach(function (h, i) {
+          put(h, CLOUD.x + 190 + i * 130, CLOUD.y - 20);
+          link('internet', h, LINE.ethernet, 'thin');
+        });
+        outside.slice(4).forEach(function (h) { placed[h] = true; });
+      }
+    } else {
+      put('local', 0, 0, ['you']);
+    }
+
+    // Networks only this machine is on (a VPN, a virtual network) hang
+    // below you, not off the router: the rest of your network does not use
+    // them. Each has its hub (the VPN's gateway, or a switch) and what is
+    // behind it underneath.
+    var you = pos.local, hubs = [];
+    own.forEach(function (net) {
+      var color = LINE[data[net].link] || LINE.other;
+      var hubId = data[net].link === 'vpn' ? (linked(net, ['gateway']).sort(bySeverity)[0] || net) : net;
+      var members = (hubId !== net ? linked(hubId, ['routed']) : [])
+        .concat(linked(net, ['gateway', 'neighbour', 'direct']))
+        .filter(function (id, i, all) { return id !== hubId && !placed[id] && all.indexOf(id) === i; })
+        .sort(bySeverity);
+      members.slice(6).forEach(function (h) { placed[h] = true; });
+      members = members.slice(0, 6);
+      hubs.push({ net: net, hub: hubId, color: color, members: members,
+        width: Math.max(1, Math.min(3, members.length)) * 140 });
     });
-    return { elements: elements, positions: pos };
+    var hubY = you.y + 230, x0 = you.x;
+    hubs.forEach(function (h, k) {
+      if (k > 0) { x0 += hubs[k - 1].width / 2 + h.width / 2 + 40; }
+      put(h.hub, x0, hubY, ['hub']);
+      // A gateway is named as such, so it also gets its network's name;
+      // a network's own switch only needs the address range.
+      networkOf[h.hub] = h.hub === h.net ? (data[h.net].network || '')
+        : caption(h.net) + (data[h.net].network ? ' · ' + data[h.net].network : '');
+      h.members.forEach(function (m, i) {
+        var across = Math.min(3, h.members.length), r = Math.floor(i / 3), j = i % 3;
+        put(m, x0 + (j - (across - 1) / 2) * 140, hubY + 175 + r * 150);
+        link(h.hub, m, h.color, 'down');
+      });
+    });
+    if (hubs.length === 1) {
+      link('local', hubs[0].hub, hubs[0].color, 'dashed down');
+    } else if (hubs.length > 1) {
+      // A short bar under you, one dashed drop to each network.
+      var first = pos[hubs[0].hub].x, last = pos[hubs[hubs.length - 1].hub].x, barY = you.y + 120;
+      data.ownbar = { id: 'ownbar', kind: 'bar', width: last - first + 8 };
+      pos.ownbar = { x: (first + last) / 2, y: barY };
+      classes.ownbar = 'ownbar';
+      var point = function (x) {
+        var id = 'a:own:' + Math.round(x);
+        data[id] = { id: id, kind: 'anchor' };
+        pos[id] = { x: x, y: barY };
+        classes[id] = 'anchor';
+        return id;
+      };
+      link('local', point(you.x), '#9aa3ad', 'thin');
+      hubs.forEach(function (h) { link(point(pos[h.hub].x), h.hub, h.color, 'dashed down'); });
+    }
+
+    // Hosts this machine has no route to, in a group of their own.
+    var rest = nodes.map(function (n) { return n.data.id; }).filter(function (id) {
+      return !placed[id] && ['interface', 'internet'].indexOf(data[id].kind) < 0;
+    }).sort(bySeverity);
+    if (rest.length) {
+      var y0 = RING2.ry + 250;
+      title('title:unknown', 'Route not known', -RING2.rx - 50, y0 - 62, '#6b7178');
+      rest.forEach(function (h, i) { put(h, -RING2.rx + (i % 6) * 150, y0 + Math.floor(i / 6) * 140); });
+    }
+
+    Object.keys(pos).forEach(function (id) {
+      var d = Object.assign({}, data[id]);
+      d.text = d.kind === 'title' || d.kind === 'more' ? d.label
+        : (['bar', 'anchor'].indexOf(d.kind) >= 0 ? '' : caption(id));
+      if (networkOf[id]) { d.text += '\n' + networkOf[id]; }
+      elements.push({ group: 'nodes', data: d, classes: classes[id] });
+    });
+    return { elements: elements.concat(lines), positions: pos };
   }
 
   function renderGraph() {
-    var key = JSON.stringify(state.topology);
+    var key = JSON.stringify(state.topology) + JSON.stringify(expanded);
     if (key === drawn) { return; }
     drawn = key;
     var picture = plan(state.topology.nodes, state.topology.edges);
     cy.elements().remove();
     cy.add(picture.elements);
     cy.layout({
-      name: 'preset', fit: true, padding: 30,
+      name: 'preset', fit: true, padding: FIT_PADDING,
       positions: function (node) { return picture.positions[node.id()]; }
     }).run();
-    if (selected) { cy.$id(selected).select(); }
+    if (selected && cy.$id(selected).length) { cy.$id(selected).select(); }
+  }
+
+  // Above the drawing: a note when a VPN is up, and where this machine
+  // roughly is: a small satellite map with a pin and a circle for the rough
+  // area, or a compass when there are no pictures. The session serves the
+  // pictures; this page fetches nothing from anywhere else.
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var whereDrawn = '';
+  function svg(tag, attrs, parent) {
+    var node = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs).forEach(function (key) { node.setAttribute(key, attrs[key]); });
+    if (parent) { parent.appendChild(node); }
+    return node;
+  }
+  function compass() {
+    var face = svg('svg', { width: 44, height: 44, viewBox: '0 0 46 46', 'aria-hidden': 'true' });
+    svg('circle', { cx: 23, cy: 23, r: 21, fill: '#ffffff', stroke: '#9aa3ad', 'stroke-width': 1.5 }, face);
+    [['N', 23, 10.5], ['E', 37.5, 26], ['S', 23, 41.5], ['W', 8.5, 26]].forEach(function (mark) {
+      var letter = svg('text', { x: mark[1], y: mark[2], 'text-anchor': 'middle', 'font-size': 8,
+        'font-weight': 700, 'font-family': FONT, fill: mark[0] === 'N' ? '#e5534b' : '#4a5260' }, face);
+      letter.textContent = mark[0];
+    });
+    svg('path', { d: 'M23 13 L26.5 23 L19.5 23 Z', fill: '#e5534b' }, face);
+    svg('path', { d: 'M23 33 L26.5 23 L19.5 23 Z', fill: '#4a5260' }, face);
+    svg('circle', { cx: 23, cy: 23, r: 1.6, fill: '#ffffff' }, face);
+    return face;
+  }
+  function degrees(value, positive, negative) {
+    return Math.abs(value).toFixed(2) + '° ' + (value >= 0 ? positive : negative);
+  }
+  function placeName(place) {
+    return [place.city, place.region, place.country].filter(Boolean).join(', ') || 'Unnamed place';
+  }
+  function placeWords(box, where) {
+    var place = where.place;
+    box.appendChild(el('strong', null, placeName(place)));
+    box.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' + degrees(place.longitude, 'E', 'W')));
+  }
+  function estimatedFrom(where) {
+    var place = where.place;
+    return 'Estimated from ' + (place.public_address || 'your public address') +
+      (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source + '.';
+  }
+  // The pictures' licence asks for its credit as given, with its link.
+  function credit(view) {
+    var line = el('span', 'dim credit', 'Imagery: ');
+    var at = view.credit_url ? view.credit.indexOf(view.credit_url) : -1;
+    if (at < 0) {
+      line.appendChild(document.createTextNode(view.credit));
+      return line;
+    }
+    line.appendChild(document.createTextNode(view.credit.slice(0, at)));
+    var link = line.appendChild(el('a', null, view.credit_url));
+    link.href = view.credit_url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    line.appendChild(document.createTextNode(view.credit.slice(at + view.credit_url.length)));
+    return line;
+  }
+  function satellite(where) {
+    var view = where.map;
+    var card = el('div', 'satellite');
+    var picture = card.appendChild(el('div', 'picture'));
+    picture.style.width = view.width + 'px';
+    picture.style.height = view.height + 'px';
+    picture.setAttribute('role', 'img');
+    picture.setAttribute('aria-label', 'Satellite picture around ' + placeName(where.place) +
+      ', with a pin at the estimate and its rough area circled');
+    view.tiles.forEach(function (tile) {
+      var img = picture.appendChild(el('img', 'tile'));
+      img.alt = '';
+      img.width = view.tile_size;
+      img.height = view.tile_size;
+      img.style.left = tile.left + 'px';
+      img.style.top = tile.top + 'px';
+      img.src = '/map/tile/' + tile.z + '/' + tile.x + '/' + tile.y + '?token=' + encodeURIComponent(token);
+    });
+    var x = view.width / 2, y = view.height / 2;
+    var marks = svg('svg', { 'class': 'marks', width: view.width, height: view.height,
+      viewBox: '0 0 ' + view.width + ' ' + view.height, 'aria-hidden': 'true' }, picture);
+    svg('circle', { cx: x, cy: y, r: view.radius, fill: 'rgba(80, 160, 255, .22)',
+      stroke: '#a9d4ff', 'stroke-width': 1.6 }, marks);
+    // A pin whose tip is the estimate.
+    var pin = svg('g', { transform: 'translate(' + x + ' ' + y + ')' }, marks);
+    svg('ellipse', { cx: 0, cy: 0, rx: 4.5, ry: 1.8, fill: 'rgba(0, 0, 0, .35)' }, pin);
+    svg('path', { d: 'M0 0 C-1.8 -5 -8 -8.6 -8 -15 A8 8 0 1 1 8 -15 C8 -8.6 1.8 -5 0 0 Z',
+      fill: '#e5534b', stroke: '#ffffff', 'stroke-width': 1.4 }, pin);
+    svg('circle', { cx: 0, cy: -15, r: 3, fill: '#ffffff' }, pin);
+    var words = card.appendChild(el('div', 'words'));
+    placeWords(words, where);
+    words.appendChild(el('span', 'dim', 'Circle: rough area, about ' + Math.round(view.radius_m / 1000) +
+      ' km around the pin.'));
+    words.appendChild(el('span', 'dim', estimatedFrom(where)));
+    words.appendChild(credit(view));
+    return card;
+  }
+  // The fitted drawing starts just below the note and the location card,
+  // so neither covers part of it: only the canvas' empty margin is under
+  // them.
+  function fitStage() {
+    var where = byId('where');
+    var top = Math.max(64, Math.ceil(where.offsetTop + where.offsetHeight + 12 - FIT_PADDING));
+    var canvas = byId('cy');
+    if (canvas.style.top === top + 'px') { return; }
+    canvas.style.top = top + 'px';
+    cy.resize();
+    if (cy.elements().length) { cy.fit(cy.elements(), FIT_PADDING); }
+  }
+  window.addEventListener('resize', fitStage);
+  function renderWhere() {
+    var vpn = (state.machine && state.machine.vpn) || [];
+    var where = state.location;
+    // Drawn again only when something changed, so the pictures load once.
+    var key = JSON.stringify([vpn, where]);
+    if (key === whereDrawn) { return; }
+    whereDrawn = key;
+    var box = clear(byId('where'));
+    if (vpn.length) {
+      var names = vpn.map(function (line) { return line.split(':')[0]; }).join(', ');
+      var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
+        return /default route|all IPv4/.test(line);
+      });
+      var note = box.appendChild(el('div', 'vpn-note'));
+      note.appendChild(el('strong', null, 'VPN detected'));
+      note.appendChild(el('span', null, ' ' + names + (all
+        ? ': it carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
+        : ': it carries only some networks, so the location shown is your own connection\'s.')));
+    }
+    if (where && where.status === 'found' && where.map) {
+      box.appendChild(satellite(where));
+    } else if (where && where.status === 'found') {
+      var card = box.appendChild(el('div', 'compass'));
+      card.appendChild(compass());
+      var words = card.appendChild(el('div', 'words'));
+      placeWords(words, where);
+      words.appendChild(el('span', 'dim', estimatedFrom(where)));
+      if (where.map_error) { words.appendChild(el('span', 'dim', 'No map: ' + where.map_error)); }
+    } else if (where && where.status === 'unavailable') {
+      var off = box.appendChild(el('div', 'compass off'));
+      off.appendChild(compass());
+      var why = off.appendChild(el('div', 'words'));
+      why.appendChild(el('strong', null, 'Location unknown'));
+      why.appendChild(el('span', 'dim', where.reason));
+    }
+    fitStage();
   }
 
   function renderLegend() {
     var legend = byId('legend');
-    ROLES.forEach(function (role) {
-      if (!role[1]) { return; }
+    [['warn', 'to verify'], ['bad', 'confirmed']].forEach(function (key) {
       var item = legend.appendChild(el('span', 'item'));
-      var picture = item.appendChild(el('img'));
-      picture.src = icon(role[0]);
-      picture.alt = '';
-      item.appendChild(el('span', null, role[1]));
-    });
-    [['verify', 'to verify'], ['confirmed', 'confirmed'], ['kev', 'known exploited']].forEach(function (key) {
-      var item = legend.appendChild(el('span', 'item'));
-      item.appendChild(el('span', 'swatch ' + key[0]));
+      item.appendChild(el('span', 'glow ' + key[0]));
       item.appendChild(el('span', null, key[1]));
     });
+    [['solid', 'wired', LINE.ethernet], ['dotted', 'Wi-Fi', LINE.ethernet],
+     ['dashed', 'VPN', LINE.vpn], ['dashed', 'virtual network', LINE.virtual]].forEach(function (key) {
+      var item = legend.appendChild(el('span', 'item'));
+      var bar = item.appendChild(el('span', 'bar ' + key[0]));
+      bar.style.borderColor = key[2];
+      item.appendChild(el('span', null, key[1]));
+    });
+    legend.appendChild(el('span', 'item note', 'Other devices are drawn connected the way you are (assumed: meow only sees your own link).'));
   }
 
   // Why a node is drawn the way it is. A hint, not a finding.
   function drawnAs(data) {
     var name = '';
-    ROLES.forEach(function (role) { if (role[0] === data.role) { name = role[2]; } });
+    ROLES.forEach(function (role) { if (role[0] === data.role) { name = role[1]; } });
     return el('div', 'dim drawn', name ? 'Shown as ' + name + ': ' + data.why + '.' : '');
   }
 
@@ -819,11 +1099,21 @@
   function render() {
     renderHeader();
     renderGraph();
+    renderWhere();
     renderSide();
     renderDetail();
   }
 
-  cy.on('tap', 'node', function (event) { select(event.target.id()); });
+  cy.on('tap', 'node', function (event) {
+    var id = event.target.id();
+    if (id.indexOf('more:') === 0) {  // unfold or fold a busy line
+      var key = id.slice(5);
+      expanded[key] = !expanded[key];
+      renderGraph();
+      return;
+    }
+    select(id);
+  });
   cy.on('tap', function (event) {
     if (event.target === cy) { select(null); }
   });

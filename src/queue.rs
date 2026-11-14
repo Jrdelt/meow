@@ -261,6 +261,103 @@ const SAFE_SERVICE_SCRIPTS: &[&str] = &[
     "banner",
 ];
 
+/// nmap script categories an operator may ask for. Whatever is chosen,
+/// scripts that are also in [`SCRIPT_NEVER`] do not run.
+pub const SCRIPT_CATEGORIES: &[&str] = &["default", "safe", "vuln", "discovery", "version"];
+/// Categories that log in, guess passwords, crash or exploit services, send
+/// data to third parties or reach beyond the target.
+const SCRIPT_NEVER: &str =
+    "intrusive or external or brute or dos or exploit or fuzzer or malware or broadcast";
+
+fn is_operator_script_list(val: &str) -> bool {
+    !val.is_empty()
+        && val
+            .split(',')
+            .all(|item| SCRIPT_CATEGORIES.contains(&item) || SAFE_SERVICE_SCRIPTS.contains(&item))
+}
+
+/// The operator's flags, sorted into the stage each belongs to: port
+/// choice, up check, timing and OS detection run in the port stage; version
+/// detection and scripts in the service stage, on the open ports only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconFlags {
+    pub ports: Vec<String>,
+    pub versions: Vec<String>,
+    /// Script categories and built-in script names.
+    pub scripts: Vec<String>,
+}
+
+pub fn split_recon_flags(flags: &[String]) -> ReconFlags {
+    let mut out = ReconFlags::default();
+    let add_scripts = |out: &mut ReconFlags, list: &str| {
+        for item in list.split(',') {
+            if !out.scripts.iter().any(|known| known == item) {
+                out.scripts.push(item.to_owned());
+            }
+        }
+    };
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "-sC" => add_scripts(&mut out, "default"),
+            // -A is -O -sV -sC (and a traceroute, left out).
+            "-A" => {
+                out.ports.push("-O".to_owned());
+                add_scripts(&mut out, "default");
+            }
+            "--script" => {
+                if let Some(list) = flags.next() {
+                    add_scripts(&mut out, list);
+                }
+            }
+            "-sV" => {} // the service stage always runs version detection
+            "--version-light" | "--version-all" => out.versions.push(flag.clone()),
+            "--version-intensity" => {
+                out.versions.push(flag.clone());
+                out.versions.extend(flags.next().cloned());
+            }
+            other => {
+                if let Some(list) = other.strip_prefix("--script=") {
+                    add_scripts(&mut out, list);
+                } else if other.starts_with("--version-intensity=") {
+                    out.versions.push(flag.clone());
+                } else if is_scan_technique_flag(other)
+                    && other[2..].contains('V')
+                    && other.len() > 3
+                {
+                    // -sSV: the scan type stays here, V is the service stage's.
+                    out.ports.push(other.replacen('V', "", 1));
+                } else {
+                    out.ports.push(flag.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The nmap `--script` expression for the built-in scripts plus the
+/// operator's choice, with the never-run categories excluded.
+fn script_expression(builtin: &[&str], chosen: &[String]) -> String {
+    let mut names: Vec<String> = builtin.iter().map(|name| (*name).to_owned()).collect();
+    let mut categories = Vec::new();
+    for item in chosen {
+        if SCRIPT_CATEGORIES.contains(&item.as_str()) {
+            categories.push(item.as_str());
+        } else if !names.contains(item) {
+            names.push(item.clone());
+        }
+    }
+    let mut parts = names;
+    if !categories.is_empty() {
+        parts.push(format!(
+            "(({}) and not ({SCRIPT_NEVER}))",
+            categories.join(" or ")
+        ));
+    }
+    parts.join(" or ")
+}
+
 /// Which of `flags` are high-rate (`-T4`, `-T5`, "-A").
 pub fn high_rate_flags(flags: &[String]) -> Vec<&str> {
     flags
@@ -346,7 +443,14 @@ fn is_host_probe_flag(flag: &str) -> bool {
     false
 }
 
-fn validate_flags_inner(flags: &[String], allow_service_scripts: bool) -> Result<()> {
+/// `operator`: flags typed on `meow recon`, which may also choose script
+/// categories (`-sC`, `-A`, `--script default`); presets from
+/// `config.toml` may not.
+fn validate_flags_inner(
+    flags: &[String],
+    allow_service_scripts: bool,
+    operator: bool,
+) -> Result<()> {
     if flags.len() > MAX_NMAP_FLAGS {
         bail!("too many nmap flags (at most {MAX_NMAP_FLAGS} allowed)");
     }
@@ -389,7 +493,8 @@ fn validate_flags_inner(flags: &[String], allow_service_scripts: bool) -> Result
                 | "-T3"
                 | "-T4"
                 | "-T5"
-        ) || is_scan_technique_flag(arg)
+        ) || (operator && matches!(arg, "-sC" | "-A"))
+            || is_scan_technique_flag(arg)
             || is_host_probe_flag(arg)
         {
             i += 1;
@@ -521,6 +626,20 @@ fn validate_flags_inner(flags: &[String], allow_service_scripts: bool) -> Result
                     }
                     continue;
                 }
+                "--script" if operator => {
+                    let val = take_val(&mut i)?;
+                    if !is_operator_script_list(val) {
+                        bail!(
+                            "nmap '--script' takes script categories ({}) or built-in scripts ({}); \
+                             scripts that are intrusive, brute-force, denial-of-service, exploits, \
+                             external or broadcast never run. For anything else run nmap yourself \
+                             and import the result with `meow add`",
+                            SCRIPT_CATEGORIES.join(", "),
+                            SAFE_SERVICE_SCRIPTS.join(", ")
+                        );
+                    }
+                    continue;
+                }
                 _ => bail!(
                     "nmap flag '{name}' is not allowed in recon (scripts, file outputs, and target files are refused)"
                 ),
@@ -536,14 +655,14 @@ fn validate_flags_inner(flags: &[String], allow_service_scripts: bool) -> Result
 
 /// Validates extra operator `nmap` flags passed to `meow recon <target> -- ...`.
 pub fn validate_nmap_flags(flags: &[String]) -> Result<()> {
-    validate_flags_inner(flags, false)
+    validate_flags_inner(flags, false, true)
 }
 
 /// Validates `nmap_ports` and `nmap_services` preset lists from `config.toml`
 /// and `profile.toml`.
 pub fn validate_preset_nmap_flags(ports: &[String], services: &[String]) -> Result<()> {
-    validate_flags_inner(ports, false).context("invalid recon nmap_ports preset")?;
-    validate_flags_inner(services, true).context("invalid recon nmap_services preset")?;
+    validate_flags_inner(ports, false, false).context("invalid recon nmap_ports preset")?;
+    validate_flags_inner(services, true, false).context("invalid recon nmap_services preset")?;
     Ok(())
 }
 
@@ -561,6 +680,20 @@ pub fn adapt_for_privilege(flags: Vec<String>, privileged: bool) -> (Vec<String>
             notices.push(
                 "not running as root: removed -O (OS detection needs raw sockets)".to_owned(),
             );
+        } else if is_scan_technique_flag(&flag) && flag[2..].contains('U') {
+            // A UDP scan needs raw sockets: nmap would refuse the whole run.
+            let rest: String = flag[2..]
+                .chars()
+                .filter(|&c| c != 'U')
+                .map(|c| if c == 'S' { 'T' } else { c })
+                .collect();
+            notices.push(format!(
+                "not running as root: left out the UDP scan in {flag} (it needs root; scan UDP \
+                 with `sudo nmap -sU -oX udp.xml <target>` and import it with `meow add udp.xml`)"
+            ));
+            if !rest.is_empty() {
+                out.push(format!("-s{rest}"));
+            }
         } else if flag.starts_with("-s") && !flag.starts_with("--") && flag[2..].contains('S') {
             notices.push(format!(
                 "not running as root: {flag} replaced with {} (connect scan)",
@@ -585,6 +718,55 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// How many hosts nmap itself found up (`<hosts up="N" ...>` in its XML).
+fn nmap_hosts_up(xml: &str) -> Option<u64> {
+    let at = xml.find("<hosts ")?;
+    let rest = &xml[at..];
+    let value = rest.split("up=\"").nth(1)?.split('"').next()?;
+    value.parse().ok()
+}
+
+/// Said when nothing answered nmap's host discovery: nmap then scans no
+/// ports at all, so a host that is on but ignores those probes looks absent.
+fn discovery_hint(flags: &[String]) -> String {
+    if flags.iter().any(|flag| flag == "-Pn" || flag == "-P0") {
+        return "; nothing answered, even scanning without the up check".to_owned();
+    }
+    "; nothing answered nmap's up check (ping and probes to ports 80 and 443), so no ports \
+     were scanned. If the host is on, run again with `-- -Pn` to scan it anyway, or with \
+     other probes such as `-- -PS22,445,3389`"
+        .to_owned()
+}
+
+/// Flags that say which ports to scan.
+fn chooses_ports(flag: &str) -> bool {
+    flag == "-F"
+        || flag.starts_with("--top-ports")
+        || flag.starts_with("--port-ratio")
+        || (flag.starts_with("-p") && !flag.starts_with("--"))
+}
+
+/// The preset's flags without its own choice of ports (`--top-ports 1000`,
+/// `-p-`, `-F`). nmap applies `--top-ports` within any `-p` range, so an
+/// operator's `-p-` next to the preset's `--top-ports 1000` would still
+/// scan only 1,000 ports.
+fn without_port_choice(flags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(flags.len());
+    let mut flags = flags.into_iter();
+    while let Some(flag) = flags.next() {
+        if !chooses_ports(&flag) {
+            out.push(flag);
+            continue;
+        }
+        // `-p 80`, `--top-ports 1000`, `--port-ratio 0.1` take their value
+        // as the next argument; `-p-`, `-p80`, `--top-ports=1000` do not.
+        if matches!(flag.as_str(), "-p" | "--top-ports" | "--port-ratio") {
+            flags.next();
+        }
+    }
+    out
+}
+
 /// Stage 1: port inventory.
 pub fn ports_command(
     settings: &ReconSettings,
@@ -594,7 +776,12 @@ pub fn ports_command(
     privileged: bool,
     output: &Path,
 ) -> (ToolCommand, Vec<String>) {
-    let mut flags = preset.nmap_ports.clone();
+    // Ports the operator names replace the preset's choice of ports.
+    let mut flags = if extra.iter().any(|flag| chooses_ports(flag)) {
+        without_port_choice(preset.nmap_ports.clone())
+    } else {
+        preset.nmap_ports.clone()
+    };
     flags.extend(extra.iter().cloned());
     let (mut args, notices) = adapt_for_privilege(flags, privileged);
     let ipv6 = match target {
@@ -624,12 +811,29 @@ pub fn ports_command(
 pub fn services_command(
     settings: &ReconSettings,
     preset: &Preset,
+    extra: &ReconFlags,
     address: &str,
     ports: &[u16],
     privileged: bool,
     output: &Path,
 ) -> (ToolCommand, Vec<String>) {
-    let (mut args, notices) = adapt_for_privilege(preset.nmap_services.clone(), privileged);
+    let mut flags = preset.nmap_services.clone();
+    if !extra.scripts.is_empty() {
+        // One --script with everything: the built-in scripts stay.
+        let builtin: Vec<String> = match flags.iter().position(|flag| flag == "--script") {
+            Some(at) if at + 1 < flags.len() => {
+                let list = flags.remove(at + 1);
+                flags.remove(at);
+                list.split(',').map(str::to_owned).collect()
+            }
+            _ => Vec::new(),
+        };
+        let builtin: Vec<&str> = builtin.iter().map(String::as_str).collect();
+        flags.push("--script".to_owned());
+        flags.push(script_expression(&builtin, &extra.scripts));
+    }
+    flags.extend(extra.versions.iter().cloned());
+    let (mut args, notices) = adapt_for_privilege(flags, privileged);
     if address.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
         args.push("-6".to_owned());
     }
@@ -1156,7 +1360,7 @@ async fn run_stage(
                 &settings,
                 &preset,
                 target,
-                &task.extra_flags,
+                &split_recon_flags(&task.extra_flags).ports,
                 privileged,
                 &out(".xml"),
             );
@@ -1168,11 +1372,19 @@ async fn run_stage(
                 let _ = std::fs::remove_file(&command.output);
                 bail!(describe_failure(&command.program, &outcome, limits));
             }
+            let answered = std::fs::read_to_string(&command.output)
+                .ok()
+                .and_then(|xml| nmap_hosts_up(&xml));
             let changed = ingest(state, &command.output)?;
             let hosts = hosts_in_target(&state.graph(), target);
             let open: usize = hosts.iter().map(|h| h.open_ports().count()).sum();
+            let silent = if answered == Some(0) {
+                discovery_hint(&task.extra_flags)
+            } else {
+                String::new()
+            };
             Ok(StageEnd::Done(format!(
-                "{} hosts up, {open} open ports ({changed} new facts)",
+                "{} hosts up, {open} open ports ({changed} new facts){silent}",
                 hosts.len()
             )))
         }
@@ -1198,6 +1410,7 @@ async fn run_stage(
                 let (command, notices) = services_command(
                     &settings,
                     &preset,
+                    &split_recon_flags(&task.extra_flags),
                     address,
                     ports,
                     privileged,
@@ -1433,6 +1646,30 @@ mod tests {
         assert_eq!(notices.len(), 3);
         assert!(notices[0].contains("-sS replaced with -sT"));
         assert!(notices[1].contains("removed -O"));
+
+        // UDP needs root: left out, with a way to do it by hand.
+        let (user, notices) = adapt_for_privilege(strings(&["-sU", "-sSU", "-T3"]), false);
+        assert_eq!(user, strings(&["-sT", "-T3"]));
+        assert_eq!(notices.len(), 2);
+        assert!(
+            notices[0].contains("left out the UDP scan in -sU"),
+            "{notices:?}"
+        );
+        assert!(notices[0].contains("meow add udp.xml"), "{notices:?}");
+        let (root, notices) = adapt_for_privilege(strings(&["-sU"]), true);
+        assert_eq!((root, notices.len()), (strings(&["-sU"]), 0));
+    }
+
+    #[test]
+    fn a_silent_target_says_how_to_scan_it_anyway() {
+        let down = r#"<nmaprun><runstats><finished/><hosts up="0" down="1" total="1"/></runstats></nmaprun>"#;
+        let up =
+            r#"<nmaprun><host/><runstats><hosts up="1" down="0" total="1"/></runstats></nmaprun>"#;
+        assert_eq!(nmap_hosts_up(down), Some(0));
+        assert_eq!(nmap_hosts_up(up), Some(1));
+        assert_eq!(nmap_hosts_up("<nmaprun>"), None);
+        assert!(discovery_hint(&[]).contains("run again with `-- -Pn`"));
+        assert!(discovery_hint(&strings(&["-Pn"])).contains("even scanning without the up check"));
     }
 
     #[test]
@@ -1450,14 +1687,38 @@ mod tests {
         );
         assert!(notices.is_empty());
 
+        // Ports the operator names replace the preset's --top-ports, which
+        // nmap would otherwise apply within them (verified with nmap 7.94:
+        // `--top-ports 1000 -p-` scans 1000 ports, `-p-` alone 65535).
         let extra = strings(&["-p", "80,443", "-O"]);
         let (command, notices) =
             ports_command(&settings, &mild, &target("10.0.0.5"), &extra, false, out);
         assert_eq!(
             args(&command),
-            "-sT -T3 --top-ports 1000 -p 80,443 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
+            "-sT -T3 -p 80,443 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
         );
         assert_eq!(notices.len(), 2);
+        for (extra, expected) in [
+            (vec!["-p-"], "-sS -T3 -p-"),
+            (vec!["-p1-10000"], "-sS -T3 -p1-10000"),
+            (vec!["--top-ports", "100"], "-sS -T3 --top-ports 100"),
+            (vec!["-F"], "-sS -T3 -F"),
+            (vec!["-Pn"], "-sS -T3 --top-ports 1000 -Pn"),
+        ] {
+            let (command, _) = ports_command(
+                &settings,
+                &mild,
+                &target("10.0.0.5"),
+                &strings(&extra),
+                true,
+                out,
+            );
+            assert_eq!(
+                args(&command),
+                format!("{expected} -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"),
+                "{extra:?}"
+            );
+        }
 
         let aggressive = settings.preset(Mode::Aggressive, &PresetOverride::default());
         let (command, _) = ports_command(
@@ -1481,6 +1742,7 @@ mod tests {
         let (command, _) = services_command(
             &settings,
             &mild,
+            &ReconFlags::default(),
             "10.0.0.5",
             &[22, 443, 8080],
             false,
@@ -1494,12 +1756,73 @@ mod tests {
         let (command, _) = services_command(
             &settings,
             &mild,
+            &ReconFlags::default(),
             "2001:db8::a",
             &[80],
             true,
             Path::new("/t/svc.xml"),
         );
         assert!(args(&command).contains("-6 -p 80 -oX /t/svc.xml -- 2001:db8::a"));
+    }
+
+    #[test]
+    fn os_detection_versions_and_scripts_go_to_the_stage_they_belong_to() {
+        let flags = split_recon_flags(&strings(&[
+            "-A",
+            "-p-",
+            "-Pn",
+            "--script",
+            "vuln,default",
+            "--version-all",
+            "-sSV",
+        ]));
+        assert_eq!(flags.ports, strings(&["-O", "-p-", "-Pn", "-sS"]));
+        assert_eq!(flags.versions, strings(&["--version-all"]));
+        assert_eq!(flags.scripts, strings(&["default", "vuln"]));
+
+        let settings = ReconSettings::default();
+        let mild = settings.preset(Mode::Mild, &PresetOverride::default());
+        let (command, _) = services_command(
+            &settings,
+            &mild,
+            &flags,
+            "10.0.0.5",
+            &[22, 445],
+            true,
+            Path::new("/t/svc.xml"),
+        );
+        // One --script: the built-in scripts, then the chosen categories
+        // with the never-run ones excluded (nmap --script-help checked:
+        // 0 of the selected scripts are intrusive, external, brute, dos,
+        // exploit, fuzzer, malware or broadcast).
+        assert_eq!(
+            command.args,
+            strings(&[
+                "-sV",
+                "--version-intensity",
+                "5",
+                "-T3",
+                "--script",
+                "ssl-cert or http-server-header or http-title or ((default or vuln) and not \
+                 (intrusive or external or brute or dos or exploit or fuzzer or malware or broadcast))",
+                "--version-all",
+                "-p",
+                "22,445",
+                "-oX",
+                "/t/svc.xml",
+                "--",
+                "10.0.0.5",
+            ])
+        );
+        // -sC alone, and --script= spelled inline.
+        assert_eq!(
+            split_recon_flags(&strings(&["-sC"])).scripts,
+            strings(&["default"])
+        );
+        assert_eq!(
+            split_recon_flags(&strings(&["--script=safe,ssh-hostkey"])).scripts,
+            strings(&["safe", "ssh-hostkey"])
+        );
     }
 
     #[test]
@@ -1520,6 +1843,11 @@ mod tests {
                 "192.0.2.1,198.51.100.0/24",
             ],
             &["-T", "3", "--exclude-ports=9100,515"],
+            // OS detection, versions and scripts by category.
+            &["-A"],
+            &["-sC", "-O", "--version-all"],
+            &["--script", "default,vuln,safe,discovery,version"],
+            &["--script=ssh-hostkey,banner"],
         ] {
             validate_nmap_flags(&strings(allowed))
                 .unwrap_or_else(|e| panic!("rejected safe flags {allowed:?}: {e:#}"));
@@ -1532,12 +1860,15 @@ mod tests {
 
         for blocked in [
             &["--script=/tmp/evil.nse"][..],
-            &["--script", "ssl-cert"],
+            &["--script", "intrusive"],
+            &["--script", "default,brute"],
+            &["--script", "all"],
+            &["--script", "*"],
+            &["--script", "vuln and intrusive"],
+            &["--script", "smb-vuln-ms17-010"],
             &["--script-args", "foo=bar"],
             &["--script-args-file=/etc/passwd"],
-            &["-sC"],
             &["-sSC"],
-            &["-A"],
             &["-oN", "/tmp/out.txt"],
             &["-oX", "/tmp/out.xml"],
             &["-oG", "-"],

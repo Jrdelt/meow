@@ -14,25 +14,35 @@ workspace for authorized defensive work. Rust with a small C11 stream filter.
 `meow <name>` wraps your normal shell. While you work, it quietly builds a
 graph of the hosts, ports, paths and software it sees, matches that software
 against public vulnerability databases, and keeps every raw observation apart
-from every conclusion. Nothing leaves your machine unless you ask for it.
+from every conclusion. Nothing about your targets leaves your machine unless
+you ask for it; the lookups meow makes by itself (vulnerability databases, the
+map's location estimate and its satellite picture) are described below and can
+be turned off.
 
 The full specification is in [`SPEC.md`](SPEC.md). Notes for contributors and
-coding agents are in [`AGENTS.md`](AGENTS.md).
+coding agents are in [`AGENTS.md`](AGENTS.md). Report security problems
+privately, as [`SECURITY.md`](SECURITY.md) describes. MIT licensed
+([`LICENSE`](LICENSE)).
 
 ## Install
 
-With Homebrew (macOS and Linuxbrew):
+On Linux (Kali, Debian, Ubuntu, Fedora, Arch, ...) and macOS, from a clone of
+this repository. No Homebrew is needed on Linux: the script uses the system's
+package manager.
+
+```sh
+git clone https://github.com/Jrdelt/meow.git
+cd meow
+./install.sh
+```
+
+Or with Homebrew, on macOS (or Linux where Homebrew is already installed;
+Kali and most distributions do not have it):
 
 ```sh
 brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
 brew trust Jrdelt/meow        # required once on Homebrew 7+
 brew install meow             # tagged release (or `brew install --HEAD meow`)
-```
-
-Or on macOS / Linux, from a clone of this repository:
-
-```sh
-./install.sh
 ```
 
 Or on Windows (PowerShell):
@@ -113,18 +123,44 @@ terminal, add `--session <name>` or `--local`.
 
 ## The map
 
-`meow map` draws the network the way it is sketched on a whiteboard, left to
-right: the Internet cloud, routers, firewalls, servers, network segments and
-clients, with this machine marked as "You".
+`meow map` draws your network like a home-network illustration: your router
+(or access point) in the middle, the Internet cloud joined to it at the top
+right, and the devices on your network around the router on straight lines,
+you among them.
 
-| Drawn as | Because |
+| On the map | What it means |
 |---|---|
-| Internet cloud | The routing table has a default route. Nothing is sent there. |
-| Router | It is a gateway in the routing table, or its OS guess or a service banner says so. |
-| Firewall, switch | Its OS guess or a service banner names one. |
-| Server | A port on it was seen open, or a service on it was mentioned. |
-| Client | Nothing is known to listen on it. Devices in the neighbour table (ARP, NDP) are drawn as clients without becoming hosts: reading that table sends nothing. |
-| Network segment | One per active interface: the LAN, Wi-Fi or VPN this machine is attached to. Crowded segments stack their devices in rows above and below the line. |
+| Line to the router | Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
+| Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
+| Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
+| Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
+| Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
+| `+N more` | More than 14 devices fold away (13 with a VPN or virtual network below you); click to unfold, then "show fewer". |
+| VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
+| Location (top right) | Where this machine roughly is, estimated from its public address (see below): a small satellite picture with a pin and a circle for the rough area (about 25 km), or a compass when there is no picture. |
+| Route not known | Hosts this machine has no route to, in a group at the bottom. |
+
+A private address such as 192.168.0.81 has no location, so the estimate needs
+the address the rest of the world sees. When the map opens, meow asks
+`ipinfo.io` once (and again only when the network changes): a plain request
+that carries nothing about you or your targets; the service sees only the
+address it comes from. While a VPN carries all traffic nothing is asked,
+since the answer would be the VPN's exit. `[location] enabled = false` in
+`config.toml` turns it off; `url` picks another service.
+
+The picture is Sentinel-2 cloudless 2016 by EOX: free satellite imagery
+(CC BY 4.0), shown with the credit EOX asks for. meow fetches the few tiles
+around the estimate itself (at most six), keeps them in memory and hands them
+to the page, which loads nothing from anywhere else. The tile requests carry
+only the tiles' numbers, which tell EOX the rough area. EOX offers its
+picture service free for non-commercial use (commercial use: see
+[cloudless.eox.at](https://cloudless.eox.at)). `[location] map = false` shows
+only the compass; `tiles` picks another picture source (`{z}`, `{x}` and `{y}`
+are filled in).
+
+The picture is drawn from this machine's own tables (interfaces, routes,
+neighbours) and from scans; reading the tables sends nothing. Click any device
+for its cards.
 
 A name that only appeared in text (a URL printed in the session shell, such
 as `curl https://example.com/install.sh`) is not drawn: nothing was seen on
@@ -147,10 +183,8 @@ rows of label and value:
 
 Only cards that have something to say are shown.
 
-The picture is a drawing hint, not a finding. Click any node to read what it
-was derived from. A host with hypotheses to verify gets an amber marker, one
-with a confirmed finding a red one, and a dashed red frame means a match is in
-the CISA known-exploited catalog.
+The picture is a drawing hint, not a finding. Click any device to read what it
+was derived from.
 
 ## This machine
 
@@ -206,6 +240,16 @@ installs without asking). Whatever is still missing skips its stage, and the
 map and HUD say so. `meow tools` does the same check at any time. A wordlist
 is looked for in `recon.wordlist_path`, then in the usual system places, then
 in `~/.meow/wordlists/` (the first `.txt` file there). Without root, `-sS` becomes `-sT` and `-O` is dropped.
+
+OS detection, versions and scripts: `meow recon <host> -- -A` (or `-O`, `-sC`,
+`--script default,vuln`). Version detection always runs on the open ports;
+scripts run there too, by category: `default`, `safe`, `vuln`, `discovery`,
+`version`. Scripts that are also intrusive, brute-force, denial-of-service,
+exploits, fuzzers, malware, contact third parties or broadcast to the whole
+network never run, whatever is asked. Every script's result is kept on its
+port or host, and Windows' SMB answer names the system when OS detection
+could not. For any other nmap option, run nmap yourself and `meow add` the
+XML.
 Each tool has a time limit and a 50 MB output cap, and is killed with
 everything it started when the session ends. Unfinished tasks are offered for
 resume the next time the workspace is opened.
@@ -320,7 +364,7 @@ is unavailable; the map and the HUD say so.
 ## Configuration
 
 `~/.meow/config.toml` is created on first use, with comments. Sections:
-`default_mode`, `shell`, `[cve]`, `[recon]`, `[ai]`. Per-workspace overrides
+`default_mode`, `shell`, `[location]`, `[cve]`, `[recon]`, `[ai]`. Per-workspace overrides
 live in `profile.toml`. Your own AI setup is in `~/.meow/ai.toml` and overrides
 `[ai]`. `MEOW_HOME` moves the base directory.
 

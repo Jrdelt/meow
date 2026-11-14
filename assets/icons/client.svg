@@ -1,25 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90" viewBox="0 0 120 90">
-<!-- meow map icon: a desktop computer: monitor and tower. Original artwork, same licence as the project. -->
-<defs>
-<filter id="a" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.045" numOctaves="2" seed="3" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="3" xChannelSelector="R" yChannelSelector="G"/></filter>
-<filter id="b" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.03" numOctaves="2" seed="11" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="4.5" xChannelSelector="G" yChannelSelector="R"/></filter>
-<pattern id="h" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(-35)"><rect width="5" height="5" fill="#e3f2f9"/><line x1="0" y1="2.5" x2="5" y2="2.5" stroke="#58a6c8" stroke-width="1.6"/></pattern>
-<g id="ink" stroke-linecap="round" stroke-linejoin="round">
-<rect x="10" y="16" width="62" height="44" rx="3"/>
-<path d="M36 60 L34 70 L50 70 L48 60"/>
-<path d="M24 71 L60 71 L65 78 L19 78 Z"/>
-<rect x="82" y="10" width="28" height="68" rx="2"/>
-</g>
-</defs>
-<g filter="url(#a)">
-<use href="#ink" fill="#ffffff" stroke="#2e2e2e" stroke-width="2.3"/>
-<g fill="url(#h)" stroke="#2e2e2e" stroke-width="1.1" stroke-linejoin="round">
-<rect x="15" y="21" width="52" height="34"/>
-</g>
-<g fill="none" stroke="#2e2e2e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-<path d="M87 19 H105 M87 26 H105 M87 33 H105"/>
-<circle cx="96" cy="67" r="2.6"/>
-</g>
-</g>
-<use href="#ink" fill="none" stroke="#2e2e2e" stroke-width="1" opacity="0.45" filter="url(#b)"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80" viewBox="0 0 100 80">
+<!-- meow map icon: a desktop computer. Original artwork, same licence as the project. -->
+<rect x="4" y="12" width="60" height="42" rx="3" fill="#3c4a5c"/><rect x="8" y="16" width="52" height="34" fill="#dbe9f6"/>
+<rect x="29" y="54" width="10" height="9" fill="#5a6b7f"/><rect x="20" y="63" width="28" height="4" rx="2" fill="#3c4a5c"/>
+<rect x="70" y="6" width="24" height="62" rx="3" fill="#eef2f6" stroke="#3c4a5c" stroke-width="2.5"/>
+<path d="M75 15h14M75 21h14M75 27h14" stroke="#3c4a5c" stroke-width="2"/><circle cx="82" cy="40" r="2.2" fill="#2f6fd6"/>
 </svg>

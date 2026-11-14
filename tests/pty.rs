@@ -378,7 +378,17 @@ fn setup_asks_on_the_terminal_and_never_shows_the_key() {
         "Your Claude API key (nothing shows as you type or paste",
     );
     // A typo, corrected with backspace, then Enter.
-    hosted.send(&format!("{CLAUDE_KEY}x\x7f\r"));
+    // Ctrl+V does not paste in a terminal: explained, and no "v" is kept.
+    hosted.send("\x16");
+    expect(
+        &mut hosted,
+        "use Ctrl+Shift+V, or right-click and choose Paste.",
+    );
+    // A real paste (bracketed, as terminals send it), a typo, a backspace.
+    hosted.send(&format!("\x1b[200~{CLAUDE_KEY}\x1b[201~x\x7f"));
+    let stars = "*".repeat(CLAUDE_KEY.len());
+    expect(&mut hosted, &stars);
+    hosted.send("\r");
     expect(
         &mut hosted,
         "Model for [C] triage (press Enter to keep claude-opus-5-5): ",
