@@ -45,6 +45,44 @@ fn sans_from_ssl_cert(output: &str) -> Vec<String> {
 }
 
 /// The target of "Did not follow redirect to <url>" in an `http-title`.
+/// Ports tried and not open: (protocol, state) -> (count, port ranges).
+type NotOpenGroups = std::collections::BTreeMap<(String, String), (u32, Vec<(u16, u16)>)>;
+
+/// `1-21,23` as ranges; anything else in the list is skipped.
+fn port_ranges(list: &str, into: &mut Vec<(u16, u16)>) {
+    for part in list.split(',').take(4096) {
+        let (low, high) = part.split_once('-').unwrap_or((part, part));
+        if let (Ok(low), Ok(high)) = (low.trim().parse::<u16>(), high.trim().parse::<u16>()) {
+            if low <= high {
+                into.push((low, high));
+            }
+        }
+    }
+}
+
+/// Ranges as nmap writes them: sorted, joined where they touch.
+fn format_ranges(mut ranges: Vec<(u16, u16)>) -> String {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u16, u16)> = Vec::new();
+    for (low, high) in ranges {
+        match merged.last_mut() {
+            Some(last) if u32::from(low) <= u32::from(last.1) + 1 => last.1 = last.1.max(high),
+            _ => merged.push((low, high)),
+        }
+    }
+    merged
+        .iter()
+        .map(|&(low, high)| {
+            if low == high {
+                low.to_string()
+            } else {
+                format!("{low}-{high}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn redirect_from_title(output: &str) -> Option<String> {
     let rest = output.split("redirect to ").nth(1)?;
     let url = rest.split_whitespace().next()?;
@@ -121,6 +159,25 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
         let Some(ports) = child(host, "ports") else {
             continue;
         };
+        // What was tried and not open: (protocol, state) -> (count, ranges).
+        let mut not_open: NotOpenGroups = NotOpenGroups::new();
+        for extra in children(ports, "extraports") {
+            let state = attr(extra, "state").unwrap_or_else(|| "closed".to_owned());
+            let count = extra
+                .attribute("count")
+                .and_then(|c| c.parse::<u32>().ok())
+                .unwrap_or(0);
+            let reasons: Vec<_> = children(extra, "extrareasons").collect();
+            let protocol = reasons
+                .iter()
+                .find_map(|r| attr(*r, "proto"))
+                .unwrap_or_else(|| "tcp".to_owned());
+            let group = not_open.entry((protocol, state)).or_default();
+            group.0 += count;
+            for reason in reasons {
+                port_ranges(reason.attribute("ports").unwrap_or(""), &mut group.1);
+            }
+        }
         for port in children(ports, "port") {
             let Some(number) = port.attribute("portid").and_then(|p| p.parse::<u16>().ok()) else {
                 continue;
@@ -129,6 +186,10 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                 .and_then(|s| attr(s, "state"))
                 .unwrap_or_else(|| "open".to_owned());
             if state != "open" && state != "open|filtered" {
+                let protocol = attr(port, "protocol").unwrap_or_else(|| "tcp".to_owned());
+                let group = not_open.entry((protocol, state)).or_default();
+                group.0 += 1;
+                group.1.push((number, number));
                 continue;
             }
             let protocol = match attr(port, "protocol") {
@@ -248,6 +309,20 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                 }
             }
         }
+        for ((protocol, state), (count, ranges)) in not_open {
+            out.push(Observation::NotOpen {
+                address: address.clone(),
+                protocol,
+                state,
+                count,
+                ports: format_ranges(ranges),
+                record: EvidenceRecord::observed(
+                    Source::NmapXml,
+                    Confidence::High,
+                    raw(xml, ports),
+                ),
+            });
+        }
     }
     Ok(out)
 }
@@ -347,6 +422,38 @@ pub(crate) const SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 mod tests {
     use super::*;
     use crate::graph::Graph;
+
+    #[test]
+    fn ports_tried_and_not_open_are_kept_by_state() {
+        let xml = r#"<nmaprun><host><status state="up"/><address addr="192.0.2.7" addrtype="ipv4"/>
+<ports><extraports state="closed" count="996"><extrareasons reason="conn-refused" count="996" proto="tcp" ports="1-21,23-79,81-442,444-1000"/></extraports>
+<port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="OpenSSH" version="9.6p1"/></port>
+<port protocol="tcp" portid="25"><state state="filtered"/></port>
+<port protocol="tcp" portid="80"><state state="open"/></port>
+<port protocol="tcp" portid="443"><state state="filtered"/></port>
+</ports></host></nmaprun>"#;
+        let mut graph = Graph::default();
+        graph.apply_all(parse(xml).unwrap());
+        let host = &graph.hosts["192.0.2.7"];
+        assert_eq!(host.open_ports().count(), 2);
+        let closed = &host.not_open["tcp closed"];
+        assert_eq!(
+            (closed.count, closed.ports.as_str()),
+            (996, "1-21,23-79,81-442,444-1000")
+        );
+        let filtered = &host.not_open["tcp filtered"];
+        assert_eq!((filtered.count, filtered.ports.as_str()), (2, "25,443"));
+        // Older nmap gives only a count.
+        let bare = r#"<nmaprun><host><status state="up"/><address addr="192.0.2.8" addrtype="ipv4"/>
+<ports><extraports state="filtered" count="1000"/></ports></host></nmaprun>"#;
+        graph.apply_all(parse(bare).unwrap());
+        let group = &graph.hosts["192.0.2.8"].not_open["tcp filtered"];
+        assert_eq!((group.count, group.ports.as_str()), (1000, ""));
+        assert_eq!(
+            format_ranges(vec![(5, 5), (1, 3), (4, 4), (10, 12), (11, 20)]),
+            "1-5,10-20"
+        );
+    }
 
     #[test]
     fn sample_scan_becomes_hosts_ports_and_names() {

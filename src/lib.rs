@@ -10,6 +10,7 @@ pub mod cve;
 pub mod db;
 pub mod endpoint;
 pub mod evidence;
+pub mod geoip;
 pub mod graph;
 pub mod hud;
 pub mod ipc;

@@ -10,6 +10,7 @@
     .\install.ps1 -Yes          # do not ask
     .\install.ps1 -DryRun       # only show what would be done
     .\install.ps1 -NoTools      # leave out the scanners and the wordlist
+    .\install.ps1 -NoGeo        # leave out the location database
 #>
 
 [CmdletBinding()]
@@ -20,6 +21,7 @@ param(
     [switch]$DryRun,
     [switch]$NoTools,
     [switch]$WithTools,
+    [switch]$NoGeo,
     [Alias('h')]
     [switch]$Help
 )
@@ -63,6 +65,7 @@ and a wordlist for the directory stage.
   .\install.ps1 -Yes          do not ask
   .\install.ps1 -DryRun       only show what would be done
   .\install.ps1 -NoTools      leave out the scanners and the wordlist
+  .\install.ps1 -NoGeo        leave out the location database
 "@
     exit 0
 }
@@ -133,6 +136,17 @@ if (Test-Path -LiteralPath $WordlistDir) {
 }
 $NeedWordlist = $InstallTools -and ($ExistingWordlists.Count -eq 0)
 
+# The location database (DB-IP Lite, CC BY 4.0) puts scanned servers on the
+# map without sending their addresses anywhere; a copy younger than 30 days
+# is kept.
+$GeoDir = Join-Path $MeowHome "geo"
+$GeoCity = Join-Path $GeoDir "dbip-city-lite.mmdb"
+$NeedGeo = -not $NoGeo
+if ((Test-Path -LiteralPath $GeoCity) -and
+    ((Get-Item -LiteralPath $GeoCity).LastWriteTime -gt (Get-Date).AddDays(-30))) {
+    $NeedGeo = $false
+}
+
 Write-Host "   /\_/\    _ __ ___   ___  _____      __" -ForegroundColor Cyan
 Write-Host "  ( o.o )  | '_ `` _ \ / _ \/ _ \ \ /\ / /" -ForegroundColor Cyan
 Write-Host "   > ^ <   | | | | | |  __/ (_) \ V  V /" -ForegroundColor Cyan
@@ -158,6 +172,9 @@ if ($InstallTools -and $MissingTools.Count -gt 0) {
 }
 if ($NeedWordlist) {
     Write-Host "  - download the SecLists web-content wordlist from GitHub to $(Join-Path $WordlistDir 'common.txt')"
+}
+if ($NeedGeo) {
+    Write-Host "  - download the DB-IP Lite location database (about 65 MB, 135 MB unpacked) to $GeoDir"
 }
 if (-not $NeedCompiler -and -not $NeedRust -and -not $UpdateRust) {
     Write-Host "The C compiler and Rust are already installed."
@@ -290,6 +307,43 @@ try {
             }
         } catch {
             Warn "Could not download the wordlist from $WORDLIST_URL. Put any .txt wordlist in $WordlistDir and meow will use it."
+        }
+    }
+
+    # This month's file, or last month's early in a month before it is out.
+    function Get-GeoFile([string]$Name) {
+        $Part = Join-Path $GeoDir (".$Name." + [System.Guid]::NewGuid().ToString("N"))
+        foreach ($Month in @((Get-Date).ToString("yyyy-MM"), (Get-Date).AddMonths(-1).ToString("yyyy-MM"))) {
+            try {
+                Invoke-WebRequest -Uri "https://download.db-ip.com/free/$Name-$Month.mmdb.gz" -OutFile "$Part.gz" -UseBasicParsing
+                $In = [System.IO.File]::OpenRead("$Part.gz")
+                try {
+                    $Unzip = New-Object System.IO.Compression.GZipStream($In, [System.IO.Compression.CompressionMode]::Decompress)
+                    $Out = [System.IO.File]::Create($Part)
+                    try { $Unzip.CopyTo($Out) } finally { $Out.Dispose(); $Unzip.Dispose() }
+                } finally { $In.Dispose() }
+                $Bytes = [System.IO.File]::ReadAllBytes($Part)
+                $Tail = [System.Text.Encoding]::ASCII.GetString($Bytes, [Math]::Max(0, $Bytes.Length - 100000), [Math]::Min(100000, $Bytes.Length))
+                if ($Tail.Contains("MaxMind.com")) {
+                    Move-Item -LiteralPath $Part -Destination (Join-Path $GeoDir "$Name.mmdb") -Force
+                    Remove-Item -LiteralPath "$Part.gz" -Force -ErrorAction SilentlyContinue
+                    return $true
+                }
+            } catch {
+                # Try last month's file, then give up.
+            }
+        }
+        Remove-Item -LiteralPath $Part, "$Part.gz" -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    if ($NeedGeo) {
+        Say "Downloading the location database (IP Geolocation by DB-IP, https://db-ip.com)"
+        New-Item -ItemType Directory -Force -Path $GeoDir | Out-Null
+        if ((Get-GeoFile "dbip-city-lite") -and (Get-GeoFile "dbip-asn-lite")) {
+            Say "Location database saved to $GeoDir"
+        } else {
+            Warn "Could not download the location database from download.db-ip.com. The map still shows your own place; run this again later."
         }
     }
 

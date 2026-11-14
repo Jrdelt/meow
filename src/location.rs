@@ -39,6 +39,9 @@ pub struct LocationSettings {
     pub map: bool,
     /// Where the map's pictures come from: `{z}`, `{x}`, `{y}` are filled in.
     pub tiles: String,
+    /// The folder with the location database for scanned servers; empty
+    /// means `~/.meow/geo`, where `install.sh` puts it.
+    pub database: String,
 }
 
 impl Default for LocationSettings {
@@ -48,6 +51,7 @@ impl Default for LocationSettings {
             url: LOOKUP_URL.to_owned(),
             map: true,
             tiles: tiles::TILES_URL.to_owned(),
+            database: String::new(),
         }
     }
 }
@@ -232,12 +236,19 @@ pub async fn map_for(
     if !settings.map {
         return None;
     }
-    let view = tiles::view(place.latitude, place.longitude, &settings.tiles);
-    Some(
-        tiles::fetch(&settings.tiles, &view)
-            .await
-            .map(|pictures| (view, pictures)),
-    )
+    let mut view = tiles::view(place.latitude, place.longitude, &settings.tiles);
+    let mut pictures = match tiles::fetch(&settings.tiles, &view).await {
+        Ok(pictures) => pictures,
+        Err(error) => return Some(Err(error)),
+    };
+    // The closer view is a bonus: without its pictures the map still shows.
+    if let Some(closer) = &view.closer {
+        match tiles::fetch(&settings.tiles, closer).await {
+            Ok(more) => pictures.extend(more),
+            Err(_) => view.closer = None,
+        }
+    }
+    Some(Ok((view, pictures)))
 }
 
 /// The host part of `url`, to say where an estimate came from.

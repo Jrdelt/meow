@@ -60,7 +60,7 @@ Before every push:
 
 - **Active Phase & Step:** `v0.1.0` release: Cat Setup GUI (`src/wizard.rs`), hardening (`ISS-001`..`ISS-011`), installers & GitHub/local sync complete; `meow tools` (recon checks and offers to install its tools).
 - **Last Verified Commit:** See `git log -n 1 --oneline`.
-- **In-Progress / Partial Work:** None (`351` tests passing).
+- **In-Progress / Partial Work:** None (`355` tests passing).
 - **Next Exact Action:** Log any newly discovered issues in `issue/issues.md`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
@@ -84,11 +84,11 @@ Before every push:
   - zsh: the shim `.zshenv` restores the user's `ZDOTDIR` first, so system and
     user startup files load natively. Never keep it on the shim after that.
   - Map page: cards, no inline scripts, no `innerHTML`; checked in Chromium.
-    Topology: router centre, devices on rings (solid wired / dotted Wi-Fi from
-    `link`), cloud top right, VPN and virtual networks below you. Location
-    card and VPN note (`location.rs`; satellite tiles from `tiles.rs`, served
-    from memory, compass fallback) only after `locate`. Internet and
-    neighbour clients are drawn only, never hosts.
+    Topology: top-down tree (cloud, router, one row of devices, you last;
+    solid wired / dotted Wi-Fi from `link`) scrolling sideways; VPN and
+    virtual networks below you. Round location map and VPN pill (`location.rs`,
+    `tiles.rs` tiles from memory) after `locate`; it follows the selection
+    (`locate_host`, offline `geoip.rs`). Internet/neighbour clients: drawn only.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.
   - Windows is compile-checked only (`cargo clippy --target

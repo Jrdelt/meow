@@ -71,6 +71,10 @@ enabled = true
 # map = false to show only a compass. `tiles` picks another picture source.
 map = true
 # tiles = "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg"
+# Selecting a device moves the map to it: a public address is looked up in
+# the location database install.sh downloads to ~/.meow/geo (DB-IP Lite),
+# never sent anywhere. Another folder with the database can be named here.
+# database = ""
 
 [cve]
 # Look up known vulnerabilities for discovered software (NIST NVD, OSV.dev,

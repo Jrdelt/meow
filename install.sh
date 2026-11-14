@@ -8,6 +8,8 @@
 #   ./install.sh --yes         do not ask
 #   ./install.sh --dry-run     only show what would be done
 #   ./install.sh --no-tools    leave out the scanners and the wordlist
+#   ./install.sh --no-geo      leave out the location database (the map's
+#                              round map then shows only your own place)
 #   ./install.sh --tools-only  only the scanners and the wordlist (what
 #                              `meow recon` and `meow tools` run)
 #
@@ -43,6 +45,7 @@ assume_yes=no
 dry_run=no
 with_tools=yes
 tools_only=no
+with_geo=yes
 for arg in "$@"; do
     case "$arg" in
     -y | --yes) assume_yes=yes ;;
@@ -50,8 +53,9 @@ for arg in "$@"; do
     --with-tools) with_tools=yes ;;
     --no-tools) with_tools=no ;;
     --tools-only) tools_only=yes ;;
+    --no-geo) with_geo=no ;;
     -h | --help)
-        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) die "Unknown option: $arg (try --help)" ;;
@@ -195,8 +199,21 @@ for list in \
 done
 [ "$with_tools" = yes ] || need_wordlist=no
 
+# The location database (DB-IP Lite, CC BY 4.0) puts scanned servers on the
+# map without sending their addresses anywhere. DB-IP publishes a new one
+# each month; a copy younger than 30 days is kept.
+geo_dir="$meow_home/geo"
+need_geo=$with_geo
+if [ -n "$(find "$geo_dir/dbip-city-lite.mmdb" -mtime -30 2>/dev/null)" ]; then
+    need_geo=no
+fi
+if [ "$need_geo" = yes ] && ! have gzip; then
+    warn "gzip is not installed, so the location database is not downloaded."
+    need_geo=no
+fi
+
 need_fetcher=no
-if [ "$need_rust$need_wordlist" != nono ] && ! have curl && ! have wget; then
+if [ "$need_rust$need_wordlist$need_geo" != nonono ] && ! have curl && ! have wget; then
     need_fetcher=yes
 fi
 
@@ -260,10 +277,13 @@ fi
 if [ "$need_wordlist" = yes ]; then
     echo "  - download the SecLists web-content wordlist from GitHub to $wordlist_dir/common.txt"
 fi
+if [ "$need_geo" = yes ]; then
+    echo "  - download the DB-IP Lite location database (about 65 MB, 135 MB unpacked) to $geo_dir"
+fi
 if [ "$tools_only" = no ] && [ "$need_compiler$need_rust$update_rust" = "nonono" ]; then
     echo "The C compiler and Rust are already installed."
 fi
-if [ "$tools_only" = yes ] && [ -z "$missing_tools" ] && [ "$need_wordlist" = no ]; then
+if [ "$tools_only" = yes ] && [ -z "$missing_tools" ] && [ "$need_wordlist" = no ] && [ "$need_geo" = no ]; then
     say "Every tool meow recon uses is already installed."
     exit 0
 fi
@@ -322,6 +342,7 @@ if [ "$need_fetcher" = yes ]; then
         [ "$must_fetch" = no ] || die "Could not install curl."
         warn "Could not install curl, so the wordlist is not downloaded. Put any .txt wordlist in $wordlist_dir and meow will use it."
         need_wordlist=no
+        need_geo=no
     fi
 fi
 
@@ -424,6 +445,35 @@ if [ "$need_wordlist" = yes ]; then
         rm -f "$wordlist_part"
         wordlist_part=""
         warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $wordlist_dir and meow will use it."
+    fi
+fi
+
+# This month's file, or last month's early in a month before it is out.
+geo_get() {
+    name=$1
+    this_month=$(date +%Y-%m)
+    last_month=$(date -d "$(date +%Y-%m-15) -1 month" +%Y-%m 2>/dev/null || date -v-1m +%Y-%m)
+    part=$(mktemp "$geo_dir/.$name.XXXXXX")
+    for month in "$this_month" "$last_month"; do
+        if fetch "https://download.db-ip.com/free/$name-$month.mmdb.gz" "$part.gz" &&
+            gzip -dc "$part.gz" >"$part" &&
+            tail -c 100000 "$part" | grep -aq 'MaxMind.com'; then
+            rm -f "$part.gz"
+            mv "$part" "$geo_dir/$name.mmdb"
+            return 0
+        fi
+    done
+    rm -f "$part" "$part.gz"
+    return 1
+}
+
+if [ "$need_geo" = yes ]; then
+    say "Downloading the location database (IP Geolocation by DB-IP, https://db-ip.com)"
+    mkdir -p "$geo_dir"
+    if geo_get dbip-city-lite && geo_get dbip-asn-lite; then
+        say "Location database saved to $geo_dir"
+    else
+        warn "Could not download the location database from download.db-ip.com. The map still shows your own place; run this again later."
     fi
 fi
 

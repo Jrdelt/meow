@@ -123,21 +123,21 @@ terminal, add `--session <name>` or `--local`.
 
 ## The map
 
-`meow map` draws your network like a home-network illustration: your router
-(or access point) in the middle, the Internet cloud joined to it at the top
-right, and the devices on your network around the router on straight lines,
-you among them.
+`meow map` draws your network top-down, like a home-network diagram: the
+Internet cloud at the top, your router (or access point) under it, and every
+device on your network in one row below the router, you last.
 
 | On the map | What it means |
 |---|---|
-| Line to the router | Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
+| Lines from the router | One line down to a bar, then one down to each device. Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
 | Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
 | Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
 | Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
 | Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
-| `+N more` | More than 14 devices fold away (13 with a VPN or virtual network below you); click to unfold, then "show fewer". |
-| VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
-| Location (top right) | Where this machine roughly is, estimated from its public address (see below): a small satellite picture with a pin and a circle for the rough area (about 25 km), or a compass when there is no picture. |
+| A long row | Every device is drawn. A row wider than the card scrolls left and right (trackpad, Shift + mouse wheel, the scrollbar, or drag the background); it opens on the router. A tall drawing makes the card taller rather than too small to read. |
+| Blue VPN pill (top right) | A VPN is up; "location hidden" when it carries all traffic. Hover it for which networks it carries. |
+| Round map follows the selection | Select a device and the round map moves to it, with its IPv4 and IPv6 addresses under it. A public address is looked up in the location database on your disk (nothing is sent anywhere with it); a device on your own network is shown where you are, marked "On your network". Deselect to come back to yourself. |
+| Round map (top right) | Where this machine roughly is, estimated from its public address (see below): a round satellite picture with a pin and a circle for the rough area (about 25 km), the city and state with the coordinates under them (hover for the details). Click the map to zoom in four times closer around the pin, and again to zoom out. A compass when there is no picture. |
 | Route not known | Hosts this machine has no route to, in a group at the bottom. |
 
 A private address such as 192.168.0.81 has no location, so the estimate needs
@@ -147,6 +147,13 @@ that carries nothing about you or your targets; the service sees only the
 address it comes from. While a VPN carries all traffic nothing is asked,
 since the answer would be the VPN's exit. `[location] enabled = false` in
 `config.toml` turns it off; `url` picks another service.
+
+Scanned servers are placed with the DB-IP Lite location database (IP
+Geolocation by [DB-IP](https://db-ip.com), CC BY 4.0), which `install.sh`
+and `install.ps1` download to `~/.meow/geo` (about 65 MB) and `meow update`
+refreshes monthly; `--no-geo` / `-NoGeo` leaves it out. The address is looked
+up in the files on your disk. Fetching the satellite picture for a server
+tells EOX that server's rough area, as it does for yours.
 
 The picture is Sentinel-2 cloudless 2016 by EOX: free satellite imagery
 (CC BY 4.0), shown with the credit EOX asks for. meow fetches the few tiles
@@ -176,7 +183,9 @@ rows of label and value:
   verify, informational notes and false positives each fold open. An entry
   unfolds into its verification checklist and the buttons to confirm it, mark
   it a false positive or reopen it. Without a selection it covers every host.
-- For a selected host: **Open Ports**, **Web** (server headers, certificate
+- For a selected host: **Open Ports** (each port and its service, a
+  **Versions** section with the software that answered, and the ports the
+  last scan tried that were closed or filtered), **Web** (server headers, certificate
   names and paths, when there are any), **Ask AI**, **Evidence**, **Add a note**.
 - **Hosts** (click one to select it), **Routes**, **Neighbours**,
   **All interfaces**, **Background Tasks** and **Notices**.
