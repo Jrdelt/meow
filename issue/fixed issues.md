@@ -149,3 +149,9 @@ Verified fixes moved here from `issue/issues.md` after passing `cargo fmt --chec
 - **Problem:** Interfaces were classified by name only, and every macOS `en*` interface counted as `ethernet`. On a MacBook `en0` is the Wi-Fi, so the HUD and map showed Wi-Fi (including an iPhone hotspot) as Ethernet.
 - **Resolution:** On macOS the observer also reads `networksetup -listallhardwareports` (local settings only, nothing is sent) and sets `wifi`, `ethernet` or `virtual` (Thunderbolt Bridge) from the hardware port macOS names for each device.
 - **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (Linux; the macOS command's output format is taken from macOS documentation, not run here).
+
+### `ISS-016` [Medium / Accuracy] — Windows Connections Had No Name or Kind (No Wi-Fi, Ethernet or VPN); Linux Relied on Names
+- **Locations Fixed:** `src/observer.rs` (`windows::adapters`, `windows::name_interfaces`, `linux::mark_wireless`, `observe`)
+- **Problem:** On Windows the observer built interfaces from `route print` only, named them `if-<address>` and classified every one as `other`, so the map and HUD could not say Wi-Fi, Ethernet or VPN, and a Windows VPN was never flagged. On Linux Wi-Fi was recognised only by the `wl…` naming convention.
+- **Resolution:** Windows also reads `ipconfig /all` (System32, local settings only) and renames each `if-<address>` interface, its routes and its neighbours to the adapter's name, with its kind from the heading and description (English and common translations; blocks are recognised by shape and the untranslated "IPv4"). Linux marks an interface `wifi` when the kernel lists `/sys/class/net/<name>/wireless`.
+- **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (Linux and `x86_64-pc-windows-gnu`), and `cargo test` passed (Linux; Windows parsing tested against English and German `ipconfig /all` samples, not run on Windows).

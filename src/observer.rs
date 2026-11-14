@@ -136,6 +136,20 @@ pub mod linux {
     use super::*;
 
     /// `ip -o link show`: marks interfaces that are administratively down.
+    /// Sets `wifi` for every interface the kernel lists with a `wireless`
+    /// directory under `sys` (`/sys/class/net/<name>/wireless`).
+    pub fn mark_wireless(sys: &Path, list: &mut [Interface]) {
+        for interface in list.iter_mut() {
+            let name = interface.name.as_str();
+            if name.is_empty() || name.contains('/') || name.starts_with('.') {
+                continue;
+            }
+            if sys.join(name).join("wireless").is_dir() {
+                interface.kind = "wifi".to_owned();
+            }
+        }
+    }
+
     pub fn links(text: &str, out: &mut Vec<Interface>) {
         for line in text.lines() {
             let mut fields = line.split_whitespace();
@@ -502,6 +516,147 @@ pub mod windows {
     fn prefix_from_mask(mask: Ipv4Addr) -> Option<u8> {
         let value = u32::from(mask);
         (value.leading_ones() + value.trailing_zeros() == 32).then(|| value.leading_ones() as u8)
+    }
+
+    /// One adapter from `ipconfig /all`: its name, what kind of link it is,
+    /// and its IPv4 addresses.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Adapter {
+        pub name: String,
+        pub kind: &'static str,
+        pub addresses: Vec<Ipv4Addr>,
+    }
+
+    /// The kind of link an adapter is, from its heading and description.
+    /// Words are matched in English and the common translations.
+    fn adapter_kind(text: &str) -> &'static str {
+        let text = text.to_lowercase();
+        let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
+        if has(&[
+            "vpn",
+            "tap-windows",
+            "wireguard",
+            "wintun",
+            "tunnel",
+            "tailscale",
+            "openvpn",
+            "anyconnect",
+            "fortinet",
+            "nordlynx",
+            "zerotier",
+            "proton",
+        ]) {
+            "vpn"
+        } else if has(&[
+            "hyper-v",
+            "vethernet",
+            "virtualbox",
+            "vmware",
+            "wsl",
+            "loopback",
+        ]) {
+            "virtual"
+        } else if has(&[
+            "wireless",
+            "wi-fi",
+            "wlan",
+            "802.11",
+            "drahtlos",
+            "sans fil",
+            "inalámbric",
+        ]) {
+            "wifi"
+        } else if has(&["ethernet", "gbe", "realtek pcie"]) {
+            "ethernet"
+        } else {
+            "other"
+        }
+    }
+
+    /// `ipconfig /all`. Headings are localised, so blocks are found by
+    /// shape: an adapter heading starts at column 0 and ends with `:`; its
+    /// lines are indented. "IPv4" is not translated in most languages.
+    pub fn adapters(text: &str) -> Vec<Adapter> {
+        let mut out: Vec<Adapter> = Vec::new();
+        let mut words = String::new();
+        for line in text.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !line.starts_with(char::is_whitespace) {
+                if let Some(heading) = trimmed.strip_suffix(':') {
+                    // "Wireless LAN adapter Wi-Fi" -> "Wi-Fi"; other languages
+                    // keep the whole heading.
+                    let name = heading
+                        .rsplit_once(" adapter ")
+                        .map_or(heading, |(_, name)| name)
+                        .trim()
+                        .to_owned();
+                    words = heading.to_owned();
+                    out.push(Adapter {
+                        name,
+                        kind: adapter_kind(heading),
+                        addresses: Vec::new(),
+                    });
+                }
+                continue;
+            }
+            let Some(adapter) = out.last_mut() else {
+                continue;
+            };
+            if let Some((_, value)) = trimmed.split_once(": ") {
+                // The description line names the hardware ("Intel Wi-Fi 6E").
+                if adapter.kind == "other" {
+                    words.push(' ');
+                    words.push_str(value);
+                    adapter.kind = adapter_kind(&words);
+                }
+                if trimmed.contains("IPv4") {
+                    let value = value.split('(').next().unwrap_or("").trim();
+                    if let Ok(ip) = Ipv4Addr::from_str(value) {
+                        adapter.addresses.push(ip);
+                    }
+                }
+            }
+        }
+        out.retain(|adapter| !adapter.addresses.is_empty());
+        out
+    }
+
+    /// Gives the interfaces found in the routing table (`if-<address>`)
+    /// their adapter's name and kind, everywhere they are referred to.
+    pub fn name_interfaces(
+        adapters: &[Adapter],
+        interfaces: &mut [Interface],
+        routes: &mut [Route],
+        neighbors: &mut [Neighbor],
+    ) {
+        for adapter in adapters {
+            for ip in &adapter.addresses {
+                let old = format!("if-{ip}");
+                let Some(interface) = interfaces.iter_mut().find(|i| i.name == old) else {
+                    continue;
+                };
+                if interface.kind != "loopback" {
+                    interface.kind = adapter.kind.to_owned();
+                }
+                let new = sanitize_name(&adapter.name).unwrap_or_else(|| old.clone());
+                interface.name = new.clone();
+                for route in routes.iter_mut().filter(|r| r.interface == old) {
+                    route.interface = new.clone();
+                }
+                for neighbor in neighbors.iter_mut().filter(|n| n.interface == old) {
+                    neighbor.interface = new.clone();
+                }
+            }
+        }
+    }
+
+    fn sanitize_name(name: &str) -> Option<String> {
+        let clean: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        let clean = clean.trim().to_owned();
+        (!clean.is_empty()).then_some(clean)
     }
 
     /// `route print -4`. Column headings are localised, so rows are
@@ -1488,6 +1643,9 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
             &run("ip", &["-o", "addr", "show"], notes),
             &mut local.interfaces,
         );
+        // The kernel marks wireless devices; names like `wlp2s0` are only
+        // a convention and can be renamed.
+        linux::mark_wireless(Path::new("/sys/class/net"), &mut local.interfaces);
         linux::routes(
             &run("ip", &["route", "show"], notes),
             false,
@@ -1516,6 +1674,15 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
             &mut local.routes,
         );
         windows::neighbors(&run("arp", &["-a"], notes), &mut local.neighbors);
+        // Adapter names and kinds (Wi-Fi, Ethernet, VPN, virtual): the
+        // routing table only knows addresses.
+        let adapters = windows::adapters(&run("ipconfig", &["/all"], notes));
+        windows::name_interfaces(
+            &adapters,
+            &mut local.interfaces,
+            &mut local.routes,
+            &mut local.neighbors,
+        );
         windows::listeners(
             &run("netstat", &["-an", "-p", "tcp"], notes),
             &mut local.listeners,
@@ -1785,6 +1952,116 @@ mod tests {
                 "en9  fd00::9/64  local network only",
             ]
         );
+    }
+
+    #[test]
+    fn windows_adapters_are_named_and_classified_in_any_language() {
+        let english = [
+            "",
+            "Windows IP Configuration",
+            "",
+            "   Host Name . . . . . : example-pc",
+            "",
+            "Wireless LAN adapter Wi-Fi:",
+            "",
+            "   Connection-specific DNS Suffix  . : lan",
+            "   Description . . . . . . . . . . . : Intel(R) Wi-Fi 6E AX211 160MHz",
+            "   IPv4 Address. . . . . . . . . . . : 192.168.0.153(Preferred)",
+            "   Subnet Mask . . . . . . . . . . . : 255.255.255.0",
+            "",
+            "Ethernet adapter Ethernet:",
+            "",
+            "   Media State . . . . . . . . . . . : Media disconnected",
+            "",
+            "Unknown adapter NordLynx:",
+            "",
+            "   Description . . . . . . . . . . . : NordLynx Tunnel",
+            "   IPv4 Address. . . . . . . . . . . : 10.5.0.2(Preferred)",
+            "",
+            "Ethernet adapter vEthernet (WSL):",
+            "",
+            "   IPv4 Address. . . . . . . . . . . : 172.29.80.1(Preferred)",
+        ]
+        .join("\r\n");
+        let english = english.as_str();
+        let found = windows::adapters(english);
+        let summary: Vec<(&str, &str, String)> = found
+            .iter()
+            .map(|a| (a.name.as_str(), a.kind, a.addresses[0].to_string()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("Wi-Fi", "wifi", "192.168.0.153".to_owned()),
+                ("NordLynx", "vpn", "10.5.0.2".to_owned()),
+                ("vEthernet (WSL)", "virtual", "172.29.80.1".to_owned()),
+            ],
+            "the disconnected Ethernet adapter has no address and is left out"
+        );
+
+        // German Windows: headings and labels translated, "IPv4" is not.
+        let german = [
+            "Drahtlos-LAN-Adapter WLAN:",
+            "",
+            "   Beschreibung. . . . . . . . . . . : Intel(R) Wi-Fi 6",
+            "   IPv4-Adresse  . . . . . . . . . . : 192.168.178.20(Bevorzugt)",
+        ]
+        .join("\r\n");
+        let found = windows::adapters(&german);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].kind, found[0].addresses[0].to_string()),
+            ("wifi", "192.168.178.20".to_owned())
+        );
+
+        // The routing table's `if-<address>` names become the adapter names.
+        let mut interfaces = vec![Interface {
+            name: "if-192.168.0.153".into(),
+            kind: "other".into(),
+            up: true,
+            addresses: vec!["192.168.0.153/24".into()],
+        }];
+        let mut routes = vec![Route {
+            destination: "0.0.0.0/0".into(),
+            gateway: Some("192.168.0.1".into()),
+            interface: "if-192.168.0.153".into(),
+        }];
+        let mut neighbors = vec![Neighbor {
+            address: "192.168.0.1".into(),
+            mac: Some("00:00:5e:00:53:01".into()),
+            interface: "if-192.168.0.153".into(),
+        }];
+        windows::name_interfaces(
+            &windows::adapters(english),
+            &mut interfaces,
+            &mut routes,
+            &mut neighbors,
+        );
+        assert_eq!(
+            (interfaces[0].name.as_str(), interfaces[0].kind.as_str()),
+            ("Wi-Fi", "wifi")
+        );
+        assert_eq!(routes[0].interface, "Wi-Fi");
+        assert_eq!(neighbors[0].interface, "Wi-Fi");
+    }
+
+    #[test]
+    fn linux_wireless_devices_are_found_by_the_kernel_flag() {
+        let sys = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(sys.path().join("renamed0/wireless")).unwrap();
+        std::fs::create_dir_all(sys.path().join("eth0")).unwrap();
+        let mut list: Vec<Interface> = ["renamed0", "eth0", "../etc"]
+            .iter()
+            .map(|name| Interface {
+                name: (*name).to_owned(),
+                kind: interface_kind(name).to_owned(),
+                up: true,
+                addresses: Vec::new(),
+            })
+            .collect();
+        linux::mark_wireless(sys.path(), &mut list);
+        let kinds: Vec<&str> = list.iter().map(|i| i.kind.as_str()).collect();
+        assert_eq!(kinds, ["wifi", "ethernet", "other"]);
     }
 
     #[test]
