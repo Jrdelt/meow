@@ -39,6 +39,9 @@ pub struct LocationSettings {
     pub map: bool,
     /// Where the map's pictures come from: `{z}`, `{x}`, `{y}` are filled in.
     pub tiles: String,
+    /// The folder with the location database for scanned servers; empty
+    /// means `~/.meow/geo`, where `install.sh` puts it.
+    pub database: String,
 }
 
 impl Default for LocationSettings {
@@ -48,6 +51,7 @@ impl Default for LocationSettings {
             url: LOOKUP_URL.to_owned(),
             map: true,
             tiles: tiles::TILES_URL.to_owned(),
+            database: String::new(),
         }
     }
 }

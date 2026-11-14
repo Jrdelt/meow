@@ -543,7 +543,7 @@
   // The satellite map: the picture with the rough area circled and a pin
   // at the estimate; the place and its coordinates under it. The details
   // stay in the tooltip.
-  function satellite(where) {
+  function satellite(where, extra) {
     var closer = mapCloser && where.map.closer;
     var view = closer || where.map, place = where.place;
     var card = el('div', 'satellite');
@@ -591,8 +591,58 @@
     words.appendChild(el('strong', null, placeName(place)));
     words.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' +
       degrees(place.longitude, 'E', 'W')));
+    if (extra) { extra(words); }
     words.appendChild(credit(view));
     return card;
+  }
+
+  // The selected device's own addresses, under its map.
+  function addressLines(box, target) {
+    var known = target.addresses || {};
+    box.appendChild(el('span', 'address', 'IPv4 ' + ((known.ipv4 || []).join(', ') || 'not seen')));
+    box.appendChild(el('span', 'address', 'IPv6 ' + ((known.ipv6 || []).join(', ') || 'not seen')));
+  }
+  function dbCredit(box, target) {
+    if (!target.credit) { return; }
+    var line = box.appendChild(el('span', 'attribution'));
+    var link = line.appendChild(el('a', null, target.credit));
+    link.href = target.credit_url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+  }
+  // The address of the device selected on the drawing, if it has one.
+  function selectedAddress() {
+    if (!selected) { return null; }
+    var match = /^(?:host|nb):(.+)$/.exec(selected);
+    return match ? match[1] : null;
+  }
+  // The round map for the selected device: its place from the database on
+  // this machine, or yours when it is on your network.
+  function targetView(box, target) {
+    if (target.status === 'looking') {
+      box.appendChild(el('span', 'dim', 'Locating ' + target.address + '\u2026'));
+      return;
+    }
+    if (target.place && target.map) {
+      var where = { place: target.place, map: target.map,
+        source: target.status === 'local' ? 'your own estimate' : 'the location database on this machine' };
+      var card = box.appendChild(satellite(where, function (words) {
+        if (target.status === 'local') { words.appendChild(el('span', 'dim', 'On your network, near you')); }
+        addressLines(words, target);
+        dbCredit(words, target);
+      }));
+      card.title = target.address + ': ' + (target.status === 'local'
+        ? 'on your network, so it is where you are.' : estimatedFrom(where));
+      return;
+    }
+    var off = box.appendChild(el('div', 'compass off'));
+    off.appendChild(compass());
+    var why = off.appendChild(el('div', 'words'));
+    why.appendChild(el('strong', null, target.place ? placeName(target.place) : 'Location unknown'));
+    if (target.status === 'local') { why.appendChild(el('span', 'dim', 'On your network, near you')); }
+    if (target.note) { why.appendChild(el('span', 'dim', target.note)); }
+    addressLines(why, target);
+    dbCredit(why, target);
   }
 
   // The drawing starts just below the note and the location card, so
@@ -614,7 +664,8 @@
     var vpn = (state.machine && state.machine.vpn) || [];
     var where = state.location;
     // Drawn again only when something changed, so the pictures load once.
-    var key = JSON.stringify([vpn, where, mapCloser]);
+    var target = state.target && state.target.address === selectedAddress() ? state.target : null;
+    var key = JSON.stringify([vpn, where, mapCloser, target]);
     if (key === whereDrawn) { return; }
     whereDrawn = key;
     // Top right: a blue pill when a VPN is up, the round map under it.
@@ -629,7 +680,9 @@
         ? 'It carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
         : 'It carries only some networks, so the location shown is your own connection\'s.');
     }
-    if (where && where.status === 'found' && where.map) {
+    if (target) {
+      targetView(box, target);
+    } else if (where && where.status === 'found' && where.map) {
       box.appendChild(satellite(where));
     } else if (where && where.status === 'found') {
       var card = box.appendChild(el('div', 'compass'));
@@ -743,13 +796,22 @@
     }
   }
 
+  var locatedFor = null;
   function select(id) {
     selected = id;
     cy.elements().unselect();
     if (id) { cy.$id(id).select(); }
+    // The round map follows the selected device, and comes back to you.
+    var address = selectedAddress();
+    if (address !== locatedFor) {
+      locatedFor = address;
+      mapCloser = false;
+      send({ cmd: 'locate_host', address: address });
+    }
     renderDetail();
     renderHosts();
     renderAdvisory();
+    renderWhere();
   }
 
   // Every host as one row: what it is, and what there is to look at.

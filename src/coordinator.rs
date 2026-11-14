@@ -38,14 +38,16 @@ use crate::cve::{self, CveClient};
 use crate::db::Db;
 use crate::endpoint::Target;
 use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
+use crate::geoip::{self, GeoDb};
 use crate::graph::{Graph, Host, LocalNet, Observation};
+use crate::location::Place;
 use crate::location::{self, Location};
 use crate::mode::Mode;
 use crate::observer;
 use crate::parsers::text::TextParser;
 use crate::pty::LineSink;
 use crate::queue;
-use crate::tiles::Picture;
+use crate::tiles::{MapView, Picture};
 use crate::timeutil::now_rfc3339;
 use crate::topology::Topology;
 use crate::vault::Vault;
@@ -164,6 +166,34 @@ pub enum Command {
     /// Starts estimating where this machine is (the map sends it when it
     /// opens); does nothing once started.
     Locate,
+    /// Puts the device selected on the map on the round map (`None`: back
+    /// to this machine). A public address is looked up in the location
+    /// database on this disk; nothing is sent anywhere with it.
+    LocateHost {
+        #[serde(default)]
+        address: Option<String>,
+    },
+}
+
+/// Where the device selected on the map is, for the round map.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TargetLocation {
+    pub address: String,
+    /// `looking`, `found` (from the database), `local` (on your network:
+    /// your own estimate), `unknown`, `no_database` or `name_only`.
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<Place>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub map: Option<Box<MapView>>,
+    /// Why there is no place or no map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The database's credit, when the place came from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_url: Option<&'static str>,
 }
 
 /// The AI request that is running, or the last one that finished.
@@ -203,6 +233,14 @@ pub struct State {
     locating: AtomicBool,
     /// The location map's pictures, served to the page from memory.
     pictures: Mutex<Vec<Picture>>,
+    /// The location database on this disk (`~/.meow/geo`).
+    geo: GeoDb,
+    /// The selected device on the round map, its pictures, and the places
+    /// already looked up.
+    target: Mutex<Option<TargetLocation>>,
+    target_pictures: Mutex<Vec<Picture>>,
+    target_places: Mutex<std::collections::HashMap<String, Option<Place>>>,
+    target_generation: std::sync::atomic::AtomicU64,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
 }
@@ -340,6 +378,11 @@ impl State {
             "notices": &*lock(&self.notices),
             "ai": &*lock(&self.ai_status),
             "location": &*lock(&self.location),
+            "target": lock(&self.target).as_ref().map(|target| {
+                let mut value = json!(target);
+                value["addresses"] = known_addresses(&graph, &target.address);
+                value
+            }),
             "budget": self.ai.budget(),
         })
     }
@@ -461,6 +504,31 @@ impl State {
                     self.handle.spawn(location_loop(Arc::clone(self)));
                 }
                 Ok(json!({ "locating": true }))
+            }
+            Command::LocateHost { address } => {
+                let generation = self.target_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                let Some(address) = address
+                    .map(|a| a.trim().to_owned())
+                    .filter(|a| !a.is_empty())
+                else {
+                    *lock(&self.target) = None;
+                    lock(&self.target_pictures).clear();
+                    self.touch();
+                    return Ok(json!({ "target": null }));
+                };
+                *lock(&self.target) = Some(TargetLocation {
+                    address: address.clone(),
+                    status: "looking",
+                    place: None,
+                    map: None,
+                    note: None,
+                    credit: None,
+                    credit_url: None,
+                });
+                self.touch();
+                self.handle
+                    .spawn(locate_target(Arc::clone(self), address.clone(), generation));
+                Ok(json!({ "locating": address }))
             }
             Command::Ai { tier, address } => {
                 let (graph, host) = {
@@ -736,8 +804,148 @@ async fn map_tile(
             picture.bytes.clone(),
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => match lock(&state.target_pictures)
+            .iter()
+            .find(|picture| (picture.z, picture.x, picture.y) == (z, x, y))
+        {
+            Some(picture) => (
+                [(header::CONTENT_TYPE, picture.media_type)],
+                picture.bytes.clone(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
     }
+}
+
+/// Every IPv4 and IPv6 address meow has seen for the device at `address`:
+/// its own, and those of entries with the same hardware address or name.
+fn known_addresses(graph: &Graph, address: &str) -> Value {
+    let host = graph.host(address);
+    let mac = host
+        .and_then(|host| host.mac.clone())
+        .or_else(|| {
+            graph
+                .local
+                .neighbors
+                .iter()
+                .find(|n| n.address == address)
+                .and_then(|n| n.mac.clone())
+        })
+        .map(|mac| mac.to_ascii_lowercase());
+    let names: Vec<&String> = host
+        .map(|host| host.hostnames.iter().collect())
+        .unwrap_or_default();
+    let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    all.insert(address.to_owned());
+    for other in graph.hosts.values() {
+        let same_mac = mac.is_some() && other.mac.as_ref().map(|m| m.to_ascii_lowercase()) == mac;
+        let same_name = other.hostnames.iter().any(|name| names.contains(&name));
+        if same_mac || same_name {
+            all.insert(other.address.clone());
+        }
+    }
+    if let Some(mac) = &mac {
+        for neighbour in &graph.local.neighbors {
+            if neighbour
+                .mac
+                .as_ref()
+                .map(|m| m.to_ascii_lowercase())
+                .as_ref()
+                == Some(mac)
+            {
+                all.insert(neighbour.address.clone());
+            }
+        }
+    }
+    let (mut ipv4, mut ipv6) = (Vec::new(), Vec::new());
+    for entry in all {
+        match entry.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(_)) => ipv4.push(entry),
+            Ok(std::net::IpAddr::V6(_)) => ipv6.push(entry),
+            Err(_) => {}
+        }
+    }
+    json!({ "ipv4": ipv4, "ipv6": ipv6 })
+}
+
+/// Finds where the device selected on the map is, then fetches its map's
+/// pictures. A newer selection wins: a stale answer is dropped.
+async fn locate_target(state: Shared, address: String, generation: u64) {
+    let settings = state.config.location.clone();
+    let mut target = TargetLocation {
+        address: address.clone(),
+        status: "unknown",
+        place: None,
+        map: None,
+        note: None,
+        credit: None,
+        credit_url: None,
+    };
+    let mut pictures = Vec::new();
+    match address.parse::<std::net::IpAddr>() {
+        Err(_) => {
+            target.status = "name_only";
+            target.note = Some("only a name is known, no address to place".to_owned());
+        }
+        Ok(ip) if geoip::is_local(ip) => {
+            // On your network: it is where you are.
+            target.status = "local";
+            if let Some(Location::Found { place, map, .. }) = &*lock(&state.location) {
+                target.place = Some(place.clone());
+                target.map = map.clone();
+            }
+        }
+        Ok(ip) => {
+            let cached = lock(&state.target_places).get(&address).cloned();
+            let place = match cached {
+                Some(place) => Ok(place),
+                None if !state.geo.available() => Err(None),
+                None => {
+                    let geo = state.geo.clone();
+                    match tokio::task::spawn_blocking(move || geo.lookup(ip)).await {
+                        Ok(Ok(place)) => {
+                            lock(&state.target_places).insert(address.clone(), place.clone());
+                            Ok(place)
+                        }
+                        Ok(Err(error)) => Err(Some(format!("{error:#}"))),
+                        Err(error) => Err(Some(error.to_string())),
+                    }
+                }
+            };
+            match place {
+                Err(None) => {
+                    target.status = "no_database";
+                    target.note = Some(
+                        "the location database is not installed: run install.sh or meow update"
+                            .to_owned(),
+                    );
+                }
+                Err(Some(reason)) => target.note = Some(reason),
+                Ok(None) => target.note = Some("not in the location database".to_owned()),
+                Ok(Some(place)) => {
+                    target.status = "found";
+                    target.credit = Some(geoip::CREDIT);
+                    target.credit_url = Some(geoip::CREDIT_URL);
+                    match location::map_for(&settings, &place).await {
+                        Some(Ok((view, fetched))) => {
+                            target.map = Some(Box::new(view));
+                            pictures = fetched;
+                        }
+                        Some(Err(error)) => target.note = Some(format!("no map: {error:#}")),
+                        None => {}
+                    }
+                    target.place = Some(place);
+                }
+            }
+        }
+    }
+    if state.target_generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    *lock(&state.target_pictures) = pictures;
+    *lock(&state.target) = Some(target);
+    state.touch();
 }
 
 fn router(state: Shared) -> Router {
@@ -1040,6 +1248,14 @@ impl Coordinator {
         // Stages left "running" belong to a session that ended mid-run.
         queue::mark_running_interrupted(&lock(&db))?;
         let (tap, tap_rx) = mpsc::channel(TAP_QUEUE);
+        // The location database for scanned servers.
+        let geo = GeoDb::new(&if config.location.database.is_empty() {
+            crate::workspace::MeowHome::from_env()
+                .map(|home| home.root().join(geoip::DIR))
+                .unwrap_or_default()
+        } else {
+            PathBuf::from(&config.location.database)
+        });
         let state = Arc::new(State {
             session: workspace.name.clone(),
             port,
@@ -1060,6 +1276,11 @@ impl Coordinator {
             location: Mutex::new(None),
             locating: AtomicBool::new(false),
             pictures: Mutex::new(Vec::new()),
+            geo,
+            target: Mutex::new(None),
+            target_pictures: Mutex::new(Vec::new()),
+            target_places: Mutex::new(std::collections::HashMap::new()),
+            target_generation: std::sync::atomic::AtomicU64::new(0),
             handle: runtime.handle().clone(),
         });
 
@@ -1212,6 +1433,9 @@ mod tests {
         config.cve.enabled = false;
         config.location.url = format!("http://{address}/json");
         config.location.tiles = format!("http://{address}/tiles/{{z}}/{{x}}/{{y}}");
+        // An empty folder: no location database installed.
+        let no_database = tempfile::tempdir().unwrap();
+        config.location.database = no_database.path().display().to_string();
         let coordinator = Coordinator::start(workspace, config).unwrap();
         let state = coordinator.state();
         let info = coordinator.info();
@@ -1290,6 +1514,39 @@ mod tests {
             }
             other => panic!("unexpected location {other:?}: {location}"),
         }
+
+        // The round map follows the device selected on the drawing.
+        let target = |address: Option<&str>| {
+            state
+                .execute(Command::LocateHost {
+                    address: address.map(str::to_owned),
+                })
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let target = state.snapshot()["target"].clone();
+                if target["status"] != "looking" || std::time::Instant::now() > deadline {
+                    break target;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        // On your network: where you are, with its own addresses.
+        let local = target(Some("192.168.0.153"));
+        assert_eq!(local["status"], "local", "{local}");
+        assert_eq!(local["addresses"]["ipv4"], json!(["192.168.0.153"]));
+        assert_eq!(local["addresses"]["ipv6"], json!([]));
+        if location["status"] == "found" {
+            assert_eq!(local["place"]["city"], "Spokane");
+            assert!(local["map"]["tiles"].as_array().is_some());
+        }
+        // A public address needs the database, which is not installed here;
+        // nothing was asked of anyone.
+        let public = target(Some("8.8.8.8"));
+        assert_eq!(public["status"], "no_database", "{public}");
+        assert!(public["note"].as_str().unwrap().contains("install.sh"));
+        assert_eq!(target(Some("www.example.com"))["status"], "name_only");
+        assert_eq!(target(None), Value::Null);
         coordinator.shutdown();
     }
 

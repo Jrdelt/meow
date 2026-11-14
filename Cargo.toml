@@ -23,6 +23,7 @@ fd-lock = "4.0"
 futures-util = "0.3"
 getrandom = "0.3"
 ipnetwork = "0.20"
+maxminddb = "0.33"
 petgraph = "0.7"
 portable-pty = "0.9"
 # Terminal control is used through the `ratatui::crossterm` re-export.

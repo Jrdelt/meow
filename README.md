@@ -136,6 +136,7 @@ device on your network in one row below the router, you last.
 | Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
 | A long row | Every device is drawn. A row wider than the card scrolls left and right (trackpad, Shift + mouse wheel, the scrollbar, or drag the background); it opens on the router. A tall drawing makes the card taller rather than too small to read. |
 | Blue VPN pill (top right) | A VPN is up; "location hidden" when it carries all traffic. Hover it for which networks it carries. |
+| Round map follows the selection | Select a device and the round map moves to it, with its IPv4 and IPv6 addresses under it. A public address is looked up in the location database on your disk (nothing is sent anywhere with it); a device on your own network is shown where you are, marked "On your network". Deselect to come back to yourself. |
 | Round map (top right) | Where this machine roughly is, estimated from its public address (see below): a round satellite picture with a pin and a circle for the rough area (about 25 km), the city and state with the coordinates under them (hover for the details). Click the map to zoom in four times closer around the pin, and again to zoom out. A compass when there is no picture. |
 | Route not known | Hosts this machine has no route to, in a group at the bottom. |
 
@@ -146,6 +147,13 @@ that carries nothing about you or your targets; the service sees only the
 address it comes from. While a VPN carries all traffic nothing is asked,
 since the answer would be the VPN's exit. `[location] enabled = false` in
 `config.toml` turns it off; `url` picks another service.
+
+Scanned servers are placed with the DB-IP Lite location database (IP
+Geolocation by [DB-IP](https://db-ip.com), CC BY 4.0), which `install.sh`
+and `install.ps1` download to `~/.meow/geo` (about 65 MB) and `meow update`
+refreshes monthly; `--no-geo` / `-NoGeo` leaves it out. The address is looked
+up in the files on your disk. Fetching the satellite picture for a server
+tells EOX that server's rough area, as it does for yours.
 
 The picture is Sentinel-2 cloudless 2016 by EOX: free satellite imagery
 (CC BY 4.0), shown with the credit EOX asks for. meow fetches the few tiles
