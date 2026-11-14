@@ -21,6 +21,7 @@ impl Machine {
         let machine = Self { tmp };
         for tool in [
             "dirname", "grep", "uname", "id", "sed", "mkdir", "chmod", "cat", "mktemp", "rm", "mv",
+            "basename",
         ] {
             let real = std::env::var_os("PATH")
                 .and_then(|paths| {
@@ -248,9 +249,19 @@ fn yes_builds_installs_and_explains_the_path() {
         text.contains(&format!("Installed meow 9.9.9 at {}", installed.display())),
         "{text}"
     );
-    // ~/.cargo/bin is not on this shell's PATH, so the user is told how to
-    // get it there.
-    assert!(text.contains("Open a new terminal"), "{text}");
+    // ~/.cargo/bin is not on this shell's PATH, and nothing adds it there,
+    // so the user gets the exact lines to add it.
+    assert!(text.contains("is not on your PATH yet"), "{text}");
+    let cargo_bin = machine.home().join(".cargo/bin");
+    assert!(
+        text.contains(&format!(
+            "echo 'export PATH=\"{}:$PATH\"' >> {}",
+            cargo_bin.display(),
+            machine.home().join(".profile").display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Open a new terminal"), "{text}");
 
     // Everything meow recon drives comes along by default.
     assert!(
@@ -513,4 +524,26 @@ fn meow_tools_lists_what_recon_lacks_and_installs_it_on_request() {
     // Nothing left to do.
     let text = out(&machine.meow(&["tools"]));
     assert!(!text.contains("not installed"), "{text}");
+}
+
+#[test]
+fn another_program_called_meow_is_pointed_out() {
+    let machine = Machine::bare();
+    machine
+        .with_compiler()
+        .with_rust(90)
+        .with_curl("admin\n")
+        // The ASCII-cat program of the same name, first on PATH.
+        .tool("meow", "echo 'Print ASCII cats to your terminal'");
+    let output = machine.run(&["--yes", "--no-tools"]);
+    assert!(output.status.success(), "{}", err(&output));
+    let warning = err(&output);
+    let other = machine.bin().join("meow");
+    assert!(
+        warning.contains(&format!(
+            "Another program called meow is at {}, and your shell runs it instead of this one.",
+            other.display()
+        )),
+        "{warning}"
+    );
 }

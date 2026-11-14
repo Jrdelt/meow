@@ -432,9 +432,30 @@ if [ "$tools_only" = yes ]; then
     exit 0
 fi
 
+# Another program called `meow` (one prints ASCII cats) may be what the
+# user's shell finds first.
+other=$(
+    PATH=$original_path
+    command -v meow 2>/dev/null || true
+)
+if [ -n "$other" ] && [ "$other" != "$installed" ]; then
+    warn "Another program called meow is at $other, and your shell runs it instead of this one."
+    warn "Remove it (for a package: dpkg -S $other, then sudo apt remove <package>), or keep $cargo_home/bin first on PATH."
+fi
+
 case ":$original_path:" in
 *":$cargo_home/bin:"*) say "Ready. Run 'meow' for the interactive setup GUI, or 'meow <name>' to open a session" ;;
 *)
-    say "Ready. Open a new terminal (or run: . \"$cargo_home/env\"), then run 'meow' for the interactive setup GUI or 'meow <name>'"
+    # Nothing adds this folder to PATH by itself (rustup runs with
+    # --no-modify-path, and a distribution's Rust never does).
+    case "$(basename "${SHELL:-sh}")" in
+    zsh) profile="$HOME/.zshrc" ;;
+    bash) profile="$HOME/.bashrc" ;;
+    *) profile="$HOME/.profile" ;;
+    esac
+    say "Ready, but $cargo_home/bin is not on your PATH yet, so your shell cannot find meow. Add it once:"
+    echo "    echo 'export PATH=\"$cargo_home/bin:\$PATH\"' >> $profile"
+    echo "    export PATH=\"$cargo_home/bin:\$PATH\""
+    say "Then run 'meow' for the interactive setup GUI, or 'meow <name>' to open a session"
     ;;
 esac
