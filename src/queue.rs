@@ -599,6 +599,26 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// How many hosts nmap itself found up (`<hosts up="N" ...>` in its XML).
+fn nmap_hosts_up(xml: &str) -> Option<u64> {
+    let at = xml.find("<hosts ")?;
+    let rest = &xml[at..];
+    let value = rest.split("up=\"").nth(1)?.split('"').next()?;
+    value.parse().ok()
+}
+
+/// Said when nothing answered nmap's host discovery: nmap then scans no
+/// ports at all, so a host that is on but ignores those probes looks absent.
+fn discovery_hint(flags: &[String]) -> String {
+    if flags.iter().any(|flag| flag == "-Pn" || flag == "-P0") {
+        return "; nothing answered, even scanning without the up check".to_owned();
+    }
+    "; nothing answered nmap's up check (ping and probes to ports 80 and 443), so no ports \
+     were scanned. If the host is on, run again with `-- -Pn` to scan it anyway, or with \
+     other probes such as `-- -PS22,445,3389`"
+        .to_owned()
+}
+
 /// Flags that say which ports to scan.
 fn chooses_ports(flag: &str) -> bool {
     flag == "-F"
@@ -1216,11 +1236,19 @@ async fn run_stage(
                 let _ = std::fs::remove_file(&command.output);
                 bail!(describe_failure(&command.program, &outcome, limits));
             }
+            let answered = std::fs::read_to_string(&command.output)
+                .ok()
+                .and_then(|xml| nmap_hosts_up(&xml));
             let changed = ingest(state, &command.output)?;
             let hosts = hosts_in_target(&state.graph(), target);
             let open: usize = hosts.iter().map(|h| h.open_ports().count()).sum();
+            let silent = if answered == Some(0) {
+                discovery_hint(&task.extra_flags)
+            } else {
+                String::new()
+            };
             Ok(StageEnd::Done(format!(
-                "{} hosts up, {open} open ports ({changed} new facts)",
+                "{} hosts up, {open} open ports ({changed} new facts){silent}",
                 hosts.len()
             )))
         }
@@ -1493,6 +1521,18 @@ mod tests {
         assert!(notices[0].contains("meow add udp.xml"), "{notices:?}");
         let (root, notices) = adapt_for_privilege(strings(&["-sU"]), true);
         assert_eq!((root, notices.len()), (strings(&["-sU"]), 0));
+    }
+
+    #[test]
+    fn a_silent_target_says_how_to_scan_it_anyway() {
+        let down = r#"<nmaprun><runstats><finished/><hosts up="0" down="1" total="1"/></runstats></nmaprun>"#;
+        let up =
+            r#"<nmaprun><host/><runstats><hosts up="1" down="0" total="1"/></runstats></nmaprun>"#;
+        assert_eq!(nmap_hosts_up(down), Some(0));
+        assert_eq!(nmap_hosts_up(up), Some(1));
+        assert_eq!(nmap_hosts_up("<nmaprun>"), None);
+        assert!(discovery_hint(&[]).contains("run again with `-- -Pn`"));
+        assert!(discovery_hint(&strings(&["-Pn"])).contains("even scanning without the up check"));
     }
 
     #[test]
