@@ -269,6 +269,32 @@ pub mod linux {
 pub mod macos {
     use super::*;
 
+    /// `networksetup -listallhardwareports`: blocks of `Hardware Port: Wi-Fi`
+    /// then `Device: en0`. Sets the kind of each interface macOS names.
+    pub fn hardware_ports(text: &str, list: &mut [Interface]) {
+        let mut port: Option<String> = None;
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix("Hardware Port:") {
+                port = Some(name.trim().to_ascii_lowercase());
+            } else if let (Some(device), Some(name)) = (line.strip_prefix("Device:"), &port) {
+                let kind = if name.contains("wi-fi") || name.contains("airport") {
+                    "wifi"
+                } else if name.contains("thunderbolt bridge") {
+                    "virtual"
+                } else if name.contains("ethernet") || name.contains("lan") {
+                    "ethernet"
+                } else {
+                    continue;
+                };
+                let device = device.trim();
+                if let Some(interface) = list.iter_mut().find(|i| i.name == device) {
+                    interface.kind = kind.to_owned();
+                }
+            }
+        }
+    }
+
     /// `0xffffff00` (macOS, the BSDs) or `255.255.255.0`.
     fn prefix_from_mask(mask: &str) -> Option<u8> {
         let value = match mask.strip_prefix("0x") {
@@ -1497,6 +1523,14 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
     } else {
         // macOS and the BSDs.
         macos::ifconfig(&run("ifconfig", &[], notes), &mut local.interfaces);
+        if cfg!(target_os = "macos") {
+            // The names alone cannot tell a MacBook's Wi-Fi (en0) from a
+            // desktop's Ethernet (also en0); macOS can, from local settings.
+            macos::hardware_ports(
+                &run("networksetup", &["-listallhardwareports"], notes),
+                &mut local.interfaces,
+            );
+        }
         macos::routes(&run("netstat", &["-rn"], notes), &mut local.routes);
         macos::neighbors(&run("arp", &["-an"], notes), &mut local.neighbors);
         macos::listeners(
@@ -1749,6 +1783,39 @@ mod tests {
                 "en7  192.168.50.2/24  local network only",
                 "en8  192.168.60.2/32  local network only",
                 "en9  fd00::9/64  local network only",
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_hardware_ports_tell_wifi_from_ethernet() {
+        let text = "\nHardware Port: Ethernet\nDevice: en5\nEthernet Address: 00:00:5e:00:53:01\n\n\
+                    Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 00:00:5e:00:53:02\n\n\
+                    Hardware Port: Thunderbolt Bridge\nDevice: bridge0\nEthernet Address: N/A\n\n\
+                    Hardware Port: iPhone USB\nDevice: en7\n\nVLAN Configurations\n===================\n";
+        let mut list: Vec<Interface> = ["en0", "en5", "bridge0", "en7", "utun4"]
+            .iter()
+            .map(|name| Interface {
+                name: (*name).to_owned(),
+                kind: interface_kind(name).to_owned(),
+                up: true,
+                addresses: Vec::new(),
+            })
+            .collect();
+        assert_eq!(list[0].kind, "ethernet", "a name alone says ethernet");
+        macos::hardware_ports(text, &mut list);
+        let kinds: Vec<(&str, &str)> = list
+            .iter()
+            .map(|i| (i.name.as_str(), i.kind.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("en0", "wifi"),
+                ("en5", "ethernet"),
+                ("bridge0", "virtual"),
+                ("en7", "ethernet"),
+                ("utun4", "vpn"),
             ]
         );
     }
