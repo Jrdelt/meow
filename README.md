@@ -16,7 +16,8 @@ graph of the hosts, ports, paths and software it sees, matches that software
 against public vulnerability databases, and keeps every raw observation apart
 from every conclusion. Nothing about your targets leaves your machine unless
 you ask for it; the lookups meow makes by itself (vulnerability databases, the
-map's location estimate) are described below and can be turned off.
+map's location estimate and its satellite picture) are described below and can
+be turned off.
 
 The full specification is in [`SPEC.md`](SPEC.md). Notes for contributors and
 coding agents are in [`AGENTS.md`](AGENTS.md). Report security problems
@@ -136,7 +137,8 @@ you among them.
 | Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
 | `+N more` | More than 14 devices fold away (13 with a VPN or virtual network below you); click to unfold, then "show fewer". |
 | VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
-| Compass | Where this machine roughly is, estimated from its public address (see below). |
+| Location (top right) | Where this machine roughly is, estimated from its public address (see below): a small satellite picture with a pin and a circle for the rough area (about 25 km), or a compass when there is no picture. |
+| Route not known | Hosts this machine has no route to, in a group at the bottom. |
 
 A private address such as 192.168.0.81 has no location, so the estimate needs
 the address the rest of the world sees. When the map opens, meow asks
@@ -145,7 +147,16 @@ that carries nothing about you or your targets; the service sees only the
 address it comes from. While a VPN carries all traffic nothing is asked,
 since the answer would be the VPN's exit. `[location] enabled = false` in
 `config.toml` turns it off; `url` picks another service.
-| Route not known | Hosts this machine has no route to, in a group at the bottom. |
+
+The picture is Sentinel-2 cloudless 2016 by EOX: free satellite imagery
+(CC BY 4.0), shown with the credit EOX asks for. meow fetches the few tiles
+around the estimate itself (at most six), keeps them in memory and hands them
+to the page, which loads nothing from anywhere else. The tile requests carry
+only the tiles' numbers, which tell EOX the rough area. EOX offers its
+picture service free for non-commercial use (commercial use: see
+[cloudless.eox.at](https://cloudless.eox.at)). `[location] map = false` shows
+only the compass; `tiles` picks another picture source (`{z}`, `{x}` and `{y}`
+are filled in).
 
 The picture is drawn from this machine's own tables (interfaces, routes,
 neighbours) and from scans; reading the tables sends nothing. Click any device

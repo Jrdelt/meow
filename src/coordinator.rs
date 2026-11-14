@@ -45,6 +45,7 @@ use crate::observer;
 use crate::parsers::text::TextParser;
 use crate::pty::LineSink;
 use crate::queue;
+use crate::tiles::Picture;
 use crate::timeutil::now_rfc3339;
 use crate::topology::Topology;
 use crate::vault::Vault;
@@ -200,6 +201,8 @@ pub struct State {
     /// Where this machine is estimated to be; `None` until the map asks.
     location: Mutex<Option<Location>>,
     locating: AtomicBool,
+    /// The location map's pictures, served to the page from memory.
+    pictures: Mutex<Vec<Picture>>,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
 }
@@ -715,10 +718,31 @@ async fn asset(AxumPath(name): AxumPath<String>) -> Response {
     webui::asset(&name)
 }
 
+/// One picture of the location map, from memory: the page never fetches
+/// pictures from anywhere else, and this never fetches anything.
+async fn map_tile(
+    AxumState(state): AxumState<Shared>,
+    AxumPath((z, x, y)): AxumPath<(u8, u32, u32)>,
+) -> Response {
+    let pictures = lock(&state.pictures);
+    match pictures
+        .iter()
+        .find(|picture| (picture.z, picture.x, picture.y) == (z, x, y))
+    {
+        Some(picture) => (
+            [(header::CONTENT_TYPE, picture.media_type)],
+            picture.bytes.clone(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn router(state: Shared) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/{name}", get(asset))
+        .route("/map/tile/{z}/{x}/{y}", get(map_tile))
         .route("/api/state", get(get_state))
         .route("/api/command", post(post_command))
         .route("/ws", get(websocket))
@@ -805,11 +829,27 @@ async fn location_loop(state: Shared) {
                 location::Plan::Hidden(vpn) => Location::HiddenByVpn { vpn },
                 location::Plan::Lookup { partial_vpns } => {
                     match location::lookup(&settings.url).await {
-                        Ok(place) => Location::Found {
-                            place,
-                            source: location::source(&settings.url),
-                            vpn: partial_vpns,
-                        },
+                        Ok(place) => {
+                            let (map, map_error) = match location::map_for(&settings, &place).await
+                            {
+                                Some(Ok((view, pictures))) => {
+                                    *lock(&state.pictures) = pictures;
+                                    (Some(Box::new(view)), None)
+                                }
+                                Some(Err(error)) => {
+                                    retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
+                                    (None, Some(format!("{error:#}")))
+                                }
+                                None => (None, None),
+                            };
+                            Location::Found {
+                                place,
+                                source: location::source(&settings.url),
+                                vpn: partial_vpns,
+                                map,
+                                map_error,
+                            }
+                        }
                         Err(error) => {
                             retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
                             Location::Unavailable {
@@ -819,6 +859,10 @@ async fn location_loop(state: Shared) {
                     }
                 }
             };
+            // Pictures of a place no longer shown are dropped.
+            if !matches!(found, Location::Found { map: Some(_), .. }) {
+                lock(&state.pictures).clear();
+            }
             *lock(&state.location) = Some(found);
             state.touch();
         }
@@ -1013,6 +1057,7 @@ impl Coordinator {
             ai_status: Mutex::new(AiStatus::default()),
             location: Mutex::new(None),
             locating: AtomicBool::new(false),
+            pictures: Mutex::new(Vec::new()),
             handle: runtime.handle().clone(),
         });
 
@@ -1135,17 +1180,20 @@ mod tests {
 
     #[test]
     fn the_map_asks_once_and_the_estimate_lands_in_the_snapshot() {
-        // A stand-in lookup service on its own thread.
+        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        // A stand-in lookup and map picture service on its own thread.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             block_on(async move {
-                let app = axum::Router::new().route(
-                    "/json",
-                    axum::routing::get(|| async {
-                        axum::Json(json!({ "ip": "203.0.113.7", "city": "Spokane",
-                            "region": "Washington", "country": "US", "loc": "47.6588,-117.4260" }))
-                    }),
-                );
+                let app = axum::Router::new()
+                    .route(
+                        "/json",
+                        axum::routing::get(|| async {
+                            axum::Json(json!({ "ip": "203.0.113.7", "city": "Spokane",
+                                "region": "Washington", "country": "US", "loc": "47.6588,-117.4260" }))
+                        }),
+                    )
+                    .route("/tiles/{z}/{x}/{y}", axum::routing::get(|| async { JPEG }));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(listener.local_addr().unwrap()).unwrap();
                 axum::serve(listener, app).await.unwrap();
@@ -1161,8 +1209,31 @@ mod tests {
         let mut config = Config::default();
         config.cve.enabled = false;
         config.location.url = format!("http://{address}/json");
+        config.location.tiles = format!("http://{address}/tiles/{{z}}/{{x}}/{{y}}");
         let coordinator = Coordinator::start(workspace, config).unwrap();
         let state = coordinator.state();
+        let info = coordinator.info();
+        // A map picture as the page asks for it: (status, type, bytes).
+        let picture = |z: u64, x: u64, y: u64| {
+            block_on(async {
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let response = client
+                    .get(format!(
+                        "{}/map/tile/{z}/{x}/{y}?token={}",
+                        info.base_url(),
+                        info.token
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let kind = response
+                    .headers()
+                    .get("content-type")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                (status, kind, response.bytes().await.unwrap().to_vec())
+            })
+        };
 
         // Nothing is looked up until the map asks.
         assert_eq!(state.snapshot()["location"], Value::Null);
@@ -1182,8 +1253,33 @@ mod tests {
                 assert_eq!(location["place"]["city"], "Spokane");
                 assert_eq!(location["place"]["latitude"], 47.6588);
                 assert_eq!(location["source"], "127.0.0.1");
+                // The map came with it, its pictures served from memory.
+                let map = &location["map"];
+                assert_eq!(
+                    (map["width"].as_u64(), map["height"].as_u64()),
+                    (Some(192), Some(120))
+                );
+                assert_eq!(map["credit"], "Map pictures from 127.0.0.1");
+                assert!(location.get("map_error").is_none(), "{location}");
+                let tiles = map["tiles"].as_array().unwrap();
+                assert!(!tiles.is_empty());
+                for tile in tiles {
+                    let (z, x, y) = (
+                        tile["z"].as_u64().unwrap(),
+                        tile["x"].as_u64().unwrap(),
+                        tile["y"].as_u64().unwrap(),
+                    );
+                    let (status, kind, bytes) = picture(z, x, y);
+                    assert_eq!((status, kind.as_deref()), (200, Some("image/jpeg")));
+                    assert_eq!(bytes, JPEG);
+                }
+                // Only those: nothing else is fetched or served.
+                assert_eq!(picture(1, 0, 0).0, 404);
             }
-            Some("hidden_by_vpn") => assert!(location["vpn"].as_array().is_some()),
+            Some("hidden_by_vpn") => {
+                assert!(location["vpn"].as_array().is_some());
+                assert_eq!(picture(8, 44, 89).0, 404);
+            }
             other => panic!("unexpected location {other:?}: {location}"),
         }
         coordinator.shutdown();
@@ -1272,7 +1368,7 @@ mod tests {
     fn every_route_needs_the_token() {
         let fx = fixture();
         let info = fx.coordinator.info();
-        for path in ["/api/state", "/", "/ws"] {
+        for path in ["/api/state", "/", "/ws", "/map/tile/8/44/89"] {
             let (status, _) = request(&info, "GET", path, &[], None);
             assert_eq!(status, 401, "{path} without a token");
             let (status, _) = request(&info, "GET", &format!("{path}?token=wrong"), &[], None);

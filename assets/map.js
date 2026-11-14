@@ -26,6 +26,8 @@
   // With networks of your own below you, the lower right stays theirs.
   var BUSY_BELOW_YOU = [40];
   var CLOUD = { x: 360, y: -230 };
+  // Room kept around the fitted drawing, in screen pixels.
+  var FIT_PADDING = 40;
   var expanded = {};    // networks the reader unfolded, by network id
   var askedWhere = false;
 
@@ -442,15 +444,18 @@
     cy.elements().remove();
     cy.add(picture.elements);
     cy.layout({
-      name: 'preset', fit: true, padding: 40,
+      name: 'preset', fit: true, padding: FIT_PADDING,
       positions: function (node) { return picture.positions[node.id()]; }
     }).run();
     if (selected && cy.$id(selected).length) { cy.$id(selected).select(); }
   }
 
-  // Above the drawing: a note when a VPN is up, and a small compass with
-  // the estimated place of this machine when one is known.
+  // Above the drawing: a note when a VPN is up, and where this machine
+  // roughly is: a small satellite map with a pin and a circle for the rough
+  // area, or a compass when there are no pictures. The session serves the
+  // pictures; this page fetches nothing from anywhere else.
   var SVG_NS = 'http://www.w3.org/2000/svg';
+  var whereDrawn = '';
   function svg(tag, attrs, parent) {
     var node = document.createElementNS(SVG_NS, tag);
     Object.keys(attrs).forEach(function (key) { node.setAttribute(key, attrs[key]); });
@@ -471,12 +476,95 @@
     return face;
   }
   function degrees(value, positive, negative) {
-    return Math.abs(value).toFixed(2) + '\u00b0 ' + (value >= 0 ? positive : negative);
+    return Math.abs(value).toFixed(2) + '° ' + (value >= 0 ? positive : negative);
   }
+  function placeName(place) {
+    return [place.city, place.region, place.country].filter(Boolean).join(', ') || 'Unnamed place';
+  }
+  function placeWords(box, where) {
+    var place = where.place;
+    box.appendChild(el('strong', null, placeName(place)));
+    box.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' + degrees(place.longitude, 'E', 'W')));
+  }
+  function estimatedFrom(where) {
+    var place = where.place;
+    return 'Estimated from ' + (place.public_address || 'your public address') +
+      (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source + '.';
+  }
+  // The pictures' licence asks for its credit as given, with its link.
+  function credit(view) {
+    var line = el('span', 'dim credit', 'Imagery: ');
+    var at = view.credit_url ? view.credit.indexOf(view.credit_url) : -1;
+    if (at < 0) {
+      line.appendChild(document.createTextNode(view.credit));
+      return line;
+    }
+    line.appendChild(document.createTextNode(view.credit.slice(0, at)));
+    var link = line.appendChild(el('a', null, view.credit_url));
+    link.href = view.credit_url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    line.appendChild(document.createTextNode(view.credit.slice(at + view.credit_url.length)));
+    return line;
+  }
+  function satellite(where) {
+    var view = where.map;
+    var card = el('div', 'satellite');
+    var picture = card.appendChild(el('div', 'picture'));
+    picture.style.width = view.width + 'px';
+    picture.style.height = view.height + 'px';
+    picture.setAttribute('role', 'img');
+    picture.setAttribute('aria-label', 'Satellite picture around ' + placeName(where.place) +
+      ', with a pin at the estimate and its rough area circled');
+    view.tiles.forEach(function (tile) {
+      var img = picture.appendChild(el('img', 'tile'));
+      img.alt = '';
+      img.width = view.tile_size;
+      img.height = view.tile_size;
+      img.style.left = tile.left + 'px';
+      img.style.top = tile.top + 'px';
+      img.src = '/map/tile/' + tile.z + '/' + tile.x + '/' + tile.y + '?token=' + encodeURIComponent(token);
+    });
+    var x = view.width / 2, y = view.height / 2;
+    var marks = svg('svg', { 'class': 'marks', width: view.width, height: view.height,
+      viewBox: '0 0 ' + view.width + ' ' + view.height, 'aria-hidden': 'true' }, picture);
+    svg('circle', { cx: x, cy: y, r: view.radius, fill: 'rgba(80, 160, 255, .22)',
+      stroke: '#a9d4ff', 'stroke-width': 1.6 }, marks);
+    // A pin whose tip is the estimate.
+    var pin = svg('g', { transform: 'translate(' + x + ' ' + y + ')' }, marks);
+    svg('ellipse', { cx: 0, cy: 0, rx: 4.5, ry: 1.8, fill: 'rgba(0, 0, 0, .35)' }, pin);
+    svg('path', { d: 'M0 0 C-1.8 -5 -8 -8.6 -8 -15 A8 8 0 1 1 8 -15 C8 -8.6 1.8 -5 0 0 Z',
+      fill: '#e5534b', stroke: '#ffffff', 'stroke-width': 1.4 }, pin);
+    svg('circle', { cx: 0, cy: -15, r: 3, fill: '#ffffff' }, pin);
+    var words = card.appendChild(el('div', 'words'));
+    placeWords(words, where);
+    words.appendChild(el('span', 'dim', 'Circle: rough area, about ' + Math.round(view.radius_m / 1000) +
+      ' km around the pin.'));
+    words.appendChild(el('span', 'dim', estimatedFrom(where)));
+    words.appendChild(credit(view));
+    return card;
+  }
+  // The fitted drawing starts just below the note and the location card,
+  // so neither covers part of it: only the canvas' empty margin is under
+  // them.
+  function fitStage() {
+    var where = byId('where');
+    var top = Math.max(64, Math.ceil(where.offsetTop + where.offsetHeight + 12 - FIT_PADDING));
+    var canvas = byId('cy');
+    if (canvas.style.top === top + 'px') { return; }
+    canvas.style.top = top + 'px';
+    cy.resize();
+    if (cy.elements().length) { cy.fit(cy.elements(), FIT_PADDING); }
+  }
+  window.addEventListener('resize', fitStage);
   function renderWhere() {
-    var box = clear(byId('where'));
     var vpn = (state.machine && state.machine.vpn) || [];
     var where = state.location;
+    // Drawn again only when something changed, so the pictures load once.
+    var key = JSON.stringify([vpn, where]);
+    if (key === whereDrawn) { return; }
+    whereDrawn = key;
+    var box = clear(byId('where'));
     if (vpn.length) {
       var names = vpn.map(function (line) { return line.split(':')[0]; }).join(', ');
       var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
@@ -486,17 +574,17 @@
       note.appendChild(el('strong', null, 'VPN detected'));
       note.appendChild(el('span', null, ' ' + names + (all
         ? ': it carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
-        : ': it carries only some networks, so the location below is your own connection\'s.')));
+        : ': it carries only some networks, so the location shown is your own connection\'s.')));
     }
-    if (where && where.status === 'found') {
-      var place = where.place;
+    if (where && where.status === 'found' && where.map) {
+      box.appendChild(satellite(where));
+    } else if (where && where.status === 'found') {
       var card = box.appendChild(el('div', 'compass'));
       card.appendChild(compass());
       var words = card.appendChild(el('div', 'words'));
-      words.appendChild(el('strong', null, [place.city, place.region, place.country].filter(Boolean).join(', ') || 'Unnamed place'));
-      words.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' + degrees(place.longitude, 'E', 'W')));
-      words.appendChild(el('span', 'dim', 'estimated from ' + (place.public_address || 'your public address') +
-        (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source));
+      placeWords(words, where);
+      words.appendChild(el('span', 'dim', estimatedFrom(where)));
+      if (where.map_error) { words.appendChild(el('span', 'dim', 'No map: ' + where.map_error)); }
     } else if (where && where.status === 'unavailable') {
       var off = box.appendChild(el('div', 'compass off'));
       off.appendChild(compass());
@@ -504,6 +592,7 @@
       why.appendChild(el('strong', null, 'Location unknown'));
       why.appendChild(el('span', 'dim', where.reason));
     }
+    fitStage();
   }
 
   function renderLegend() {

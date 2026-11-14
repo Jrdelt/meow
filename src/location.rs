@@ -6,7 +6,9 @@
 //! or the targets: it has no parameters, and the service learns only the
 //! address it comes from. It is made when the map asks for it, then again
 //! only when this machine's network changes. While a VPN carries all
-//! traffic nothing is looked up: the answer would be the VPN's exit.
+//! traffic nothing is looked up: the answer would be the VPN's exit. The
+//! estimate is drawn on a small satellite map (`tiles.rs`) unless
+//! `[location] map` is off.
 
 use std::time::Duration;
 
@@ -17,6 +19,7 @@ use serde_json::Value;
 use crate::evidence::sanitize;
 use crate::graph::LocalNet;
 use crate::observer;
+use crate::tiles::{self, MapView, Picture};
 
 /// Answers with the caller's public address and its estimated place.
 pub const LOOKUP_URL: &str = "https://ipinfo.io/json";
@@ -32,6 +35,10 @@ pub struct LocationSettings {
     /// A service that answers JSON for the caller (ipinfo.io, ipapi.co,
     /// ifconfig.co and ip-api.com answers are all understood).
     pub url: String,
+    /// Draw the estimate on a small satellite map (`tiles.rs`).
+    pub map: bool,
+    /// Where the map's pictures come from: `{z}`, `{x}`, `{y}` are filled in.
+    pub tiles: String,
 }
 
 impl Default for LocationSettings {
@@ -39,6 +46,8 @@ impl Default for LocationSettings {
         Self {
             enabled: true,
             url: LOOKUP_URL.to_owned(),
+            map: true,
+            tiles: tiles::TILES_URL.to_owned(),
         }
     }
 }
@@ -68,6 +77,13 @@ pub enum Location {
         place: Place,
         source: String,
         vpn: Vec<String>,
+        /// The small satellite map, once its pictures are in (boxed: the
+        /// other kinds of answer are small).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        map: Option<Box<MapView>>,
+        /// Why there is no map although one was wanted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        map_error: Option<String>,
     },
     /// A VPN carries all traffic: nothing was looked up.
     HiddenByVpn { vpn: Vec<String> },
@@ -205,6 +221,23 @@ pub async fn lookup(url: &str) -> Result<Place> {
         .await
         .context("the location service sent something other than JSON")?;
     parse(&body).context("the location service's answer held no place")
+}
+
+/// The small map around `place` and its pictures, or `None` when
+/// `[location] map` is off.
+pub async fn map_for(
+    settings: &LocationSettings,
+    place: &Place,
+) -> Option<Result<(MapView, Vec<Picture>)>> {
+    if !settings.map {
+        return None;
+    }
+    let view = tiles::view(place.latitude, place.longitude, &settings.tiles);
+    Some(
+        tiles::fetch(&settings.tiles, &view)
+            .await
+            .map(|pictures| (view, pictures)),
+    )
 }
 
 /// The host part of `url`, to say where an estimate came from.
@@ -351,5 +384,20 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(source("https://ipinfo.io/json"), "ipinfo.io");
+
+        // The map: off means no pictures are fetched; a broken address is
+        // an error the page shows under the compass.
+        let place = parse(&json!({ "loc": "47.6,-117.4" })).unwrap();
+        let off = LocationSettings {
+            map: false,
+            ..LocationSettings::default()
+        };
+        assert!(map_for(&off, &place).await.is_none());
+        let broken = LocationSettings {
+            tiles: format!("{base}/tiles/{{z}}/{{x}}.jpg"),
+            ..LocationSettings::default()
+        };
+        let error = map_for(&broken, &place).await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("lacks {y}"), "{error:#}");
     }
 }
