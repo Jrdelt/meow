@@ -1,24 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90" viewBox="0 0 120 90">
-<!-- meow map icon: a router with two antennas. Original artwork, same licence as the project. -->
-<defs>
-<filter id="a" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.045" numOctaves="2" seed="12" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="3" xChannelSelector="R" yChannelSelector="G"/></filter>
-<filter id="b" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.03" numOctaves="2" seed="6" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="4.5" xChannelSelector="G" yChannelSelector="R"/></filter>
-<pattern id="h" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(-35)"><rect width="5" height="5" fill="#e3f2f9"/><line x1="0" y1="2.5" x2="5" y2="2.5" stroke="#58a6c8" stroke-width="1.6"/></pattern>
-<g id="ink" stroke-linecap="round" stroke-linejoin="round">
-<path d="M14 50 L84 38 L106 48 L106 62 L36 76 L14 64 Z"/>
-<path d="M40 45 L33 14" fill="none"/>
-<path d="M80 39 L88 10" fill="none"/>
-</g>
-</defs>
-<g filter="url(#a)">
-<use href="#ink" fill="#ffffff" stroke="#2e2e2e" stroke-width="2.3"/>
-<g fill="url(#h)" stroke="#2e2e2e" stroke-width="1.1" stroke-linejoin="round">
-<path d="M43 65 L100 53 L100 58 L43 71 Z"/>
-</g>
-<g fill="none" stroke="#2e2e2e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-<path d="M14 50 L36 62 L106 48 M36 62 L36 76"/>
-<circle cx="21" cy="60" r="1.6"/><circle cx="28" cy="64" r="1.6"/>
-</g>
-</g>
-<use href="#ink" fill="none" stroke="#2e2e2e" stroke-width="1" opacity="0.45" filter="url(#b)"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="#c9d1d9" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+<!-- meow map icon: a router. Original artwork, same licence as the project. -->
+<rect x="7" y="25" width="34" height="12" rx="2"/><path d="M14 25 11 12M34 25l3-13"/><path d="M14 31h.01M19 31h.01"/><path d="M27 31h8"/>
 </svg>

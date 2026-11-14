@@ -120,19 +120,21 @@ terminal, add `--session <name>` or `--local`.
 
 ## The map
 
-`meow map` draws a star of lines: you in the middle, one straight line out
-per network this machine is on, and the devices on that network as stops
-along it, nearest first.
+`meow map` draws a top-down network diagram: the Internet and anything
+reached through a gateway at the top, gateways (routers) below that, one bar
+per network this machine is on, and the devices on each network underneath
+its bar, with you among them.
 
 | On the map | What it means |
 |---|---|
-| Line colour | Grey: Wi-Fi or Ethernet. Cyan: a VPN. Purple: a virtual network on this machine. Dashed grey: hosts this machine has no route to. |
-| Stop colour | Green: scanned, nothing to check. Amber: advisories to verify. Red: confirmed findings (a double ring when one is known exploited). Grey: not scanned, e.g. a device only seen in the neighbour table. |
-| A branch off a stop | What lies behind a router: the Internet (the default route) and hosts routed through it. Behind a VPN gateway the line simply carries on. |
-| `+N more` | A busy network folds after 7 stops; click to unfold, then "show fewer". |
+| Bar colour | Grey: Wi-Fi or Ethernet. Cyan: a VPN. Purple: a virtual network on this machine. You join every network besides the first with a dashed line in its colour. |
+| Device frame | Green: scanned, nothing to check. Amber: advisories to verify. Red: confirmed findings (a double frame when one is known exploited). Grey: not scanned, e.g. a device only seen in the neighbour table. |
+| Device picture | Router, server (a service seen), client (none seen), firewall, the Internet; a laptop for you. |
+| `+N more` | A busy network shows 11 devices in two rows; click to unfold, then "show fewer". |
+| Route not known | Hosts this machine has no route to, in a group of their own. |
 
 The picture is drawn from this machine's own tables (interfaces, routes,
-neighbours) and from scans; reading the tables sends nothing. Click any stop
+neighbours) and from scans; reading the tables sends nothing. Click any device
 for its cards.
 
 A name that only appeared in text (a URL printed in the session shell, such
@@ -156,7 +158,7 @@ rows of label and value:
 
 Only cards that have something to say are shown.
 
-The picture is a drawing hint, not a finding. Click any stop to read what it
+The picture is a drawing hint, not a finding. Click any device to read what it
 was derived from.
 
 ## This machine
