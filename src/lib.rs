@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod graph;
 pub mod hud;
 pub mod ipc;
+pub mod location;
 pub mod lock;
 pub mod mode;
 pub mod observer;

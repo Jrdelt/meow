@@ -83,6 +83,7 @@ The primary `meow <name>` process acts as the single session coordinator: it own
 - **`light` Mode (Default — Zero Outbound Packets):**
   - Rejects active `meow recon` jobs and warns on high-rate manual flags.
   - Passively reads local OS network tables (`arp`, routes, active sockets/interfaces without `sudo`) to map gateways/VPN interfaces (`utun`/`tun`/`eth`) and warn on subnet/interface routing mismatches.
+  - Location estimate (`src/location.rs`, `[location]` in `config.toml`, on by default): only after the map sends `locate`, one parameterless GET to a lookup service (default `https://ipinfo.io/json`), repeated only when the active VPNs, default gateway or primary address change (or 15 min after a failure). Skipped entirely while a VPN carries all traffic (default route or both `/1` halves); the map then says "VPN detected". Targets are never sent anywhere for this.
 - **Sequential 1-at-a-Time Coordinator Queue (`tokio::sync::Semaphore` = 1):**
   - Spawns child tools with `Stdio::null()` on `stdin` inside OS process groups (`setpgid` on Unix / Job Objects on Windows) with `kill_on_drop(true)`, a configurable stage wall-clock timeout, and a `50 MB` output cap, writing structured files to `<workspace>/tmp/`:
     1. **Port Inventory (`nmap`):** Uses configured flags + `-oX <tmp>/nmap_ports.xml`. **Privilege Check:** If unprivileged (`geteuid() != 0` on Unix / non-elevated Windows), automatically replaces `-sS` with `-sT` and strips `-O`, logging a notice in `meow hud`.

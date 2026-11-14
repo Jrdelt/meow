@@ -19,9 +19,12 @@
   // wanted first. The top right is left free for the cloud.
   var SLOTS1 = [20, 160, 200, 125, 235, 90, 55, 268];
   var SLOTS2 = [180, 145, 215, 112, 248, 80, 40, 285, 165, 195];
+  // With networks of your own below you, the lower right stays theirs.
+  var BUSY_BELOW_YOU = [40];
   var MAX_DEVICES = SLOTS1.length + SLOTS2.length - 2;  // "you" and "+N more" take a slot
   var CLOUD = { x: 360, y: -230 };
   var expanded = {};    // networks the reader unfolded, by network id
+  var askedWhere = false;
 
   var LINE = { wifi: '#9aa3ad', ethernet: '#9aa3ad', other: '#9aa3ad', vpn: '#1aa6b3',
     virtual: '#8a73d6', unknown: '#9aa3ad' };
@@ -79,6 +82,10 @@
         'shape': 'round-rectangle', 'width': 96, 'height': 34, 'background-opacity': 1, 'background-color': '#ffffff',
         'border-width': 1.5, 'border-style': 'dashed', 'border-color': '#9aa3ad',
         'text-valign': 'center', 'text-margin-y': 0, 'color': '#4a5260' } },
+      { selector: 'node.ownbar', style: {
+        'shape': 'round-rectangle', 'height': 4, 'width': 'data(width)', 'background-opacity': 1,
+        'background-color': '#9aa3ad', 'label': '', 'events': 'no' } },
+      { selector: 'node.anchor', style: { 'width': 1, 'height': 1, 'label': '', 'events': 'no' } },
       { selector: 'node:selected', style: { 'overlay-color': '#1f6fb2', 'overlay-opacity': 0.14 } },
       { selector: 'edge', style: {
         'curve-style': 'taxi', 'taxi-direction': 'horizontal', 'taxi-turn': '50%', 'width': 2.2,
@@ -151,6 +158,11 @@
       if (message.type === 'state') {
         state = message.state;
         render();
+        // Where this machine is: asked once, when the map first opens.
+        if (!askedWhere) {
+          askedWhere = true;
+          send({ cmd: 'locate' });
+        }
       } else if (message.type === 'result' && !message.ok) {
         flash(message.error);
       }
@@ -284,6 +296,7 @@
       networks.filter(function (n) { return ['vpn', 'virtual'].indexOf(data[n].link) < 0; })[0];
     var vpns = networks.filter(function (n) { return n !== home && data[n].link === 'vpn'; });
     var others = networks.filter(function (n) { return n !== home && vpns.indexOf(n) < 0; });
+    var own = vpns.concat(others);
 
     // Your home network: the router in the middle, devices around it.
     var hub = null;
@@ -310,7 +323,8 @@
       }
       var around = ['local'].concat(devices);
       if (hidden || unfolded) { around.push(more(home, hidden, unfolded)); }
-      var slots = SLOTS1.map(function (a) { return [a, RING1]; }).concat(SLOTS2.map(function (a) { return [a, RING2]; }));
+      var outer = own.length ? SLOTS2.filter(function (a) { return BUSY_BELOW_YOU.indexOf(a) < 0; }) : SLOTS2;
+      var slots = SLOTS1.map(function (a) { return [a, RING1]; }).concat(outer.map(function (a) { return [a, RING2]; }));
       // Unfolded: further rings, as many as it takes.
       for (var ring = 3; slots.length < around.length; ring++) {
         for (var a = 0; a < 360; a += 360 / (8 + ring * 4)) {
@@ -342,51 +356,70 @@
       put('local', 0, 0, ['you']);
     }
 
-    // Each VPN leaves through the cloud: its gateway, then what is behind it.
-    vpns.forEach(function (vpn, j) {
-      var gw = linked(vpn, ['gateway']).sort(bySeverity)[0] || vpn;
-      var x = CLOUD.x + 260 + j * 260, y = 20;
-      put(gw, x, y, ['hub']);
-      var label = caption(vpn) + (data[vpn].network ? ' · ' + data[vpn].network : '');
-      link(placed.internet ? 'internet' : 'local', gw, LINE.vpn, 'dashed down', label);
-      var behind = linked(gw, ['routed']).concat(linked(vpn, ['neighbour', 'direct']))
-        .filter(function (id) { return !placed[id]; }).sort(bySeverity);
-      behind.slice(0, 6).forEach(function (h, i) {
-        put(h, x + (i % 2 ? 70 : -70) * (i > 0 ? 1 : 0), y + 170 + Math.floor((i + 1) / 2) * 140);
-        link(gw, h, LINE.vpn, 'down');
-      });
-      behind.slice(6).forEach(function (h) { placed[h] = true; });
-    });
-
-    // Your other networks (virtual ones, a second LAN): a switch each, in
-    // a row below, joined to you.
-    others.forEach(function (net, k) {
+    // Networks only this machine is on (a VPN, a virtual network) hang
+    // below you, not off the router: the rest of your network does not use
+    // them. Each has its hub (the VPN's gateway, or a switch) and what is
+    // behind it underneath.
+    var you = pos.local, hubs = [];
+    own.forEach(function (net) {
       var color = LINE[data[net].link] || LINE.other;
-      var x = -RING2.rx + 40, y = RING2.ry + 250 + k * 210;
-      put(net, x, y, ['hub']);
-      networkOf[net] = data[net].network || '';
-      link('local', net, color, 'dashed down low');
-      var members = linked(net, ['gateway', 'neighbour', 'direct']).filter(function (id) { return !placed[id]; }).sort(bySeverity);
-      members.slice(0, 6).forEach(function (h, i) {
-        put(h, x + 180 + i * 150, y);
-        link(net, h, color);
-      });
+      var hubId = data[net].link === 'vpn' ? (linked(net, ['gateway']).sort(bySeverity)[0] || net) : net;
+      var members = (hubId !== net ? linked(hubId, ['routed']) : [])
+        .concat(linked(net, ['gateway', 'neighbour', 'direct']))
+        .filter(function (id, i, all) { return id !== hubId && !placed[id] && all.indexOf(id) === i; })
+        .sort(bySeverity);
       members.slice(6).forEach(function (h) { placed[h] = true; });
+      members = members.slice(0, 6);
+      hubs.push({ net: net, hub: hubId, color: color, members: members,
+        width: Math.max(1, Math.min(3, members.length)) * 140 });
     });
+    var hubY = you.y + 230, x0 = you.x;
+    hubs.forEach(function (h, k) {
+      if (k > 0) { x0 += hubs[k - 1].width / 2 + h.width / 2 + 40; }
+      put(h.hub, x0, hubY, ['hub']);
+      // A gateway is named as such, so it also gets its network's name;
+      // a network's own switch only needs the address range.
+      networkOf[h.hub] = h.hub === h.net ? (data[h.net].network || '')
+        : caption(h.net) + (data[h.net].network ? ' · ' + data[h.net].network : '');
+      h.members.forEach(function (m, i) {
+        var across = Math.min(3, h.members.length), r = Math.floor(i / 3), j = i % 3;
+        put(m, x0 + (j - (across - 1) / 2) * 140, hubY + 175 + r * 150);
+        link(h.hub, m, h.color, 'down');
+      });
+    });
+    if (hubs.length === 1) {
+      link('local', hubs[0].hub, hubs[0].color, 'dashed down');
+    } else if (hubs.length > 1) {
+      // A short bar under you, one dashed drop to each network.
+      var first = pos[hubs[0].hub].x, last = pos[hubs[hubs.length - 1].hub].x, barY = you.y + 120;
+      data.ownbar = { id: 'ownbar', kind: 'bar', width: last - first + 8 };
+      pos.ownbar = { x: (first + last) / 2, y: barY };
+      classes.ownbar = 'ownbar';
+      var point = function (x) {
+        var id = 'a:own:' + Math.round(x);
+        data[id] = { id: id, kind: 'anchor' };
+        pos[id] = { x: x, y: barY };
+        classes[id] = 'anchor';
+        return id;
+      };
+      link('local', point(you.x), '#9aa3ad', 'thin');
+      hubs.forEach(function (h) { link(point(pos[h.hub].x), h.hub, h.color, 'dashed down'); });
+    }
 
     // Hosts this machine has no route to, in a group of their own.
     var rest = nodes.map(function (n) { return n.data.id; }).filter(function (id) {
       return !placed[id] && ['interface', 'internet'].indexOf(data[id].kind) < 0;
     }).sort(bySeverity);
     if (rest.length) {
-      var y0 = RING2.ry + 250 + others.length * 210;
+      var y0 = RING2.ry + 250;
       title('title:unknown', 'Route not known', -RING2.rx - 50, y0 - 62, '#6b7178');
       rest.forEach(function (h, i) { put(h, -RING2.rx + (i % 6) * 150, y0 + Math.floor(i / 6) * 140); });
     }
 
     Object.keys(pos).forEach(function (id) {
       var d = Object.assign({}, data[id]);
-      d.text = d.kind === 'title' || d.kind === 'more' ? d.label : (d.kind === 'waves' ? '' : caption(id));
+      d.text = d.kind === 'title' || d.kind === 'more' ? d.label
+        : (['waves', 'bar', 'anchor'].indexOf(d.kind) >= 0 ? '' : caption(id));
       if (networkOf[id]) { d.text += '\n' + networkOf[id]; }
       elements.push({ group: 'nodes', data: d, classes: classes[id] });
     });
@@ -405,6 +438,64 @@
       positions: function (node) { return picture.positions[node.id()]; }
     }).run();
     if (selected && cy.$id(selected).length) { cy.$id(selected).select(); }
+  }
+
+  // Above the drawing: a note when a VPN is up, and a small compass with
+  // the estimated place of this machine when one is known.
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  function svg(tag, attrs, parent) {
+    var node = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs).forEach(function (key) { node.setAttribute(key, attrs[key]); });
+    if (parent) { parent.appendChild(node); }
+    return node;
+  }
+  function compass() {
+    var face = svg('svg', { width: 44, height: 44, viewBox: '0 0 46 46', 'aria-hidden': 'true' });
+    svg('circle', { cx: 23, cy: 23, r: 21, fill: '#ffffff', stroke: '#9aa3ad', 'stroke-width': 1.5 }, face);
+    [['N', 23, 10.5], ['E', 37.5, 26], ['S', 23, 41.5], ['W', 8.5, 26]].forEach(function (mark) {
+      var letter = svg('text', { x: mark[1], y: mark[2], 'text-anchor': 'middle', 'font-size': 8,
+        'font-weight': 700, 'font-family': FONT, fill: mark[0] === 'N' ? '#e5534b' : '#4a5260' }, face);
+      letter.textContent = mark[0];
+    });
+    svg('path', { d: 'M23 13 L26.5 23 L19.5 23 Z', fill: '#e5534b' }, face);
+    svg('path', { d: 'M23 33 L26.5 23 L19.5 23 Z', fill: '#4a5260' }, face);
+    svg('circle', { cx: 23, cy: 23, r: 1.6, fill: '#ffffff' }, face);
+    return face;
+  }
+  function degrees(value, positive, negative) {
+    return Math.abs(value).toFixed(2) + '\u00b0 ' + (value >= 0 ? positive : negative);
+  }
+  function renderWhere() {
+    var box = clear(byId('where'));
+    var vpn = (state.machine && state.machine.vpn) || [];
+    var where = state.location;
+    if (vpn.length) {
+      var names = vpn.map(function (line) { return line.split(':')[0]; }).join(', ');
+      var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
+        return /default route|all IPv4/.test(line);
+      });
+      var note = box.appendChild(el('div', 'vpn-note'));
+      note.appendChild(el('strong', null, 'VPN detected'));
+      note.appendChild(el('span', null, ' ' + names + (all
+        ? ': it carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
+        : ': it carries only some networks, so the location below is your own connection\'s.')));
+    }
+    if (where && where.status === 'found') {
+      var place = where.place;
+      var card = box.appendChild(el('div', 'compass'));
+      card.appendChild(compass());
+      var words = card.appendChild(el('div', 'words'));
+      words.appendChild(el('strong', null, [place.city, place.region, place.country].filter(Boolean).join(', ') || 'Unnamed place'));
+      words.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' + degrees(place.longitude, 'E', 'W')));
+      words.appendChild(el('span', 'dim', 'estimated from ' + (place.public_address || 'your public address') +
+        (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source));
+    } else if (where && where.status === 'unavailable') {
+      var off = box.appendChild(el('div', 'compass off'));
+      off.appendChild(compass());
+      var why = off.appendChild(el('div', 'words'));
+      why.appendChild(el('strong', null, 'Location unknown'));
+      why.appendChild(el('span', 'dim', where.reason));
+    }
   }
 
   function renderLegend() {
@@ -911,6 +1002,7 @@
   function render() {
     renderHeader();
     renderGraph();
+    renderWhere();
     renderSide();
     renderDetail();
   }

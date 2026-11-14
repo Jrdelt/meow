@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ai::AiSettings;
 use crate::cve::CveSettings;
+use crate::location::LocationSettings;
 use crate::mode::Mode;
 use crate::queue::{PresetOverride, ReconSettings};
 
@@ -55,6 +56,15 @@ default_mode = "light"
 # Shell to launch inside a session. Leave commented out to use the platform
 # default (zsh on macOS, bash on Linux, PowerShell on Windows).
 # shell = "/bin/zsh"
+
+[location]
+# When the map is open, estimate where this machine is from its public
+# address, asking the service below once and again when the network
+# changes. The request carries nothing about you or your targets; the
+# service sees only the address it comes from. Nothing is looked up while
+# a VPN carries all traffic. Set to false to turn it off.
+enabled = true
+# url = "https://ipinfo.io/json"
 
 [cve]
 # Look up known vulnerabilities for discovered software (NIST NVD, OSV.dev,
@@ -363,6 +373,7 @@ pub struct Config {
     pub cve: CveSettings,
     pub recon: ReconSettings,
     pub ai: AiSettings,
+    pub location: LocationSettings,
 }
 
 impl Config {
@@ -1369,6 +1380,7 @@ mod tests {
                 cve: CveSettings::default(),
                 recon: expected.recon.clone(),
                 ai: expected.ai.clone(),
+                location: LocationSettings::default(),
             }
         );
 

@@ -14,7 +14,9 @@ workspace for authorized defensive work. Rust with a small C11 stream filter.
 `meow <name>` wraps your normal shell. While you work, it quietly builds a
 graph of the hosts, ports, paths and software it sees, matches that software
 against public vulnerability databases, and keeps every raw observation apart
-from every conclusion. Nothing leaves your machine unless you ask for it.
+from every conclusion. Nothing about your targets leaves your machine unless
+you ask for it; the lookups meow makes by itself (vulnerability databases, the
+map's location estimate) are described below and can be turned off.
 
 The full specification is in [`SPEC.md`](SPEC.md). Notes for contributors and
 coding agents are in [`AGENTS.md`](AGENTS.md). Report security problems
@@ -129,9 +131,19 @@ right, and the devices on your network around the router, you among them.
 | Waves around the router | Your connection to it is Wi-Fi, so devices are drawn without lines. On Ethernet each device hangs off an orthogonal line. |
 | Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
 | Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
-| Dashed cyan line | A VPN: it leaves through the cloud to its gateway, with what is behind it underneath. |
-| Dashed purple line | Another network of yours (e.g. a virtual one), its switch and devices below. |
+| Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
+| Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
 | `+N more` | More than 16 devices fold away; click to unfold, then "show fewer". |
+| VPN detected | Shown above the drawing whenever a VPN is up, saying whether it carries all traffic or only some networks. |
+| Compass | Where this machine roughly is, estimated from its public address (see below). |
+
+A private address such as 192.168.0.81 has no location, so the estimate needs
+the address the rest of the world sees. When the map opens, meow asks
+`ipinfo.io` once (and again only when the network changes): a plain request
+that carries nothing about you or your targets; the service sees only the
+address it comes from. While a VPN carries all traffic nothing is asked,
+since the answer would be the VPN's exit. `[location] enabled = false` in
+`config.toml` turns it off; `url` picks another service.
 | Route not known | Hosts this machine has no route to, in a group at the bottom. |
 
 The picture is drawn from this machine's own tables (interfaces, routes,
@@ -340,7 +352,7 @@ is unavailable; the map and the HUD say so.
 ## Configuration
 
 `~/.meow/config.toml` is created on first use, with comments. Sections:
-`default_mode`, `shell`, `[cve]`, `[recon]`, `[ai]`. Per-workspace overrides
+`default_mode`, `shell`, `[location]`, `[cve]`, `[recon]`, `[ai]`. Per-workspace overrides
 live in `profile.toml`. Your own AI setup is in `~/.meow/ai.toml` and overrides
 `[ai]`. `MEOW_HOME` moves the base directory.
 

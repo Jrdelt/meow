@@ -60,7 +60,7 @@ Before every push:
 
 - **Active Phase & Step:** `v0.1.0` release: Cat Setup GUI (`src/wizard.rs`), hardening (`ISS-001`..`ISS-011`), installers & GitHub/local sync complete; `meow tools` (recon checks and offers to install its tools).
 - **Last Verified Commit:** See `git log -n 1 --oneline`.
-- **In-Progress / Partial Work:** None (`341` tests passing).
+- **In-Progress / Partial Work:** None (`345` tests passing).
 - **Next Exact Action:** Log any newly discovered issues in `issue/issues.md`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
@@ -85,7 +85,9 @@ Before every push:
     user startup files load natively. Never keep it on the shim after that.
   - Map page: a dashboard of cards; no inline scripts, no `innerHTML`; checked
     by hand in Chromium (Playwright). The topology is a home-network illustration
-    (router centre, devices on rings, cloud top right; `link` picks Wi-Fi); `topology::Role` carries the reason; the
+    (router centre, devices on rings, cloud top right, VPN and virtual
+    networks below you; `link` picks Wi-Fi); the compass/VPN note come from
+    `location.rs`, asked only after the page sends `locate`; `topology::Role` carries the reason; the
     Internet and neighbour clients are drawn only, never hosts. `observer::machine_report` words "this machine" for map and HUD.
   - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
     for real. `init.ps1` has never been run.

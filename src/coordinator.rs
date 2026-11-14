@@ -39,6 +39,7 @@ use crate::db::Db;
 use crate::endpoint::Target;
 use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
 use crate::graph::{Graph, Host, LocalNet, Observation};
+use crate::location::{self, Location};
 use crate::mode::Mode;
 use crate::observer;
 use crate::parsers::text::TextParser;
@@ -56,6 +57,10 @@ const MAX_NOTICES: usize = 100;
 const TAP_QUEUE: usize = 4096;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 const OBSERVE_EVERY: Duration = Duration::from_secs(30);
+/// How often the location is checked against the network, and how long
+/// after a failed lookup it is tried again.
+const LOCATE_EVERY: Duration = Duration::from_secs(30);
+const LOCATE_RETRY: Duration = Duration::from_secs(15 * 60);
 const WS_MIN_INTERVAL: Duration = Duration::from_millis(400);
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -155,6 +160,9 @@ pub enum Command {
         tier: Tier,
         address: String,
     },
+    /// Starts estimating where this machine is (the map sends it when it
+    /// opens); does nothing once started.
+    Locate,
 }
 
 /// The AI request that is running, or the last one that finished.
@@ -189,6 +197,9 @@ pub struct State {
     vault: Mutex<Vault>,
     ai: AiEngine,
     ai_status: Mutex<AiStatus>,
+    /// Where this machine is estimated to be; `None` until the map asks.
+    location: Mutex<Option<Location>>,
+    locating: AtomicBool,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
 }
@@ -325,6 +336,7 @@ impl State {
             "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
             "notices": &*lock(&self.notices),
             "ai": &*lock(&self.ai_status),
+            "location": &*lock(&self.location),
             "budget": self.ai.budget(),
         })
     }
@@ -441,6 +453,12 @@ impl State {
                 )
             }
             Command::Resume => Ok(json!({ "resumed": self.resume_unfinished()? })),
+            Command::Locate => {
+                if !self.locating.swap(true, Ordering::SeqCst) {
+                    self.handle.spawn(location_loop(Arc::clone(self)));
+                }
+                Ok(json!({ "locating": true }))
+            }
             Command::Ai { tier, address } => {
                 let (graph, host) = {
                     let graph = self.graph();
@@ -763,6 +781,51 @@ async fn observe_loop(state: Shared) {
     }
 }
 
+/// Keeps the location estimate in step with the network: looked up again
+/// only when the VPNs, the default gateway or this machine's address
+/// change, or a while after a failed lookup.
+async fn location_loop(state: Shared) {
+    let settings = state.config.location.clone();
+    let mut last_key: Option<String> = None;
+    let mut retry_at: Option<std::time::Instant> = None;
+    loop {
+        let (key, plan) = {
+            let graph = state.graph();
+            (
+                location::network_key(&graph.local),
+                location::plan(&settings, &graph.local),
+            )
+        };
+        let retry = retry_at.is_some_and(|at| std::time::Instant::now() >= at);
+        if last_key.as_deref() != Some(key.as_str()) || retry {
+            last_key = Some(key);
+            retry_at = None;
+            let found = match plan {
+                location::Plan::Off => Location::Off,
+                location::Plan::Hidden(vpn) => Location::HiddenByVpn { vpn },
+                location::Plan::Lookup { partial_vpns } => {
+                    match location::lookup(&settings.url).await {
+                        Ok(place) => Location::Found {
+                            place,
+                            source: location::source(&settings.url),
+                            vpn: partial_vpns,
+                        },
+                        Err(error) => {
+                            retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
+                            Location::Unavailable {
+                                reason: format!("{error:#}"),
+                            }
+                        }
+                    }
+                }
+            };
+            *lock(&state.location) = Some(found);
+            state.touch();
+        }
+        tokio::time::sleep(LOCATE_EVERY).await;
+    }
+}
+
 /// Mines clean terminal lines for hosts, ports, URLs and headers.
 async fn tap_loop(state: Shared, mut lines: mpsc::Receiver<String>) {
     let mut parser = TextParser::new(Source::PtyRegex);
@@ -948,6 +1011,8 @@ impl Coordinator {
             vault: Mutex::new(vault),
             ai: engine,
             ai_status: Mutex::new(AiStatus::default()),
+            location: Mutex::new(None),
+            locating: AtomicBool::new(false),
             handle: runtime.handle().clone(),
         });
 
@@ -1066,6 +1131,62 @@ mod tests {
             workspace,
             coordinator,
         }
+    }
+
+    #[test]
+    fn the_map_asks_once_and_the_estimate_lands_in_the_snapshot() {
+        // A stand-in lookup service on its own thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            block_on(async move {
+                let app = axum::Router::new().route(
+                    "/json",
+                    axum::routing::get(|| async {
+                        axum::Json(json!({ "ip": "203.0.113.7", "city": "Spokane",
+                            "region": "Washington", "country": "US", "loc": "47.6588,-117.4260" }))
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let address = rx.recv().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        config.location.url = format!("http://{address}/json");
+        let coordinator = Coordinator::start(workspace, config).unwrap();
+        let state = coordinator.state();
+
+        // Nothing is looked up until the map asks.
+        assert_eq!(state.snapshot()["location"], Value::Null);
+        state.execute(Command::Locate).unwrap();
+        state.execute(Command::Locate).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let location = loop {
+            let location = state.snapshot()["location"].clone();
+            if !location.is_null() || std::time::Instant::now() > deadline {
+                break location;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // This test machine may itself be on a VPN that takes all traffic.
+        match location["status"].as_str() {
+            Some("found") => {
+                assert_eq!(location["place"]["city"], "Spokane");
+                assert_eq!(location["place"]["latitude"], 47.6588);
+                assert_eq!(location["source"], "127.0.0.1");
+            }
+            Some("hidden_by_vpn") => assert!(location["vpn"].as_array().is_some()),
+            other => panic!("unexpected location {other:?}: {location}"),
+        }
+        coordinator.shutdown();
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

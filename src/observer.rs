@@ -902,6 +902,28 @@ fn is_active_vpn(interface: &Interface) -> bool {
     interface.kind == "vpn" && interface.up && has_routable_address(interface)
 }
 
+/// The VPNs that are up, each with whether it carries all traffic: the
+/// default route, or both halves of the IPv4 space as VPN clients usually
+/// take it.
+pub fn active_vpns(local: &LocalNet) -> Vec<(String, bool)> {
+    local
+        .interfaces
+        .iter()
+        .filter(|interface| is_active_vpn(interface))
+        .map(|interface| {
+            let through: Vec<&str> = local
+                .routes
+                .iter()
+                .filter(|route| route.interface == interface.name)
+                .map(|route| route.destination.as_str())
+                .collect();
+            let all = through.iter().any(|d| matches!(*d, "0.0.0.0/0" | "::/0"))
+                || (through.contains(&"0.0.0.0/1") && through.contains(&"128.0.0.0/1"));
+            (interface.name.clone(), all)
+        })
+        .collect()
+}
+
 /// One summary line for the session banner.
 pub fn summary(local: &LocalNet) -> String {
     let up = local
