@@ -230,20 +230,7 @@ pub fn find_wordlist(configured: Option<&str>, own_dir: Option<&Path>) -> Option
 
 /// How to get a missing tool, said where the stage is skipped.
 fn install_hint(program: &str) -> String {
-    let name = Path::new(program)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(program);
-    let how = if cfg!(target_os = "macos") {
-        format!("brew install {name}")
-    } else if name == "katana" {
-        "go install github.com/projectdiscovery/katana/cmd/katana@latest".to_owned()
-    } else if name == "feroxbuster" {
-        "cargo install feroxbuster".to_owned()
-    } else {
-        format!("install {name} with your package manager")
-    };
-    format!("{program} is not installed (to add it: {how})")
+    format!("{program} is not installed (run `meow tools` to install it)")
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,7 +1259,7 @@ async fn run_stage(
                             .map(|dir| format!("put a .txt wordlist in {}, or ", dir.display()))
                             .unwrap_or_default();
                         return Ok(StageEnd::Skipped(format!(
-                            "no wordlist found: {own}set recon.wordlist_path in config.toml"
+                            "no wordlist found: run `meow tools`, {own}set recon.wordlist_path in config.toml"
                         )));
                     }
                 },

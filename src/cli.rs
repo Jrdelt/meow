@@ -81,6 +81,12 @@ pub enum Command {
         #[arg(long)]
         forget_key: bool,
     },
+    /// Show the tools `meow recon` uses and install the missing ones
+    Tools {
+        /// Install without asking first
+        #[arg(long)]
+        yes: bool,
+    },
     /// Pull the latest meow from GitHub and rebuild it, with every tool it uses
     Update {
         /// Only show what is new; change nothing
@@ -119,6 +125,9 @@ pub enum Command {
     Recon {
         /// Host, IP address or CIDR range you are authorized to scan
         target: String,
+        /// Install a missing scanner or wordlist without asking first
+        #[arg(long)]
+        install_tools: bool,
         /// Extra nmap flags, given after `--`
         #[arg(last = true, value_name = "NMAP_FLAGS")]
         nmap_flags: Vec<String>,
@@ -175,6 +184,7 @@ impl Command {
             Command::Delete { .. } => "delete",
             Command::Setup { .. } => "setup",
             Command::Update { .. } => "update",
+            Command::Tools { .. } => "tools",
             Command::Mode { .. } => "mode",
             Command::Recon { .. } => "recon",
             Command::Map { .. } => "map",
@@ -191,7 +201,8 @@ impl Command {
             Command::List
             | Command::Delete { .. }
             | Command::Setup { .. }
-            | Command::Update { .. } => None,
+            | Command::Update { .. }
+            | Command::Tools { .. } => None,
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
             | Command::Map { session, .. }

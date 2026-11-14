@@ -348,7 +348,9 @@ fn missing_tools_and_wordlists_skip_their_stage_cleanly() {
     let row = task(&coordinator, id);
     for stage in &row.stages[2..] {
         assert!(
-            stage.detail.contains("is not installed (to add it: "),
+            stage
+                .detail
+                .contains("is not installed (run `meow tools` to install it)"),
             "{}",
             stage.detail
         );

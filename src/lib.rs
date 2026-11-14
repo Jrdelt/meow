@@ -24,6 +24,7 @@ pub mod setup;
 pub mod shims;
 pub mod tap;
 pub mod timeutil;
+pub mod tools;
 pub mod topology;
 pub mod update;
 pub mod vault;

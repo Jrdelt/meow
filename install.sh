@@ -8,6 +8,8 @@
 #   ./install.sh --yes         do not ask
 #   ./install.sh --dry-run     only show what would be done
 #   ./install.sh --no-tools    leave out the scanners and the wordlist
+#   ./install.sh --tools-only  only the scanners and the wordlist (what
+#                              `meow recon` and `meow tools` run)
 #
 # Nothing is installed that is already present, so it is safe to run again.
 
@@ -40,12 +42,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 assume_yes=no
 dry_run=no
 with_tools=yes
+tools_only=no
 for arg in "$@"; do
     case "$arg" in
     -y | --yes) assume_yes=yes ;;
     -n | --dry-run) dry_run=yes ;;
     --with-tools) with_tools=yes ;;
     --no-tools) with_tools=no ;;
+    --tools-only) tools_only=yes ;;
     -h | --help)
         sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
@@ -54,9 +58,12 @@ for arg in "$@"; do
     esac
 done
 
-cd "$(dirname "$0")"
-if [ ! -f Cargo.toml ] || ! grep -q '^name = "meow"' Cargo.toml; then
-    die "Run this script from the meow repository (Cargo.toml not found next to it)."
+# The tools need no source tree: meow runs this script from its own copy.
+if [ "$tools_only" = no ]; then
+    cd "$(dirname "$0")"
+    if [ ! -f Cargo.toml ] || ! grep -q '^name = "meow"' Cargo.toml; then
+        die "Run this script from the meow repository (Cargo.toml not found next to it)."
+    fi
 fi
 
 case "$(uname -s)" in
@@ -154,6 +161,13 @@ else
     fi
 fi
 
+if [ "$tools_only" = yes ]; then
+    with_tools=yes
+    need_compiler=no
+    need_rust=no
+    update_rust=no
+fi
+
 missing_tools=""
 for tool in nmap katana feroxbuster; do
     have "$tool" || missing_tools="$missing_tools $tool"
@@ -238,7 +252,7 @@ fi
 if [ "$update_rust" = yes ]; then
     echo "  - update Rust to the latest stable (meow needs 1.$MIN_RUST_MINOR or newer; found 1.$found_rust)"
 fi
-echo "  - build meow in release mode and install it to $cargo_home/bin/meow"
+[ "$tools_only" = yes ] || echo "  - build meow in release mode and install it to $cargo_home/bin/meow"
 if [ "$with_tools" = yes ] && [ -n "$missing_tools" ]; then
     echo "  - install the scanners meow recon drives: $missing_tools"
     echo "    (with ${pm:-a package manager}${sudo:+, using sudo}; feroxbuster can also be built with cargo, katana with go)"
@@ -246,8 +260,12 @@ fi
 if [ "$need_wordlist" = yes ]; then
     echo "  - download the SecLists web-content wordlist from GitHub to $wordlist_dir/common.txt"
 fi
-if [ "$need_compiler$need_rust$update_rust" = "nonono" ]; then
+if [ "$tools_only" = no ] && [ "$need_compiler$need_rust$update_rust" = "nonono" ]; then
     echo "The C compiler and Rust are already installed."
+fi
+if [ "$tools_only" = yes ] && [ -z "$missing_tools" ] && [ "$need_wordlist" = no ]; then
+    say "Every tool meow recon uses is already installed."
+    exit 0
 fi
 
 if [ "$dry_run" = yes ]; then
@@ -329,20 +347,24 @@ if [ "$update_rust" = yes ]; then
     rustup update stable || die "Could not update Rust."
 fi
 
-have cargo || die "Rust is installed but cargo is not on PATH. Open a new terminal and rerun this script."
-now_rust=$(rust_minor)
-if [ -z "$now_rust" ] || [ "$now_rust" -lt "$MIN_RUST_MINOR" ]; then
-    die "meow needs Rust 1.$MIN_RUST_MINOR or newer, but this is $(rustc --version 2>/dev/null || echo unknown). Run: rustup update stable"
+if [ "$tools_only" = no ]; then
+    have cargo || die "Rust is installed but cargo is not on PATH. Open a new terminal and rerun this script."
+    now_rust=$(rust_minor)
+    if [ -z "$now_rust" ] || [ "$now_rust" -lt "$MIN_RUST_MINOR" ]; then
+        die "meow needs Rust 1.$MIN_RUST_MINOR or newer, but this is $(rustc --version 2>/dev/null || echo unknown). Run: rustup update stable"
+    fi
 fi
 
 # --- meow itself ----------------------------------------------------------
 
-say "Building meow (release). The first build takes a few minutes."
-cargo install --path . --locked || die "The build failed. The messages above say why."
+if [ "$tools_only" = no ]; then
+    say "Building meow (release). The first build takes a few minutes."
+    cargo install --path . --locked || die "The build failed. The messages above say why."
 
-installed="$cargo_home/bin/meow"
-[ -x "$installed" ] || die "The build finished but $installed is missing."
-say "Installed $("$installed" --version) at $installed"
+    installed="$cargo_home/bin/meow"
+    [ -x "$installed" ] || die "The build finished but $installed is missing."
+    say "Installed $("$installed" --version) at $installed"
+fi
 
 # --- Scanners and wordlist -----------------------------------------------
 # A tool that cannot be installed is reported and skipped: meow works
@@ -355,6 +377,7 @@ install_tool() {
     fi
     case "$tool" in
     feroxbuster)
+        have cargo || return 1
         say "Building feroxbuster with cargo (a few minutes)"
         cargo install feroxbuster --locked
         ;;
@@ -402,6 +425,11 @@ if [ "$need_wordlist" = yes ]; then
         wordlist_part=""
         warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $wordlist_dir and meow will use it."
     fi
+fi
+
+if [ "$tools_only" = yes ]; then
+    say "Done."
+    exit 0
 fi
 
 case ":$original_path:" in
