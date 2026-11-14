@@ -91,6 +91,7 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
         let os = child(host, "os")
             .and_then(|os| child(os, "osmatch"))
             .and_then(|m| attr(m, "name"));
+        let os_known = os.is_some();
         let host_evidence = child(host, "status").map_or("", |s| raw(xml, s));
         out.push(Observation::Host {
             address: address.clone(),
@@ -114,6 +115,8 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                 }
             }
         }
+
+        host_scripts(xml, host, &address, os_known, &mut out);
 
         let Some(ports) = child(host, "ports") else {
             continue;
@@ -165,7 +168,7 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
             out.push(Observation::Port {
                 address: address.clone(),
                 port: number,
-                protocol,
+                protocol: protocol.clone(),
                 state,
                 service: service_name.clone(),
                 product: service.and_then(|s| attr(s, "product")),
@@ -227,10 +230,65 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                     }
                     _ => {}
                 }
+                // Every script's own words are kept, the three read above
+                // included, so nothing nmap reported is lost.
+                if let Some(id) = attr(script, "id") {
+                    out.push(Observation::Script {
+                        address: address.clone(),
+                        port: Some(number),
+                        protocol: protocol.clone(),
+                        id,
+                        output: output.to_owned(),
+                        record: EvidenceRecord::observed(
+                            Source::NmapXml,
+                            Confidence::High,
+                            raw(xml, script),
+                        ),
+                    });
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// Host scripts (`<hostscript>`, e.g. `smb-os-discovery`) report on the
+/// machine rather than a port. The SMB answer also names the operating
+/// system when OS detection did not.
+fn host_scripts(xml: &str, host: Node, address: &str, os_known: bool, out: &mut Vec<Observation>) {
+    let Some(scripts) = child(host, "hostscript") else {
+        return;
+    };
+    for script in children(scripts, "script") {
+        let Some(id) = attr(script, "id") else {
+            continue;
+        };
+        let output = script.attribute("output").unwrap_or("");
+        let record = EvidenceRecord::observed(Source::NmapXml, Confidence::High, raw(xml, script));
+        if id == "smb-os-discovery" && !os_known {
+            let os = output
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("OS:"))
+                .map(|os| os.trim().to_owned())
+                .filter(|os| !os.is_empty());
+            if os.is_some() {
+                out.push(Observation::Host {
+                    address: address.to_owned(),
+                    os,
+                    mac: None,
+                    record: record.clone(),
+                });
+            }
+        }
+        out.push(Observation::Script {
+            address: address.to_owned(),
+            port: None,
+            protocol: "tcp".to_owned(),
+            id,
+            output: output.to_owned(),
+            record,
+        });
+    }
 }
 
 /// Open TCP ports per host in an Nmap XML document, for stage 2 of recon.
@@ -362,6 +420,51 @@ mod tests {
                 ("10.0.0.5".to_owned(), vec![22, 443, 8080]),
                 ("2001:db8::a".to_owned(), vec![80]),
             ]
+        );
+    }
+
+    #[test]
+    fn every_script_result_is_kept_and_smb_names_the_system() {
+        let xml = r#"<?xml version="1.0"?>
+<nmaprun scanner="nmap" args="nmap -sV --script default -oX out.xml 192.0.2.10" version="7.94">
+<host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="22"><state state="open"/>
+<service name="ssh" product="OpenSSH" version="for_Windows_9.5"/>
+<script id="ssh-hostkey" output="&#xa;  256 aa:bb:cc (ECDSA)&#xa;  256 dd:ee:ff (ED25519)"/>
+</port></ports>
+<hostscript><script id="smb-os-discovery" output="&#xa;  OS: Windows 11 Pro 26100 (Windows 11 Pro 6.3)&#xa;  Computer name: example-pc"/>
+<script id="smb2-security-mode" output="&#xa;  3:1:1: &#xa;    Message signing enabled but not required"/></hostscript>
+</host></nmaprun>"#;
+        let mut graph = Graph::default();
+        graph.apply_all(parse(xml).unwrap());
+        let host = &graph.hosts["192.0.2.10"];
+        assert_eq!(
+            host.os.as_deref(),
+            Some("Windows 11 Pro 26100 (Windows 11 Pro 6.3)"),
+            "no OS scan ran, so the SMB answer names the system"
+        );
+        let claims: Vec<&str> = host.facts.iter().map(|f| f.claim.as_str()).collect();
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.starts_with("nmap script smb2-security-mode:")
+                    && c.contains("Message signing enabled but not required")),
+            "{claims:?}"
+        );
+        let port = &host.ports["22/tcp"];
+        assert!(
+            port.facts
+                .iter()
+                .any(|f| f.claim.starts_with("nmap script ssh-hostkey:")
+                    && f.claim.contains("dd:ee:ff (ED25519)")),
+            "{:?}",
+            port.facts
+        );
+        assert!(
+            port.facts
+                .iter()
+                .all(|f| f.record.verification_status
+                    == crate::evidence::VerificationStatus::Observed)
         );
     }
 

@@ -482,6 +482,16 @@ pub enum Observation {
         text: String,
         record: EvidenceRecord,
     },
+    /// What an nmap script reported, about one port or (`port: None`) about
+    /// the host as a whole.
+    Script {
+        address: String,
+        port: Option<u16>,
+        protocol: String,
+        id: String,
+        output: String,
+        record: EvidenceRecord,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -705,7 +715,8 @@ impl Observation {
             | Observation::Port { address, .. }
             | Observation::TlsSan { address, .. }
             | Observation::Http { address, .. }
-            | Observation::Path { address, .. } => Some(address),
+            | Observation::Path { address, .. }
+            | Observation::Script { address, .. } => Some(address),
             Observation::Note { address, .. } => address.as_deref(),
         }
     }
@@ -1180,6 +1191,31 @@ impl Graph {
                 record.normalize_observed();
                 insert_path(&mut entry.paths, &segments, &mut budget, status, record)
                     .unwrap_or(false)
+            }
+            Observation::Script {
+                address,
+                port,
+                protocol,
+                id,
+                output,
+                record,
+            } => {
+                let output = output.trim();
+                if output.is_empty() {
+                    return false;
+                }
+                let claim = format!("nmap script {}: {output}", clean(&id));
+                let fact = Fact { claim, record };
+                match port {
+                    Some(number) => match self.port_entry(&address, number, &protocol) {
+                        Some(entry) => push_fact(&mut entry.facts, fact),
+                        None => false,
+                    },
+                    None => match self.host_entry(&address) {
+                        Some(host) => push_fact(&mut host.facts, fact),
+                        None => false,
+                    },
+                }
             }
             Observation::Note {
                 address,

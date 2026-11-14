@@ -306,7 +306,7 @@ fn light_mode_refuses_recon_and_bad_targets_are_rejected() {
     }
     for unsafe_flags in [
         &["--script=/tmp/evil.nse"][..],
-        &["-sC"],
+        &["--script", "intrusive"],
         &["-oN", "/tmp/out.txt"],
         &["-iL", "/etc/hosts"],
         &["192.0.2.99"],
@@ -321,6 +321,7 @@ fn light_mode_refuses_recon_and_bad_targets_are_rejected() {
             .to_string();
         assert!(
             error.contains("not allowed")
+                || error.contains("takes script categories")
                 || error.contains("unexpected nmap argument")
                 || error.contains("requires a port range"),
             "{unsafe_flags:?}: {error}"

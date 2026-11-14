@@ -213,6 +213,16 @@ installs without asking). Whatever is still missing skips its stage, and the
 map and HUD say so. `meow tools` does the same check at any time. A wordlist
 is looked for in `recon.wordlist_path`, then in the usual system places, then
 in `~/.meow/wordlists/` (the first `.txt` file there). Without root, `-sS` becomes `-sT` and `-O` is dropped.
+
+OS detection, versions and scripts: `meow recon <host> -- -A` (or `-O`, `-sC`,
+`--script default,vuln`). Version detection always runs on the open ports;
+scripts run there too, by category: `default`, `safe`, `vuln`, `discovery`,
+`version`. Scripts that are also intrusive, brute-force, denial-of-service,
+exploits, fuzzers, malware, contact third parties or broadcast to the whole
+network never run, whatever is asked. Every script's result is kept on its
+port or host, and Windows' SMB answer names the system when OS detection
+could not. For any other nmap option, run nmap yourself and `meow add` the
+XML.
 Each tool has a time limit and a 50 MB output cap, and is killed with
 everything it started when the session ends. Unfinished tasks are offered for
 resume the next time the workspace is opened.
