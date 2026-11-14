@@ -1,7 +1,7 @@
 # AGENTS.md — `meow`
 
 Local security triage shell, topology mapper and grounded audit workspace.
-Rust (MSRV 1.88) + C11 via FFI. The full specification is in `SPEC.md`; read it
+Rust (MSRV 1.89) + C11 via FFI. The full specification is in `SPEC.md`; read it
 before changing anything. This file must stay under 100 lines.
 
 ## Toolchain Commands

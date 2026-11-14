@@ -56,7 +56,7 @@ does it, all in one go:
 
 - a C compiler if there is none (the Xcode Command Line Tools on macOS, the
   distribution's compiler package on Linux);
-- the Rust toolchain through `rustup` if there is none or it is older than 1.88;
+- the Rust toolchain through `rustup` if there is none or it is older than 1.89;
 - meow itself, built and installed as `~/.cargo/bin/meow`;
 - the scanners `meow recon` drives: `nmap`, `katana` and `feroxbuster`, with
   Homebrew on macOS or the system package manager on Linux (`feroxbuster` is
@@ -94,7 +94,7 @@ Linux with `apt`, `dnf`, `yum`, `pacman`, `zypper` or `apk`, and on Windows
 via `.\install.ps1` (`winget` or `scoop` for Visual Studio Build Tools and
 scanners, or manual Rust from <https://rustup.rs> + `cargo install --path . --locked`).
 
-To build by hand instead (Rust 1.88 or newer and a C compiler):
+To build by hand instead (Rust 1.89 or newer and a C compiler):
 
 ```sh
 cargo build --release        # binary: target/release/meow

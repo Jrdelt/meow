@@ -79,6 +79,9 @@ impl Machine {
             .env_clear()
             .env("PATH", self.bin())
             .env("HOME", self.home())
+            // Bash running as sh fills an unset SHELL in from the login
+            // shell (macOS), which picks the profile file named below.
+            .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -199,7 +202,7 @@ fn old_rust_is_updated_or_replaced() {
         .tool("rustup", "exit 0");
     let text = out(&with_rustup.run(&["--dry-run"]));
     assert!(
-        text.contains("update Rust to the latest stable (meow needs 1.88 or newer; found 1.70)"),
+        text.contains("update Rust to the latest stable (meow needs 1.89 or newer; found 1.70)"),
         "{text}"
     );
 
@@ -475,8 +478,8 @@ fn homebrew_formula_and_windows_installer_match_unix_installer() {
         "install.ps1 must pass --no-modify-path to rustup-init"
     );
     assert!(
-        windows.contains("MIN_RUST_MINOR = 88"),
-        "install.ps1 must require MSRV 1.88"
+        windows.contains("MIN_RUST_MINOR = 89"),
+        "install.ps1 must require MSRV 1.89"
     );
 }
 
