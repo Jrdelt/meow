@@ -26,6 +26,27 @@ privately, as [`SECURITY.md`](SECURITY.md) describes. MIT licensed
 
 ## Install
 
+### Download (nothing to build)
+
+Get the file for your computer from the
+[latest release](https://github.com/Jrdelt/meow/releases/latest):
+
+| Computer | File | Then |
+|---|---|---|
+| Mac with Apple silicon (M1 and newer) | `meow-<version>-macos-arm64.pkg` | Double-click it. macOS warns that it is from an unidentified developer (it is not signed with a paid Apple account), so the first time right-click it, choose **Open**, then **Open**. meow goes to `/usr/local/bin/meow`. |
+| Intel Mac | `meow-<version>-macos-x86_64.pkg` | The same. |
+| Linux / Kali | `meow-<version>-linux-x86_64.tar.gz` (or `-linux-arm64`) | `tar -xzf meow-*.tar.gz && sudo install -m 0755 meow /usr/local/bin/meow` |
+| Windows | `meow-<version>-windows-x86_64.zip` | Unzip it and put `meow.exe` in a folder on your PATH. |
+
+Then run `meow`. The first session offers to install what `meow recon` and
+the map use (nmap, katana and feroxbuster, the wordlist, the location
+database); `meow tools` does the same any time. `meow update` later downloads
+and installs newer releases by itself, after checking each download against
+its `.sha256`. Releases are built by GitHub
+(`.github/workflows/release.yml`) when a version tag is pushed.
+
+### From source
+
 On Linux (Kali, Debian, Ubuntu, Fedora, Arch, ...) and macOS, from a clone of
 this repository. No Homebrew is needed on Linux: the script uses the system's
 package manager.
@@ -77,11 +98,15 @@ that cannot be installed is reported and skipped; meow works without it.
 ### Updating
 
 ```sh
-meow update            # pull the latest from GitHub, rebuild, add new tools
+meow update            # install the newest version
 meow update --check    # only show what is new
 ```
 
-`meow update` works in the folder meow was installed from (or `--source
+A meow installed from a release download asks GitHub for the newest
+release, downloads the file for this computer, checks its SHA-256 and puts it
+in place of the running one (with `sudo` when it lives in `/usr/local/bin`).
+
+A meow built from source works in the folder it was installed from (or `--source
 <folder>`). It pulls only when that folder has no local changes and the pull is
 a fast-forward, then runs `./install.sh --yes` there (on Windows, where a
 running executable cannot overwrite itself, it prints the `.\install.ps1 -Yes`

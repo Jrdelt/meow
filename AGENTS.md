@@ -89,11 +89,11 @@ Before every push:
     virtual networks below you. Round location map and VPN pill (`location.rs`,
     `tiles.rs` tiles from memory) after `locate`; it follows the selection
     (`locate_host`, offline `geoip.rs`). Internet/neighbour clients: drawn only.
-  - Recon tests use stand-in tools; `katana`/`feroxbuster` have never run
-    for real. `init.ps1` has never been run.
-  - Windows is compile-checked only (`cargo clippy --target
-    x86_64-pc-windows-gnu --all-targets -- -D warnings`). Public repo: CI in
-    `.github/workflows/checks.yml` (gates, Windows lint, `cargo audit`).
+  - Recon tests use stand-in tools; `katana`, `feroxbuster`, `init.ps1` and
+    `install.ps1` have never run for real. Releases: `release.yml` on a `v*` tag (= Cargo
+    version) builds pkg/tar.gz/zip; `MEOW_RELEASE_BUILD` → `release.rs` update.
+  - Windows: CI lint (`--target x86_64-pc-windows-gnu`) and the release build
+    only. CI: `.github/workflows/checks.yml` (gates, Windows lint, audit).
   - macOS (owner's machine): `fmt`, `clippy`, and `cargo test --no-fail-fast`
     all pass. Tests must not depend on the login name, `/usr/bin/zsh`,
     bash >= 4.4 or unresolved temp paths.

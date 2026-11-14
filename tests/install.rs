@@ -524,9 +524,15 @@ fn meow_tools_lists_what_recon_lacks_and_installs_it_on_request() {
         "admin\n"
     );
 
-    // Nothing left to do.
+    // Nothing left to do for recon (this stand-in machine has no gzip, so
+    // the location database stays out).
     let text = out(&machine.meow(&["tools"]));
-    assert!(!text.contains("not installed"), "{text}");
+    for tool in ["nmap", "katana", "feroxbuster"] {
+        assert!(
+            !text.contains(&format!("{tool:<12} not installed")),
+            "{text}"
+        );
+    }
 }
 
 #[test]

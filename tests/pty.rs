@@ -48,9 +48,21 @@ impl Hosted {
     fn spawn_args(args: &[&str], tmp: tempfile::TempDir) -> Self {
         let pair = native_pty_system().openpty(size(24, 80)).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_meow"));
-        command.args(args);
         command.cwd(tmp.path());
-        command.env("MEOW_HOME", tmp.path().join("meow-home"));
+        // The first session's offer of the extras is tested on its own
+        // (first_session_offers_the_extras_once); elsewhere it is done.
+        let home = tmp.path().join("meow-home");
+        if !args.contains(&"--offer-test") {
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("extras-offered"), "offered\n").unwrap();
+        }
+        let args: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| *a != "--offer-test")
+            .collect();
+        command.args(&args);
+        command.env("MEOW_HOME", &home);
         command.env("SHELL", "/bin/sh");
         command.env("TERM", "xterm-256color");
         command.env("PS1", "ready> ");
@@ -652,4 +664,40 @@ fn tools_ask_before_installing_and_no_installs_nothing() {
         text(&output)
     );
     assert!(!text(&output).contains("Installing"), "{}", text(&output));
+}
+
+#[test]
+fn first_session_offers_the_extras_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("meow-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[recon]\nkatana = \"meow-no-such-katana\"\n",
+    )
+    .unwrap();
+    let mut hosted = Hosted::spawn_args(&["lab", "--offer-test"], tmp);
+    for needle in [
+        "First session on this machine",
+        "meow-no-such-katana without it meow skips the web crawl",
+        "[?] Install them now? [Y/n] ",
+    ] {
+        assert!(
+            hosted.wait_for(needle.as_bytes(), PATIENCE),
+            "no {needle:?} in: {}",
+            hosted.dump()
+        );
+    }
+    hosted.send("n\r");
+    assert!(
+        hosted.wait_for(b"ready> ", PATIENCE),
+        "the session goes on: {}",
+        hosted.dump()
+    );
+    hosted.send("exit\r");
+    let (code, output, tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0, "{}", text(&output));
+    assert!(text(&output).contains("Going ahead without them"));
+    // Asked once: the next session goes straight in.
+    assert!(tmp.path().join("meow-home").join("extras-offered").exists());
 }
