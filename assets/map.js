@@ -17,12 +17,13 @@
   // (the legend says so). You come last in the row, and what only this
   // machine uses (a VPN, a virtual network) hangs below you. A long row
   // scrolls left and right instead of shrinking.
-  var STEP = 170;                           // between devices in the row
-  var CLOUD_Y = -165, BAR_Y = 100, ROW_Y = 195;
+  // Plenty of room between devices, so nothing looks cluttered.
+  var STEP = 240, SUB_STEP = 210;           // in the row; below you
+  var CLOUD_Y = -170, BAR_Y = 110, ROW_Y = 215;
   // Room kept around the drawing, in screen pixels, and the zooms it is
   // shown at: never blown up past MAX_ZOOM, and never shrunk below
   // READABLE_ZOOM while the card can grow taller instead (up to CARD_MAX).
-  var FIT_PADDING = 40, MAX_ZOOM = 1.2, READABLE_ZOOM = 0.8, CARD_MAX = 1200;
+  var FIT_PADDING = 40, MAX_ZOOM = 1.2, READABLE_ZOOM = 0.75, CARD_MAX = 1200;
   // Browsers refuse canvases much wider than this (CSS pixels, at 2x).
   var MAX_WIDTH = 15000;
   var askedWhere = false;
@@ -341,7 +342,7 @@
           linked(g, ['routed']).forEach(function (h) { if (!placed[h] && outside.indexOf(h) < 0) { outside.push(h); } });
         });
         outside.sort(bySeverity).slice(0, 4).forEach(function (h, i) {
-          put(h, 190 + i * 130, CLOUD_Y - 20);
+          put(h, 230 + i * 200, CLOUD_Y - 20);
           link('internet', h, LINE.ethernet, 'thin');
         });
         outside.slice(4).forEach(function (h) { placed[h] = true; });
@@ -365,12 +366,15 @@
       members.slice(6).forEach(function (h) { placed[h] = true; });
       members = members.slice(0, 6);
       hubs.push({ net: net, hub: hubId, color: color, members: members,
-        width: Math.max(1, Math.min(3, members.length)) * 140 });
+        width: Math.max(1, Math.min(3, members.length)) * SUB_STEP });
     });
-    var hubY = you.y + 210;
-    var x0 = you.x - hubs.reduce(function (sum, h, k) { return sum + h.width + (k ? 40 : 0); }, 0) / 2;
+    var hubY = you.y + 230;
+    // They end under you, so with you last in the row nothing sticks out
+    // past it: the sub-networks branch down and to the left.
+    var total = hubs.reduce(function (sum, h, k) { return sum + h.width + (k ? 60 : 0); }, 0);
+    var x0 = hubs.length ? you.x + hubs[hubs.length - 1].width / 2 - total : you.x;
     hubs.forEach(function (h, k) {
-      x0 += (k ? hubs[k - 1].width / 2 + 40 : 0) + h.width / 2;
+      x0 += (k ? hubs[k - 1].width / 2 + 60 : 0) + h.width / 2;
       put(h.hub, x0, hubY, ['hub']);
       // A gateway is named as such, so it also gets its network's name;
       // a network's own switch only needs the address range.
@@ -378,7 +382,7 @@
         : caption(h.net) + (data[h.net].network ? ' · ' + data[h.net].network : '');
       h.members.forEach(function (m, i) {
         var across = Math.min(3, h.members.length), r = Math.floor(i / 3), j = i % 3;
-        put(m, x0 + (j - (across - 1) / 2) * 140, hubY + 160 + r * 150);
+        put(m, x0 + (j - (across - 1) / 2) * SUB_STEP, hubY + 175 + r * 170);
         link(h.hub, m, h.color, 'down');
       });
     });
@@ -401,7 +405,7 @@
     if (rest.length) {
       var y0 = Object.keys(pos).reduce(function (y, id) { return Math.max(y, pos[id].y); }, 0) + 230;
       title('title:unknown', 'Route not known', rowLeft - 50, y0 - 62, '#6b7178');
-      rest.forEach(function (h, i) { put(h, rowLeft + (i % 6) * 150, y0 + Math.floor(i / 6) * 140); });
+      rest.forEach(function (h, i) { put(h, rowLeft + (i % 6) * SUB_STEP, y0 + Math.floor(i / 6) * 170); });
     }
 
     Object.keys(pos).forEach(function (id) {
@@ -450,7 +454,11 @@
     cy.resize();
     // Twice: a scrollbar, once there, takes some of the height.
     for (var pass = 0; pass < 2; pass++) {
-      zoom = Math.min(MAX_ZOOM, (scroller.clientHeight - 2 * FIT_PADDING) / bb.h);
+      // As big as the height allows; smaller to fit the width, but only
+      // down to READABLE_ZOOM: past that the row scrolls instead.
+      var fitWidth = (scroller.clientWidth - 2 * FIT_PADDING) / bb.w;
+      zoom = Math.min(MAX_ZOOM, (scroller.clientHeight - 2 * FIT_PADDING) / bb.h,
+        Math.max(fitWidth, READABLE_ZOOM));
       width = Math.max(scroller.clientWidth, Math.ceil(bb.w * zoom + 2 * FIT_PADDING));
       if (width > MAX_WIDTH) {
         width = MAX_WIDTH;
@@ -515,8 +523,8 @@
     return 'Estimated from ' + (place.public_address || 'your public address') +
       (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source + '.';
   }
-  // The pictures' licence asks for its credit, with its link, in the map:
-  // a short one in the corner, the full wording in its tooltip.
+  // The pictures' licence asks for its credit, with its link: a short one
+  // under the map, the full wording in its tooltip.
   function credit(view) {
     var box = el('span', 'attribution');
     box.title = view.credit;
@@ -524,7 +532,7 @@
       box.textContent = view.credit;
       return box;
     }
-    var link = box.appendChild(el('a', null, '\u00a9 EOX Sentinel-2'));
+    var link = box.appendChild(el('a', null, '\u00a9 EOX'));
     link.href = view.credit_url;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
@@ -532,9 +540,8 @@
   }
 
   // The satellite map: the picture with the rough area circled and a pin
-  // at the estimate, and one line under it: the place and where it is.
-  // The details stay in the tooltip; the picture's credit sits in its
-  // corner, as its licence asks.
+  // at the estimate; the place and its coordinates under it. The details
+  // stay in the tooltip.
   function satellite(where) {
     var view = where.map, place = where.place;
     var card = el('div', 'satellite');
@@ -567,12 +574,13 @@
     svg('path', { d: 'M0 0 C-1.8 -5 -8 -8.6 -8 -15 A8 8 0 1 1 8 -15 C8 -8.6 1.8 -5 0 0 Z',
       fill: '#5b82d9', stroke: '#3c5fae', 'stroke-width': 1 }, pin);
     svg('circle', { cx: 0, cy: -15, r: 3.2, fill: '#ffffff' }, pin);
-    picture.appendChild(credit(view));
-    var line = card.appendChild(el('div', 'place'));
-    line.appendChild(el('strong', null, placeName(place)));
-    line.appendChild(el('span', null, ' · ' + degrees(place.latitude, 'N', 'S') + ', ' +
+    // Under the map: the place, its coordinates, and the credit the
+    // pictures' licence asks for.
+    var words = card.appendChild(el('div', 'place'));
+    words.appendChild(el('strong', null, placeName(place)));
+    words.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' +
       degrees(place.longitude, 'E', 'W')));
-    line.title = card.title;
+    words.appendChild(credit(view));
     return card;
   }
 

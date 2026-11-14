@@ -56,9 +56,9 @@ main { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 20px; }
 #where .satellite .picture { position: relative; overflow: hidden; border-radius: 50%; background: #2b3a48; border: 3px solid #ffffff; box-shadow: 0 1px 6px rgba(0, 0, 0, .3); }
 #where .satellite .tile { position: absolute; display: block; max-width: none; }
 #where .satellite .marks { position: absolute; left: 0; top: 0; }
-#where .satellite .attribution { position: absolute; left: 50%; bottom: 9px; transform: translateX(-50%); font: 8.5px/1.4 system-ui, sans-serif; color: #2b2f36; background: rgba(255, 255, 255, .72); padding: 0 5px; border-radius: 6px; white-space: nowrap; }
+#where .satellite .attribution { font-size: 9.5px; color: #8a9099; }
 #where .satellite .attribution a { color: inherit; text-decoration: none; }
-#where .satellite .place { white-space: nowrap; font-size: 12.5px; color: #2b2f36; }
+#where .satellite .place { display: flex; flex-direction: column; align-items: center; gap: 1px; white-space: nowrap; font-size: 12.5px; color: #2b2f36; line-height: 1.3; }
 #where .dim { color: #6b7178; font-size: 11.5px; }
 #legend { position: absolute; left: 12px; right: 12px; bottom: 10px; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; font: 12.5px/1.2 system-ui, sans-serif; color: #4a5260; }
 #legend .item { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
