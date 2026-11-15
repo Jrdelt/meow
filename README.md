@@ -328,7 +328,10 @@ API key, or OpenRouter (or, for `C`, any other OpenAI-style service).
 
 Before any cloud request, addresses, internal names, paths, user names and
 secrets are replaced by placeholders such as `<<HOST_01>>`, and the request is
-refused if anything private is still detected. Replies are unmasked locally
+refused if anything private is still detected. The local model `L` gets the
+real text only while it is on this machine and yours: a "local" server at
+another address, or (on Linux) one that another login user runs on this
+machine, gets the same masked text, and the answer says so. Replies are unmasked locally
 and saved to `chats/<host>.md`. Scanned text is passed to the model as data in
 one JSON field, never as instructions. Cloud use is capped per day
 (`max_daily_usd`, `max_daily_calls`); when the cap is reached, `C` answers

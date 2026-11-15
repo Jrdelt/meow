@@ -2,6 +2,8 @@
 //!
 //! * `[L]` **Local** ($0): the host's evidence goes, unmasked, to an
 //!   OpenAI-compatible server on this machine (`http://localhost:1234/v1`).
+//!   A "local" server on another machine, or one another login user runs
+//!   on this machine, gets masked text instead, as the cloud does.
 //! * `[C]` **Cloud triage** (OpenRouter): everything is masked by the
 //!   Privacy Vault first. The SHA-256 prompt cache and the daily budget are
 //!   checked before any request; when the budget is spent or no API key is
@@ -605,6 +607,83 @@ fn lock_db(db: &Arc<Mutex<Db>>) -> std::sync::MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether `raw` names this machine itself: `localhost` or a loopback
+/// address.
+pub fn is_loopback_url(raw: &str) -> bool {
+    url::Url::parse(raw.trim()).is_ok_and(|url| match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    })
+}
+
+/// The users (by uid) listening on `port`, read from a Linux
+/// `/proc/net/tcp` or `/proc/net/tcp6` table.
+#[cfg(any(target_os = "linux", test))]
+fn listener_uids(table: &str, port: u16) -> Vec<u32> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            // sl local_address rem_address st tx:rx tr:when retrnsmt uid ...
+            let mut fields = line.split_whitespace();
+            let local = fields.nth(1)?;
+            let state = fields.nth(1)?;
+            let uid = fields.nth(3)?;
+            let local_port = u16::from_str_radix(local.rsplit(':').next()?, 16).ok()?;
+            (state == "0A" && local_port == port)
+                .then(|| uid.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// On Linux: another login user who listens on the port of the "local"
+/// model server. On a shared machine anyone can answer on an unused
+/// loopback port, and the local tier sends evidence unmasked.
+fn another_users_server(url: &str) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        // Service accounts (a system-wide model server) are below this.
+        const FIRST_LOGIN_UID: u32 = 1000;
+        let port = url::Url::parse(url.trim()).ok()?.port_or_known_default()?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        ["/proc/net/tcp", "/proc/net/tcp6"]
+            .iter()
+            .filter_map(|table| std::fs::read_to_string(table).ok())
+            .flat_map(|table| listener_uids(&table, port))
+            .find(|uid| *uid >= FIRST_LOGIN_UID && *uid != me)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = url;
+        None
+    }
+}
+
+/// Masks a prompt for leaving this machine, and proves nothing private is
+/// left in it before it goes.
+fn mask_prompt(
+    vault: &Mutex<Vault>,
+    graph: &Graph,
+    prompt: &Prompt,
+) -> Result<(String, crate::vault::StreamUnmasker)> {
+    let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
+    vault.register_graph(graph);
+    vault.register_operator();
+    let masked = vault.mask_json(&prompt.user).to_string();
+    let leaks = vault.leaks(&masked);
+    if !leaks.is_empty() {
+        bail!(
+            "refusing to send: the masked request still contains private values ({})",
+            leaks.join(", ")
+        );
+    }
+    Ok((masked, vault.stream()))
+}
+
 /// Validates a cloud AI endpoint URL: must use `https://`, or `http://` only
 /// when the host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
 pub fn validate_cloud_url(raw: &str) -> Result<String> {
@@ -616,12 +695,8 @@ pub fn validate_cloud_url(raw: &str) -> Result<String> {
     match parsed.scheme() {
         "https" => Ok(url.to_owned()),
         "http" => {
-            let is_loopback = match host {
-                url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-                url::Host::Ipv4(ip) => ip.is_loopback(),
-                url::Host::Ipv6(ip) => ip.is_loopback(),
-            };
-            if is_loopback {
+            let _ = host;
+            if is_loopback_url(url) {
                 Ok(url.to_owned())
             } else {
                 bail!(
@@ -771,27 +846,61 @@ impl AiEngine {
         Ok((text, usage))
     }
 
+    /// The local tier sends the evidence unmasked, which is only right
+    /// while it stays on this machine and with this user. A "local" server
+    /// on another host, or one another login user runs on this host, gets
+    /// the same masked text a cloud would.
     async fn run_local(
         &self,
         requested: Tier,
+        graph: &Graph,
+        vault: &Mutex<Vault>,
         prompt: &Prompt,
         fallback_reason: Option<String>,
         on_text: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Outcome> {
+        let settings = self.settings.effective();
+        let masked_because = if !is_loopback_url(&settings.local_url) {
+            Some("the server is not on this machine".to_owned())
+        } else {
+            another_users_server(&settings.local_url)
+                .map(|uid| format!("the server belongs to another user, uid {uid}"))
+        };
+        let (user, mut unmasker) = match &masked_because {
+            Some(_) => {
+                let (masked, unmasker) = mask_prompt(vault, graph, prompt)?;
+                (masked, Some(unmasker))
+            }
+            None => (prompt.user.to_string(), None),
+        };
         let mut body = json!({
             "messages": [
                 { "role": "system", "content": prompt.system },
-                { "role": "user", "content": prompt.user.to_string() },
+                { "role": "user", "content": user },
             ],
             "stream": true,
             "temperature": 0.2,
         });
-        let settings = self.settings.effective();
         if !settings.local_model.is_empty() {
             body["model"] = json!(settings.local_model);
         }
+        let mut shown = String::new();
         let (text, usage) = self
-            .chat(&settings.local_url, None, &body, |piece| on_text(piece))
+            .chat(
+                &settings.local_url,
+                None,
+                &body,
+                |piece| match &mut unmasker {
+                    Some(unmasker) => {
+                        let ready = unmasker.push(piece);
+                        if !ready.is_empty() {
+                            on_text(&ready);
+                            shown.push_str(&ready);
+                        }
+                    }
+                    None => on_text(piece),
+                },
+            )
             .await
             .with_context(|| match &fallback_reason {
                 // Say why the cloud was not used, or the real cause is lost.
@@ -801,10 +910,26 @@ impl AiEngine {
                 ),
                 None => "local tier [L] failed (is a model server running?)".to_owned(),
             })?;
+        let text = match unmasker {
+            Some(mut unmasker) => {
+                let rest = unmasker.finish();
+                if !rest.is_empty() {
+                    on_text(&rest);
+                    shown.push_str(&rest);
+                }
+                shown
+            }
+            None => text,
+        };
         let model = if settings.local_model.is_empty() {
             "local"
         } else {
             &settings.local_model
+        };
+        // Shown with the answer, so the user knows what the server saw.
+        let named = match &masked_because {
+            Some(why) => format!("{model} (masked: {why})"),
+            None => model.to_owned(),
         };
         record_usage(
             &lock_db(&self.db),
@@ -818,7 +943,7 @@ impl AiEngine {
         Ok(Outcome {
             requested,
             tier: Tier::Local,
-            model: model.to_owned(),
+            model: named,
             text,
             cost_usd: 0.0,
             web_search_requests: 0,
@@ -843,7 +968,9 @@ impl AiEngine {
             _ => triage_prompt(graph, host),
         };
         if tier == Tier::Local {
-            return self.run_local(tier, &prompt, None, on_text).await;
+            return self
+                .run_local(tier, graph, vault, &prompt, None, on_text)
+                .await;
         }
 
         let unavailable = |reason: &str| -> Result<Option<String>> {
@@ -858,24 +985,13 @@ impl AiEngine {
             let reason = unavailable(
                 "no cloud API key yet (run `meow setup` to add yours, or to choose a local model)",
             )?;
-            return self.run_local(tier, &prompt, reason, on_text).await;
+            return self
+                .run_local(tier, graph, vault, &prompt, reason, on_text)
+                .await;
         };
 
         // Mask, then prove nothing private is left before going on.
-        let (masked_user, mut unmasker) = {
-            let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
-            vault.register_graph(graph);
-            vault.register_operator();
-            let masked = vault.mask_json(&prompt.user).to_string();
-            let leaks = vault.leaks(&masked);
-            if !leaks.is_empty() {
-                bail!(
-                    "refusing to send: the masked request still contains private values ({})",
-                    leaks.join(", ")
-                );
-            }
-            (masked, vault.stream())
-        };
+        let (masked_user, mut unmasker) = mask_prompt(vault, graph, &prompt)?;
 
         let model = match tier {
             Tier::Research => settings.research_model.clone(),
@@ -912,7 +1028,9 @@ impl AiEngine {
                 "daily cloud budget reached (${:.4} of ${:.2}, {} of {} calls)",
                 budget.spent_usd, budget.max_usd, budget.calls, budget.max_calls
             ))?;
-            return self.run_local(tier, &prompt, reason, on_text).await;
+            return self
+                .run_local(tier, graph, vault, &prompt, reason, on_text)
+                .await;
         }
 
         let mut shown = String::new();
@@ -1556,6 +1674,97 @@ mod tests {
             .unwrap();
         assert!((cost - 0.0042).abs() < 1e-12);
         assert_eq!(searches, 2);
+    }
+
+    #[test]
+    fn local_means_this_machine() {
+        for (url, here) in [
+            ("http://localhost:1234/v1", true),
+            ("http://LOCALHOST:1234", true),
+            ("http://127.0.0.1:11434/v1", true),
+            ("http://127.8.9.10/v1", true),
+            ("http://[::1]:8080/v1", true),
+            ("http://192.168.1.20:1234/v1", false),
+            ("https://models.example.com/v1", false),
+            ("http://localhost.example.com/v1", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(is_loopback_url(url), here, "{url}");
+        }
+        // Who listens on a port, from the kernel's table.
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:04D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 12345 1 0000000000000000 100 0 0 10 0\n\
+   1: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2345 1 0000000000000000 100 0 0 10 0\n\
+   2: 0100007F:04D2 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 3456 1 0000000000000000 20 4 30 10 -1\n\
+   3: 00000000000000000000000001000000:2CAA 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000   998        0 4567 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(listener_uids(table, 1234), [1001]);
+        assert_eq!(listener_uids(table, 22), [0]);
+        assert_eq!(listener_uids(table, 11434), [998]);
+        assert!(listener_uids(table, 8080).is_empty());
+        assert!(listener_uids("garbage\nmore garbage", 1234).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_local_server_on_another_machine_gets_masked_text() {
+        // An address of this machine that is not loopback stands in for
+        // another machine. Connecting a UDP socket sends nothing.
+        let Some(address) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| {
+                socket.connect("192.0.2.1:9")?;
+                socket.local_addr()
+            })
+            .ok()
+            .map(|local| local.ip())
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        else {
+            return; // no network at all on this machine
+        };
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let app = Router::new()
+            .route(
+                "/local/chat/completions",
+                post(
+                    |State(seen): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                        // Answers about the first masked host it was shown.
+                        let content = body["messages"][1]["content"].as_str().unwrap_or("");
+                        let name = content
+                            .find("<<HOST_")
+                            .and_then(|at| content[at..].split(">>").next())
+                            .map(|token| format!("{token}>>"))
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push(body.clone());
+                        Json(json!({ "choices": [ { "message": { "content": format!("{name} needs a patch") } } ] }))
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (engine, _) = engine(&format!("http://{address}:{port}"), None);
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, pieces) = run(&engine, Tier::Local, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        // The server saw placeholders, never the real address...
+        let sent = seen.lock().unwrap()[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!sent.contains("10.10.10.5"), "{sent}");
+        assert!(sent.contains("<<HOST_"), "{sent}");
+        // ...and the user reads the answer with the real one back in.
+        assert_eq!(outcome.text, "10.10.10.5 needs a patch");
+        assert_eq!(pieces.concat(), "10.10.10.5 needs a patch");
+        assert_eq!(outcome.tier, Tier::Local);
+        assert!(
+            outcome
+                .model
+                .contains("masked: the server is not on this machine"),
+            "{}",
+            outcome.model
+        );
     }
 
     #[tokio::test]

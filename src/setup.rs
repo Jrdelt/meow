@@ -118,6 +118,12 @@ pub fn describe(settings: &AiSettings, file: &Path) -> String {
         true => "the Claude API".to_owned(),
         false => effective.cloud_url.clone(),
     };
+    // The local tier sends real text only to this machine.
+    let off_machine = if crate::ai::is_loopback_url(&effective.local_url) {
+        ""
+    } else {
+        " (not this machine: what is sent there is masked)"
+    };
     // What happens when a model declines a request: the Claude API only.
     let declined = match (claude, effective.fallbacks().as_slice()) {
         (false, _) => String::new(),
@@ -126,7 +132,7 @@ pub fn describe(settings: &AiSettings, file: &Path) -> String {
     };
     format!(
         "Your AI setup ({}):\n\
-         \x20 [L] local model    {}, model: {model}\n\
+         \x20 [L] local model    {}{off_machine}, model: {model}\n\
          \x20 [C] cloud triage   {service}, model: {}\n\
          \x20 [R] research       model: {}\n\
          {declined}\
