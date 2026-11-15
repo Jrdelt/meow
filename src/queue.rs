@@ -215,7 +215,10 @@ pub fn find_wordlist(configured: Option<&str>, own_dir: Option<&Path>) -> Option
         .into_iter()
         .chain(STANDARD_WORDLISTS.iter().copied())
         .map(PathBuf::from)
-        .find(|path| path.is_file());
+        .find(|path| path.is_file())
+        // Tools run in a folder of their own: a relative path would not
+        // name the same file there.
+        .map(|path| std::path::absolute(&path).unwrap_or(path));
     found.or_else(|| {
         let mut own: Vec<PathBuf> = std::fs::read_dir(own_dir?)
             .ok()?
@@ -1024,10 +1027,69 @@ impl Drop for GroupGuard {
     }
 }
 
+/// Environment variables that hold credentials by their names: API keys
+/// and tokens are no business of a scanner.
+fn is_secret_variable(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"]
+        .iter()
+        .any(|word| upper.contains(word))
+}
+
 /// Runs one tool to completion, or stops it at the time or size limit.
+///
+/// The tool runs in an empty private folder made for this run, not where
+/// the session was started: feroxbuster, nmap and katana all read settings
+/// or data files from their working directory, and that directory may be
+/// one the user did not write (a cloned repository). Variables that look
+/// like credentials are not passed on.
 pub async fn run_tool(command: &ToolCommand, limits: RunLimits) -> RunOutcome {
-    let mut process = tokio::process::Command::new(&command.program);
+    // Whatever already sits where the output goes is never written through.
+    match std::fs::symlink_metadata(&command.output) {
+        Ok(meta) if meta.is_file() => {
+            let _ = std::fs::remove_file(&command.output);
+        }
+        Ok(_) => {
+            return RunOutcome::Failed(format!(
+                "{} exists and is not a regular file; refusing to write {}'s output there",
+                command.output.display(),
+                command.program
+            ))
+        }
+        Err(_) => {}
+    }
+    let scratch = command.output.parent().and_then(|dir| {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("run-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder.tempdir_in(dir).ok()
+    });
+    let Some(scratch) = scratch else {
+        return RunOutcome::Failed(format!(
+            "cannot make a private folder to run {} in",
+            command.program
+        ));
+    };
+    // A configured relative path names a program where meow was started.
+    let program = if Path::new(&command.program).components().count() > 1 {
+        std::path::absolute(&command.program)
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|_| command.program.clone().into())
+    } else {
+        command.program.clone().into()
+    };
+    let mut process = tokio::process::Command::new(program);
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_secret_variable) {
+            process.env_remove(&name);
+        }
+    }
     process
+        .current_dir(scratch.path())
         .args(&command.args)
         // No terminal input: a tool that asks a question gets EOF instead of
         // hanging the queue.
@@ -2150,6 +2212,74 @@ mod tests {
             timeout: Duration::from_secs(20),
             cap_bytes: 1024 * 1024,
         };
+
+        #[tokio::test]
+        async fn a_tool_runs_in_its_own_empty_folder_without_credentials() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            std::env::set_var("MEOW_TEST_SCANNER_API_KEY", "sk-not-for-scanners");
+            std::env::set_var("MEOW_TEST_SCANNER_PLAIN", "kept");
+            let tool = script(
+                dir.path(),
+                "tool",
+                "{ pwd; ls -A | wc -l; stat -c %a . 2>/dev/null || stat -f %Lp .; env; } > \"$1\"",
+            );
+            let outcome = run_tool(&command(tool, &out), GENEROUS).await;
+            assert_eq!(outcome, RunOutcome::Exited(Some(0)));
+            let text = std::fs::read_to_string(&out).unwrap();
+            let mut lines = text.lines();
+            let ran_in = PathBuf::from(lines.next().unwrap());
+            // Not where the session was started, but a fresh folder beside
+            // the output: empty, private, and gone afterwards.
+            assert_ne!(ran_in, std::env::current_dir().unwrap());
+            assert_eq!(
+                ran_in.parent().unwrap().canonicalize().unwrap(),
+                dir.path().canonicalize().unwrap()
+            );
+            assert!(ran_in
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("run-"));
+            assert_eq!(lines.next().unwrap().trim(), "0", "the folder is empty");
+            assert_eq!(lines.next().unwrap().trim(), "700");
+            assert!(!ran_in.exists());
+            assert!(!text.contains("sk-not-for-scanners"), "{text}");
+            assert!(text.contains("MEOW_TEST_SCANNER_PLAIN=kept"));
+            for (name, secret) in [
+                ("ANTHROPIC_API_KEY", true),
+                ("OPENROUTER_API_KEY", true),
+                ("GITHUB_TOKEN", true),
+                ("aws_secret_access_key", true),
+                ("DB_PASSWORD", true),
+                ("PATH", false),
+                ("HOME", false),
+                ("HTTPS_PROXY", false),
+                ("SSH_AUTH_SOCK", false),
+            ] {
+                assert_eq!(is_secret_variable(name), secret, "{name}");
+            }
+
+            // A link (or anything but a file) where the output goes is not
+            // written through, and the tool is not started.
+            let outside = dir.path().join("outside.txt");
+            std::fs::write(&outside, "keep me").unwrap();
+            let linked = dir.path().join("linked-out");
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+            let marker = dir.path().join("started");
+            let tool = script(
+                dir.path(),
+                "tool2",
+                &format!("touch '{}'; echo scan > \"$1\"", marker.display()),
+            );
+            let outcome = run_tool(&command(tool, &linked), GENEROUS).await;
+            assert!(
+                matches!(&outcome, RunOutcome::Failed(why) if why.contains("not a regular file")),
+                "{outcome:?}"
+            );
+            assert!(!marker.exists());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
+        }
 
         #[tokio::test]
         async fn a_tool_runs_with_stdin_closed_and_its_exit_code_is_reported() {
