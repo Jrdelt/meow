@@ -265,6 +265,70 @@ pub fn create_private_dir(path: &Path) -> Result<()> {
     restrict_dir(path).with_context(|| format!("cannot restrict {}", path.display()))
 }
 
+/// [`create_private_dir`] for a folder inside a workspace (`tmp`, `chats`,
+/// `tmp/shell`): a link standing in its place is refused, so nothing is
+/// created, chmod-ed or written wherever it points.
+pub fn create_private_subdir(path: &Path) -> Result<()> {
+    refuse_symlink(path)?;
+    create_private_dir(path)
+}
+
+/// How deep a workspace folder may nest.
+const MAX_TREE_DEPTH: usize = 32;
+
+/// Everything inside a workspace must be a file or folder of its own. A
+/// folder the user did not make (a cloned repository, an unpacked archive)
+/// can carry links in place of `session.lock`, `tmp`, `chats` or
+/// `replay.sh`; meow would then write, truncate, chmod or read wherever
+/// they point. Fails on the first symbolic link, special file, or file with
+/// a second hard link. `meow delete` still removes such a folder.
+pub fn refuse_links_inside(root: &Path) -> Result<()> {
+    fn walk(dir: &Path, depth: usize) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            bail!("{} is nested too deeply for a workspace", dir.display());
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read {}", dir.display()))
+            }
+        };
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("cannot read {}", dir.display()))?
+                .path();
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("cannot inspect {}", path.display()))?;
+            let kind = meta.file_type();
+            let refuse = |what: &str| {
+                anyhow!(
+                    "{} {what} inside a workspace, which meow never follows. Remove it, \
+                     or delete the workspace with `meow delete`",
+                    path.display()
+                )
+            };
+            if kind.is_symlink() {
+                return Err(refuse("is a symbolic link"));
+            } else if kind.is_dir() {
+                walk(&path, depth + 1)?;
+            } else if kind.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() > 1 {
+                        return Err(refuse("has a second hard link"));
+                    }
+                }
+            } else {
+                return Err(refuse("is a special file"));
+            }
+        }
+        Ok(())
+    }
+    walk(root, 0)
+}
+
 /// Atomically replaces `path` with `contents` via a `0600` temp file in the
 /// same directory (same filesystem, so the rename cannot cross mounts).
 pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
@@ -301,8 +365,8 @@ fn restrict_file(path: &Path) -> io::Result<()> {
     set_mode(path, 0o600)
 }
 
-/// Re-applies `0700` / `0600` to everything under `root`. Symlinks are
-/// skipped so a planted link cannot redirect the chmod outside the workspace.
+/// Re-applies `0700` / `0600` to everything under `root`. Links are not
+/// chmod-ed through; [`refuse_links_inside`] has refused them before this.
 #[cfg(unix)]
 fn enforce_private_tree(root: &Path) -> io::Result<()> {
     restrict_dir(root)?;
@@ -632,12 +696,13 @@ impl Workspace {
             home.workspace_dir(&name)
         };
         refuse_symlink(&dir)?;
+        refuse_links_inside(&dir)?;
 
         let profile_path = dir.join(PROFILE_FILE);
         let existed = profile_path.is_file();
         create_private_dir(&dir)?;
-        create_private_dir(&dir.join("tmp"))?;
-        create_private_dir(&dir.join("chats"))?;
+        create_private_subdir(&dir.join("tmp"))?;
+        create_private_subdir(&dir.join("chats"))?;
         enforce_private_tree(&dir)
             .with_context(|| format!("cannot restrict permissions under {}", dir.display()))?;
 
@@ -682,6 +747,7 @@ impl Workspace {
         let dir = std::path::absolute(dir)
             .with_context(|| format!("cannot resolve {}", dir.display()))?;
         refuse_symlink(&dir)?;
+        refuse_links_inside(&dir)?;
         let profile_path = dir.join(PROFILE_FILE);
         if !profile_path.is_file() {
             bail!("no meow workspace at {}", dir.display());
@@ -925,7 +991,13 @@ pub fn find_for_deletion(
 /// moment is the proof that none is.
 pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
     use crate::lock::{LockError, SessionLock};
-    match SessionLock::acquire(&workspace.dir.join(LOCK_FILE)) {
+    let lock = workspace.dir.join(LOCK_FILE);
+    // A link in place of the lock file is never opened, so no session can
+    // hold it: the folder can be deleted (links are removed, not followed).
+    if fs::symlink_metadata(&lock).is_ok_and(|meta| !meta.is_file()) {
+        return Ok(());
+    }
+    match SessionLock::acquire(&lock) {
         Ok(_released_at_once) => Ok(()),
         Err(error @ LockError::Held { .. }) => Err(anyhow!(
             "Workspace '{}' is {error}; exit that session first",
@@ -1198,14 +1270,71 @@ mod tests {
         assert!(err.to_string().contains("symbolic link"), "{err:#}");
         assert!(Workspace::load(&fx.cwd.join(".meow")).is_err());
 
-        // A symlink inside a workspace is not chmod-ed through.
+        // A link anywhere inside a workspace is refused, never followed:
+        // nothing outside is chmod-ed, written, truncated or removed.
         let (ws, _) = open(&fx, "acme", false);
-        std::os::unix::fs::symlink(&outside, ws.tmp_dir().join("link")).unwrap();
-        std::os::unix::fs::symlink(&secret, ws.dir.join("keylink")).unwrap();
         chmod(&outside, 0o755);
-        Workspace::load(&ws.dir).unwrap();
+        fs::write(outside.join(".zshrc"), "mine").unwrap();
+        let inside = |name: &str| ws.dir.join(name);
+        for (link, target) in [
+            (ws.tmp_dir().join("link"), &outside),
+            (inside("keylink"), &secret),
+            (inside("session.lock"), &secret),
+            (inside("replay.sh"), &secret),
+            (inside("last_cwd"), &secret),
+            (inside("state.db"), &secret),
+            (inside("graph.json"), &secret),
+        ] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let err = Workspace::load(&ws.dir).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("symbolic link"),
+                "{link:?}: {err:#}"
+            );
+            let err = Workspace::open_or_create(&fx.home, &fx.cwd, "acme", false, Mode::Light)
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("symbolic link"),
+                "{link:?}: {err:#}"
+            );
+            fs::remove_file(&link).unwrap();
+        }
+        // The folders meow creates itself, replaced by links to a folder
+        // that holds the user's own shell start-up file.
+        for dir in ["chats", "tmp"] {
+            fs::remove_dir_all(inside(dir)).unwrap();
+            std::os::unix::fs::symlink(&outside, inside(dir)).unwrap();
+            assert!(Workspace::load(&ws.dir).is_err(), "{dir}");
+            assert!(
+                Workspace::open_or_create(&fx.home, &fx.cwd, "acme", false, Mode::Light).is_err(),
+                "{dir}"
+            );
+            assert!(create_private_subdir(&inside(dir)).is_err(), "{dir}");
+            fs::remove_file(inside(dir)).unwrap();
+        }
         assert_eq!(mode_of(&outside), 0o755);
         assert_eq!(mode_of(&secret), 0o644);
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "k");
+        assert_eq!(fs::read_to_string(outside.join(".zshrc")).unwrap(), "mine");
+
+        // Such a folder can still be deleted; what its links name stays.
+        let (trap, _) = open(&fx, "trap", false);
+        std::os::unix::fs::symlink(&secret, trap.dir.join("session.lock")).unwrap();
+        std::os::unix::fs::symlink(&outside, trap.dir.join("tmp").join("shell")).unwrap();
+        let found = find_for_deletion(&fx.home, &fx.cwd, Some("trap")).unwrap();
+        delete(&found).unwrap();
+        assert!(!trap.dir.exists());
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "k");
+        assert_eq!(fs::read_to_string(outside.join(".zshrc")).unwrap(), "mine");
+
+        // A second hard link to a file is refused too (an unpacked archive
+        // can carry one), and so is a special file.
+        let (ws, _) = open(&fx, "acme", false);
+        fs::hard_link(&secret, ws.dir.join("replay.sh")).unwrap();
+        let err = Workspace::load(&ws.dir).unwrap_err();
+        assert!(format!("{err:#}").contains("hard link"), "{err:#}");
+        fs::remove_file(ws.dir.join("replay.sh")).unwrap();
+        Workspace::load(&ws.dir).unwrap();
     }
 
     #[test]

@@ -21,7 +21,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::workspace::{create_private_dir, private_open_options, write_private_atomic, Workspace};
+use crate::workspace::{
+    create_private_subdir, private_open_options, write_private_atomic, Workspace,
+};
 
 const REPLAY_HEADER: &str = "\
 # meow replay log. One entry per command:
@@ -358,7 +360,8 @@ pub fn prepare(
     }
 
     let dir = workspace.tmp_dir().join("shell");
-    create_private_dir(&dir)?;
+    create_private_subdir(&workspace.tmp_dir())?;
+    create_private_subdir(&dir)?;
     ensure_replay_log(&workspace.replay_path())?;
 
     let quote: fn(&str) -> String = match kind {

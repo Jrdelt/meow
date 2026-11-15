@@ -72,13 +72,37 @@ impl SessionLock {
     /// Takes the exclusive lock on `path` without blocking and records this
     /// process id in the file for diagnostics.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
-        let file = private_open_options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(LockError::Io)?;
+        // The file is truncated and written below, so a link in its place
+        // (a workspace folder someone else prepared) is never followed: not
+        // a symbolic link, and not a second hard link to another file.
+        let refused = |what: &str| {
+            LockError::Io(io::Error::other(format!(
+                "{} {what}; refusing to use it as a lock file",
+                path.display()
+            )))
+        };
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(refused("is a symbolic link"));
+        }
+        let mut options = private_open_options();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path).map_err(LockError::Io)?;
+        let meta = file.metadata().map_err(LockError::Io)?;
+        if !meta.is_file() {
+            return Err(refused("is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() > 1 {
+                return Err(refused("has a second hard link"));
+            }
+        }
         let mut lock = RwLock::new(file);
 
         for attempt in 0..3 {
@@ -191,6 +215,33 @@ mod tests {
         assert_eq!(read_pid(&path), Some(std::process::id()));
         drop(held);
         assert!(!SessionLock::is_held(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_place_of_the_lock_file_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "keep me").unwrap();
+
+        // A symbolic link: refused, the file it names keeps its content.
+        let path = dir.path().join("session.lock");
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert!(matches!(SessionLock::acquire(&path), Err(LockError::Io(_))));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep me");
+        assert!(!SessionLock::is_held(&path));
+        fs::remove_file(&path).unwrap();
+
+        // A second hard link to another file: refused before truncating.
+        fs::hard_link(&outside, &path).unwrap();
+        assert!(matches!(SessionLock::acquire(&path), Err(LockError::Io(_))));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep me");
+        fs::remove_file(&path).unwrap();
+
+        // An ordinary lock file still works.
+        let lock = SessionLock::acquire(&path).unwrap();
+        assert!(SessionLock::is_held(&path));
+        drop(lock);
     }
 
     #[cfg(unix)]
