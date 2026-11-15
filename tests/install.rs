@@ -556,3 +556,56 @@ fn another_program_called_meow_is_pointed_out() {
         "{warning}"
     );
 }
+
+#[test]
+fn the_tool_installer_never_runs_programs_in_the_folder_the_user_is_in() {
+    // rustup's rustc and cargo obey a rust-toolchain.toml in the current
+    // folder, so the installer must not probe or run them in a folder the
+    // user merely happens to be in (a repository under review).
+    let machine = Machine::bare();
+    machine.with_curl("admin\n").with_package_manager();
+    let log = machine.home().join("where-rust-ran");
+    let record = format!("pwd >> '{}'", log.display());
+    machine
+        .tool(
+            "rustc",
+            &format!("{record}\necho 'rustc 1.90.0 (abcdef 2026-01-01)'"),
+        )
+        .tool("cargo", &record);
+    let project = machine.tmp.path().join("project-under-review");
+    std::fs::create_dir(&project).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_meow"))
+        .args(["tools", "--yes"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", machine.bin())
+        .env("HOME", machine.home())
+        .env("MEOW_HOME", machine.home().join(".meow"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    let ran_in = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !ran_in.contains("project-under-review"),
+        "rustc or cargo ran in the user's folder:\n{ran_in}"
+    );
+
+    // The script itself, asked for the tools only, behaves the same.
+    let _ = std::fs::remove_file(&log);
+    let output = Command::new("/bin/sh")
+        .arg(SCRIPT)
+        .args(["--tools-only", "--yes"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", machine.bin())
+        .env("HOME", machine.home())
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    let ran_in = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!ran_in.contains("project-under-review"), "{ran_in}");
+}

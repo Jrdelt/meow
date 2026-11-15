@@ -136,6 +136,9 @@ pub fn install() -> Result<bool> {
         .arg(INSTALLER)
         .arg("install.sh")
         .args(["--tools-only", "--yes"])
+        // Not in the folder the user happens to be in: rustup's cargo and
+        // rustc obey a rust-toolchain.toml found there.
+        .current_dir("/")
         .status()
         .context("cannot run the installer (sh)")?;
     Ok(status.success())

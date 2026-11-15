@@ -68,6 +68,10 @@ if [ "$tools_only" = no ]; then
     if [ ! -f Cargo.toml ] || ! grep -q '^name = "meow"' Cargo.toml; then
         die "Run this script from the meow repository (Cargo.toml not found next to it)."
     fi
+else
+    # Nothing below needs the folder the user is in, and rustup's cargo and
+    # rustc would obey a rust-toolchain.toml found there.
+    cd / || die "Cannot change to the root directory."
 fi
 
 case "$(uname -s)" in
@@ -150,7 +154,9 @@ fi
 need_rust=no
 update_rust=no
 found_rust=""
-if ! have cargo || ! have rustc; then
+if [ "$tools_only" = yes ]; then
+    : # meow is not rebuilt, so Rust is not looked at.
+elif ! have cargo || ! have rustc; then
     need_rust=yes
 else
     found_rust=$(rust_minor)
