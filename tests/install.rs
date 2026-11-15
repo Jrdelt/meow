@@ -403,9 +403,22 @@ fn supply_chain_and_shell_profile_hardening_in_install_script() {
         !script.contains("/SecLists/master/"),
         "WORDLIST_URL must be pinned to a commit hash"
     );
+    // Temporary files are removed on every way out, and an interrupt is a
+    // way out: the script does not carry on after Ctrl-C.
+    for line in [
+        "trap cleanup EXIT",
+        "trap 'exit 130' INT",
+        "trap 'exit 143' TERM",
+    ] {
+        assert!(script.contains(line), "missing: {line}");
+    }
     assert!(
-        script.contains("trap cleanup EXIT INT TERM"),
-        "cleanup trap must cover EXIT INT TERM"
+        script.contains("wget --https-only --max-redirect=0"),
+        "wget must not follow a redirect off https"
+    );
+    assert!(
+        !script.contains("MEOW_WORDLIST_SHA256"),
+        "the wordlist's digest is pinned, not taken from the environment"
     );
 
     // Mismatched SHA-256 digest rejects the wordlist and leaves no temp file.
@@ -608,4 +621,24 @@ fn the_tool_installer_never_runs_programs_in_the_folder_the_user_is_in() {
     assert!(output.status.success(), "{}{}", out(&output), err(&output));
     let ran_in = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(!ran_in.contains("project-under-review"), "{ran_in}");
+}
+
+#[test]
+fn ctrl_c_stops_the_installer() {
+    // The download is interrupted the way Ctrl-C does it: the script must
+    // stop there, not clean up and carry on with the next step.
+    let machine = Machine::bare();
+    machine
+        .with_compiler()
+        .with_rust(90)
+        .with_package_manager()
+        .tool("kill", "exec /bin/kill \"$@\"")
+        .tool("sleep", "exec /bin/sleep \"$@\"")
+        .tool("curl", "kill -INT $PPID\nsleep 1");
+    let output = machine.run(&["--yes"]);
+    let text = format!("{}{}", out(&output), err(&output));
+    assert_eq!(output.status.code(), Some(130), "{text}");
+    assert!(text.contains("Downloading the wordlist"), "{text}");
+    assert!(!text.contains("Ready"), "{text}");
+    assert!(!machine.wordlist().exists());
 }

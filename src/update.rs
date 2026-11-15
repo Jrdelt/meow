@@ -134,6 +134,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
         .arg("protocol.ext.allow=never")
         .arg("-C")
         .arg(dir)
@@ -163,6 +165,8 @@ fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
         .arg("protocol.ext.allow=never")
         .arg("-c")
         .arg(file_policy)
@@ -174,6 +178,41 @@ fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
     if !status.success() {
         bail!("git {} failed (see the messages above)", args.join(" "));
     }
+    Ok(())
+}
+
+/// git, and then the folder's `install.sh`, are run in `dir`: it must be
+/// this user's own. A folder that another account owns or can write to (a
+/// shared build directory, a temporary path someone else re-created) could
+/// make both run that account's code.
+#[cfg(unix)]
+fn ensure_own_checkout(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: these calls have no preconditions and cannot fail.
+    let (me, my_group) = unsafe { (libc::geteuid(), libc::getegid()) };
+    for path in [dir.to_path_buf(), dir.join(".git")] {
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        let problem = if meta.file_type().is_symlink() {
+            "is a symbolic link"
+        } else if meta.uid() != me {
+            "belongs to another user"
+        } else if meta.mode() & 0o002 != 0 || (meta.mode() & 0o020 != 0 && meta.gid() != my_group) {
+            "can be changed by other users"
+        } else {
+            continue;
+        };
+        bail!(
+            "{} {problem}, so nothing is run in it. Update from a meow folder of your own \
+             (clone it again and run ./install.sh there), or pass --source <folder>",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_own_checkout(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -198,6 +237,7 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
             dir.display()
         );
     }
+    ensure_own_checkout(&dir)?;
     println!("[+] meow source: {}", dir.display());
 
     let changed = git(&dir, &["status", "--porcelain", "--untracked-files=no"])?;
@@ -213,11 +253,9 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     )
     .context("the checked-out branch does not track a branch on GitHub")?;
     let remote_name = upstream.split('/').next().unwrap_or("origin");
-    let remote_url = git(
-        &dir,
-        &["config", "--get", &format!("remote.{remote_name}.url")],
-    )
-    .with_context(|| format!("cannot read remote URL for {remote_name}"))?;
+    // The address git will really use, after its own rewriting rules.
+    let remote_url = git(&dir, &["ls-remote", "--get-url", "--", remote_name])
+        .with_context(|| format!("cannot read remote URL for {remote_name}"))?;
     let local_remote = validate_remote_url(&dir, &remote_url, args.source.is_some())?;
 
     println!("[+] Checking {upstream} for changes");

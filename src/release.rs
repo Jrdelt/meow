@@ -14,8 +14,6 @@ use sha2::{Digest, Sha256};
 
 /// GitHub's answer for the newest published release.
 pub const LATEST_URL: &str = "https://api.github.com/repos/Jrdelt/meow/releases/latest";
-/// Overrides `LATEST_URL` (tests).
-pub const URL_ENV: &str = "MEOW_RELEASES_URL";
 /// Which release file this build is, set by `.github/workflows/release.yml`
 /// (`macos-arm64`, `linux-x86_64`, ...); `None` for a build from a checkout.
 pub const BUILD: Option<&str> = option_env!("MEOW_RELEASE_BUILD");
@@ -99,6 +97,20 @@ async fn get(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A release file is fetched only from GitHub over https (or, for a
+/// stand-in release address under test, from this machine).
+fn trusted_download(raw: &str, stand_in: bool) -> bool {
+    if stand_in {
+        return crate::ai::is_loopback_url(raw);
+    }
+    url::Url::parse(raw).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| {
+                host == "github.com" || host.ends_with(".githubusercontent.com")
+            })
+    })
+}
+
 /// The system's own `tar`, which also unpacks `.zip` files on Windows.
 fn tar() -> PathBuf {
     if cfg!(windows) {
@@ -126,7 +138,9 @@ fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
         bail!("the download could not be unpacked");
     }
     let program = into.join(format!("meow{}", std::env::consts::EXE_SUFFIX));
-    if !program.is_file() {
+    // A regular file of its own: an archive can also hold a link, which
+    // would name some other file to install.
+    if !std::fs::symlink_metadata(&program).is_ok_and(|meta| meta.is_file()) {
         bail!("the download holds no meow program");
     }
     Ok(program)
@@ -137,12 +151,20 @@ fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
 /// for the password on the terminal.
 fn replace(new: &Path, exe: &Path) -> Result<()> {
     let dir = exe.parent().context("meow's own folder is not known")?;
-    let staged = dir.join(format!(".meow-update-{}", std::process::id()));
-    if std::fs::copy(new, &staged).is_ok() {
+    // Staged beside the program under a random name made for this run: a
+    // guessable name could already be there as a link to another file.
+    let staged = tempfile::Builder::new()
+        .prefix(".meow-update-")
+        .tempfile_in(dir)
+        .and_then(|mut staged| {
+            std::io::copy(&mut std::fs::File::open(new)?, staged.as_file_mut())?;
+            Ok(staged)
+        });
+    if let Ok(staged) = staged {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o755))?;
         }
         if cfg!(windows) {
             // A running program cannot be overwritten, but it can be moved.
@@ -150,7 +172,10 @@ fn replace(new: &Path, exe: &Path) -> Result<()> {
             let _ = std::fs::remove_file(&old);
             std::fs::rename(exe, &old).context("cannot move the running meow aside")?;
         }
-        return std::fs::rename(&staged, exe)
+        return staged
+            .persist(exe)
+            .map(|_| ())
+            .map_err(|error| error.error)
             .with_context(|| format!("cannot put the new meow at {}", exe.display()));
     }
     if cfg!(windows) {
@@ -179,13 +204,9 @@ fn replace(new: &Path, exe: &Path) -> Result<()> {
 /// `meow update` for a release install.
 pub fn run(check: bool) -> Result<ExitCode> {
     let build = BUILD.context("this meow was not installed from a release")?;
-    let url = std::env::var(URL_ENV)
-        .ok()
-        .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| LATEST_URL.to_owned());
     let exe = std::env::current_exe().context("cannot tell where this meow is")?;
     let exe = exe.canonicalize().unwrap_or(exe);
-    run_with(&url, build, env!("CARGO_PKG_VERSION"), &exe, check)
+    run_with(LATEST_URL, build, env!("CARGO_PKG_VERSION"), &exe, check)
 }
 
 /// The update itself, with everything that differs in tests passed in.
@@ -196,6 +217,7 @@ pub fn run_with(
     exe: &Path,
     check: bool,
 ) -> Result<ExitCode> {
+    let stand_in = crate::ai::is_loopback_url(url);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -203,6 +225,9 @@ pub fn run_with(
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
+        // Every request and every redirect stays on https. A loopback
+        // release address (a stand-in under test) is the one exception.
+        .https_only(!stand_in)
         .user_agent("meow")
         .build()
         .context("cannot create the HTTP client")?;
@@ -229,6 +254,13 @@ pub fn run_with(
     };
     let archive_url = find(&name)?;
     let sum_url = find(&format!("{name}.sha256"))?;
+    for asset in [&archive_url, &sum_url] {
+        if !trusted_download(asset, stand_in) {
+            bail!(
+                "the release names a download that is not on GitHub ({asset}); nothing was fetched"
+            );
+        }
+    }
     println!("[+] Downloading {name}");
     let archive = runtime.block_on(get(&http, &archive_url))?;
     let sum = runtime.block_on(get(&http, &sum_url))?;
@@ -269,6 +301,37 @@ mod tests {
             archive_name("0.1.2", "windows-x86_64"),
             "meow-0.1.2-windows-x86_64.zip"
         );
+    }
+
+    #[test]
+    fn release_files_come_from_github_over_https_only() {
+        for (url, trusted) in [
+            (
+                "https://github.com/Jrdelt/meow/releases/download/v0.1.2/meow.tar.gz",
+                true,
+            ),
+            (
+                "https://objects.githubusercontent.com/github-production-release-asset/x",
+                true,
+            ),
+            ("https://release-assets.githubusercontent.com/x", true),
+            (
+                "http://github.com/Jrdelt/meow/releases/download/v0.1.2/meow.tar.gz",
+                false,
+            ),
+            ("https://downloads.example.com/meow.tar.gz", false),
+            ("https://github.com.example.com/meow.tar.gz", false),
+            ("https://notgithubusercontent.com/meow.tar.gz", false),
+            ("http://127.0.0.1:8000/meow.tar.gz", false),
+            ("file:///tmp/meow.tar.gz", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(trusted_download(url, false), trusted, "{url}");
+        }
+        // Under test the release address is on this machine, and so must
+        // its files be.
+        assert!(trusted_download("http://127.0.0.1:8000/meow.tar.gz", true));
+        assert!(!trusted_download("https://github.com/x", true));
     }
 
     #[test]
@@ -323,6 +386,17 @@ mod tests {
         let exe = dir.path().join("bin").join("meow");
         std::fs::create_dir(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "old").unwrap();
+        // Someone guessed the name the new program used to be staged under
+        // and left a link there to a file of the user's.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            exe.parent()
+                .unwrap()
+                .join(format!(".meow-update-{}", std::process::id())),
+        )
+        .unwrap();
         let url = format!("{base}/latest");
         // Up to date already: nothing changes.
         let _ = run_with(&url, "linux-x86_64", "0.2.0", &exe, false).unwrap();
@@ -335,6 +409,7 @@ mod tests {
         assert!(std::fs::read_to_string(&exe)
             .unwrap()
             .contains("meow 0.2.0"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,

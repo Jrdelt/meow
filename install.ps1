@@ -31,11 +31,7 @@ $ErrorActionPreference = 'Stop'
 $MIN_RUST_MINOR = 89
 $RUSTUP_URL = "https://win.rustup.rs/x86_64"
 $WORDLIST_URL = "https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
-$WORDLIST_SHA256 = if ($env:MEOW_WORDLIST_SHA256) {
-    $env:MEOW_WORDLIST_SHA256.ToLowerInvariant()
-} else {
-    "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
-}
+$WORDLIST_SHA256 = "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
 $KATANA_GO = "github.com/projectdiscovery/katana/cmd/katana@v1.1.2"
 
 function Say([string]$Message) {

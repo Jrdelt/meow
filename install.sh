@@ -21,7 +21,10 @@ MIN_RUST_MINOR=89
 RUSTUP_URL="https://sh.rustup.rs"
 # The SecLists web-content wordlist (about 4,700 entries), pinned to an immutable commit.
 WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
-WORDLIST_SHA256="${MEOW_WORDLIST_SHA256:-78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52}"
+WORDLIST_SHA256="78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
+# The most a location database file may weigh, packed and unpacked.
+GEO_MAX_PACKED=209715200
+GEO_MAX_BYTES=536870912
 KATANA_GO="github.com/projectdiscovery/katana/cmd/katana@v1.1.2"
 
 rustup_init=""
@@ -31,7 +34,11 @@ cleanup() {
     [ -n "$wordlist_part" ] && rm -f "$wordlist_part"
     return 0
 }
-trap cleanup EXIT INT TERM
+# Ctrl-C stops the script: without the exit the shell would carry on with
+# the next download or package install after cleaning up.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -227,7 +234,9 @@ fetch() {
     if have curl; then
         curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"
     else
-        wget --https-only -q -O "$2" "$1"
+        # wget follows a redirect to http:// even with --https-only, so it
+        # follows none.
+        wget --https-only --max-redirect=0 -q -O "$2" "$1"
     fi
 }
 
@@ -361,7 +370,7 @@ if [ "$need_rust" = yes ]; then
         curl --proto '=https' --tlsv1.2 -sSf -o "$rustup_init" "$RUSTUP_URL" ||
             die "Could not download the Rust installer from $RUSTUP_URL."
     else
-        wget --https-only -q -O "$rustup_init" "$RUSTUP_URL" ||
+        wget --https-only --max-redirect=0 -q -O "$rustup_init" "$RUSTUP_URL" ||
             die "Could not download the Rust installer from $RUSTUP_URL."
     fi
     sh "$rustup_init" -y --profile minimal --no-modify-path || die "The Rust installer failed."
@@ -461,8 +470,11 @@ geo_get() {
     last_month=$(date -d "$(date +%Y-%m-15) -1 month" +%Y-%m 2>/dev/null || date -v-1m +%Y-%m)
     part=$(mktemp "$geo_dir/.$name.XXXXXX")
     for month in "$this_month" "$last_month"; do
+        # Bounded at every step: the download, and what it unpacks to.
         if fetch "https://download.db-ip.com/free/$name-$month.mmdb.gz" "$part.gz" &&
-            gzip -dc "$part.gz" >"$part" &&
+            [ "$(wc -c <"$part.gz")" -le "$GEO_MAX_PACKED" ] &&
+            gzip -dc "$part.gz" | head -c "$((GEO_MAX_BYTES + 1))" >"$part" &&
+            [ "$(wc -c <"$part")" -le "$GEO_MAX_BYTES" ] &&
             tail -c 100000 "$part" | grep -aq 'MaxMind.com'; then
             rm -f "$part.gz"
             mv "$part" "$geo_dir/$name.mmdb"

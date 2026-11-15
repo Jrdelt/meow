@@ -214,3 +214,45 @@ fn hooks_are_disabled_and_untrusted_remotes_are_refused() {
         );
     }
 }
+
+#[test]
+fn a_source_folder_others_can_change_is_not_used() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repos = Repos::new();
+    repos.push_change("new.txt");
+    // A file system monitor set in the checkout's own git config would be
+    // run by `git status`; meow turns it off.
+    let marker = repos.path("monitor-ran");
+    let monitor = repos.path("monitor.sh");
+    std::fs::write(
+        &monitor,
+        format!("#!/bin/sh\necho ran > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &repos.path("clone"),
+        &["config", "core.fsmonitor", monitor.to_str().unwrap()],
+    );
+
+    // Anyone on the machine may write to the folder: nothing is run in it.
+    let clone = repos.path("clone");
+    std::fs::set_permissions(&clone, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let output = repos.update(&[]);
+    let shown = text(&output);
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("can be changed by other users"), "{shown}");
+    assert!(
+        !shown.contains("meow source:"),
+        "git was not reached: {shown}"
+    );
+    assert!(!repos.path("clone/new.txt").exists(), "nothing was pulled");
+
+    // The user's own folder again: the update runs, the monitor does not.
+    std::fs::set_permissions(&clone, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = repos.update(&[]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(repos.path("clone/new.txt").exists());
+    assert!(!marker.exists(), "core.fsmonitor from the checkout was run");
+}

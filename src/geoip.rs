@@ -24,6 +24,22 @@ pub const ASN_FILE: &str = "dbip-asn-lite.mmdb";
 pub const CREDIT: &str = "IP Geolocation by DB-IP";
 pub const CREDIT_URL: &str = "https://db-ip.com";
 const FIELD_MAX: usize = 80;
+/// The files are read whole; the city file is about 130 MB. Anything far
+/// beyond that is not a location database meow should load.
+const FILE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Opens a database file that is a regular file of a sane size.
+fn open(path: &Path) -> Result<maxminddb::Reader<Vec<u8>>> {
+    let meta = std::fs::metadata(path).context("cannot read the location database")?;
+    if !meta.is_file() || meta.len() > FILE_MAX_BYTES {
+        anyhow::bail!(
+            "{} is not a location database meow will load (over {} MB, or not a file)",
+            path.display(),
+            FILE_MAX_BYTES / (1024 * 1024)
+        );
+    }
+    maxminddb::Reader::open_readfile(path).context("cannot read the location database")
+}
 
 #[derive(Deserialize, Default)]
 struct Named {
@@ -86,8 +102,7 @@ impl GeoDb {
     /// Where `address` is, by the files; `None` when they do not know it.
     /// Slow-ish (it reads the files): call it off the async threads.
     pub fn lookup(&self, address: IpAddr) -> Result<Option<Place>> {
-        let city = maxminddb::Reader::open_readfile(self.dir.join(CITY_FILE))
-            .context("cannot read the location database")?;
+        let city = open(&self.dir.join(CITY_FILE))?;
         let Some(found) = city
             .lookup(address)
             .context("the location database could not be searched")?
@@ -108,7 +123,7 @@ impl GeoDb {
             return Ok(None);
         }
         // The network is a bonus: without the ASN file the place still stands.
-        let network = maxminddb::Reader::open_readfile(self.dir.join(ASN_FILE))
+        let network = open(&self.dir.join(ASN_FILE))
             .ok()
             .and_then(|asn| asn.lookup(address).ok()?.decode::<AsnRecord>().ok()?)
             .and_then(|asn| {
@@ -186,5 +201,16 @@ mod tests {
         assert!(!db.available());
         let error = db.lookup("8.8.8.8".parse().unwrap()).unwrap_err();
         assert!(format!("{error:#}").contains("cannot read the location database"));
+
+        // A file far too large to be one is refused before it is read
+        // (sparse here: it takes no disk space).
+        let huge = std::fs::File::create(dir.path().join(CITY_FILE)).unwrap();
+        huge.set_len(FILE_MAX_BYTES + 1).unwrap();
+        assert!(db.available());
+        let error = db.lookup("8.8.8.8".parse().unwrap()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a location database"),
+            "{error:#}"
+        );
     }
 }
