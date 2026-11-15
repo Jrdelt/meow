@@ -317,6 +317,9 @@ pub async fn fetch(template: &str, view: &MapView) -> Result<Vec<Picture>> {
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        // The picture service names the pictures; it does not get to send
+        // this machine's requests on to another address.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("meow")
         .build()
         .context("cannot create the HTTP client")?;
@@ -492,6 +495,12 @@ mod tests {
             )
             .route("/page/{z}/{x}/{y}", get(|| async { "<!doctype html>" }))
             .route(
+                "/moved/{z}/{x}/{y}",
+                get(|Path((z, x, y)): Path<(u8, u32, u32)>| async move {
+                    axum::response::Redirect::to(&format!("/ok/{z}/{x}/{y}"))
+                }),
+            )
+            .route(
                 "/huge/{z}/{x}/{y}",
                 get(|| async {
                     let mut huge = JPEG.to_vec();
@@ -528,6 +537,8 @@ mod tests {
             ("page", "other than a JPEG or PNG"),
             ("huge", "larger than 1024 KB"),
             ("missing", "HTTP 404"),
+            // A redirect is an answer, not somewhere to go.
+            ("moved", "HTTP 303"),
         ] {
             let template = format!("{base}/{path}/{{z}}/{{x}}/{{y}}");
             let error = fetch(&template, &view).await.unwrap_err();

@@ -218,6 +218,9 @@ pub struct State {
     pub session: String,
     pub port: u16,
     pub token: String,
+    /// Served in the map page and sent with every state push to it, never
+    /// taken from a client: how the page knows its own session.
+    page_key: String,
     pub config: Config,
     workspace: Mutex<Workspace>,
     graph: Mutex<Graph>,
@@ -784,7 +787,7 @@ async fn serve_socket(state: Shared, mut socket: WebSocket) {
     let mut revision = state.revision.subscribe();
     let send_state = |state: &Shared| {
         Message::Text(
-            json!({ "type": "state", "state": state.snapshot() })
+            json!({ "type": "state", "key": state.page_key, "state": state.snapshot() })
                 .to_string()
                 .into(),
         )
@@ -824,7 +827,7 @@ async fn serve_socket(state: Shared, mut socket: WebSocket) {
 }
 
 async fn index(AxumState(state): AxumState<Shared>) -> Response {
-    webui::page(&state.token)
+    webui::page(&state.token, &state.page_key)
 }
 
 async fn asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -970,7 +973,14 @@ async fn locate_target(state: Shared, address: String, generation: u64) {
                     target.status = "found";
                     target.credit = Some(geoip::CREDIT);
                     target.credit_url = Some(geoip::CREDIT_URL);
-                    match location::map_for(&settings, &place).await {
+                    // `[location] enabled = false` asks for no outside
+                    // request about places at all, pictures included.
+                    let map = if settings.enabled {
+                        location::map_for(&settings, &place).await
+                    } else {
+                        None
+                    };
+                    match map {
                         Some(Ok((view, fetched))) => {
                             target.map = Some(Box::new(view));
                             pictures = fetched;
@@ -1303,6 +1313,7 @@ impl Coordinator {
             session: workspace.name.clone(),
             port,
             token,
+            page_key: new_token()?,
             config,
             workspace: Mutex::new(workspace),
             graph: Mutex::new(graph),
@@ -1443,6 +1454,77 @@ mod tests {
             workspace,
             coordinator,
         }
+    }
+
+    #[test]
+    fn location_off_means_no_picture_requests_for_a_selected_server_either() {
+        use std::sync::atomic::AtomicUsize;
+        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            block_on(async move {
+                let app = axum::Router::new().route(
+                    "/tiles/{z}/{x}/{y}",
+                    axum::routing::get(|| async {
+                        ASKED.fetch_add(1, Ordering::SeqCst);
+                        JPEG
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let address = rx.recv().unwrap();
+        let place = Place {
+            city: Some("Mountain View".into()),
+            region: Some("California".into()),
+            country: Some("United States".into()),
+            latitude: 37.422,
+            longitude: -122.085,
+            public_address: Some("8.8.8.8".into()),
+            network: None,
+        };
+        let select = |enabled: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+            let (workspace, _) =
+                Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+            let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+            let mut config = Config::default();
+            config.cve.enabled = false;
+            config.location.enabled = enabled;
+            config.location.tiles = format!("http://{address}/tiles/{{z}}/{{x}}/{{y}}");
+            let coordinator = Coordinator::start(workspace, config).unwrap();
+            let state = coordinator.state();
+            // The place is known already, as after a database lookup.
+            lock(&state.target_places).insert("8.8.8.8".to_owned(), Some(place.clone()));
+            state
+                .execute(Command::LocateHost {
+                    address: Some("8.8.8.8".into()),
+                })
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let target = loop {
+                let target = state.snapshot()["target"].clone();
+                if target["status"] != "looking" || std::time::Instant::now() > deadline {
+                    break target;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            coordinator.shutdown();
+            target
+        };
+        let off = select(false);
+        assert_eq!(off["status"], "found", "{off}");
+        assert_eq!(off["place"]["city"], "Mountain View");
+        assert!(off.get("map").is_none(), "{off}");
+        assert_eq!(ASKED.load(Ordering::SeqCst), 0, "no picture was asked for");
+        // On, the same selection fetches the pictures.
+        let on = select(true);
+        assert!(on["map"]["tiles"].as_array().is_some(), "{on}");
+        assert!(ASKED.load(Ordering::SeqCst) > 0);
     }
 
     #[test]
@@ -1888,6 +1970,37 @@ mod tests {
             let first = next().await;
             assert_eq!(first["type"], "state");
             assert_eq!(first["state"]["graph"]["hosts"], json!({}));
+            // Every push carries the key served in the map page, which is
+            // how the page tells its session from whatever else may answer
+            // on this port later. The key is in the page and nowhere else.
+            let page_key = fx.coordinator.state().page_key.clone();
+            assert_eq!(page_key.len(), 64);
+            assert_ne!(page_key, info.token);
+            assert_eq!(first["key"], json!(page_key));
+            assert!(!first["state"].to_string().contains(&page_key));
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let page = client
+                .get(format!("{}/?token={}", info.base_url(), info.token))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(page.contains(&format!("<meta name=\"meow-page\" content=\"{page_key}\">")));
+            let api = client
+                .get(format!(
+                    "{}/api/state?token={}",
+                    info.base_url(),
+                    info.token
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!api.contains(&page_key));
 
             // A change made elsewhere is pushed without being asked for.
             fx.coordinator

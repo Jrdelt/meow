@@ -62,7 +62,8 @@ default_mode = "light"
 # address, asking the service below once and again when the network
 # changes. The request carries nothing about you or your targets; the
 # service sees only the address it comes from. Nothing is looked up while
-# a VPN carries all traffic. Set to false to turn it off.
+# a VPN carries all traffic. Set to false to turn it off: no place is looked
+# up and no map picture is fetched, for this machine or for a selected server.
 enabled = true
 # url = "https://ipinfo.io/json"
 # Show the estimate on a small satellite map with a pin and a circle for the

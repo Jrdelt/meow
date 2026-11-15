@@ -4,6 +4,16 @@
   'use strict';
 
   var token = new URLSearchParams(location.search).get('token') || '';
+  // A value only the session that served this page knows. Whatever answers
+  // on this port after the session has ended does not have it.
+  var pageKey = (document.querySelector('meta[name="meow-page"]') || {}).content || '';
+  var ended = false;
+  // Lookup tables keyed by host names and addresses: a host may be called
+  // `constructor` or `__proto__`, which every plain object already has.
+  function table() { return Object.create(null); }
+  function own(object, key) {
+    return object && Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
+  }
   var socket = null;
   var state = null;
   var selected = null;
@@ -165,6 +175,13 @@
     ws.onmessage = function (event) {
       var message = JSON.parse(event.data);
       if (message.type === 'state') {
+        if (message.key !== pageKey) {
+          // Not the session this page came from: another program now has
+          // its port. Nothing it sends is shown.
+          ended = true;
+          ws.close();
+          return;
+        }
         state = message.state;
         render();
         // Where this machine is: asked once, when the map first opens.
@@ -177,9 +194,9 @@
       }
     };
     ws.onclose = function () {
-      byId('conn').textContent = 'session closed';
+      byId('conn').textContent = ended ? 'session ended' : 'session closed';
       byId('conn').className = 'badge off';
-      setTimeout(connect, 2000);
+      if (!ended) { setTimeout(connect, 2000); }
     };
   }
 
@@ -222,7 +239,8 @@
   var PRINTER = /(^|[\s,])(9100|515|631)\/tcp|ipp|printer|jetdirect/i;
 
   function plan(nodes, edges) {
-    var data = {}, out = {}, pos = {}, classes = {}, elements = [], lines = [], placed = {}, networkOf = {};
+    var data = table(), out = table(), pos = table(), classes = table(), elements = [], lines = [],
+      placed = table(), networkOf = table();
     nodes.forEach(function (node) { data[node.data.id] = node.data; out[node.data.id] = []; });
     edges.forEach(function (edge) {
       var e = edge.data;
@@ -746,7 +764,7 @@
   }
 
   // <details> keep the state the reader left them in across refreshes.
-  var unfolded = {};
+  var unfolded = table();
   function fold(key, className, openByDefault) {
     var box = el('details', className);
     box.open = key in unfolded ? unfolded[key] : !!openByDefault;
@@ -859,7 +877,7 @@
     // The newest run of each target in full; earlier runs of the same
     // target (all kept in the workspace) fold away under it.
     var latest = [];
-    var earlier = {};
+    var earlier = table();
     (state.tasks || []).forEach(function (task) {
       if (task.target in earlier) { earlier[task.target].push(task); return; }
       earlier[task.target] = [];
@@ -936,7 +954,7 @@
     text.appendChild(el('span', 'dim', where.join(' · ')));
 
     var status = advisory.verification_status;
-    var checks = ((state.checklists[address] || {})[advisory.id] || {});
+    var checks = own(own(state.checklists, address), advisory.id) || {};
     (checks.items || []).forEach(function (check) {
       var label = el('span', 'label', check.label);
       item.appendChild(row(label, marked(check.detail, check.done ? 'ok' : 'warn')));
@@ -979,7 +997,7 @@
     // What to do comes first: one line per piece of software, since one
     // update usually answers every advisory matched on it.
     var fixes = state.fixes || {};
-    var mine = {};
+    var mine = table();
     (state.graph.local.interfaces || []).forEach(function (iface) {
       (iface.addresses || []).forEach(function (cidr) { mine[cidr.split('/')[0]] = true; });
     });
@@ -1103,8 +1121,9 @@
     if (web.childNodes.length > 1) { cards.push(web); }
 
     var ai = card('Ask AI');
-    var ready = Object.keys(state.checklists[host.address] || {}).some(function (id) {
-      return state.checklists[host.address][id].research_ready;
+    var lists = own(state.checklists, host.address) || {};
+    var ready = Object.keys(lists).some(function (id) {
+      return lists[id].research_ready;
     });
     var ask = ai.appendChild(el('div', 'actions'));
     [['local', '[L] Local'], ['cloud', '[C] Cloud triage'], ['research', '[R] Deep research']].forEach(function (tier) {
@@ -1181,7 +1200,7 @@
       return;
     }
     var data = node.data();
-    var host = data.address ? state.graph.hosts[data.address] : null;
+    var host = data.address ? own(state.graph.hosts, data.address) : null;
     if (host) {
       byId('detail-title').textContent = 'Host Info';
       // address -> type -> OS -> version, one row each.

@@ -208,6 +208,7 @@ pub async fn lookup(url: &str) -> Result<Place> {
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("meow")
         .build()
         .context("cannot create the HTTP client")?;

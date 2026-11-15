@@ -35,9 +35,18 @@ fn with_type(content_type: &'static str, body: String) -> Response {
 
 /// The map page. The session token is written into the asset URLs so the
 /// browser can fetch them; it is 64 hex characters, so no escaping applies.
-pub fn page(token: &str) -> Response {
+/// `page_key` is a second value of the same shape that only ever travels
+/// from the session to its page: the page shows a state message only when
+/// it carries that key, so a program that takes over the port after the
+/// session has ended cannot feed the open tab.
+pub fn page(token: &str, page_key: &str) -> Response {
     debug_assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-    with_type("text/html; charset=utf-8", PAGE.replace("{{TOKEN}}", token))
+    debug_assert!(page_key.chars().all(|c| c.is_ascii_hexdigit()));
+    with_type(
+        "text/html; charset=utf-8",
+        PAGE.replace("{{TOKEN}}", token)
+            .replace("{{PAGE}}", page_key),
+    )
 }
 
 pub fn asset(name: &str) -> Response {
@@ -147,6 +156,8 @@ mod tests {
             "inline scripts would need a weaker content policy"
         );
         assert_eq!(PAGE.matches("{{TOKEN}}").count(), 3);
+        assert_eq!(PAGE.matches("{{PAGE}}").count(), 1);
+        assert!(SCRIPT.contains("message.key !== pageKey"));
         let filled = PAGE.replace("{{TOKEN}}", &token);
         for asset in ["map.css", "cytoscape.min.js", "map.js"] {
             assert!(
