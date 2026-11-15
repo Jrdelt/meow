@@ -29,6 +29,11 @@ use crate::timeutil::now_rfc3339;
 const MAX_TOKEN_LEN: usize = 24;
 const ENTROPY_MIN_LEN: usize = 20;
 const ENTROPY_MIN_BITS: f64 = 3.6;
+/// Sixteen symbols give at most 4 bits; random hexadecimal of 20 characters
+/// or more is above this 99.7 % of the time.
+const HEX_MIN_BITS: f64 = 2.8;
+/// An MD5 or NTLM hash, and longer.
+const HEX_KEY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
@@ -98,11 +103,45 @@ static AUTH_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 static COOKIE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?im)\b(?:set-)?cookie\s*:\s*([^\r\n]{4,})").expect("valid regex")
 });
+/// A name that holds a credential, alone or as one part of a longer name:
+/// `password`, `DB_PASSWORD`, `aws_secret_access_key`, `reset-password-token`,
+/// `PHPSESSID`. The name may be quoted; the value may be quoted too.
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\b(?:x-api-key|api[_-]?key|apikey|secret|client[_-]?secret|password|passwd|pwd|pass|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?id|private[_-]?key)\b["']?\s*[:=]\s*["']?([^\s"',;&<>]{4,})"#,
-    )
+    Regex::new(concat!(
+        r#"(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*"#,
+        r#"(?:x-api-key|(?:api|access|secret|private|auth|encryption|signing|master|license)[_-]?key"#,
+        r#"|apikey|client[_-]?secret|secret|password|passwd|passphrase|pwd|pass"#,
+        r#"|(?:access|refresh|auth|id|bearer|session|csrf|xsrf)[_-]?token|token|credentials?"#,
+        r#"|[a-z]*sess(?:ion)?[_-]?id)"#,
+        r#"(?:[_.-][A-Za-z0-9]+)*["']?\s*[:=]\s*"#,
+        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
+    ))
     .expect("valid regex")
+});
+/// The same in camelCase (`dbPassword`, `clientSecret`), which the pattern
+/// above cannot see without taking `compass` and `tokens` for names.
+static KEY_VALUE_CAMEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"[a-z0-9]+(?:Password|Passwd|Passphrase|Pwd|Secret|Token|ApiKey|Credentials?)"#,
+        r#"[A-Za-z0-9]*["']?\s*[:=]\s*"#,
+        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
+    ))
+    .expect("valid regex")
+});
+/// Query parameters that carry a credential under a short name.
+static URL_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)[?&;](?:key|sig|signature|code|auth|authkey)=([^&\s#"'<>]{3,})"#)
+        .expect("valid regex")
+});
+/// Password hashes in the `$id$salt$hash` form (crypt, bcrypt, Argon2).
+static CRYPT_HASH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$(?:1|2[abxy]?|5|6|y|apr1|argon2(?:id|i|d)?|pbkdf2[a-z0-9-]*)\$[^\s:]{8,}")
+        .expect("valid regex")
+});
+/// A UUID: session ids and API keys are often one.
+static UUID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+        .expect("valid regex")
 });
 static URL_CREDENTIALS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"://([^/\s:@]{1,64}):([^/\s@]{1,128})@").expect("valid regex"));
@@ -200,16 +239,81 @@ fn is_base64_credentials(blob: &str) -> bool {
         })
 }
 
+/// A word as people write them: digits, lower case, upper case or
+/// CamelCase with short acronyms, possibly numbered (`Report2023`).
+fn is_wordlike(word: &str) -> bool {
+    let letters = word.trim_end_matches(|c: char| c.is_ascii_digit());
+    if letters.bytes().any(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if letters.bytes().all(|b| b.is_ascii_lowercase())
+        || letters.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return true;
+    }
+    // camelCase: a first part of at least two small letters (or none), then
+    // capital runs of at most four letters, each followed by small letters;
+    // the last capital run may end the word (`TagNameNS`).
+    let bytes = letters.as_bytes();
+    let mut at = bytes.iter().take_while(|b| b.is_ascii_lowercase()).count();
+    if at == 1 {
+        return false;
+    }
+    while at < bytes.len() {
+        let capitals = bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_uppercase())
+            .count();
+        at += capitals;
+        let lower = bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_lowercase())
+            .count();
+        if capitals == 0 || capitals > 4 || (lower == 0 && at < bytes.len()) {
+            return false;
+        }
+        at += lower;
+    }
+    true
+}
+
+/// A Base64-looking blob that is cut into short runs by `/`, `+`, `-` or
+/// `_` (an AWS secret key, a URL-safe token): mixed case, and most of it
+/// is not made of words. Paths and dashed names are made of words.
+fn is_scrambled(blob: &str) -> bool {
+    if blob.len() < ENTROPY_MIN_LEN
+        || !blob.bytes().any(|b| b.is_ascii_uppercase())
+        || !blob.bytes().any(|b| b.is_ascii_lowercase())
+    {
+        return false;
+    }
+    let (mut total, mut odd) = (0, 0);
+    for word in blob.split(|c: char| !c.is_ascii_alphanumeric()) {
+        total += word.len();
+        if !is_wordlike(word) {
+            odd += word.len();
+        }
+    }
+    total >= ENTROPY_MIN_LEN && odd * 10 >= total * 6
+}
+
 /// A random-looking token: some unbroken run of letters and digits is long
 /// and varied. Splitting on punctuation first keeps URL paths, package
 /// names and dashed identifiers (`detail/CVE-2021-23017`) from qualifying.
+/// Hexadecimal has fewer symbols, so a hash or key written in it counts
+/// from a lower variety; a blob cut up by `/` or `+` is judged as a whole.
 fn is_high_entropy(blob: &str) -> bool {
     blob.split(|c: char| !c.is_ascii_alphanumeric()).any(|run| {
-        run.len() >= ENTROPY_MIN_LEN
-            && run.bytes().any(|b| b.is_ascii_digit())
-            && run.bytes().any(|b| b.is_ascii_alphabetic())
-            && entropy(run) >= ENTROPY_MIN_BITS
-    })
+        let hex = run.bytes().all(|b| b.is_ascii_hexdigit());
+        let mixed =
+            run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
+        if hex {
+            (run.len() >= HEX_KEY_LEN && entropy(run) >= HEX_MIN_BITS)
+                || (run.len() >= ENTROPY_MIN_LEN && mixed && entropy(run) >= HEX_MIN_BITS)
+        } else {
+            run.len() >= ENTROPY_MIN_LEN && mixed && entropy(run) >= ENTROPY_MIN_BITS
+        }
+    }) || is_scrambled(blob)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,9 +586,17 @@ impl Vault {
         whole(&PRIVATE_KEY, Kind::Sec, &mut spans);
         whole(&JWT, Kind::Sec, &mut spans);
         whole(&KNOWN_KEY, Kind::Sec, &mut spans);
+        whole(&CRYPT_HASH, Kind::Sec, &mut spans);
+        whole(&UUID, Kind::Sec, &mut spans);
         group(&AUTH_HEADER, 1, Kind::Sec, &mut spans);
         group(&COOKIE, 1, Kind::Sec, &mut spans);
-        group(&KEY_VALUE, 1, Kind::Sec, &mut spans);
+        group(&URL_SECRET, 1, Kind::Sec, &mut spans);
+        // The value is quoted with ", with ' or not at all.
+        for regex in [&*KEY_VALUE, &*KEY_VALUE_CAMEL] {
+            for index in 1..=3 {
+                group(regex, index, Kind::Sec, &mut spans);
+            }
+        }
         group(&URL_CREDENTIALS, 1, Kind::User, &mut spans);
         group(&URL_CREDENTIALS, 2, Kind::Sec, &mut spans);
         for found in BLOB.find_iter(text) {
@@ -830,6 +942,100 @@ mod tests {
             assert!(secret.preview.len() < 24, "{}", secret.preview);
         }
         assert_eq!(vault.unmask("use <<SEC_10>>"), format!("use {jwt}"));
+    }
+
+    #[test]
+    fn common_secret_formats_do_not_pass() {
+        // What the 2026-11 audit saw arrive at a stand-in cloud in clear.
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "DB_PASSWORD=Sup3rS3cret!x MYSQL_ROOT_PASSWORD=r00tpw99 SMTP_PASS=mailpw77 \
+                 APP_SECRET=s3cr3tvalue1 API_TOKEN=tok_live_12345",
+                &["Sup3rS3cret!x", "r00tpw99", "mailpw77", "s3cr3tvalue1", "tok_live_12345"],
+            ),
+            (
+                "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                &["wJalrXUtnFEMI", "K7MDENG", "bPxRfiCYEXAMPLEKEY"],
+            ),
+            // The same key with nothing naming it.
+            (
+                "found wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY in the page source",
+                &["wJalrXUtnFEMI", "K7MDENG", "bPxRfiCYEXAMPLEKEY"],
+            ),
+            ("passphrase: correcthorse99", &["correcthorse99"]),
+            ("PHPSESSID=9f2c1a77b1d04e2aa3c1", &["9f2c1a77b1d04e2aa3c1"]),
+            ("JSESSIONID: 0A1B2C3D4E5F", &["0A1B2C3D4E5F"]),
+            (
+                "/cb?session_token=9a8b7c6d5e&reset_password_token=zz11yy22",
+                &["9a8b7c6d5e", "zz11yy22"],
+            ),
+            // An LM / NTLM pair, and one hash alone.
+            (
+                "Administrator:500:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::",
+                &["aad3b435b51404ee", "8846f7eaee8fb117ad06bdd830b7586c"],
+            ),
+            ("hash 5f4dcc3b5aa765d61d8327deb882cf99 seen", &["5f4dcc3b5aa765d61d8327deb882cf99"]),
+            ("etag 9f2c1a77b1d04e2aa3c1 short hex", &["9f2c1a77b1d04e2aa3c1"]),
+            (
+                "root:$6$rounds=5000$saltsalt$Hx3bT0d5q1ZyVQkq9nD0wq7uYbXnJw1:19000:0:99999:7:::",
+                &["saltsalt", "Hx3bT0d5q1ZyVQkq9nD0wq7uYbXnJw1"],
+            ),
+            ("$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", &["N9qo8uLOickgx2ZMRZoMye"]),
+            ("config: {\"dbPassword\": \"p@ss w0rd!\", \"clientSecret\":\"abc123xyz\"}", &["p@ss w0rd!", "abc123xyz"]),
+            ("password = 'two words here'", &["two words here"]),
+            ("pwd=abc", &["abc"]),
+            ("GET /api?key=AbC123xYz&sig=deadbeef01&page=2", &["AbC123xYz", "deadbeef01"]),
+            ("apiKey: 123e4567-e89b-12d3-a456-426614174000", &["123e4567", "426614174000"]),
+            ("session 123e4567-e89b-12d3-a456-426614174000 opened", &["426614174000"]),
+            ("ENCRYPTION_KEY=hunter2hunter2", &["hunter2hunter2"]),
+            ("vault.credentials: s3cr3t-cr3d", &["s3cr3t-cr3d"]),
+        ];
+        for (text, secrets) in cases {
+            let mut vault = Vault::ephemeral();
+            let masked = vault.mask_text(text);
+            for secret in *secrets {
+                assert!(!masked.contains(secret), "{secret} survived in: {masked}");
+            }
+            assert!(masked.contains("<<SEC_"), "{masked}");
+            assert_eq!(vault.unmask(&masked), *text);
+            assert!(!vault.exposed_secrets().is_empty());
+        }
+    }
+
+    #[test]
+    fn words_that_only_contain_a_secret_word_are_left_alone() {
+        let mut vault = Vault::ephemeral();
+        for plain in [
+            "compass: north-east",
+            "bypass=true and passive: enabled",
+            "tokens: 1500 used, tokenizer=default",
+            "secretary: on leave",
+            "Public Key type: rsa, Public Key bits: 2048",
+            "ssh-hostkey: 2048 (RSA)",
+            "see vuln/detail/CVE-2021-23017 and Discovery/Web-Content/raft-medium-directories",
+            "wp-content/uploads/2023/05/Annual-Report-2023-final and images/2021/Q3/Board-Meeting-Photo-0042",
+            "org/apache/logging/log4j/core/lookup/JndiLookup, apache/logging-log4j2/pull/608/files",
+            "X-Content-Type-Options and Strict-Transport-Security are missing",
+            "deadbeefdeadbeefdeadbeef is a test pattern",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        ] {
+            assert_eq!(vault.mask_text(plain), plain, "{plain}");
+        }
+        assert!(vault.exposed_secrets().is_empty());
+        for (word, like) in [
+            ("report", true),
+            ("CVE", true),
+            ("Report2023", true),
+            ("JndiLookup", true),
+            ("XMLHttpRequest", true),
+            ("0042", true),
+            ("K7MDENG", false),
+            ("wJalrXUtnFEMI", false),
+            ("bPxRfiCYEXAMPLEKEY", false),
+            ("log4j2", false),
+        ] {
+            assert_eq!(is_wordlike(word), like, "{word}");
+        }
     }
 
     #[test]

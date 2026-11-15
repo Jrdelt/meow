@@ -335,7 +335,13 @@ API key, or OpenRouter (or, for `C`, any other OpenAI-style service).
 
 Before any cloud request, addresses, internal names, paths, user names and
 secrets are replaced by placeholders such as `<<HOST_01>>`, and the request is
-refused if anything private is still detected. The local model `L` gets the
+refused if anything private is still detected. Secrets are found by their
+name (`password=`, `DB_PASSWORD=`, `aws_secret_access_key`, a session cookie)
+or their form (tokens, keys, hashes, UUIDs, random-looking strings). A
+password written like an ordinary word, with nothing naming it, cannot be
+told from a word. For that reason your own notes are not sent with a request
+that leaves this machine: the model is only told how many there are. Set
+`cloud_notes = true` under `[ai]` to send them, masked like the rest. The local model `L` gets the
 real text only while it is on this machine and yours: a "local" server at
 another address, or (on Linux) one that another login user runs on this
 machine, gets the same masked text, and the answer says so. Replies are unmasked locally

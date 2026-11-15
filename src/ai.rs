@@ -112,6 +112,10 @@ pub struct AiSettings {
     /// before declines a request. Left out, the built-in chain applies; an
     /// empty list leaves the choice to the API.
     pub cloud_fallbacks: Option<Vec<String>>,
+    /// Send the operator's notes with a request that leaves this machine.
+    /// Off: a note is free text, and no pattern recognises a password that
+    /// is written like a word (`tried admin / Winter2026`).
+    pub cloud_notes: bool,
     /// The user's own setup file (`~/.meow/ai.toml`), written by
     /// `meow setup`. Read again for every request, so a change applies to a
     /// running session at once.
@@ -132,6 +136,7 @@ impl Default for AiSettings {
             openrouter_api_key: None,
             cloud_provider: None,
             cloud_fallbacks: None,
+            cloud_notes: false,
             user_file: None,
         }
     }
@@ -662,16 +667,35 @@ fn another_users_server(url: &str) -> Option<u32> {
 }
 
 /// Masks a prompt for leaving this machine, and proves nothing private is
-/// left in it before it goes.
+/// left in it before it goes. The operator's notes are left out unless
+/// `with_notes`: the prompt then says how many were withheld.
 fn mask_prompt(
     vault: &Mutex<Vault>,
     graph: &Graph,
     prompt: &Prompt,
+    with_notes: bool,
 ) -> Result<(String, crate::vault::StreamUnmasker)> {
     let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
     vault.register_graph(graph);
     vault.register_operator();
-    let masked = vault.mask_json(&prompt.user).to_string();
+    // Everything is masked, the notes too: a secret in a note is then on
+    // the list of what to rotate, whether or not the note is sent.
+    let mut user = vault.mask_json(&prompt.user);
+    if !with_notes {
+        if let Some(data) = user
+            .get_mut("untrusted_scan_data")
+            .and_then(Value::as_object_mut)
+        {
+            let withheld = data
+                .remove("operator_notes")
+                .and_then(|notes| notes.as_array().map(Vec::len))
+                .unwrap_or(0);
+            if withheld > 0 {
+                data.insert("operator_notes_withheld".to_owned(), json!(withheld));
+            }
+        }
+    }
+    let masked = user.to_string();
     let leaks = vault.leaks(&masked);
     if !leaks.is_empty() {
         bail!(
@@ -866,7 +890,7 @@ impl AiEngine {
         };
         let (user, mut unmasker) = match &masked_because {
             Some(_) => {
-                let (masked, unmasker) = mask_prompt(vault, graph, prompt)?;
+                let (masked, unmasker) = mask_prompt(vault, graph, prompt, settings.cloud_notes)?;
                 (masked, Some(unmasker))
             }
             None => (prompt.user.to_string(), None),
@@ -989,7 +1013,7 @@ impl AiEngine {
         };
 
         // Mask, then prove nothing private is left before going on.
-        let (masked_user, mut unmasker) = mask_prompt(vault, graph, &prompt)?;
+        let (masked_user, mut unmasker) = mask_prompt(vault, graph, &prompt, settings.cloud_notes)?;
 
         let model = match tier {
             Tier::Research => settings.research_model.clone(),
@@ -1593,10 +1617,10 @@ mod tests {
         let user: Value =
             serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(user["untrusted_scan_data"]["address"], "<<HOST_01>>");
-        assert!(user["untrusted_scan_data"]["operator_notes"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("session token <<SEC_01>> worked for <<USER_"));
+        // The operator's note stays here; the model is told one exists.
+        assert!(user["untrusted_scan_data"].get("operator_notes").is_none());
+        assert_eq!(user["untrusted_scan_data"]["operator_notes_withheld"], 1);
+        assert!(!sent.contains("session token"), "{sent}");
         // Public identifiers are intact so the model can reason about them.
         assert!(
             sent.contains("nginx") && sent.contains("1.18.0") && sent.contains("CVE-2021-23017")
@@ -1630,6 +1654,95 @@ mod tests {
             stored.contains("<<HOST_01>>") && !stored.contains("10.10.10.5"),
             "the cache holds masked text"
         );
+    }
+
+    /// Notes holding what the 2026-11 audit saw reach a stand-in cloud.
+    fn lab_with_credential_notes() -> Graph {
+        let mut graph = lab();
+        for text in [
+            "DB_PASSWORD=Sup3rS3cret!x MYSQL_ROOT_PASSWORD=r00tpw99 SMTP_PASS=mailpw77",
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "tried admin/admin123 and backup:Winter2026!",
+            "passphrase: correcthorse99 and PHPSESSID=9f2c1a77b1d04e2aa3c1",
+            "lm hash aad3b435b51404eeaad3b435b51404ee",
+        ] {
+            graph.apply(Observation::Note {
+                address: Some("10.10.10.5".into()),
+                text: text.into(),
+                record: EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, "x"),
+            });
+        }
+        // The same kinds of text as a scanned server sends them.
+        graph.apply(Observation::Script {
+            address: "10.10.10.5".into(),
+            port: Some(443),
+            protocol: "tcp".into(),
+            id: "http-config-backup".into(),
+            output: "APP_SECRET=s3cr3tvalue1 API_TOKEN=tok_live_12345 \
+                     /cb?session_token=9a8b7c6d5e&reset_password_token=zz11yy22"
+                .into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        graph
+    }
+
+    #[tokio::test]
+    async fn notes_stay_here_and_named_secrets_never_reach_the_cloud() {
+        if !no_env_key() {
+            return;
+        }
+        const SECRETS: &[&str] = &[
+            "Sup3rS3cret!x",
+            "r00tpw99",
+            "mailpw77",
+            "wJalrXUtnFEMI",
+            "bPxRfiCYEXAMPLEKEY",
+            "correcthorse99",
+            "9f2c1a77b1d04e2aa3c1",
+            "aad3b435b51404eeaad3b435b51404ee",
+            "s3cr3tvalue1",
+            "tok_live_12345",
+            "9a8b7c6d5e",
+            "zz11yy22",
+        ];
+        let graph = lab_with_credential_notes();
+
+        // As set up by default: no note leaves, in any form.
+        let (base, mock) = mock_models().await;
+        let (engine, _db) = engine(&base, Some("sk-or-test"));
+        let vault = Mutex::new(Vault::ephemeral());
+        run(&engine, Tier::Cloud, &graph, &vault).await.0.unwrap();
+        let sent = mock.cloud.lock().unwrap()[0].1.to_string();
+        for secret in SECRETS
+            .iter()
+            .chain(&["admin123", "Winter2026", "tried admin"])
+        {
+            assert!(!sent.contains(secret), "{secret} was sent:\n{sent}");
+        }
+        assert!(sent.contains("operator_notes_withheld"), "{sent}");
+        assert!(sent.contains("http-config-backup"), "scan data still goes");
+        // What the notes held is still on the list of what to rotate.
+        assert!(vault.lock().unwrap().exposed_secrets().len() >= SECRETS.len());
+
+        // With notes switched on they go masked: every secret that has a
+        // name or a recognisable form is replaced.
+        let (base, mock) = mock_models().await;
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let settings = AiSettings {
+            cloud_url: format!("{base}/cloud"),
+            openrouter_api_key: Some("sk-or-test".into()),
+            cloud_notes: true,
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(settings, db).unwrap();
+        let vault = Mutex::new(Vault::ephemeral());
+        run(&engine, Tier::Cloud, &graph, &vault).await.0.unwrap();
+        let sent = mock.cloud.lock().unwrap()[0].1.to_string();
+        for secret in SECRETS {
+            assert!(!sent.contains(secret), "{secret} was sent:\n{sent}");
+        }
+        assert!(sent.contains("operator_notes"), "{sent}");
+        assert!(!sent.contains("operator_notes_withheld"), "{sent}");
     }
 
     #[tokio::test]

@@ -114,6 +114,10 @@ research_model = "anthropic/claude-opus-5.5"
 # Hard daily caps for the cloud tiers; when reached, [C] answers locally.
 max_daily_usd = 1.0
 max_daily_calls = 20
+# Your own notes stay on this machine: a note is free text, and nothing can
+# recognise a password that is written like a word. true sends them (masked
+# like everything else) with requests that leave this machine.
+# cloud_notes = false
 "#;
 
 /// Validates a workspace name so it is a safe single directory name on
