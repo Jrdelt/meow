@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State as AxumState};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,6 +56,17 @@ use crate::workspace::{write_private_atomic, Config, Workspace};
 
 pub const FIRST_PORT: u16 = 8765;
 const PORT_ATTEMPTS: u16 = 100;
+/// Connections the server holds at once before one has shown the session
+/// token. Each takes a file descriptor of the session's own process, which
+/// also needs them for the terminal, the database and the scanners.
+const MAX_CONNECTIONS: usize = 64;
+/// How long a client may take to send a whole request head, on a new
+/// connection and between requests on one it keeps open.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause after a failed accept (out of descriptors) before trying again.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// `runtime.json` is about 110 bytes.
+const RUNTIME_MAX: u64 = 4096;
 const MAX_NOTICES: usize = 100;
 const TAP_QUEUE: usize = 4096;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -76,8 +87,12 @@ pub struct RuntimeInfo {
 }
 
 impl RuntimeInfo {
+    /// Reads `runtime.json`. Helpers and the listing read it before anything
+    /// else in a workspace, so a link, a pipe or a huge file in its place is
+    /// "no session" and never read through.
     pub fn read(path: &Path) -> Option<Self> {
-        let info: Self = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let text = crate::workspace::read_bounded(path, RUNTIME_MAX).ok()?;
+        let info: Self = serde_json::from_str(&text).ok()?;
         let valid_token = !info.token.is_empty()
             && info
                 .token
@@ -748,17 +763,28 @@ async fn guard(AxumState(state): AxumState<Shared>, request: Request, next: Next
     response
 }
 
+/// A refusal by the guard. The connection is closed with it: a client
+/// without the token cannot keep one of the connection slots by asking
+/// again and again.
+fn refuse(status: StatusCode, message: &str) -> Response {
+    let mut response = deny(status, message);
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
 async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response {
     let headers = request.headers();
     if !host_allowed(headers, state.port) {
-        return deny(StatusCode::FORBIDDEN, "unexpected Host header");
+        return refuse(StatusCode::FORBIDDEN, "unexpected Host header");
     }
     if !origin_allowed(headers, state.port) {
-        return deny(StatusCode::FORBIDDEN, "cross-origin request refused");
+        return refuse(StatusCode::FORBIDDEN, "cross-origin request refused");
     }
     let presented = token_from(headers, request.uri().query());
     if !presented.is_some_and(|token| constant_time_eq(&token, &state.token)) {
-        return deny(StatusCode::UNAUTHORIZED, "missing or wrong session token");
+        return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     }
     next.run(request).await
 }
@@ -1245,20 +1271,60 @@ pub struct Coordinator {
     _runtime_file: RuntimeFile,
 }
 
-async fn bind_loopback() -> Result<tokio::net::TcpListener> {
-    let mut last_error = None;
-    for offset in 0..PORT_ATTEMPTS {
-        let address = SocketAddr::from(([127, 0, 0, 1], FIRST_PORT + offset));
-        match tokio::net::TcpListener::bind(address).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => last_error = Some(error),
+/// Listens on the first free loopback port from `first`, or, when all
+/// `attempts` of them are taken, on any free one: clients read the port
+/// from `runtime.json`, so another program sitting on the usual ports
+/// cannot keep a session from starting.
+async fn bind_loopback(first: u16, attempts: u16) -> Result<tokio::net::TcpListener> {
+    for offset in 0..attempts {
+        let Some(port) = first.checked_add(offset) else {
+            break;
+        };
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+            return Ok(listener);
         }
     }
-    Err(anyhow!(
-        "no free loopback port in {FIRST_PORT}-{}: {}",
-        FIRST_PORT + PORT_ATTEMPTS - 1,
-        last_error.map(|e| e.to_string()).unwrap_or_default()
-    ))
+    tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .context("no free loopback port for the session")
+}
+
+/// Serves `app` on `listener`, HTTP/1.1 only. `axum::serve` would take every
+/// connection offered and wait on each for ever; any local program could
+/// then use up the session's file descriptors with connections that never
+/// send a request. Here at most `slots` connections are held at once, and
+/// one that has not sent a request head within `head_timeout` is closed.
+/// A WebSocket leaves its slot once the token was accepted and it is open.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    slots: Arc<tokio::sync::Semaphore>,
+    head_timeout: Duration,
+) {
+    loop {
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            return;
+        };
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_RETRY).await;
+                continue;
+            }
+        };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let _slot = slot;
+            let mut http = hyper::server::conn::http1::Builder::new();
+            http.timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(head_timeout);
+            let _ = http
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+    }
 }
 
 impl Coordinator {
@@ -1271,7 +1337,7 @@ impl Coordinator {
             .build()
             .context("cannot start the coordinator runtime")?;
 
-        let listener = runtime.block_on(bind_loopback())?;
+        let listener = runtime.block_on(bind_loopback(FIRST_PORT, PORT_ATTEMPTS))?;
         let port = listener.local_addr()?.port();
         let token = new_token()?;
 
@@ -1340,9 +1406,12 @@ impl Coordinator {
         });
 
         let app = router(Arc::clone(&state));
-        runtime.spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        runtime.spawn(serve(
+            listener,
+            app,
+            Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            HEAD_TIMEOUT,
+        ));
         runtime.spawn(saver(Arc::clone(&state)));
         runtime.spawn(observe_loop(Arc::clone(&state)));
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
@@ -1736,13 +1805,117 @@ mod tests {
     }
 
     #[test]
+    fn a_taken_port_range_does_not_keep_a_session_from_starting() {
+        block_on(async {
+            // Someone else holds the whole range (here: one port).
+            let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = taken.local_addr().unwrap().port();
+            let listener = bind_loopback(port, 1).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(address.ip().is_loopback());
+            assert_ne!(address.port(), port);
+            assert_ne!(address.port(), 0);
+            // A free range is used from its first port.
+            drop(taken);
+            let listener = bind_loopback(port, 1).await.unwrap();
+            assert_eq!(listener.local_addr().unwrap().port(), port);
+            // The top of the port numbers does not overflow.
+            assert!(bind_loopback(u16::MAX, 100).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn idle_connections_are_closed_and_never_more_than_the_limit_are_held() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const LIMIT: usize = 4;
+        let head_timeout = Duration::from_millis(300);
+        block_on(async {
+            let app = Router::new().route("/ping", get(|| async { "pong" }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let slots = Arc::new(tokio::sync::Semaphore::new(LIMIT));
+            tokio::spawn(serve(listener, app, Arc::clone(&slots), head_timeout));
+
+            // Twenty clients connect and never send a request.
+            let mut idle = Vec::new();
+            for _ in 0..20 {
+                idle.push(tokio::net::TcpStream::connect(address).await.unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(slots.available_permits(), 0, "only {LIMIT} are held");
+
+            // A real request still gets its answer.
+            let answer = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                stream
+                    .write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply).await.unwrap();
+                reply
+            })
+            .await
+            .expect("answered while idle connections wait");
+            assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+            assert!(answer.ends_with("pong"), "{answer}");
+
+            // Every idle client is hung up on.
+            for mut stream in idle {
+                let mut rest = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+                    .await
+                    .expect("an idle connection is closed")
+                    .ok();
+            }
+            // One that sends half a request head fares no better.
+            let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+            slow.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n")
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), slow.read_to_end(&mut rest))
+                .await
+                .expect("a half-sent request is closed")
+                .ok();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                slots.available_permits() >= LIMIT - 1,
+                "slots are free again"
+            );
+        });
+    }
+
+    #[test]
+    fn a_request_without_the_token_does_not_keep_its_connection() {
+        use std::io::{Read, Write};
+        let fx = fixture();
+        let port = fx.coordinator.info().port;
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        // Reading to the end only returns once the server has hung up.
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).expect("closed, not kept");
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+        assert!(reply.to_ascii_lowercase().contains("connection: close"));
+        fx.coordinator.shutdown();
+    }
+
+    #[test]
     fn runtime_file_is_private_and_removed_at_shutdown() {
         let fx = fixture();
         let path = fx.workspace.runtime_path();
         let info = RuntimeInfo::read(&path).unwrap();
         assert_eq!(info, fx.coordinator.info());
         assert_eq!(info.pid, std::process::id());
-        assert!((FIRST_PORT..FIRST_PORT + PORT_ATTEMPTS).contains(&info.port));
+        assert_ne!(info.port, 0);
         assert_eq!(info.token.len(), 64);
         assert!(info.token.chars().all(|c| c.is_ascii_hexdigit()));
         #[cfg(unix)]

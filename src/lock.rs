@@ -136,9 +136,20 @@ impl SessionLock {
     /// True when an exclusive `SessionLock` is currently held on `path`.
     /// Read-only: never creates, truncates or modifies `path`.
     pub fn is_held(path: &Path) -> bool {
-        let Ok(file) = File::open(path) else {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Never through a link, and never waiting on a pipe put there.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let Ok(file) = options.open(path) else {
             return false;
         };
+        if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+            return false;
+        }
         let lock = RwLock::new(file);
         let held = match lock.try_read() {
             Ok(guard) => {
@@ -151,8 +162,18 @@ impl SessionLock {
     }
 }
 
+/// The process id written into the lock file at `path` by whoever took the
+/// lock last. Unreadable on Windows while the lock is held.
+pub fn holder_pid(path: &Path) -> Option<u32> {
+    read_pid(path)
+}
+
 fn read_pid(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    crate::workspace::read_bounded(path, 64)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]

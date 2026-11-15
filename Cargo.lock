@@ -1474,6 +1474,8 @@ dependencies = [
  "fd-lock",
  "futures-util",
  "getrandom 0.3.4",
+ "hyper",
+ "hyper-util",
  "ipnetwork 0.20.0",
  "libc",
  "maxminddb",

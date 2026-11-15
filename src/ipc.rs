@@ -23,14 +23,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Connection details of the live session in `dir`, if `session.lock` is
-/// currently held and `runtime.json` is readable.
+/// currently held and `runtime.json` is readable and was written by the
+/// process that holds the lock.
 ///
 /// Checking `SessionLock::is_held` before trusting `runtime.json` ensures a
 /// stale file left behind by `SIGKILL` never causes helpers or the HUD to
-/// transmit the bearer token to an unrelated process on a reused port.
+/// transmit the bearer token to an unrelated process on a reused port. The
+/// process id is compared as well: a session that is still starting holds
+/// the lock before it has replaced the file of the session before it.
 pub fn runtime_info_in(dir: &Path) -> Option<RuntimeInfo> {
     let info = RuntimeInfo::read(&dir.join(RUNTIME_FILE))?;
-    SessionLock::is_held(&dir.join(LOCK_FILE)).then_some(info)
+    let lock = dir.join(LOCK_FILE);
+    if !SessionLock::is_held(&lock) {
+        return None;
+    }
+    match crate::lock::holder_pid(&lock) {
+        Some(pid) => (pid == info.pid).then_some(info),
+        // Windows cannot read a locked file; elsewhere an unreadable
+        // process id means the lock is changing hands.
+        None => cfg!(windows).then_some(info),
+    }
 }
 
 /// Connection details of the session that owns `workspace`, if its
@@ -214,6 +226,121 @@ mod tests {
             "foreign listener must never be contacted when session.lock is not held"
         );
         assert!(leaked.lock().unwrap().is_empty());
+    }
+
+    /// A listener that counts requests to `/api/command` and answers like
+    /// some other program.
+    #[cfg(unix)]
+    fn counting_listener() -> (u16, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let app = Router::new().route(
+                    "/api/command",
+                    post(move || {
+                        let hits_srv = Arc::clone(&hits_srv);
+                        async move {
+                            hits_srv.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::NOT_FOUND, "not meow")
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap().port()).unwrap();
+                let _ = axum::serve(listener, app).await;
+            });
+        });
+        (rx.recv().unwrap(), hits)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_starting_session_does_not_vouch_for_the_runtime_file_of_the_one_before() {
+        let (port, hits) = counting_listener();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        // The session before was killed: its runtime.json is still there.
+        // A new session holds the lock and has not written its own yet.
+        std::fs::write(
+            workspace.runtime_path(),
+            serde_json::to_vec(&RuntimeInfo {
+                pid: std::process::id() + 1,
+                port,
+                token: "0123456789abcdef".repeat(4),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let _held = SessionLock::acquire(&workspace.lock_path()).unwrap();
+
+        assert_eq!(runtime_info(&workspace), None);
+        assert_eq!(send(&workspace, &Command::Ping).unwrap(), None);
+        assert!(!is_live(&workspace.dir));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // Its own file is trusted.
+        let own = RuntimeInfo {
+            pid: std::process::id(),
+            port,
+            token: "0123456789abcdef".repeat(4),
+        };
+        std::fs::write(workspace.runtime_path(), serde_json::to_vec(&own).unwrap()).unwrap();
+        assert_eq!(runtime_info(&workspace), Some(own));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pipe_or_huge_file_as_runtime_file_or_lock_is_no_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let runtime = dir.join(RUNTIME_FILE);
+
+        // A link to a file that never ends.
+        std::os::unix::fs::symlink("/dev/zero", &runtime).unwrap();
+        assert_eq!(RuntimeInfo::read(&runtime), None);
+        assert!(!is_live(dir));
+        std::fs::remove_file(&runtime).unwrap();
+
+        // A link to a real runtime file elsewhere.
+        let elsewhere = dir.join("elsewhere.json");
+        let info = RuntimeInfo {
+            pid: std::process::id(),
+            port: 9,
+            token: "0123456789abcdef".repeat(4),
+        };
+        std::fs::write(&elsewhere, serde_json::to_vec(&info).unwrap()).unwrap();
+        assert_eq!(RuntimeInfo::read(&elsewhere), Some(info.clone()));
+        std::os::unix::fs::symlink(&elsewhere, &runtime).unwrap();
+        assert_eq!(RuntimeInfo::read(&runtime), None);
+        std::fs::remove_file(&runtime).unwrap();
+
+        // A regular file far larger than meow writes.
+        let mut big = serde_json::to_vec(&info).unwrap();
+        big.resize(1024 * 1024, b' ');
+        std::fs::write(&runtime, &big).unwrap();
+        assert_eq!(RuntimeInfo::read(&runtime), None);
+        std::fs::remove_file(&runtime).unwrap();
+
+        // A pipe nobody writes to, as the runtime file and as the lock:
+        // neither read waits.
+        let pipe = std::ffi::CString::new(runtime.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+        assert_eq!(RuntimeInfo::read(&runtime), None);
+        std::fs::remove_file(&runtime).unwrap();
+        std::fs::write(&runtime, serde_json::to_vec(&info).unwrap()).unwrap();
+        let lock = dir.join(LOCK_FILE);
+        let pipe = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+        assert!(!SessionLock::is_held(&lock));
+        assert_eq!(runtime_info_in(dir), None);
     }
 
     #[test]

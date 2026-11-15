@@ -26,7 +26,7 @@ const MAX_PATH_NODES: usize = 5000;
 const MAX_FIELD: usize = 200;
 const MAX_REFERENCE_LEN: usize = 512;
 const MAX_REFERENCES: usize = 16;
-const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
 /// How much a graph may hold, as an estimate of what its observations add
 /// to `graph.json`. Kept below `MAX_GRAPH_BYTES`: what was recorded can be
 /// saved, and what was saved can be loaded again.

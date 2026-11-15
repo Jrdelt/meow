@@ -40,6 +40,8 @@ pub const LOCK_FILE: &str = "session.lock";
 /// Port and token of the running session; present only while one is open.
 pub const RUNTIME_FILE: &str = "runtime.json";
 const NAME_MAX: usize = 64;
+/// Longer than any path a shell reports as its directory.
+const LAST_CWD_MAX: u64 = 64 * 1024;
 
 /// Device names Windows refuses as file or directory names.
 const WINDOWS_RESERVED: &[&str] = &[
@@ -253,6 +255,40 @@ pub fn private_open_options() -> OpenOptions {
         options.mode(0o600);
     }
     options
+}
+
+/// Reads a small text file meow keeps, without following a link left in
+/// its place and without taking in more than `max` bytes. A folder someone
+/// else prepared can therefore not make the read wait (a pipe) or fill
+/// memory (`/dev/zero`, a huge file).
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<String> {
+    use std::io::Read;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Without O_NONBLOCK, opening a pipe waits for someone to write.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::other("is a link"));
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("is not a regular file"));
+    }
+    if meta.len() > max {
+        return Err(io::Error::other("is larger than meow writes it"));
+    }
+    let mut text = String::new();
+    file.take(max + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max {
+        return Err(io::Error::other("is larger than meow writes it"));
+    }
+    Ok(text)
 }
 
 /// Creates `path` (and missing parents) as a private directory and
@@ -711,10 +747,13 @@ fn remember_mark(home: &MeowHome, mark: &str) -> Result<()> {
     )
 }
 
+/// A profile is a few lines; a larger file is not one meow wrote.
+const PROFILE_MAX: u64 = 64 * 1024;
+
 impl Profile {
     fn read(path: &Path) -> Result<Self> {
-        let text =
-            fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let text = read_bounded(path, PROFILE_MAX)
+            .with_context(|| format!("cannot read {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
     }
 }
@@ -891,6 +930,15 @@ impl Workspace {
         self.dir.join(RUNTIME_FILE)
     }
 
+    /// Removes what a session that was killed left behind: its
+    /// `runtime.json` and the page `meow map` wrote, both with its token.
+    /// Called by a new session as soon as it holds the lock, so helpers do
+    /// not take the old port for the new session while it starts.
+    pub fn forget_last_session(&self) {
+        let _ = fs::remove_file(self.runtime_path());
+        let _ = fs::remove_file(self.tmp_dir().join(crate::webui::OPENER_FILE));
+    }
+
     pub fn tmp_dir(&self) -> PathBuf {
         self.dir.join("tmp")
     }
@@ -906,7 +954,7 @@ impl Workspace {
     /// The directory the previous session ended in, if it was recorded and
     /// still exists.
     pub fn restored_cwd(&self) -> Option<PathBuf> {
-        let text = fs::read_to_string(self.last_cwd_path()).ok()?;
+        let text = read_bounded(&self.last_cwd_path(), LAST_CWD_MAX).ok()?;
         // Windows PowerShell may prepend a byte-order mark.
         let text = text.trim_start_matches('\u{feff}');
         let dir = PathBuf::from(text.trim_end_matches(['\r', '\n']));
@@ -1129,7 +1177,7 @@ pub fn delete(workspace: &WorkspaceSummary) -> Result<()> {
 
 /// Number of hosts in a `graph.json`, read without validating the rest.
 fn count_hosts(graph: &Path) -> usize {
-    fs::read_to_string(graph)
+    read_bounded(graph, crate::graph::MAX_GRAPH_BYTES)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|json| {
@@ -1565,6 +1613,69 @@ mod tests {
         assert!(Path::new(&env[1].1).is_absolute());
         assert_eq!(Path::new(&env[1].1), ws.dir);
         assert_eq!(env[2], ("MEOW_MODE".to_owned(), "mild".into()));
+    }
+
+    #[test]
+    fn a_new_session_forgets_what_a_killed_one_left() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", false);
+        fs::write(ws.runtime_path(), "{}").unwrap();
+        fs::create_dir_all(ws.tmp_dir()).unwrap();
+        let page = ws.tmp_dir().join(crate::webui::OPENER_FILE);
+        fs::write(&page, "old token").unwrap();
+        ws.forget_last_session();
+        assert!(!ws.runtime_path().exists());
+        assert!(!page.exists());
+        // Nothing to forget is fine too.
+        ws.forget_last_session();
+    }
+
+    #[test]
+    fn bounded_reads_take_small_regular_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("small");
+        fs::write(&file, "twelve bytes").unwrap();
+        assert_eq!(read_bounded(&file, 12).unwrap(), "twelve bytes");
+        assert!(read_bounded(&file, 11).is_err(), "one byte too many");
+        assert!(read_bounded(&tmp.path().join("missing"), 12).is_err());
+        assert!(read_bounded(tmp.path(), 12).is_err(), "a directory");
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(read_bounded(&link, 12).is_err(), "a link to a small file");
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+            assert!(read_bounded(&link, 12).is_err(), "a link to an endless one");
+            // The endless file itself: not a regular file, nothing is read.
+            assert!(read_bounded(Path::new("/dev/zero"), 12).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_does_not_read_a_huge_graph_or_profile() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", false);
+        // A graph far over the limit, sparse on disk: counted as no hosts
+        // without being read.
+        let graph = fs::File::create(ws.graph_path()).unwrap();
+        graph.set_len(crate::graph::MAX_GRAPH_BYTES + 1).unwrap();
+        assert_eq!(count_hosts(&ws.graph_path()), 0);
+        // A real one still counts.
+        fs::write(
+            ws.graph_path(),
+            r#"{"hosts":{"10.0.0.5":{},"10.0.0.6":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(count_hosts(&ws.graph_path()), 2);
+        // A profile that is a link elsewhere, or enormous, is not read.
+        let real = fs::read_to_string(ws.profile_path()).unwrap();
+        let big = fs::File::create(ws.profile_path()).unwrap();
+        big.set_len(PROFILE_MAX + 1).unwrap();
+        assert!(Profile::read(&ws.profile_path()).is_err());
+        fs::write(ws.profile_path(), &real).unwrap();
+        assert!(Profile::read(&ws.profile_path()).is_ok());
     }
 
     #[test]

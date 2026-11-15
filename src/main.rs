@@ -416,6 +416,7 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
         LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
         LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
     })?;
+    workspace.forget_last_session();
     workspace.record_open()?;
 
     let program = pty::resolve_shell(
