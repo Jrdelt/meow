@@ -226,13 +226,26 @@ impl MeowHome {
     }
 
     /// Absolute `./.meow` of `cwd`, refused when it is the base directory
-    /// itself (running `--local` from the home directory).
+    /// itself (running `--local` from the home directory) or lies inside it.
+    /// The two are compared as the folders they really are: either path may
+    /// reach the same place through a link (a linked `/home`, a `MEOW_HOME`
+    /// kept in a dotfiles folder), and then the names differ.
     pub fn local_dir(&self, cwd: &Path) -> Result<PathBuf> {
         let dir = std::path::absolute(cwd.join(LOCAL_DIR))
             .with_context(|| format!("cannot resolve {}", cwd.display()))?;
-        if dir == self.0 {
+        let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let base = real(&self.0);
+        // `./.meow` may not exist yet; its folder does.
+        let local = fs::canonicalize(&dir).unwrap_or_else(|_| real(cwd).join(LOCAL_DIR));
+        if local == base || dir == self.0 {
             bail!(
                 "{} is meow's own data directory; run --local from a project directory",
+                dir.display()
+            );
+        }
+        if local.starts_with(&base) || dir.starts_with(&self.0) {
+            bail!(
+                "{} is inside meow's own data directory; run --local from a project directory",
                 dir.display()
             );
         }
@@ -255,6 +268,50 @@ pub fn private_open_options() -> OpenOptions {
         options.mode(0o600);
     }
     options
+}
+
+/// Parses a settings file. The error names the file, the line and what is
+/// wrong, and never quotes the file: the toml crate's own message shows the
+/// whole offending line, which would print a key from `ai.toml` or
+/// `config.toml`, or control bytes from a profile that came with a folder.
+pub fn parse_toml<T: serde::de::DeserializeOwned>(text: &str, path: &Path) -> Result<T> {
+    toml::from_str(text).map_err(|error| {
+        let what = without_values(&crate::evidence::sanitize(error.message(), 300));
+        match error.span() {
+            Some(span) => {
+                let before = text.get(..span.start).unwrap_or(text);
+                let line = before.matches('\n').count() + 1;
+                anyhow!("invalid {}: line {line}: {what}", path.display())
+            }
+            None => anyhow!("invalid {}: {what}", path.display()),
+        }
+    })
+}
+
+/// A parser message without the value it complains about. "invalid type:
+/// string "..."" and "unknown variant `...`" repeat what the file holds.
+fn without_values(message: &str) -> String {
+    for kind in ["invalid type: ", "invalid value: "] {
+        let Some(rest) = message.strip_prefix(kind) else {
+            continue;
+        };
+        let (found, expected) = match rest.rfind(", expected ") {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, ""),
+        };
+        let found: String = found
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == ' ')
+            .collect();
+        return format!("{kind}{}{expected}", found.trim_end());
+    }
+    if message.starts_with("unknown variant ") {
+        return match message.rfind(", expected ") {
+            Some(at) => format!("unknown value{}", &message[at..]),
+            None => "unknown value".to_owned(),
+        };
+    }
+    message.to_owned()
 }
 
 /// Reads a small text file meow keeps, without following a link left in
@@ -511,8 +568,7 @@ impl Config {
         restrict_file(&path).with_context(|| format!("cannot restrict {}", path.display()))?;
         let text =
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        let mut config: Config =
-            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        let mut config: Config = parse_toml(&text, &path)?;
         // Each user's own AI setup lives beside the config, not in it.
         config.ai.user_file = Some(home.ai_path());
         config.recon.wordlist_dir = Some(home.root().join("wordlists"));
@@ -533,8 +589,7 @@ impl Config {
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let clean_key = nvd_api_key.map(str::trim).filter(|k| !k.is_empty());
         let updated = update_config_toml(&existing, default_mode, cve_enabled, clean_key)?;
-        let parsed: Config = toml::from_str(&updated)
-            .with_context(|| format!("refusing to write invalid {}", path.display()))?;
+        let parsed: Config = parse_toml(&updated, &path).context("refusing to write the change")?;
         if parsed.default_mode != default_mode
             || parsed.cve.enabled != cve_enabled
             || parsed.cve.nvd_api_key.as_deref() != clean_key
@@ -754,7 +809,7 @@ impl Profile {
     fn read(path: &Path) -> Result<Self> {
         let text = read_bounded(path, PROFILE_MAX)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+        parse_toml(&text, path)
     }
 }
 
@@ -1628,6 +1683,94 @@ mod tests {
         assert!(!page.exists());
         // Nothing to forget is fine too.
         ws.forget_last_session();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_is_refused_in_the_data_directory_however_it_is_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join(".meow")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        // The base directory is named through the link, the current
+        // directory by its real name, as the system reports it.
+        let home = MeowHome::at(tmp.path().join("link").join(".meow")).unwrap();
+        let own = "meow's own data directory";
+        let error = home.local_dir(&real).unwrap_err().to_string();
+        assert!(error.contains(own), "{error}");
+        assert!(find_for_deletion(&home, &real, None).is_err());
+        assert!(Workspace::open_or_create(&home, &real, "", true, Mode::Light).is_err());
+        // And the other way round.
+        let home = MeowHome::at(real.join(".meow")).unwrap();
+        let error = home
+            .local_dir(&tmp.path().join("link"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(own), "{error}");
+        // Inside the data directory is refused as well.
+        fs::create_dir_all(real.join(".meow").join("workspaces")).unwrap();
+        for inside in [real.join(".meow"), real.join(".meow").join("workspaces")] {
+            let error = home.local_dir(&inside).unwrap_err().to_string();
+            assert!(
+                error.contains("inside meow's own data directory"),
+                "{error}"
+            );
+        }
+        // A project directory is fine, existing `./.meow` or not.
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        assert_eq!(home.local_dir(&project).unwrap(), project.join(".meow"));
+        fs::create_dir_all(project.join(".meow")).unwrap();
+        assert_eq!(home.local_dir(&project).unwrap(), project.join(".meow"));
+    }
+
+    #[test]
+    fn a_settings_error_names_the_line_and_never_shows_it() {
+        const KEY: &str = "FAKE-PLACEHOLDER-KEY-0000-1111-2222";
+        let path = Path::new("/home/someone/.meow/config.toml");
+        let samples = [
+            // The closing quote is missing.
+            (format!("[cve]\nenabled = true\nnvd_api_key = \"{KEY}\n"), 3),
+            // The key twice.
+            (
+                format!("[cve]\nnvd_api_key = \"{KEY}\"\nnvd_api_key = \"{KEY}\"\n"),
+                3,
+            ),
+            // No quotes at all.
+            (format!("[cve]\nnvd_api_key = {KEY}\n"), 2),
+            // The key where a switch belongs.
+            (format!("[cve]\nenabled = \"{KEY}\"\n"), 2),
+            // The key where a mode belongs.
+            (format!("default_mode = \"{KEY}\"\n"), 1),
+            // Colour codes on a broken line.
+            ("name = \"a\"\n\u{1b}[31mmode = = \u{1b}[2J\n".to_owned(), 2),
+        ];
+        for (text, line) in samples {
+            let error = parse_toml::<Config>(&text, path).unwrap_err();
+            let shown = format!("{error:#}");
+            assert!(!shown.contains(KEY), "{shown}");
+            assert!(!shown.contains("PLACEHOLDER"), "{shown}");
+            assert!(!shown.contains('\u{1b}'), "{shown:?}");
+            assert!(!shown.contains('\n'), "{shown:?}");
+            assert!(
+                shown.starts_with(&format!(
+                    "invalid /home/someone/.meow/config.toml: line {line}: "
+                )),
+                "{shown}"
+            );
+            assert!(!shown.ends_with(": "), "says what is wrong: {shown}");
+        }
+        // A file that is fine still loads.
+        assert!(parse_toml::<Config>(CONFIG_TEMPLATE, path).is_ok());
+        assert_eq!(
+            without_values("invalid type: string \"abc, expected x\", expected a boolean"),
+            "invalid type: string, expected a boolean"
+        );
+        assert_eq!(
+            without_values("unknown variant `abc`, expected one of `light`, `mild`"),
+            "unknown value, expected one of `light`, `mild`"
+        );
+        assert_eq!(without_values("duplicate key `a`"), "duplicate key `a`");
     }
 
     #[test]

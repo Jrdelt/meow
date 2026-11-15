@@ -171,9 +171,7 @@ impl AiOverrides {
     /// Reads the file; a missing file is an empty setup.
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
-            }
+            Ok(text) => crate::workspace::parse_toml(&text, path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
         }

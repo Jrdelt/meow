@@ -241,8 +241,7 @@ impl Wizard {
         let mut config = if config_file.is_file() {
             let text = std::fs::read_to_string(&config_file)
                 .with_context(|| format!("cannot read {}", config_file.display()))?;
-            toml::from_str::<Config>(&text)
-                .with_context(|| format!("invalid {}", config_file.display()))?
+            crate::workspace::parse_toml::<Config>(&text, &config_file)?
         } else {
             Config::default()
         };
