@@ -472,3 +472,66 @@ fn light_mode_pauses_queued_work_and_leaving_it_resumes() {
     assert_eq!(statuses(&coordinator, first), ["done"; 4]);
     assert_eq!(statuses(&coordinator, second), ["done"; 4]);
 }
+
+#[test]
+fn a_planted_task_cannot_carry_unchecked_flags_into_a_later_stage() {
+    let lab = Lab::new();
+    let coordinator = lab.start();
+    // A normal run first, so the graph holds open ports to inspect.
+    let first = recon(&coordinator, "10.0.0.5");
+    wait_finished(&coordinator, first);
+    let before = lab.calls().len();
+
+    // A task row as a tampered state.db would hold it: the port stage
+    // already done, and flags the queue refuses when a task is added.
+    let state = coordinator.state();
+    let planted = {
+        let db = state.db_lock();
+        db.conn()
+            .execute(
+                "INSERT INTO tasks (target, mode, extra_flags, created_utc) VALUES \
+                 ('10.0.0.5', 'mild', '[\"--script\",\"/tmp/evil.nse\"]', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .unwrap();
+        let id = db.conn().last_insert_rowid();
+        for (position, (stage, status)) in [
+            ("ports", "done"),
+            ("services", "pending"),
+            ("crawl", "pending"),
+            ("dirs", "pending"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.conn()
+                .execute(
+                    "INSERT INTO task_stages (task_id, stage, position, status) VALUES (?1, ?2, ?3, ?4)",
+                    (id, stage, position as i64, status),
+                )
+                .unwrap();
+        }
+        id
+    };
+
+    assert_eq!(state.resume_unfinished().unwrap(), 1);
+    wait_finished(&coordinator, planted);
+    let row = task(&coordinator, planted);
+    assert_eq!(row.stages[1].status, "failed", "{:?}", row.stages[1]);
+    assert!(
+        row.stages[1].detail.contains("--script"),
+        "the refusal names the flag: {}",
+        row.stages[1].detail
+    );
+    // nmap was never started with it.
+    let calls = lab.calls();
+    assert!(
+        calls[before..].iter().all(|call| !call.contains("nmap")),
+        "{:?}",
+        &calls[before..]
+    );
+    assert!(
+        calls.iter().all(|call| !call.contains("evil.nse")),
+        "{calls:?}"
+    );
+}

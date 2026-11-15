@@ -337,14 +337,16 @@ pub fn split_recon_flags(flags: &[String]) -> ReconFlags {
 }
 
 /// The nmap `--script` expression for the built-in scripts plus the
-/// operator's choice, with the never-run categories excluded.
+/// operator's choice, with the never-run categories excluded. Anything that
+/// is neither a known category nor a built-in script is left out, whatever
+/// the caller checked: a script file or expression never reaches nmap.
 fn script_expression(builtin: &[&str], chosen: &[String]) -> String {
     let mut names: Vec<String> = builtin.iter().map(|name| (*name).to_owned()).collect();
     let mut categories = Vec::new();
     for item in chosen {
         if SCRIPT_CATEGORIES.contains(&item.as_str()) {
             categories.push(item.as_str());
-        } else if !names.contains(item) {
+        } else if SAFE_SERVICE_SCRIPTS.contains(&item.as_str()) && !names.contains(item) {
             names.push(item.clone());
         }
     }
@@ -1348,6 +1350,9 @@ async fn run_stage(
     let settings = state.config.recon.clone();
     let preset = settings.preset(task.mode, &state.profile_recon());
     validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services)?;
+    // A stored task is only as trustworthy as the workspace's database, so
+    // its flags are checked before every stage, not only when it is queued.
+    validate_nmap_flags(&task.extra_flags)?;
     let limits = settings.limits();
     let tmp = state.workspace_dir().join("tmp");
     let privileged = is_privileged();
@@ -1355,7 +1360,6 @@ async fn run_stage(
 
     match stage {
         Stage::Ports => {
-            validate_nmap_flags(&task.extra_flags)?;
             let (command, notices) = ports_command(
                 &settings,
                 &preset,
@@ -1763,6 +1767,21 @@ mod tests {
             Path::new("/t/svc.xml"),
         );
         assert!(args(&command).contains("-6 -p 80 -oX /t/svc.xml -- 2001:db8::a"));
+    }
+
+    #[test]
+    fn only_known_categories_and_built_in_scripts_reach_the_script_expression() {
+        let chosen = strings(&[
+            "vuln",
+            "banner",
+            "/tmp/evil.nse",
+            "http-shellshock",
+            "default or exploit",
+        ]);
+        assert_eq!(
+            script_expression(&["ssl-cert"], &chosen),
+            format!("ssl-cert or banner or ((vuln) and not ({SCRIPT_NEVER}))")
+        );
     }
 
     #[test]
