@@ -1341,6 +1341,7 @@ pub fn count_unfinished(state_db: &Path) -> usize {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     rusqlite::Connection::open_with_flags(state_db, flags)
         .and_then(|conn| {
+            crate::db::harden(&conn)?;
             conn.query_row(
                 "SELECT COUNT(DISTINCT task_id) FROM task_stages
                  WHERE status IN ('pending', 'running', 'interrupted')",
@@ -2255,6 +2256,65 @@ mod tests {
             decline(&db, first).unwrap();
         }
         assert_eq!(count_unfinished(&path), 1);
+    }
+
+    #[test]
+    fn a_database_someone_else_prepared_cannot_run_its_own_statements() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A file in which the table that is counted is a view that never
+        // finishes: the count comes back at once, as nothing.
+        let endless = dir.path().join("endless.db");
+        rusqlite::Connection::open(&endless)
+            .unwrap()
+            .execute_batch(
+                "CREATE VIEW task_stages AS
+                 WITH RECURSIVE forever(task_id, status) AS (
+                     SELECT 1, 'pending' UNION ALL SELECT task_id + 1, 'pending' FROM forever
+                 ) SELECT task_id, status FROM forever;",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(count_unfinished(&endless), 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // A real database with a trigger added behind meow's back: queueing
+        // a task does not run it, and deleting a task still removes its
+        // stages (the schema's own rule).
+        let path = dir.path().join("state.db");
+        drop(Db::open(&path).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE planted (note TEXT);
+                 CREATE TRIGGER on_task AFTER INSERT ON tasks BEGIN
+                     INSERT INTO planted VALUES ('ran');
+                     UPDATE tasks SET extra_flags = '[\"--script\",\"/tmp/x.nse\"]';
+                 END;",
+            )
+            .unwrap();
+        let db = Db::open(&path).unwrap();
+        let id = enqueue(&db, "10.0.0.5", Mode::Mild, &[]).unwrap();
+        let planted: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM planted", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(planted, 0, "the trigger did not run");
+        assert!(task(&db, id).unwrap().unwrap().extra_flags.is_empty());
+        assert_eq!(count_unfinished(&path), 1);
+        db.conn()
+            .execute("DELETE FROM tasks WHERE id = ?1", [id])
+            .unwrap();
+        let stages: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM task_stages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stages, 0, "stages still go with their task");
+        // The schema cannot be rewritten through meow's own connection.
+        assert!(db
+            .conn()
+            .execute_batch("PRAGMA writable_schema = ON; DELETE FROM sqlite_schema;")
+            .is_err());
     }
 
     #[cfg(unix)]

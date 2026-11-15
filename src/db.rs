@@ -79,6 +79,20 @@ pub struct Db {
     conn: Connection,
 }
 
+/// Settings for a database file that may not be the one meow wrote (a
+/// workspace folder can be copied or handed on). meow's schema has no views
+/// and no triggers, so neither runs: a file that adds some cannot attach
+/// its own statements to meow's, or make a plain count run for ever. The
+/// schema itself is not trusted to call functions with side effects.
+pub fn harden(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::config::DbConfig;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    Ok(())
+}
+
 impl Db {
     /// Opens (creating if needed) the database at `path` and migrates it to
     /// the current schema.
@@ -102,6 +116,7 @@ impl Db {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        harden(&conn)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // `journal_mode` returns the resulting mode as a row.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
