@@ -40,6 +40,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 const MAX_PATHS: usize = 40;
 const MAX_FACTS: usize = 60;
 const MAX_HYPOTHESES: usize = 25;
+/// A host answering on a thousand ports with a hundred certificate names
+/// each (a tarpit) does not become a request of megabytes.
+const MAX_PORTS: usize = 64;
+const MAX_NAMES_PER_PORT: usize = 16;
+const MAX_CPES_PER_PORT: usize = 8;
 const MAX_REPLY: usize = 200_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,9 +353,13 @@ fn clean(text: &str) -> String {
 
 /// The compact, size-capped view of one host that the triage tiers see.
 fn compact_host(graph: &Graph, host: &Host) -> Value {
-    let ports: Vec<Value> = host
-        .ports
-        .values()
+    // Open ports first: they are what a triage is about.
+    let mut listed: Vec<&crate::graph::Port> = host.ports.values().collect();
+    listed.sort_by_key(|port| port.state != "open");
+    let ports_left_out = listed.len().saturating_sub(MAX_PORTS);
+    let ports: Vec<Value> = listed
+        .into_iter()
+        .take(MAX_PORTS)
         .map(|port| {
             let paths: Vec<String> = port
                 .paths
@@ -368,10 +377,11 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
                 "service": port.service,
                 "product": port.product,
                 "version": port.version,
-                "cpes": port.cpes,
+                "cpes": port.cpes.iter().take(MAX_CPES_PER_PORT).collect::<Vec<_>>(),
                 "http_server": port.http.as_ref().and_then(|h| h.server.clone()),
                 "redirects_to": port.http.as_ref().and_then(|h| h.location.clone()),
-                "tls_names": port.tls_sans,
+                "tls_names": port.tls_sans.iter().take(MAX_NAMES_PER_PORT).collect::<Vec<_>>(),
+                "tls_names_left_out": port.tls_sans.len().saturating_sub(MAX_NAMES_PER_PORT),
                 "paths": paths,
             })
         })
@@ -429,6 +439,7 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
         "hostnames": host.hostnames,
         "operating_system": host.os,
         "ports": ports,
+        "ports_left_out": ports_left_out,
         "observed_facts": observed,
         "hypotheses": hypotheses,
         "operator_notes": notes.iter().map(|n| clean(&n.claim)).collect::<Vec<_>>(),
@@ -696,7 +707,7 @@ fn mask_prompt(
         }
     }
     let masked = user.to_string();
-    let leaks = vault.leaks(&masked);
+    let leaks = vault.leaks_json(&user);
     if !leaks.is_empty() {
         bail!(
             "refusing to send: the masked request still contains private values ({})",
@@ -1292,6 +1303,55 @@ mod tests {
     }
 
     #[test]
+    fn a_host_with_a_thousand_ports_and_names_makes_a_bounded_request() {
+        let mut graph = Graph::default();
+        for port in 1..=1000u16 {
+            graph.apply(Observation::Port {
+                address: "10.10.10.9".into(),
+                port,
+                protocol: "tcp".into(),
+                state: if port == 999 { "open" } else { "filtered" }.into(),
+                service: None,
+                product: None,
+                version: None,
+                extra_info: None,
+                cpes: (0..20).map(|n| format!("cpe:2.3:a:v:p{n}:1.0")).collect(),
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        for name in 0..100 {
+            graph.apply(Observation::TlsSan {
+                address: "10.10.10.9".into(),
+                port: 999,
+                san: format!("n{name}.tarpit.example"),
+                record: EvidenceRecord::observed(Source::TlsSan, Confidence::High, "x"),
+            });
+        }
+        let host = &graph.hosts["10.10.10.9"];
+        let data = &triage_prompt(&graph, host).user["untrusted_scan_data"];
+        let ports = data["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), MAX_PORTS);
+        assert_eq!(data["ports_left_out"], 1000 - MAX_PORTS);
+        // The open port is among those kept, with a bounded list of names.
+        assert_eq!(ports[0]["port"], "999/tcp");
+        assert_eq!(
+            ports[0]["tls_names"].as_array().unwrap().len(),
+            MAX_NAMES_PER_PORT
+        );
+        assert_eq!(ports[0]["tls_names_left_out"], 100 - MAX_NAMES_PER_PORT);
+        assert_eq!(
+            ports[0]["cpes"].as_array().unwrap().len(),
+            MAX_CPES_PER_PORT
+        );
+        assert!(data.to_string().len() < 200_000);
+        // Masking it is quick, however many names the graph registered.
+        let vault = Mutex::new(Vault::ephemeral());
+        let started = std::time::Instant::now();
+        mask_prompt(&vault, &graph, &triage_prompt(&graph, host), false).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn scraped_text_only_ever_appears_inside_the_untrusted_field() {
         let graph = lab();
         let host = &graph.hosts["10.10.10.5"];
@@ -1672,6 +1732,17 @@ mod tests {
                 record: EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, "x"),
             });
         }
+        // Names the graph knows from nowhere else, as scripts report them.
+        graph.apply(Observation::Script {
+            address: "10.10.10.5".into(),
+            port: Some(445),
+            protocol: "tcp".into(),
+            id: "smb-os-discovery".into(),
+            output: "Computer name: filesrv01 Domain name: ad.victim-corp.com \
+                     FQDN: FILESRV01.ad.victim-corp.com; logged in as jsmith; addr:fe80::1c2d"
+                .into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
         // The same kinds of text as a scanned server sends them.
         graph.apply(Observation::Script {
             address: "10.10.10.5".into(),
@@ -1704,6 +1775,11 @@ mod tests {
             "tok_live_12345",
             "9a8b7c6d5e",
             "zz11yy22",
+            "filesrv01",
+            "FILESRV01",
+            "victim-corp",
+            "jsmith",
+            "fe80::1c2d",
         ];
         let graph = lab_with_credential_notes();
 
@@ -1722,7 +1798,7 @@ mod tests {
         assert!(sent.contains("operator_notes_withheld"), "{sent}");
         assert!(sent.contains("http-config-backup"), "scan data still goes");
         // What the notes held is still on the list of what to rotate.
-        assert!(vault.lock().unwrap().exposed_secrets().len() >= SECRETS.len());
+        assert!(vault.lock().unwrap().exposed_secrets().len() >= 10);
 
         // With notes switched on they go masked: every secret that has a
         // name or a recognisable form is replaced.

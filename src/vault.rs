@@ -155,16 +155,22 @@ static KNOWN_KEY: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("valid regex")
 });
+/// `=` only as padding at the end: in `jwt=eyJ...` the name is not part of
+/// the value.
 static BLOB: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/_=-]{16,}").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/_-]{16,}={0,2}").expect("valid regex"));
 static IPV4: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("valid regex"));
-static IPV6: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[^0-9a-f:.])((?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%[\w.-]+)?)")
-        .expect("valid regex")
+/// A run of the characters an IPv6 address is written with. The address in
+/// it is found by parsing, not by this pattern: see [`ipv6_in`].
+static IPV6_RUN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[0-9a-f:.]*:[0-9a-f:.]*:[0-9a-f:.]*(?:%[\w.-]+)?").expect("valid regex")
 });
 static MAC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b").expect("valid regex")
+    Regex::new(
+        r"(?i)\b(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\b",
+    )
+    .expect("valid regex")
 });
 static HOSTNAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[a-z0-9_](?:[a-z0-9_-]*[a-z0-9])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9])?)+\b")
@@ -175,11 +181,437 @@ static EMAIL_USER: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 static FS_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?:/(?:home|Users|root|var|etc|opt|srv|mnt|data|tmp|usr/local)(?:/[^\s"'<>:;,|]+)+|\b[A-Za-z]:\\(?:[^\s"'<>:;,|\\]+\\)*[^\s"'<>:;,|\\]+)"#,
-    )
+    Regex::new(concat!(
+        r#"(?:/(?:home|Users|root|var|etc|opt|srv|mnt|data|tmp|usr/local|Volumes|media|private|Library)"#,
+        r#"(?:/[^\s"'<>:;,|]+)+"#,
+        r#"|~/[^\s"'<>:;,|]+"#,
+        r#"|\\\\[A-Za-z0-9._$-]+\\[^\s"'<>|]+"#,
+        r#"|\b[A-Za-z]:\\(?:[^\s"'<>:;,|\\]+\\)*[^\s"'<>:;,|\\]+)"#,
+    ))
     .expect("valid regex")
 });
+/// Fields in which a scanner reports what a machine or its domain is called
+/// (`smb-os-discovery`, `rdp-ntlm-info`, `nbstat`): the value is a name even
+/// when it is one word.
+static NAMED_HOST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:NetBIOS[_ ](?:Domain|Computer)[_ ]Name|Computer name|Domain name|Forest name",
+        r"|FQDN|DNS[_ ](?:Domain|Computer|Tree)[_ ]Name|Target[_ ]Name|Workgroup|Server name)",
+        r"\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._-]{1,253})",
+    ))
+    .expect("valid regex")
+});
+/// A login name given as such: `user=svc_backup`, `Login: jsmith`,
+/// `logged in as CORP\jsmith`.
+static NAMED_USER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"(?i)(?:(?:^|[^A-Za-z0-9])(?:user(?:[_-]?name)?|login|logon|account|owner)["']?\s*[:=]\s*["']?"#,
+        r#"|\b(?:logged (?:in|on) as|authenticated as|running as|as user)\s+["']?)"#,
+        r#"([A-Za-z0-9][A-Za-z0-9._@\\$-]{1,63})"#,
+    ))
+    .expect("valid regex")
+});
+
+/// Login names every system has: they tell nothing about the target.
+const COMMON_USERS: &[&str] = &[
+    "root",
+    "admin",
+    "administrator",
+    "guest",
+    "nobody",
+    "anonymous",
+    "system",
+    "user",
+    "test",
+    "www-data",
+    "daemon",
+    "none",
+    "null",
+    "true",
+    "false",
+    "yes",
+    "no",
+    "unknown",
+];
+
+/// Top-level domains under which a name is taken for a real host name and
+/// masked: the generic ones and the country codes. Not the whole registry:
+/// a name under a rarer ending is masked once the graph knows it.
+const PUBLIC_TLDS: &[&str] = &[
+    "com",
+    "net",
+    "org",
+    "edu",
+    "gov",
+    "mil",
+    "int",
+    "info",
+    "biz",
+    "name",
+    "pro",
+    "mobi",
+    "asia",
+    "aero",
+    "coop",
+    "museum",
+    "jobs",
+    "travel",
+    "dev",
+    "app",
+    "cloud",
+    "online",
+    "site",
+    "tech",
+    "xyz",
+    "top",
+    "club",
+    "shop",
+    "store",
+    "blog",
+    "live",
+    "news",
+    "agency",
+    "digital",
+    "email",
+    "group",
+    "network",
+    "solutions",
+    "systems",
+    "services",
+    "world",
+    "company",
+    "center",
+    "media",
+    "global",
+    "consulting",
+    "technology",
+    "software",
+    "security",
+    "host",
+    "hosting",
+    "website",
+    "space",
+    "link",
+    "work",
+    "tools",
+    "zone",
+    "ltd",
+    "inc",
+    "llc",
+    "gmbh",
+    "bank",
+    "finance",
+    "health",
+    "team",
+    "wiki",
+    "law",
+    "io",
+    "ai",
+    "co",
+    "tv",
+    "me",
+    "eu",
+    "uk",
+    "us",
+    "de",
+    "fr",
+    "nl",
+    "be",
+    "ch",
+    "at",
+    "it",
+    "es",
+    "pt",
+    "se",
+    "no",
+    "fi",
+    "dk",
+    "ie",
+    "pl",
+    "cz",
+    "sk",
+    "hu",
+    "ro",
+    "bg",
+    "gr",
+    "tr",
+    "ru",
+    "ua",
+    "by",
+    "kz",
+    "lt",
+    "lv",
+    "ee",
+    "is",
+    "lu",
+    "li",
+    "si",
+    "hr",
+    "rs",
+    "ba",
+    "mk",
+    "al",
+    "md",
+    "cy",
+    "mt",
+    "il",
+    "sa",
+    "ae",
+    "qa",
+    "kw",
+    "bh",
+    "om",
+    "jo",
+    "lb",
+    "eg",
+    "ma",
+    "dz",
+    "tn",
+    "ng",
+    "ke",
+    "za",
+    "gh",
+    "tz",
+    "ug",
+    "et",
+    "in",
+    "pk",
+    "bd",
+    "lk",
+    "np",
+    "cn",
+    "hk",
+    "tw",
+    "jp",
+    "kr",
+    "sg",
+    "my",
+    "th",
+    "vn",
+    "ph",
+    "id",
+    "au",
+    "nz",
+    "ca",
+    "mx",
+    "br",
+    "ar",
+    "cl",
+    "pe",
+    "ve",
+    "uy",
+    "ec",
+    "bo",
+    "py",
+    "cr",
+    "pa",
+    "do",
+    "cu",
+    "to",
+    "tk",
+    "ml",
+    "ws",
+    "cc",
+    "sh",
+    "so",
+    "st",
+    "ps",
+    "pm",
+    "cf",
+    "sc",
+    "la",
+    "ly",
+    "gg",
+    "im",
+    "je",
+    "ac",
+    "fm",
+    "am",
+];
+/// Country codes that are far more often a file ending than a domain: a
+/// two-part name under one of them (`install.sh`, `README.md`) is a file.
+const FILE_LIKE_TLDS: &[&str] = &[
+    "py", "sh", "md", "rs", "so", "ps", "pm", "do", "cf", "mk", "sc", "cc",
+];
+/// Sites of software makers and advisory databases, and product names that
+/// look like host names. They tell the model what software this is.
+const PUBLIC_NAMES: &[&str] = &[
+    "nist.gov",
+    "mitre.org",
+    "cve.org",
+    "cisa.gov",
+    "first.org",
+    "osv.dev",
+    "github.com",
+    "gitlab.com",
+    "exploit-db.com",
+    "owasp.org",
+    "nmap.org",
+    "wikipedia.org",
+    "w3.org",
+    "ietf.org",
+    "nginx.org",
+    "nginx.com",
+    "apache.org",
+    "openssl.org",
+    "openssh.com",
+    "openbsd.org",
+    "php.net",
+    "python.org",
+    "mozilla.org",
+    "microsoft.com",
+    "debian.org",
+    "ubuntu.com",
+    "redhat.com",
+    "kernel.org",
+    "wordpress.org",
+    "jquery.com",
+    "letsencrypt.org",
+    "digicert.com",
+    "npmjs.com",
+    "pypi.org",
+    "oracle.com",
+    "mysql.com",
+    "postgresql.org",
+    "mariadb.org",
+    "mongodb.com",
+    "redis.io",
+    "docker.com",
+    "kubernetes.io",
+    "vmware.com",
+    "cisco.com",
+    "fortinet.com",
+    "f5.com",
+    "citrix.com",
+    "atlassian.com",
+    "jenkins.io",
+    "elastic.co",
+    "grafana.com",
+    "drupal.org",
+    "joomla.org",
+    "isc.org",
+    "samba.org",
+    "exim.org",
+    "postfix.org",
+    "dovecot.org",
+    "haproxy.org",
+    "gnu.org",
+    "asp.net",
+    "ado.net",
+    "vb.net",
+    "socket.io",
+    "web.py",
+];
+/// Words of the request itself and of every scan. A certificate that names
+/// itself `port` or `nginx` does not get that word masked everywhere.
+const PLAIN_WORDS: &[&str] = &[
+    "task",
+    "triage",
+    "research",
+    "address",
+    "hostnames",
+    "ports",
+    "port",
+    "state",
+    "service",
+    "product",
+    "version",
+    "cpes",
+    "paths",
+    "claim",
+    "source",
+    "confidence",
+    "title",
+    "severity",
+    "status",
+    "open",
+    "closed",
+    "filtered",
+    "tcp",
+    "udp",
+    "sctp",
+    "http",
+    "https",
+    "ssl",
+    "tls",
+    "ssh",
+    "ftp",
+    "smtp",
+    "dns",
+    "smb",
+    "rdp",
+    "high",
+    "medium",
+    "low",
+    "critical",
+    "true",
+    "false",
+    "null",
+    "none",
+    "unknown",
+    "nginx",
+    "apache",
+    "server",
+    "client",
+    "host",
+    "name",
+    "localhost",
+    "www",
+    "mail",
+    "admin",
+    "test",
+    "the",
+    "and",
+    "for",
+    "not",
+];
+
+/// The IPv6 address in the run `text[from..to]` (hexadecimal digits, colons
+/// and dots with at least two colons), as a span of `text`. The run may hold
+/// more than the address: the `c:` of `src:2001:db8::1`, a colon from
+/// `addr:fe80::1`, a full stop that ends the sentence. An address is not
+/// taken out of the middle of a word (`std::net`).
+fn ipv6_span(text: &str, from: usize, to: usize) -> Option<(usize, usize)> {
+    let run = &text[from..to];
+    let (body, zone) = match run.find('%') {
+        Some(at) => (&run[..at], &run[at..]),
+        None => (run, ""),
+    };
+    let in_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let trimmed = body.trim_end_matches('.');
+    let mut starts = vec![0];
+    if let Some(colon) = trimmed.find(':') {
+        if !trimmed[colon..].starts_with("::") {
+            starts.push(colon + 1);
+        }
+    }
+    let mut ends = vec![trimmed.len()];
+    if trimmed.ends_with(':') && !trimmed.ends_with("::") {
+        ends.push(trimmed.len() - 1);
+    }
+    for &start in &starts {
+        for &end in &ends {
+            let whole = end == body.len();
+            if start >= end
+                || (start == 0 && in_word(text[..from].chars().next_back()))
+                || (whole && zone.is_empty() && in_word(text[to..].chars().next()))
+            {
+                continue;
+            }
+            if trimmed[start..end].parse::<Ipv6Addr>().is_ok() {
+                let end = if whole { end + zone.len() } else { end };
+                return Some((from + start, from + end));
+            }
+        }
+    }
+    None
+}
+
+/// Four numbers of at most 255 with dots between: also `010.001.000.007`,
+/// which the standard parser refuses.
+fn is_dotted_quad(text: &str) -> bool {
+    text.split('.').count() == 4 && text.split('.').all(|part| part.parse::<u8>().is_ok())
+}
 
 /// Shannon entropy in bits per character.
 fn entropy(text: &str) -> f64 {
@@ -340,7 +772,33 @@ pub struct Vault {
     counters: HashMap<Kind, u32>,
     /// Internal base domains: every name under one of them is masked.
     suffixes: BTreeSet<String>,
+    /// Registered names and user names by their first word, in lower case,
+    /// so that finding them in a text does not mean trying each one.
+    by_first_word: HashMap<String, Vec<(Kind, String)>>,
     store: Option<Arc<Mutex<Db>>>,
+}
+
+/// The first run of letters, digits and `_` in `value`, in lower case.
+fn first_word(value: &str) -> String {
+    value
+        .chars()
+        .skip_while(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// One label of a host name that is worth masking: letters, digits and
+/// hyphens, and not one of [`PLAIN_WORDS`].
+fn is_single_label_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (2..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !PLAIN_WORDS.contains(&lower.as_str())
 }
 
 fn extract_redirect_host(location: &str) -> Option<String> {
@@ -400,6 +858,7 @@ impl Vault {
                     let counter = vault.counters.entry(kind).or_default();
                     *counter = (*counter).max(index);
                 }
+                vault.index(kind, &value);
                 vault.tokens.insert((kind, value.clone()), token.clone());
                 vault.entries.insert(
                     token,
@@ -450,9 +909,22 @@ impl Vault {
                 ],
             );
         }
+        self.index(kind, &value);
         self.tokens.insert((kind, value), token.clone());
         self.entries.insert(token.clone(), entry);
         token
+    }
+
+    fn index(&mut self, kind: Kind, value: &str) {
+        if matches!(kind, Kind::User | Kind::Dom) && value.len() >= 2 {
+            let word = first_word(value);
+            if !word.is_empty() {
+                self.by_first_word
+                    .entry(word)
+                    .or_default()
+                    .push((kind, value.to_ascii_lowercase()));
+            }
+        }
     }
 
     /// Marks a base domain as internal: it and every name below it are masked.
@@ -473,7 +945,9 @@ impl Vault {
         let domain = |vault: &mut Self, name: &str| {
             let name = name.trim_start_matches("*.");
             if name.parse::<IpAddr>().is_ok() || !name.contains('.') {
-                if !name.is_empty() && name.parse::<IpAddr>().is_err() {
+                // One word: a machine name, unless it is a word every scan
+                // and every request holds (a certificate can name anything).
+                if name.parse::<IpAddr>().is_err() && is_single_label_name(name) {
                     vault.register(Kind::Dom, name);
                 }
                 return;
@@ -565,6 +1039,39 @@ impl Vault {
                 .any(|suffix| name == *suffix || name.ends_with(&format!(".{suffix}")))
     }
 
+    /// Whether the host-name-shaped text at `text[start..end]` is masked: a
+    /// name the graph knows or an internal one, and otherwise any name under
+    /// a real top-level domain. Scanned text names machines the graph has
+    /// never seen (`FQDN: FILESRV01.ad.example-corp.com` in a script's
+    /// output), and a public name identifies whose network this is. Left
+    /// alone: the sites of software makers and advisory databases, file
+    /// names, and a name that is one part of a path.
+    fn is_masked_name(&self, text: &str, start: usize, end: usize) -> bool {
+        let name = text[start..end].to_ascii_lowercase();
+        if self.is_internal_name(&name) {
+            return true;
+        }
+        let labels: Vec<&str> = name.split('.').collect();
+        let tld = labels.last().copied().unwrap_or("");
+        if !PUBLIC_TLDS.contains(&tld) || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
+            return false;
+        }
+        if labels.len() == 2 && FILE_LIKE_TLDS.contains(&tld) {
+            return false;
+        }
+        if PUBLIC_NAMES
+            .iter()
+            .any(|public| name == *public || name.ends_with(&format!(".{public}")))
+        {
+            return false;
+        }
+        // `/cgi-bin/status.pl`: after one slash it is a file in a path;
+        // after two (`https://name/`) it is the host.
+        let before = &text.as_bytes()[..start];
+        let in_path = before.ends_with(b"/") && !before.ends_with(b"//");
+        !in_path
+    }
+
     /// Finds every sensitive span in `text`: (start, end, kind).
     fn detect(&self, text: &str) -> Vec<(usize, usize, Kind)> {
         let mut spans: Vec<(usize, usize, Kind)> = Vec::new();
@@ -607,66 +1114,144 @@ impl Vault {
 
         whole(&MAC, Kind::Host, &mut spans);
         for found in IPV4.find_iter(text) {
-            if found.as_str().parse::<IpAddr>().is_ok() {
+            if is_dotted_quad(found.as_str()) {
                 spans.push((found.start(), found.end(), Kind::Host));
             }
         }
-        for found in IPV6.captures_iter(text) {
-            let part = found.get(1).expect("group 1 always participates");
-            let address = part.as_str().split('%').next().unwrap_or("");
-            if address.parse::<Ipv6Addr>().is_ok() {
-                spans.push((part.start(), part.end(), Kind::Host));
+        for found in IPV6_RUN.find_iter(text) {
+            if let Some((start, end)) = ipv6_span(text, found.start(), found.end()) {
+                spans.push((start, end, Kind::Host));
             }
         }
         for found in HOSTNAME.find_iter(text) {
-            if self.is_internal_name(found.as_str()) {
+            if self.is_masked_name(text, found.start(), found.end()) {
                 spans.push((found.start(), found.end(), Kind::Dom));
+            }
+        }
+        for found in NAMED_HOST.captures_iter(text) {
+            let part = found.get(1).expect("group 1 always participates");
+            let value = part.as_str().trim_end_matches('.');
+            if value.contains('.') || is_single_label_name(value) {
+                spans.push((part.start(), part.start() + value.len(), Kind::Dom));
+            }
+        }
+        for found in NAMED_USER.captures_iter(text) {
+            let part = found.get(1).expect("group 1 always participates");
+            let value = part.as_str().trim_end_matches('.');
+            if !COMMON_USERS.contains(&value.to_ascii_lowercase().as_str()) {
+                spans.push((part.start(), part.start() + value.len(), Kind::User));
             }
         }
         whole(&FS_PATH, Kind::Path, &mut spans);
         group(&EMAIL_USER, 1, Kind::User, &mut spans);
         // Registered values that no pattern above would recognise (single
-        // label host names, user names).
-        for ((kind, value), _) in self
-            .tokens
-            .iter()
-            .filter(|((kind, _), _)| matches!(kind, Kind::User | Kind::Dom))
-        {
-            if value.len() < 3 {
-                continue;
-            }
+        // label host names, user names), looked up by the word they begin
+        // with at every place a word begins.
+        if !self.by_first_word.is_empty() {
             let lower = text.to_ascii_lowercase();
-            let needle = value.to_ascii_lowercase();
-            let mut from = 0;
-            while let Some(at) = lower[from..].find(&needle) {
-                let (start, end) = (from + at, from + at + needle.len());
-                let boundary =
-                    |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-                if boundary(text[..start].chars().next_back())
-                    && boundary(text[end..].chars().next())
-                {
-                    spans.push((start, end, *kind));
+            let bytes = lower.as_bytes();
+            let in_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let mut at = 0;
+            while at < bytes.len() {
+                if !in_word(bytes[at]) || (at > 0 && in_word(bytes[at - 1])) {
+                    at += 1;
+                    continue;
                 }
-                from = end;
+                let word_end = at + bytes[at..].iter().take_while(|b| in_word(**b)).count();
+                if let Some(candidates) = self.by_first_word.get(&lower[at..word_end]) {
+                    for (kind, needle) in candidates {
+                        let end = at + needle.len();
+                        if lower[at..].starts_with(needle.as_str())
+                            && !bytes.get(end).is_some_and(|b| in_word(*b))
+                        {
+                            spans.push((at, end, *kind));
+                        }
+                    }
+                }
+                at = word_end;
             }
         }
         spans
     }
 
-    /// Replaces every sensitive value in `text` by its placeholder.
-    pub fn mask_text(&mut self, text: &str) -> String {
-        let mut spans = self.detect(text);
-        // Longest match first, so a secret is never left half-masked by a
-        // shorter overlapping match.
-        spans.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then(a.0.cmp(&b.0)));
-        let mut chosen: Vec<(usize, usize, Kind)> = Vec::new();
-        for span in spans {
-            let overlaps = chosen.iter().any(|kept| span.0 < kept.1 && kept.0 < span.1);
-            if !overlaps && text.is_char_boundary(span.0) && text.is_char_boundary(span.1) {
-                chosen.push(span);
+    /// Registers the names a text introduces as such (`Computer name: X`,
+    /// `user=Y`), so that the same name is masked wherever else it stands,
+    /// also in a string that is masked before this one.
+    fn learn(&mut self, text: &str) {
+        for regex in [&*NAMED_HOST, &*NAMED_USER] {
+            let user = std::ptr::eq(regex, &*NAMED_USER);
+            let found: Vec<String> = regex
+                .captures_iter(text)
+                .filter_map(|c| c.get(1))
+                .map(|part| part.as_str().trim_end_matches('.').to_owned())
+                .collect();
+            for value in found {
+                if user {
+                    if !COMMON_USERS.contains(&value.to_ascii_lowercase().as_str()) {
+                        self.register(Kind::User, &value);
+                    }
+                } else if value.contains('.') {
+                    self.register(Kind::Dom, &value);
+                    // host.ad.example.com: every name under ad.example.com.
+                    let labels: Vec<&str> = value.split('.').collect();
+                    if labels.len() >= 3 {
+                        self.register_domain_suffix(&labels[1..].join("."));
+                    }
+                } else if is_single_label_name(&value) {
+                    self.register(Kind::Dom, &value);
+                }
             }
         }
-        chosen.sort_by_key(|span| span.0);
+    }
+
+    fn learn_json(&mut self, value: &Value) {
+        match value {
+            Value::String(text) => self.learn(text),
+            Value::Array(items) => items.iter().for_each(|item| self.learn_json(item)),
+            Value::Object(map) => map.values().for_each(|item| self.learn_json(item)),
+            _ => {}
+        }
+    }
+
+    /// Replaces every sensitive value in `text` by its placeholder.
+    pub fn mask_text(&mut self, text: &str) -> String {
+        self.learn(text);
+        let mut spans: Vec<(usize, usize, Kind)> = self
+            .detect(text)
+            .into_iter()
+            .filter(|span| text.is_char_boundary(span.0) && text.is_char_boundary(span.1))
+            .collect();
+        // Spans that overlap are masked as one, from the first start to the
+        // last end: dropping the shorter one would leave its other half in
+        // clear (`::ffff:10.0.0.5`). A secret anywhere makes it a secret.
+        spans.sort_by_key(|span| (span.0, std::cmp::Reverse(span.1)));
+        let rank = |kind: Kind| match kind {
+            Kind::Sec => 5,
+            Kind::Host => 4,
+            Kind::Path => 3,
+            Kind::Dom => 2,
+            Kind::User => 1,
+            Kind::Lit => 0,
+        };
+        let mut chosen: Vec<(usize, usize, Kind)> = Vec::new();
+        for span in spans {
+            match chosen.last_mut() {
+                Some(last) if span.0 < last.1 => {
+                    // The longer of the two names the kind, a secret always.
+                    let longer = (span.1 - span.0) > (last.1 - last.0);
+                    if span.2 == Kind::Sec
+                        || (last.2 != Kind::Sec
+                            && (longer
+                                || (span.1 - span.0 == last.1 - last.0
+                                    && rank(span.2) > rank(last.2))))
+                    {
+                        last.2 = span.2;
+                    }
+                    last.1 = last.1.max(span.1);
+                }
+                _ => chosen.push(span),
+            }
+        }
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
         for (start, end, kind) in chosen {
@@ -681,14 +1266,22 @@ impl Vault {
     /// Masks the string values of a JSON document. Keys, numbers and the
     /// structure are left alone, so the result is still the same document.
     pub fn mask_json(&mut self, value: &Value) -> Value {
+        self.learn_json(value);
+        self.mask_json_values(value)
+    }
+
+    fn mask_json_values(&mut self, value: &Value) -> Value {
         match value {
             Value::String(text) => Value::String(self.mask_text(text)),
-            Value::Array(items) => {
-                Value::Array(items.iter().map(|item| self.mask_json(item)).collect())
-            }
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.mask_json_values(item))
+                    .collect(),
+            ),
             Value::Object(map) => Value::Object(
                 map.iter()
-                    .map(|(key, item)| (key.clone(), self.mask_json(item)))
+                    .map(|(key, item)| (key.clone(), self.mask_json_values(item)))
                     .collect(),
             ),
             other => other.clone(),
@@ -711,12 +1304,45 @@ impl Vault {
     /// (`HOST`, `SEC`, ...). Used as a last check before a request leaves
     /// the machine: anything found here means the request must not be sent.
     pub fn leaks(&self, text: &str) -> Vec<String> {
+        // A placeholder where a value was (`password="<<SEC_01>>"`) is what
+        // masking leaves behind, not a leak: a span counts only when it
+        // holds a letter or digit outside placeholders.
+        let holds_text = |start: usize, end: usize| {
+            TOKEN
+                .replace_all(&text[start..end], "")
+                .chars()
+                .any(|c| c.is_alphanumeric())
+        };
         let mut found: Vec<String> = self
             .detect(text)
             .into_iter()
-            .filter(|(_, _, kind)| *kind != Kind::Lit)
+            .filter(|(start, end, kind)| {
+                *kind != Kind::Lit
+                    && text.is_char_boundary(*start)
+                    && text.is_char_boundary(*end)
+                    && holds_text(*start, *end)
+            })
             .map(|(_, _, kind)| kind.tag().to_owned())
             .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// [`Vault::leaks`] for the string values of a JSON document, each on
+    /// its own, as they were masked. The keys are the request's own words,
+    /// and the document's text has escapes in it that no value holds.
+    pub fn leaks_json(&self, value: &Value) -> Vec<String> {
+        fn walk(vault: &Vault, value: &Value, found: &mut Vec<String>) {
+            match value {
+                Value::String(text) => found.extend(vault.leaks(text)),
+                Value::Array(items) => items.iter().for_each(|item| walk(vault, item, found)),
+                Value::Object(map) => map.values().for_each(|item| walk(vault, item, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(self, value, &mut found);
         found.sort();
         found.dedup();
         found
@@ -909,7 +1535,7 @@ mod tests {
             ),
             (
                 "login?user=bob&password=hunter2&next=/",
-                "login?user=bob&password=<<SEC_05>>&next=/",
+                "login?user=<<USER_02>>&password=<<SEC_05>>&next=/",
             ),
             (
                 "api_key: \"sk_live_4eC39HqLyjWDarjtT1zdp7dc\"",
@@ -942,6 +1568,135 @@ mod tests {
             assert!(secret.preview.len() < 24, "{}", secret.preview);
         }
         assert_eq!(vault.unmask("use <<SEC_10>>"), format!("use {jwt}"));
+    }
+
+    #[test]
+    fn names_users_and_address_forms_the_graph_never_saw_are_masked() {
+        // What the 2026-11 audit saw arrive at a stand-in cloud in clear:
+        // script output about a host the graph knows only by its address.
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "smb-os-discovery: Computer name: filesrv01 NetBIOS computer name: FILESRV01 \
+                 Domain name: ad.victim-corp.com FQDN: FILESRV01.ad.victim-corp.com",
+                &["filesrv01", "FILESRV01", "victim-corp"],
+            ),
+            (
+                "rdp-ntlm-info: Target_Name: VICTIMCORP NetBIOS_Domain_Name: VICTIMCORP \
+                 DNS_Computer_Name: filesrv01.ad.victim-corp.com then VICTIMCORP\\jsmith logged on",
+                &["VICTIMCORP", "victim-corp", "filesrv01"],
+            ),
+            ("smtp-commands: mx1.victim-corp.com Hello", &["victim-corp", "mx1"]),
+            ("backup host is nas7.bigbank-internal.com", &["bigbank", "nas7"]),
+            ("mail to jane.doe@victim-corp.co.uk", &["jane.doe", "victim-corp"]),
+            ("logged in as jsmith, then user=svc_backup and Login: CORP\\j.doe", &["jsmith", "svc_backup", "j.doe"]),
+            ("inet6 addr:fe80::1c2d scope link", &["fe80::1c2d"]),
+            ("host:2001:db8:77::15 answered", &["2001:db8:77::15", "db8"]),
+            ("src:2001:db8::15 dst=::ffff:10.0.0.5", &["2001:db8::15", "10.0.0.5", ".0.0.5"]),
+            ("gateway 010.010.010.007 and 0050.56ab.cdef", &["010.010.010.007", "0050.56ab.cdef"]),
+            ("fe80::1%eth0 is the router.", &["fe80::1"]),
+            (
+                "share \\\\FILESRV01\\Finance$\\payroll.xlsx, notes in ~/clients/acme-bank/loot and /Volumes/ACME/dump",
+                &["FILESRV01", "Finance", "payroll", "acme-bank", "ACME"],
+            ),
+        ];
+        for (text, private) in cases {
+            let mut vault = Vault::ephemeral();
+            let masked = vault.mask_text(text);
+            for value in *private {
+                assert!(
+                    !masked.to_lowercase().contains(&value.to_lowercase()),
+                    "{value} survived in: {masked}"
+                );
+            }
+            assert!(vault.leaks(&masked).is_empty(), "{masked}");
+            assert!(!vault.unmask(&masked).contains("<<"), "{masked}");
+        }
+        // The real text comes back (an address in its canonical form).
+        let mut vault = Vault::ephemeral();
+        let text = "inet6 addr:fe80::1c2d and dst=::ffff:10.0.0.5 for user=svc_backup";
+        let masked = vault.mask_text(text);
+        assert_eq!(
+            masked,
+            "inet6 addr:<<HOST_01>> and dst=<<HOST_02>> for user=<<USER_01>>"
+        );
+        assert_eq!(
+            vault.unmask(&masked),
+            "inet6 addr:fe80::1c2d and dst=10.0.0.5 for user=svc_backup"
+        );
+        // A name learnt in one string is masked in every other string of
+        // the same document, whichever comes first.
+        let mut vault = Vault::ephemeral();
+        let masked = vault.mask_json(&json!({
+            "a": "share on OLDNAS was open",
+            "b": "nbstat: NetBIOS_Computer_Name: OLDNAS",
+        }));
+        assert!(!masked.to_string().contains("OLDNAS"), "{masked}");
+    }
+
+    #[test]
+    fn code_times_files_and_software_sites_are_not_addresses_or_names() {
+        let mut vault = Vault::ephemeral();
+        for plain in [
+            "use std::net::IpAddr; foo::bar(a::b_c) at 09:41:00",
+            "found install.sh, exploit.py and README.md under /cgi-bin/status.pl",
+            "GET /vendor/example.com.zip and /static/js/app.min.js",
+            "Node.js v14 with Socket.IO and ASP.NET 4.8 behind nginx/1.18.0",
+            "fixed in https://httpd.apache.org/security and https://github.com/nginx/nginx/pull/1",
+            "User-Agent: curl/8.4.0; owner: root; user=admin; uid=0(root)",
+            "org.apache.commons.text.StringSubstitutor and com.fasterxml.jackson.core",
+            "version 2.4.41-4ubuntu3.14 (10.2.3 build)",
+        ] {
+            assert_eq!(vault.mask_text(plain), plain, "{plain}");
+        }
+        assert_eq!(vault.len(), 0);
+    }
+
+    #[test]
+    fn a_certificate_cannot_make_requests_fail_or_mask_plain_words() {
+        // A scanned server names itself after words of the request.
+        let mut graph = Graph::default();
+        for san in ["task", "port", "state", "nginx", "dc01"] {
+            graph.apply(Observation::TlsSan {
+                address: "10.10.10.5".into(),
+                port: 443,
+                san: san.into(),
+                record: EvidenceRecord::observed(Source::TlsSan, Confidence::High, "x"),
+            });
+        }
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+        let document = json!({
+            "task": "triage",
+            "ports": [{ "port": "443/tcp", "state": "open", "product": "nginx on dc01" }],
+            // Escaped in the document's text, this value would look longer.
+            "claim": "pwd:ab\" quoted",
+        });
+        let masked = vault.mask_json(&document);
+        assert_eq!(masked["task"], "triage");
+        assert_eq!(masked["ports"][0]["state"], "open");
+        assert_eq!(masked["ports"][0]["product"], "nginx on <<DOM_01>>");
+        assert!(vault.leaks_json(&masked).is_empty(), "{masked}");
+        // What masking leaves where a value was is not a leak either.
+        let masked =
+            vault.mask_json(&json!({ "c": "{\"password\": \"hunter22\"}; Cookie: sid=abc123def" }));
+        assert!(vault.leaks_json(&masked).is_empty(), "{masked}");
+        assert!(!masked.to_string().contains("hunter22"));
+    }
+
+    #[test]
+    fn masking_stays_fast_with_many_names_in_the_vault() {
+        let mut vault = Vault::ephemeral();
+        for index in 0..20_000 {
+            vault.register(Kind::Dom, &format!("host{index}"));
+            vault.register(Kind::User, &format!("user{index}"));
+        }
+        let text =
+            "plain words and numbers 12345 with host777 and user19999 in between. ".repeat(40);
+        let document = Value::Array((0..300).map(|_| json!(text)).collect());
+        let started = std::time::Instant::now();
+        let masked = vault.mask_json(&document).to_string();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!masked.contains("host777") && !masked.contains("user19999"));
     }
 
     #[test]

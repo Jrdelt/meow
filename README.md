@@ -335,7 +335,12 @@ API key, or OpenRouter (or, for `C`, any other OpenAI-style service).
 
 Before any cloud request, addresses, internal names, paths, user names and
 secrets are replaced by placeholders such as `<<HOST_01>>`, and the request is
-refused if anything private is still detected. Secrets are found by their
+refused if anything private is still detected. A host name is masked when the
+session knows it, when it is an internal one, and otherwise whenever it stands
+under a real top-level domain; the sites of software makers and advisory
+databases are left readable, as are file names. Names a scan reports in its
+own words (`Computer name:`, `NetBIOS_Domain_Name:`, `user=`) are masked
+wherever they appear. Secrets are found by their
 name (`password=`, `DB_PASSWORD=`, `aws_secret_access_key`, a session cookie)
 or their form (tokens, keys, hashes, UUIDs, random-looking strings). A
 password written like an ordinary word, with nothing naming it, cannot be
