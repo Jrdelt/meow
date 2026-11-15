@@ -288,6 +288,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let mut graph = Graph::load(&path)?;
             let changed = graph.apply_all(parsed.observations);
             graph.save(&path)?;
+            if graph.is_full() {
+                println!(
+                    "[!] This workspace's graph is full: not everything in the file was recorded. Open a new workspace for further targets."
+                );
+            }
             println!(
                 "[+] {} ({}): {total} facts parsed, {changed} new or updated{skipped}",
                 file.display(),

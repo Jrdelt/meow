@@ -231,6 +231,8 @@ pub struct State {
     /// Where this machine is estimated to be; `None` until the map asks.
     location: Mutex<Option<Location>>,
     locating: AtomicBool,
+    /// The "graph is full" notice was shown.
+    full_noticed: AtomicBool,
     /// The location map's pictures, served to the page from memory.
     pictures: Mutex<Vec<Picture>>,
     /// The location database on this disk (`~/.meow/geo`).
@@ -243,6 +245,18 @@ pub struct State {
     target_generation: std::sync::atomic::AtomicU64,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
+}
+
+/// Removes the evidence record of every node in a port's path tree.
+fn drop_path_evidence(node: &mut Value) {
+    if let Some(object) = node.as_object_mut() {
+        object.remove("record");
+        if let Some(children) = object.get_mut("children").and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                drop_path_evidence(child);
+            }
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -321,10 +335,21 @@ impl State {
             return;
         }
         let path = self.graph_path();
-        let result = self.graph().save(&path);
+        let (result, full) = {
+            let mut graph = self.graph();
+            (graph.save(&path), graph.is_full())
+        };
         if let Err(error) = result {
-            self.dirty.store(true, Ordering::SeqCst);
+            // Tried again on the next change, not in a loop: a graph that
+            // is too large stays too large.
             self.notice(format!("cannot save graph.json: {error:#}"));
+        }
+        if full && !self.full_noticed.swap(true, Ordering::SeqCst) {
+            self.notice(
+                "this workspace's graph is full: new hosts, ports and paths are no longer \
+                 recorded. Open a new workspace for further targets"
+                    .to_owned(),
+            );
         }
     }
 
@@ -364,12 +389,26 @@ impl State {
             .filter(|(_, plan)| !plan.is_empty())
             .map(|(address, plan)| (address, json!(plan)))
             .collect();
+        // Neither the map nor the HUD shows the raw evidence of each web
+        // path, and it is most of a large graph: it stays out of the push.
+        let mut shown = json!(&*graph);
+        if let Some(hosts) = shown.get_mut("hosts").and_then(Value::as_object_mut) {
+            for host in hosts.values_mut() {
+                if let Some(ports) = host.get_mut("ports").and_then(Value::as_object_mut) {
+                    for port in ports.values_mut() {
+                        if let Some(paths) = port.get_mut("paths") {
+                            drop_path_evidence(paths);
+                        }
+                    }
+                }
+            }
+        }
         json!({
             "session": self.session,
             "mode": self.mode(),
             "port": self.port,
             "revision": *self.revision.borrow(),
-            "graph": &*graph,
+            "graph": shown,
             "checklists": checklists,
             "fixes": fixes,
             "topology": Topology::build(&graph).cytoscape(&graph),
@@ -1275,6 +1314,7 @@ impl Coordinator {
             ai_status: Mutex::new(AiStatus::default()),
             location: Mutex::new(None),
             locating: AtomicBool::new(false),
+            full_noticed: AtomicBool::new(false),
             pictures: Mutex::new(Vec::new()),
             geo,
             target: Mutex::new(None),
@@ -1399,6 +1439,22 @@ mod tests {
             workspace,
             coordinator,
         }
+    }
+
+    #[test]
+    fn the_live_push_leaves_out_the_evidence_of_web_paths() {
+        let mut tree = json!({ "children": {
+            "admin": { "status": 403, "record": { "evidence": "GET /admin 403" }, "children": {
+                "login": { "status": 200, "record": { "evidence": "GET /admin/login 200" } }
+            } }
+        } });
+        drop_path_evidence(&mut tree);
+        assert_eq!(
+            tree,
+            json!({ "children": { "admin": { "status": 403, "children": {
+                "login": { "status": 200 }
+            } } } })
+        );
     }
 
     #[test]

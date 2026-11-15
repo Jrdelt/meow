@@ -27,6 +27,12 @@ const MAX_FIELD: usize = 200;
 const MAX_REFERENCE_LEN: usize = 512;
 const MAX_REFERENCES: usize = 16;
 const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+/// How much a graph may hold, as an estimate of what its observations add
+/// to `graph.json`. Kept below `MAX_GRAPH_BYTES`: what was recorded can be
+/// saved, and what was saved can be loaded again.
+const MAX_GRAPH_WEIGHT: usize = 48 * 1024 * 1024;
+/// The structure around one recorded item in the file.
+const ITEM_OVERHEAD: usize = 400;
 const MAX_HOSTS: usize = 4096;
 const MAX_PORTS_PER_HOST: usize = 1024;
 const MAX_HOSTNAMES_PER_HOST: usize = 128;
@@ -554,6 +560,22 @@ pub struct Graph {
     /// Hosts removed while loading an older graph; nothing is saved.
     #[serde(skip)]
     pub cleaned: Vec<String>,
+    #[serde(skip)]
+    tally: Tally,
+}
+
+/// The running size of a graph and whether it has filled up. Bookkeeping,
+/// not content: two graphs holding the same things are equal.
+#[derive(Debug, Clone, Default)]
+struct Tally {
+    weight: usize,
+    full: bool,
+}
+
+impl PartialEq for Tally {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 impl Default for Graph {
@@ -565,6 +587,7 @@ impl Default for Graph {
             hosts: BTreeMap::new(),
             notes: Vec::new(),
             cleaned: Vec::new(),
+            tally: Tally::default(),
         }
     }
 }
@@ -753,6 +776,101 @@ fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
 }
 
 impl Observation {
+    /// An upper estimate of what recording this adds to `graph.json`: its
+    /// text (escaped it is at most twice as long) and the structure around
+    /// it.
+    fn weight(&self) -> usize {
+        let opt = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+        let text = match self {
+            Observation::Host {
+                address,
+                os,
+                mac,
+                record,
+            } => address.len() + opt(os) + opt(mac) + record.evidence.len(),
+            Observation::Hostname {
+                address,
+                hostname,
+                record,
+            } => address.len() + hostname.len() + record.evidence.len(),
+            Observation::Port {
+                address,
+                protocol,
+                state,
+                service,
+                product,
+                version,
+                extra_info,
+                cpes,
+                record,
+                ..
+            } => {
+                // The port's name is also the claim of the fact it leaves.
+                2 * (address.len()
+                    + protocol.len()
+                    + state.len()
+                    + opt(service)
+                    + opt(product)
+                    + opt(version)
+                    + opt(extra_info))
+                    + cpes.iter().map(|cpe| cpe.len() + 4).sum::<usize>()
+                    + record.evidence.len()
+            }
+            Observation::TlsSan {
+                address,
+                san,
+                record,
+                ..
+            } => address.len() + 2 * san.len() + record.evidence.len(),
+            Observation::Http {
+                address,
+                scheme,
+                server,
+                location,
+                record,
+                ..
+            } => {
+                address.len()
+                    + scheme.len()
+                    + 2 * (opt(server) + opt(location))
+                    + record.evidence.len()
+            }
+            Observation::Path {
+                address,
+                scheme,
+                path,
+                record,
+                ..
+            } => {
+                // Every segment is a node of its own in the tree.
+                let segments = path.bytes().filter(|byte| *byte == b'/').count();
+                address.len() + scheme.len() + path.len() + 16 * segments + record.evidence.len()
+            }
+            Observation::Note {
+                address,
+                text,
+                record,
+            } => opt(address) + text.len() + record.evidence.len(),
+            Observation::NotOpen {
+                address,
+                protocol,
+                state,
+                ports,
+                record,
+                ..
+            } => address.len() + protocol.len() + state.len() + ports.len() + record.evidence.len(),
+            Observation::Script {
+                address,
+                protocol,
+                id,
+                output,
+                record,
+                ..
+            } => address.len() + protocol.len() + id.len() + output.len() + record.evidence.len(),
+        };
+        2 * text + ITEM_OVERHEAD
+    }
+
     /// The host this observation is about; `None` for a workspace note.
     pub fn address(&self) -> Option<&str> {
         match self {
@@ -812,7 +930,46 @@ impl Graph {
             graph.cleaned = gone;
         }
         graph.version = GRAPH_VERSION;
+        graph.tally.weight = graph.measure();
         Ok(graph)
+    }
+
+    /// The weight of what this graph already holds, counted the way
+    /// [`Observation::weight`] counts what is added.
+    fn measure(&self) -> usize {
+        fn facts(list: &[Fact]) -> usize {
+            list.iter()
+                .map(|fact| 2 * (fact.claim.len() + fact.record.evidence.len()) + ITEM_OVERHEAD)
+                .sum()
+        }
+        fn paths(node: &PathNode) -> usize {
+            node.children
+                .iter()
+                .map(|(name, child)| {
+                    let evidence = child.record.as_ref().map_or(0, |r| r.evidence.len());
+                    2 * (name.len() + evidence) + ITEM_OVERHEAD + paths(child)
+                })
+                .sum()
+        }
+        let hosts: usize = self
+            .hosts
+            .values()
+            .map(|host| {
+                let ports: usize = host
+                    .ports
+                    .values()
+                    .map(|port| ITEM_OVERHEAD + facts(&port.facts) + paths(&port.paths))
+                    .sum();
+                ITEM_OVERHEAD + facts(&host.facts) + ports
+            })
+            .sum();
+        hosts + facts(&self.notes)
+    }
+
+    /// True once the graph holds as much as it can keep: new observations
+    /// are no longer recorded (verdicts and notes already there stay).
+    pub fn is_full(&self) -> bool {
+        self.tally.full
     }
 
     /// Sanitizes all text fields and protocol keys on a deserialized graph so
@@ -953,9 +1110,25 @@ impl Graph {
     }
 
     /// Atomically replaces `graph.json`.
+    ///
+    /// Never writes a file `load` would refuse: one that is too large even
+    /// without indentation is not written, and the last good file stays.
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.updated_utc = now_rfc3339();
-        let json = serde_json::to_vec_pretty(self).context("cannot serialise the graph")?;
+        let mut json = serde_json::to_vec_pretty(self).context("cannot serialise the graph")?;
+        if json.len() as u64 > MAX_GRAPH_BYTES {
+            json = serde_json::to_vec(self).context("cannot serialise the graph")?;
+        }
+        if json.len() as u64 > MAX_GRAPH_BYTES {
+            self.tally.full = true;
+            bail!(
+                "the graph has grown to {} MB, more than the {} MB a workspace can hold; \
+                 {} keeps what was saved before",
+                json.len() / (1024 * 1024),
+                MAX_GRAPH_BYTES / (1024 * 1024),
+                path.display()
+            );
+        }
         write_private_atomic(path, &json)
     }
 
@@ -1056,7 +1229,24 @@ impl Graph {
     }
 
     /// Merges one observation. Returns `true` if the graph changed.
+    ///
+    /// A graph that is full records nothing more: every observation has a
+    /// weight, and their sum stays below what `graph.json` may hold, however
+    /// much a scanned server, a crawl or an imported file sends.
     pub fn apply(&mut self, observation: Observation) -> bool {
+        let weight = observation.weight();
+        if self.tally.weight.saturating_add(weight) > MAX_GRAPH_WEIGHT {
+            self.tally.full = true;
+            return false;
+        }
+        let changed = self.record(observation);
+        if changed {
+            self.tally.weight += weight;
+        }
+        changed
+    }
+
+    fn record(&mut self, observation: Observation) -> bool {
         match observation {
             Observation::Host {
                 address,
@@ -1720,6 +1910,74 @@ mod tests {
         assert!(graph
             .set_advisory_status("10.0.0.5", "CVE-0000-0000", VerificationStatus::Confirmed)
             .is_err());
+    }
+
+    #[test]
+    fn a_flood_of_urls_fills_the_graph_which_still_saves_and_loads() {
+        // 225,000 distinct URLs on 45 ports of one server: what a hostile
+        // site's output or a crafted import file can hold.
+        let mut graph = Graph::default();
+        let mut kept = 0usize;
+        for port in 8001..=8045u16 {
+            for n in 0..5000 {
+                if graph.apply(path("10.9.8.7", port, &format!("/p{n:05}"), 200)) {
+                    kept += 1;
+                }
+            }
+        }
+        assert!(graph.is_full());
+        assert!(kept > 50_000 && kept < 225_000, "{kept}");
+        // Nothing more is recorded, whatever it is.
+        assert!(!graph.apply(port("10.9.8.9", 22, "ssh", None)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.save(&file).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().len() <= MAX_GRAPH_BYTES);
+        // The file opens again. What it holds is counted on loading, so a
+        // second flood fills it up again without outgrowing the file.
+        let mut loaded = Graph::load(&file).unwrap();
+        assert_eq!(
+            loaded.hosts["10.9.8.7"].ports.len(),
+            graph.hosts["10.9.8.7"].ports.len()
+        );
+        for port in 9001..=9045u16 {
+            for n in 0..5000 {
+                loaded.apply(path("10.9.8.7", port, &format!("/q{n:05}"), 200));
+            }
+        }
+        assert!(loaded.is_full());
+        loaded.save(&file).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().len() <= MAX_GRAPH_BYTES);
+        assert!(Graph::load(&file).is_ok());
+    }
+
+    #[test]
+    fn a_graph_too_large_to_load_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        let mut graph = Graph::default();
+        graph.apply(port("10.0.0.5", 22, "ssh", None));
+        graph.save(&file).unwrap();
+        let good = std::fs::read(&file).unwrap();
+
+        // Grown past the limit behind `apply`'s back.
+        graph.notes.push(Fact {
+            claim: "x".repeat(MAX_GRAPH_BYTES as usize + 1),
+            record: rec(Source::NmapXml),
+        });
+        let error = graph.save(&file).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("more than the 64 MB"),
+            "{error:#}"
+        );
+        assert!(graph.is_full());
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            good,
+            "the last good file stays"
+        );
+        assert!(Graph::load(&file).is_ok());
     }
 
     #[test]
