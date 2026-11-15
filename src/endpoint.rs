@@ -219,6 +219,52 @@ impl Target {
             Target::Network(network) => network.contains(ip),
         }
     }
+
+    /// Refuses a range of more than [`MAX_RANGE_ADDRESSES`] addresses. A
+    /// slip of the prefix (`/8` for `/24`, or `0.0.0.0/0`) would otherwise
+    /// send a scan across networks nobody asked about.
+    pub fn check_size(&self) -> Result<(), String> {
+        let Target::Network(network) = self else {
+            return Ok(());
+        };
+        let bits = match network {
+            IpNetwork::V4(_) => 32,
+            IpNetwork::V6(_) => 128,
+        };
+        let host_bits = bits - u32::from(network.prefix());
+        if host_bits <= MAX_RANGE_BITS {
+            return Ok(());
+        }
+        let size = if host_bits < 64 {
+            group_thousands(1u64 << host_bits)
+        } else {
+            format!("2^{host_bits}")
+        };
+        Err(format!(
+            "{network} covers {size} addresses; meow scans at most {} at once \
+             (/{} or smaller for IPv4, /{} for IPv6). Queue the parts you mean one by one",
+            group_thousands(MAX_RANGE_ADDRESSES),
+            32 - MAX_RANGE_BITS,
+            128 - MAX_RANGE_BITS
+        ))
+    }
+}
+
+/// The largest range `meow recon` takes: an IPv4 `/16`.
+const MAX_RANGE_BITS: u32 = 16;
+pub const MAX_RANGE_ADDRESSES: u64 = 1 << MAX_RANGE_BITS;
+
+/// `65536` as `65,536`.
+fn group_thousands(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 impl fmt::Display for Target {
@@ -316,6 +362,34 @@ pub fn path_segments(path: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_is_at_most_a_sixteen_bit_one() {
+        for fine in [
+            "10.0.0.5",
+            "example.org",
+            "10.0.0.0/24",
+            "10.20.0.0/16",
+            "192.0.2.7/32",
+            "fd00::/112",
+            "fd00::5/128",
+        ] {
+            assert_eq!(Target::parse(fine).unwrap().check_size(), Ok(()), "{fine}");
+        }
+        let refused = |text: &str| Target::parse(text).unwrap().check_size().unwrap_err();
+        assert!(refused("10.0.0.0/15").starts_with("10.0.0.0/15 covers 131,072 addresses"));
+        assert!(refused("10.0.0.0/8").contains("covers 16,777,216 addresses"));
+        assert!(refused("0.0.0.0/0").contains("covers 4,294,967,296 addresses"));
+        assert!(refused("fd00::/111").contains("covers 131,072 addresses"));
+        assert!(refused("fd00::/64").contains("covers 2^64 addresses"));
+        assert!(refused("::/0").contains("covers 2^128 addresses"));
+        assert!(refused("::/0")
+            .contains("at most 65,536 at once (/16 or smaller for IPv4, /112 for IPv6)"));
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(1234567), "1,234,567");
+    }
 
     fn endpoint(text: &str) -> Option<(String, Option<u16>)> {
         Endpoint::parse(text).map(|e| (e.host.canonical(), e.port))

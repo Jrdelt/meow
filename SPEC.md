@@ -91,6 +91,8 @@ The primary `meow <name>` process acts as the single session coordinator: it own
     3. **Web Link & JS Route Crawl (`katana`, if HTTP/HTTPS open):** Outputs structured JSONL (`-j -silent -nc -jc -fs fqdn -ct 5m -o <tmp>/katana.jsonl`), staying on the crawled host; links to other sites are left out of the graph.
     4. **Directory/Endpoint Inventory (`feroxbuster`, if HTTP/HTTPS open & wordlist verified):** Validates `wordlist_path` in `config.toml` or standard system paths first (skipping cleanly with a HUD notice if absent on macOS/Windows). Enforces mutual-exclusion rules (`--rate-limit` + `--scan-limit 1` + `--auto-bail` in `mild`; `--auto-tune` without `--rate-limit` in `aggressive`) writing structured `--json -o <tmp>/ferox.jsonl` with `--quiet --no-state`.
   - Persists stage status (`pending`, `running`, `interrupted`, `done`) in `state.db` for `[Y/n]` resume on reopen.
+  - A task runs in the gentler of the mode it was queued in and the session's mode now, re-checked before every tool and every 250 ms while one runs: `light` stops the running tool and pauses the task; a change between `mild` and `aggressive` restarts the stage with the new settings.
+  - A range target is at most 65,536 addresses (IPv4 `/16`, IPv6 `/112`), checked when queued and again when a stored task runs.
 
 ---
 

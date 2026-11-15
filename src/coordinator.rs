@@ -542,6 +542,7 @@ impl State {
                 let parsed = Target::parse(&target).with_context(|| {
                     format!("'{target}' is not a host name, an IP address or a CIDR range")
                 })?;
+                parsed.check_size().map_err(|reason| anyhow!(reason))?;
                 queue::validate_nmap_flags(&flags)?;
                 let preset = self.config.recon.preset(mode, &self.profile_recon());
                 queue::validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services)?;

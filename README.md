@@ -289,6 +289,13 @@ Each tool has a time limit and a 50 MB output cap, and is killed with
 everything it started when the session ends. Unfinished tasks are offered for
 resume the next time the workspace is opened.
 
+The mode also governs what is already queued. Switch to `light` and the tool
+that is running is stopped and the rest waits; switch from `aggressive` to
+`mild` and the running stage starts again with the mild settings. Switching up
+never makes an earlier request more active than it was asked for. A range is
+at most 65,536 addresses (an IPv4 `/16`, an IPv6 `/112`); queue a larger
+network in parts.
+
 ## Evidence and conclusions
 
 Every fact carries five fields: `source`, `timestamp_utc`, `confidence`, the

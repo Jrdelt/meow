@@ -955,6 +955,8 @@ pub enum RunOutcome {
     OutputCapExceeded,
     NotInstalled,
     Failed(String),
+    /// Stopped by meow because it may no longer run (the mode changed).
+    Stopped,
 }
 
 /// Kills the whole process group when dropped, so a cancelled stage or a
@@ -1044,6 +1046,19 @@ fn is_secret_variable(name: &str) -> bool {
 /// one the user did not write (a cloned repository). Variables that look
 /// like credentials are not passed on.
 pub async fn run_tool(command: &ToolCommand, limits: RunLimits) -> RunOutcome {
+    run_tool_while(command, limits, || true).await
+}
+
+/// [`run_tool`], stopping the tool (and everything it started) as soon as
+/// `may_run` says no. It is asked before the start and every [`CAP_POLL`].
+pub async fn run_tool_while(
+    command: &ToolCommand,
+    limits: RunLimits,
+    may_run: impl Fn() -> bool,
+) -> RunOutcome {
+    if !may_run() {
+        return RunOutcome::Stopped;
+    }
     // Whatever already sits where the output goes is never written through.
     match std::fs::symlink_metadata(&command.output) {
         Ok(meta) if meta.is_file() => {
@@ -1134,6 +1149,9 @@ pub async fn run_tool(command: &ToolCommand, limits: RunLimits) -> RunOutcome {
             },
             () = &mut deadline => break RunOutcome::TimedOut,
             _ = poll.tick() => {
+                if !may_run() {
+                    break RunOutcome::Stopped;
+                }
                 let size = tokio::fs::metadata(&command.output).await.map(|m| m.len()).unwrap_or(0);
                 if size > limits.cap_bytes {
                     break RunOutcome::OutputCapExceeded;
@@ -1341,6 +1359,17 @@ pub fn count_unfinished(state_db: &Path) -> usize {
 enum StageEnd {
     Done(String),
     Skipped(String),
+    /// The mode changed while the stage ran: its tool was stopped and no
+    /// other was started. What it had found by then is kept.
+    ModeChanged,
+}
+
+/// The mode a task runs in: the gentler of the one it was queued in and the
+/// one the session is in now. Switching the session down governs work that
+/// is already queued; switching it up does not turn an earlier request into
+/// a more active one.
+fn running_mode(state: &State, task: &TaskRow) -> Mode {
+    task.mode.min(state.mode())
 }
 
 fn hosts_in_target(graph: &Graph, target: &Target) -> Vec<Host> {
@@ -1407,6 +1436,7 @@ fn describe_failure(program: &str, outcome: &RunOutcome, limits: RunLimits) -> S
         ),
         RunOutcome::NotInstalled => format!("{program} is not installed"),
         RunOutcome::Failed(reason) => reason.clone(),
+        RunOutcome::Stopped => format!("{program} was stopped: the mode changed"),
     }
 }
 
@@ -1417,7 +1447,10 @@ async fn run_stage(
     stage: Stage,
 ) -> Result<StageEnd> {
     let settings = state.config.recon.clone();
-    let preset = settings.preset(task.mode, &state.profile_recon());
+    let mode = running_mode(state, task);
+    // Asked before every tool and while one runs.
+    let same_mode = || running_mode(state, task) == mode;
+    let preset = settings.preset(mode, &state.profile_recon());
     validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services)?;
     // A stored task is only as trustworthy as the workspace's database, so
     // its flags are checked before every stage, not only when it is queued.
@@ -1440,7 +1473,11 @@ async fn run_stage(
             for notice in notices {
                 state.notice(notice);
             }
-            let outcome = run_tool(&command, limits).await;
+            let outcome = run_tool_while(&command, limits, same_mode).await;
+            if outcome == RunOutcome::Stopped {
+                let _ = std::fs::remove_file(&command.output);
+                return Ok(StageEnd::ModeChanged);
+            }
             if !matches!(outcome, RunOutcome::Exited(Some(0))) {
                 let _ = std::fs::remove_file(&command.output);
                 bail!(describe_failure(&command.program, &outcome, limits));
@@ -1494,7 +1531,11 @@ async fn run_stage(
                         state.notice(notice);
                     }
                 }
-                let outcome = run_tool(&command, limits).await;
+                let outcome = run_tool_while(&command, limits, same_mode).await;
+                if outcome == RunOutcome::Stopped {
+                    let _ = std::fs::remove_file(&command.output);
+                    return Ok(StageEnd::ModeChanged);
+                }
                 if !matches!(outcome, RunOutcome::Exited(Some(0))) {
                     let _ = std::fs::remove_file(&command.output);
                     bail!(describe_failure(&command.program, &outcome, limits));
@@ -1559,7 +1600,7 @@ async fn run_stage(
                     Some(wordlist) => dirs_command(&settings, &preset, url, wordlist, &output),
                     None => crawl_command(&settings, &preset, url, &output),
                 };
-                let outcome = run_tool(&command, limits).await;
+                let outcome = run_tool_while(&command, limits, same_mode).await;
                 match outcome {
                     RunOutcome::NotInstalled => {
                         return Ok(StageEnd::Skipped(install_hint(&command.program)))
@@ -1574,6 +1615,12 @@ async fn run_stage(
                         ingest_only(state, &command.output, Some(&names)).unwrap_or_default();
                     changed += added;
                     elsewhere.extend(dropped);
+                    if outcome == RunOutcome::Stopped {
+                        let _ = std::fs::remove_file(&command.output);
+                    }
+                }
+                if outcome == RunOutcome::Stopped {
+                    return Ok(StageEnd::ModeChanged);
                 }
                 if matches!(
                     outcome,
@@ -1615,24 +1662,46 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
         state.touch();
         result
     };
+    // Checked again here: a task is only as trustworthy as the database.
+    if let Err(reason) = target.check_size() {
+        update(Stage::Ports, "failed", &reason)?;
+        for later in &STAGES[1..] {
+            update(*later, "skipped", "the port inventory failed")?;
+        }
+        state.notice(format!("recon {} refused: {reason}", task.target));
+        return Ok(());
+    }
 
     for row in &task.stages {
         if !matches!(row.status.as_str(), "pending" | "interrupted" | "running") {
             continue;
         }
         let stage = row.stage;
-        // Light mode sends no packets: stop here and keep the rest for later.
-        if state.mode() == Mode::Light {
-            update(stage, "interrupted", "paused: the session is in light mode")?;
-            state.notice(format!(
-                "recon {} paused: light mode sends no packets",
-                task.target
-            ));
-            return Ok(());
-        }
-        update(stage, "running", "")?;
-        state.notice(format!("recon {}: {} started", task.target, stage.as_str()));
-        match run_stage(state, &task, &target, stage).await {
+        let end = loop {
+            // Light mode sends no packets: stop here and keep the rest for
+            // later. A task stored as light (meow queues none) never runs.
+            if running_mode(state, &task) == Mode::Light {
+                update(stage, "interrupted", "paused: the session is in light mode")?;
+                state.notice(format!(
+                    "recon {} paused: light mode sends no packets",
+                    task.target
+                ));
+                return Ok(());
+            }
+            update(stage, "running", "")?;
+            state.notice(format!("recon {}: {} started", task.target, stage.as_str()));
+            match run_stage(state, &task, &target, stage).await {
+                // Start the stage again with what the mode is now.
+                Ok(StageEnd::ModeChanged) => state.notice(format!(
+                    "recon {}: {} stopped, the mode changed",
+                    task.target,
+                    stage.as_str()
+                )),
+                end => break end,
+            }
+        };
+        match end {
+            Ok(StageEnd::ModeChanged) => {}
             Ok(StageEnd::Done(detail)) => {
                 update(stage, "done", &detail)?;
                 state.notice(format!(

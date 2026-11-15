@@ -46,7 +46,7 @@ impl Lab {
             let path = tmp.path().join(name);
             let script = format!(
                 "#!/bin/sh\necho \"start {name} $*\" >> '{log}'\n\
-                 while [ -f '{hold}' ]; do sleep 0.05; done\n{body}\necho \"end {name}\" >> '{log}'\n",
+                 while [ -f '{hold}' ] || [ -f '{hold}-{name}' ]; do sleep 0.05; done\n{body}\necho \"end {name}\" >> '{log}'\n",
                 log = log.display(),
                 hold = hold.display(),
             );
@@ -327,11 +327,42 @@ fn light_mode_refuses_recon_and_bad_targets_are_rejected() {
             "{unsafe_flags:?}: {error}"
         );
     }
+    // A range far wider than anyone means to scan.
+    for wide in [
+        "0.0.0.0/0",
+        "10.0.0.0/8",
+        "172.16.0.0/15",
+        "::/0",
+        "fd00::/64",
+    ] {
+        let error = run(wide).unwrap_err().to_string();
+        assert!(error.contains("at most 65,536 at once"), "{wide}: {error}");
+    }
     assert!(
         lab.calls().is_empty(),
         "nothing may run for a refused request"
     );
     assert!(queue::tasks(&state.db_lock(), 10).unwrap().is_empty());
+
+    // The widest that is taken, and one planted in the database.
+    for fine in ["10.20.0.0/16", "fd00::1:0/112"] {
+        run(fine).unwrap();
+    }
+    let planted = queue::enqueue(&state.db_lock(), "0.0.0.0/0", Mode::Mild, &[]).unwrap();
+    state.resume_unfinished().unwrap();
+    wait_finished(&coordinator, planted);
+    assert_eq!(
+        statuses(&coordinator, planted),
+        ["failed", "skipped", "skipped", "skipped"]
+    );
+    assert!(task(&coordinator, planted).stages[0]
+        .detail
+        .contains("0.0.0.0/0 covers 4,294,967,296 addresses"));
+    assert!(
+        !lab.calls().iter().any(|call| call.contains("0.0.0.0/0")),
+        "{:?}",
+        lab.calls()
+    );
 }
 
 #[test]
@@ -442,26 +473,25 @@ fn light_mode_pauses_queued_work_and_leaving_it_resumes() {
     state
         .execute(Command::SetMode { mode: Mode::Light })
         .unwrap();
-    std::fs::remove_file(lab.file("hold")).unwrap();
     wait_until("both tasks to pause", || {
-        statuses(&coordinator, first)[1] == "interrupted"
+        statuses(&coordinator, first)[0] == "interrupted"
             && statuses(&coordinator, second)[0] == "interrupted"
     });
-    assert_eq!(
-        statuses(&coordinator, first)[0],
-        "done",
-        "the running stage was allowed to finish"
-    );
-    assert!(task(&coordinator, second).stages[0]
-        .detail
-        .contains("light mode"));
-    let calls_while_paused = lab.calls().len();
-    std::thread::sleep(Duration::from_millis(200));
+    for id in [first, second] {
+        assert!(task(&coordinator, id).stages[0]
+            .detail
+            .contains("light mode"));
+    }
+    // The tool that was running was stopped, not left to finish.
+    std::fs::remove_file(lab.file("hold")).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         lab.calls().len(),
-        calls_while_paused,
-        "nothing runs in light mode"
+        1,
+        "nothing runs in light mode: {:?}",
+        lab.calls()
     );
+    assert!(leftovers(&lab.workspace.tmp_dir()).is_empty());
 
     let result = state
         .execute(Command::SetMode { mode: Mode::Mild })
@@ -471,6 +501,112 @@ fn light_mode_pauses_queued_work_and_leaving_it_resumes() {
     wait_finished(&coordinator, second);
     assert_eq!(statuses(&coordinator, first), ["done"; 4]);
     assert_eq!(statuses(&coordinator, second), ["done"; 4]);
+}
+
+#[test]
+fn work_queued_in_aggressive_runs_as_mild_once_the_session_is_mild() {
+    let mut lab = Lab::new();
+    lab.workspace.set_mode(Mode::Aggressive).unwrap();
+    std::fs::write(lab.file("hold"), "").unwrap();
+    let coordinator = lab.start();
+    let state = coordinator.state();
+    let id = recon(&coordinator, "10.0.0.5");
+    assert_eq!(task(&coordinator, id).mode, Mode::Aggressive);
+    wait_until("the first tool to start", || lab.calls().len() == 1);
+    assert!(lab.calls()[0].contains(" -T4 "), "{:?}", lab.calls());
+
+    // The session is turned down while the aggressive scan runs: that scan
+    // is stopped and the stage starts again with the mild settings.
+    state
+        .execute(Command::SetMode { mode: Mode::Mild })
+        .unwrap();
+    wait_until("the stage to start again", || lab.calls().len() == 2);
+    std::fs::remove_file(lab.file("hold")).unwrap();
+    wait_finished(&coordinator, id);
+    assert_eq!(statuses(&coordinator, id), ["done"; 4]);
+    let calls = lab.calls();
+    assert!(calls[1].starts_with("start nmap") && calls[1].contains(" -T3 "));
+    for call in &calls[1..] {
+        assert!(!call.contains(" -T4"), "{call}");
+        assert!(!call.contains("--auto-tune"), "{call}");
+    }
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("start feroxbuster") && call.contains("--rate-limit")),
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls.iter().filter(|call| *call == "end nmap").count(),
+        2,
+        "the stopped scan never reached its end: {calls:?}"
+    );
+
+    // Turning the session up does not make an earlier mild request aggressive.
+    state
+        .execute(Command::SetMode { mode: Mode::Mild })
+        .unwrap();
+    std::fs::write(lab.file("hold"), "").unwrap();
+    let before = lab.calls().len();
+    let mild = recon(&coordinator, "10.0.0.5");
+    wait_until("the mild task to start", || lab.calls().len() == before + 1);
+    state
+        .execute(Command::SetMode {
+            mode: Mode::Aggressive,
+        })
+        .unwrap();
+    std::fs::remove_file(lab.file("hold")).unwrap();
+    wait_finished(&coordinator, mild);
+    for call in &lab.calls()[before..] {
+        assert!(!call.contains(" -T4"), "{call}");
+        assert!(!call.contains("--auto-tune"), "{call}");
+    }
+}
+
+#[test]
+fn light_mode_stops_a_stage_between_its_runs() {
+    let lab = Lab::new();
+    // The crawl covers two sites (ports 80 and 443); the first run waits.
+    std::fs::write(lab.file("hold-katana"), "").unwrap();
+    let coordinator = lab.start();
+    let state = coordinator.state();
+    let id = recon(&coordinator, "10.0.0.5");
+    let crawls = |lab: &Lab| {
+        lab.calls()
+            .iter()
+            .filter(|call| call.starts_with("start katana"))
+            .count()
+    };
+    wait_until("the first crawl to start", || crawls(&lab) == 1);
+
+    state
+        .execute(Command::SetMode { mode: Mode::Light })
+        .unwrap();
+    wait_until("the crawl to pause", || {
+        statuses(&coordinator, id)[2] == "interrupted"
+    });
+    std::fs::remove_file(lab.file("hold-katana")).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        crawls(&lab),
+        1,
+        "no second site was crawled: {:?}",
+        lab.calls()
+    );
+    assert!(!lab.calls().iter().any(|call| call == "end katana"));
+    assert_eq!(
+        statuses(&coordinator, id),
+        ["done", "done", "interrupted", "pending"]
+    );
+    assert!(leftovers(&lab.workspace.tmp_dir()).is_empty());
+
+    // Leaving light mode runs the stage from its start.
+    state
+        .execute(Command::SetMode { mode: Mode::Mild })
+        .unwrap();
+    wait_finished(&coordinator, id);
+    assert_eq!(statuses(&coordinator, id), ["done"; 4]);
+    assert_eq!(crawls(&lab), 3);
 }
 
 #[test]

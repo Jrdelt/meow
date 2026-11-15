@@ -6,7 +6,10 @@ use std::fmt;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+/// Ordered from the gentlest to the most active.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Passive only: zero outbound packets (default)
