@@ -1153,3 +1153,70 @@ exit
     // It does not outlive the session.
     assert!(!page.exists());
 }
+
+#[test]
+fn a_workspace_that_came_with_the_folder_is_not_opened_unasked() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home()).unwrap();
+    std::fs::write(
+        sandbox.home().join("config.toml"),
+        "default_mode = \"light\"\n[cve]\nenabled = false\n",
+    )
+    .unwrap();
+    // The folder already holds a .meow someone else prepared.
+    let planted = sandbox.project().join(".meow");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join("profile.toml"),
+        "name = \"demo\"\nmode = \"aggressive\"\n",
+    )
+    .unwrap();
+    std::fs::write(planted.join("graph.json"), "{}").unwrap();
+
+    // No terminal to ask on: it is described and not opened.
+    let output = sandbox.run(&["review", "--local"], &[]);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    for needle in [
+        "you did not make on this machine",
+        "Its own mode is aggressive",
+        "graph.json",
+        "Not opened",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in: {text}");
+    }
+    assert!(!text.contains("Coordinator on"), "{text}");
+    assert!(
+        !planted.join("session.lock").exists(),
+        "nothing was started"
+    );
+
+    // Helper commands refuse it too; the listing shows it; delete works.
+    let output = sandbox.run(&["mode", "mild", "--local"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("came with this folder"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        std::fs::read_to_string(planted.join("profile.toml"))
+            .unwrap()
+            .contains("aggressive"),
+        "the refused command changed nothing"
+    );
+    let listing = stdout(&sandbox.run(&["list"], &[]));
+    assert!(listing.contains("not yours"), "{listing}");
+    let output = sandbox.run(&["delete", "--local", "--yes"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!planted.exists());
+
+    // A fresh one made here afterwards is the user's own, with no question.
+    let output = sandbox.run(&["review", "--local"], &[]);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Created workspace 'review'"), "{text}");
+    assert!(text.contains("(mode: light)"), "{text}");
+    let output = sandbox.run(&["review", "--local"], &[]);
+    assert!(stdout(&output).contains("Resumed workspace 'review'"));
+}

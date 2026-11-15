@@ -701,3 +701,51 @@ fn first_session_offers_the_extras_once() {
     // Asked once: the next session goes straight in.
     assert!(tmp.path().join("meow-home").join("extras-offered").exists());
 }
+
+#[test]
+fn accepting_a_workspace_that_came_with_the_folder_opens_it_in_the_users_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let planted = tmp.path().join(".meow");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join("profile.toml"),
+        "name = \"demo\"\nmode = \"aggressive\"\n",
+    )
+    .unwrap();
+    // Anything but yes: not opened.
+    let mut hosted = Hosted::spawn_args(&["review", "--local"], tmp);
+    assert!(
+        hosted.wait_for(b"[?] Use it as your own? [y/N] ", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send("\r");
+    let (code, output, tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 1, "{}", text(&output));
+    assert!(text(&output).contains("Not opened"), "{}", text(&output));
+    assert!(!text(&output).contains("Coordinator on"));
+
+    // Yes: it opens, in the user's default mode, not the one it came with.
+    let mut hosted = Hosted::spawn_args(&["review", "--local"], tmp);
+    assert!(
+        hosted.wait_for(b"[?] Use it as your own? [y/N] ", PATIENCE),
+        "{}",
+        hosted.dump()
+    );
+    hosted.send("y\r");
+    assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
+    hosted.send("exit\r");
+    let (code, output, tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0, "{}", text(&output));
+    assert!(text(&output).contains("(mode: light)"), "{}", text(&output));
+    let profile = std::fs::read_to_string(tmp.path().join(".meow/profile.toml")).unwrap();
+    assert!(profile.contains("mode = \"light\""), "{profile}");
+
+    // Asked once: the next open goes straight in.
+    let mut hosted = Hosted::spawn_args(&["review", "--local"], tmp);
+    assert!(hosted.wait_for(b"ready> ", PATIENCE), "{}", hosted.dump());
+    hosted.send("exit\r");
+    let (code, output, _tmp) = hosted.finish_keeping_files();
+    assert_eq!(code, 0);
+    assert!(!text(&output).contains("Use it as your own"));
+}

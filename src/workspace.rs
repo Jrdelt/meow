@@ -200,6 +200,11 @@ impl MeowHome {
         &self.0
     }
 
+    /// The marks of the `./.meow` workspaces this user made or accepted.
+    pub fn local_record_path(&self) -> PathBuf {
+        self.0.join(LOCAL_RECORD_FILE)
+    }
+
     pub fn config_path(&self) -> PathBuf {
         self.0.join(CONFIG_FILE)
     }
@@ -657,6 +662,52 @@ pub struct Profile {
     /// Tool flags for this workspace; they win over `config.toml`.
     #[serde(skip_serializing_if = "PresetOverride::is_empty")]
     pub recon: PresetOverride,
+    /// A random mark a `./.meow` workspace gets when this user makes or
+    /// accepts it. `~/.meow/local-workspaces` lists this user's marks, so a
+    /// `./.meow` that came with a folder (a cloned repository, an unpacked
+    /// archive) is told apart from the user's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// The file in `~/.meow` that lists the marks of this user's `./.meow`
+/// workspaces, one per line.
+const LOCAL_RECORD_FILE: &str = "local-workspaces";
+/// More marks than anyone makes; a larger file is not read further.
+const LOCAL_RECORD_MAX: u64 = 1024 * 1024;
+
+fn new_mark() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("no secure random source: {e}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn own_marks(home: &MeowHome) -> Vec<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Ok(file) = fs::File::open(home.local_record_path()) {
+        let _ = file.take(LOCAL_RECORD_MAX).read_to_string(&mut text);
+    }
+    text.lines().map(|line| line.trim().to_owned()).collect()
+}
+
+/// Whether a `./.meow` with this profile was made or accepted by this user.
+fn is_own_local(home: &MeowHome, profile: &Profile) -> bool {
+    profile
+        .id
+        .as_deref()
+        .is_some_and(|id| id.len() == 32 && own_marks(home).iter().any(|own| own == id))
+}
+
+fn remember_mark(home: &MeowHome, mark: &str) -> Result<()> {
+    create_private_dir(home.root())?;
+    let mut marks = own_marks(home);
+    marks.retain(|known| !known.is_empty());
+    marks.push(mark.to_owned());
+    write_private_atomic(
+        &home.local_record_path(),
+        (marks.join("\n") + "\n").as_bytes(),
+    )
 }
 
 impl Profile {
@@ -713,9 +764,14 @@ impl Workspace {
                 name: name.clone(),
                 mode: default_mode,
                 recon: PresetOverride::default(),
+                // A new `./.meow` is this user's own from the start.
+                id: if local { Some(new_mark()?) } else { None },
             }
         };
         profile.name = name.clone();
+        if let (false, Some(mark)) = (existed, &profile.id) {
+            remember_mark(home, mark)?;
+        }
 
         let workspace = Self {
             name,
@@ -727,6 +783,38 @@ impl Workspace {
             workspace.save_profile()?;
         }
         Ok((workspace, !existed))
+    }
+
+    /// True for a `./.meow` this user neither made nor accepted: it came
+    /// with the folder. What it carries (its mode, queued scans, verdicts,
+    /// the directory its shell starts in) was chosen by someone else.
+    pub fn is_foreign(&self, home: &MeowHome) -> bool {
+        self.local && !is_own_local(home, &self.profile)
+    }
+
+    /// Fails for a `./.meow` that is not this user's, saying how to review
+    /// or remove it. Helper commands call this before touching it.
+    pub fn ensure_own(&self, home: &MeowHome) -> Result<()> {
+        if self.is_foreign(home) {
+            bail!(
+                "{} was not made by you on this machine: it came with this folder. \
+                 Review and accept it with `meow <name> --local` in a terminal, \
+                 or remove it with `meow delete --local`",
+                self.dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Accepts a `./.meow` that came with a folder as this user's own. Its
+    /// stored mode is replaced by `mode` (the user's default), so nothing it
+    /// has queued runs until the user chooses a mode that sends packets.
+    pub fn adopt(&mut self, home: &MeowHome, mode: Mode) -> Result<()> {
+        let mark = new_mark()?;
+        self.profile.id = Some(mark.clone());
+        self.profile.mode = mode;
+        self.save_profile()?;
+        remember_mark(home, &mark)
     }
 
     /// Records that a session now owns this workspace: stores the name it was
@@ -884,6 +972,8 @@ pub enum SessionState {
     Running,
     /// The listing was asked for from inside this workspace's session.
     Current,
+    /// A `./.meow` that came with the folder: not this user's, not read.
+    NotYours,
 }
 
 impl SessionState {
@@ -892,6 +982,7 @@ impl SessionState {
             SessionState::Closed => "-",
             SessionState::Running => "running",
             SessionState::Current => "this session",
+            SessionState::NotYours => "not yours",
         }
     }
 }
@@ -925,7 +1016,7 @@ pub fn list_workspaces(home: &MeowHome, cwd: &Path) -> Result<Vec<WorkspaceSumma
                 let Some(name) = name.to_str().and_then(|n| validate_name(n).ok()) else {
                     continue;
                 };
-                if let Some(summary) = summarize(&entry.path(), Some(name), false) {
+                if let Some(summary) = summarize(home, &entry.path(), Some(name), false) {
                     found.push(summary);
                 }
             }
@@ -934,7 +1025,7 @@ pub fn list_workspaces(home: &MeowHome, cwd: &Path) -> Result<Vec<WorkspaceSumma
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", root.display())),
     }
     if let Ok(local) = home.local_dir(cwd) {
-        found.extend(summarize(&local, None, true));
+        found.extend(summarize(home, &local, None, true));
     }
     found.sort_by(|a, b| {
         b.last_active
@@ -944,7 +1035,12 @@ pub fn list_workspaces(home: &MeowHome, cwd: &Path) -> Result<Vec<WorkspaceSumma
     Ok(found)
 }
 
-fn summarize(dir: &Path, name: Option<String>, local: bool) -> Option<WorkspaceSummary> {
+fn summarize(
+    home: &MeowHome,
+    dir: &Path,
+    name: Option<String>,
+    local: bool,
+) -> Option<WorkspaceSummary> {
     let is_real_dir = fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir());
     let profile_path = dir.join(PROFILE_FILE);
     if !is_real_dir || !profile_path.is_file() {
@@ -954,14 +1050,29 @@ fn summarize(dir: &Path, name: Option<String>, local: bool) -> Option<WorkspaceS
     let name = name
         .or_else(|| profile.as_ref().and_then(|p| validate_name(&p.name).ok()))
         .unwrap_or_else(|| dir_name(dir));
+    // A `./.meow` that came with the folder is listed, but its graph and
+    // database are someone else's files: they are not opened for a count.
+    let foreign = local && !profile.as_ref().is_some_and(|p| is_own_local(home, p));
     Some(WorkspaceSummary {
         name,
         dir: dir.to_path_buf(),
         local,
-        state: SessionState::Closed,
+        state: if foreign {
+            SessionState::NotYours
+        } else {
+            SessionState::Closed
+        },
         mode: profile.map(|p| p.mode),
-        hosts: count_hosts(&dir.join("graph.json")),
-        unfinished_tasks: crate::queue::count_unfinished(&dir.join("state.db")),
+        hosts: if foreign {
+            0
+        } else {
+            count_hosts(&dir.join("graph.json"))
+        },
+        unfinished_tasks: if foreign {
+            0
+        } else {
+            crate::queue::count_unfinished(&dir.join("state.db"))
+        },
         last_active: last_active(dir),
     })
 }
@@ -981,7 +1092,7 @@ pub fn find_for_deletion(
         }
         None => (home.local_dir(cwd)?, None),
     };
-    summarize(&dir, checked, name.is_none()).ok_or_else(|| match name {
+    summarize(home, &dir, checked, name.is_none()).ok_or_else(|| match name {
         Some(name) => anyhow!("There is no workspace named '{name}' (`meow list` shows them)"),
         None => anyhow!("There is no workspace in {}", dir.display()),
     })
@@ -1175,6 +1286,7 @@ mod tests {
                 name: "acme".into(),
                 mode: Mode::Light,
                 recon: PresetOverride::default(),
+                id: None,
             }
         );
 
@@ -1338,13 +1450,84 @@ mod tests {
     }
 
     #[test]
+    fn a_dot_meow_that_came_with_a_folder_is_not_the_users_until_accepted() {
+        let fx = fixture();
+        // One the user makes here is theirs, on every later open.
+        let (own, created) = open(&fx, "mine", true);
+        assert!(created && !own.is_foreign(&fx.home));
+        own.ensure_own(&fx.home).unwrap();
+        let (again, created) = open(&fx, "mine", true);
+        assert!(!created && !again.is_foreign(&fx.home));
+        assert!(!Workspace::load(&own.dir).unwrap().is_foreign(&fx.home));
+
+        // A folder that arrives with a .meow already in it (a cloned
+        // repository): aggressive mode, its own settings, a mark it made up,
+        // a graph and a database.
+        let cloned = fx.cwd.join("cloned");
+        let dir = cloned.join(".meow");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("profile.toml"),
+            "name = \"demo\"\nmode = \"aggressive\"\nid = \"00000000000000000000000000000000\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("graph.json"), "{ not even json").unwrap();
+        fs::write(dir.join("state.db"), "not a database").unwrap();
+        let (mut ws, created) =
+            Workspace::open_or_create(&fx.home, &cloned, "review", true, Mode::Light).unwrap();
+        assert!(!created && ws.is_foreign(&fx.home));
+        assert_eq!(ws.profile.mode, Mode::Aggressive);
+        // Helper commands refuse it, saying what to do.
+        let error = Workspace::load(&dir)
+            .unwrap()
+            .ensure_own(&fx.home)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("came with this folder"),
+            "{error:#}"
+        );
+        // The listing names it without opening its graph or database.
+        let listed = list_workspaces(&fx.home, &cloned).unwrap();
+        let entry = listed.iter().find(|w| w.local).unwrap();
+        assert_eq!(entry.state, SessionState::NotYours);
+        assert_eq!((entry.hosts, entry.unfinished_tasks), (0, 0));
+        assert!(format_listing(&listed, SystemTime::now()).contains("not yours"));
+        // It can be deleted unseen.
+        assert!(find_for_deletion(&fx.home, &cloned, None).is_ok());
+
+        // Accepted: the user's own from now on, in the user's default mode
+        // and under a mark the folder's author could not know.
+        ws.adopt(&fx.home, Mode::Light).unwrap();
+        assert!(!ws.is_foreign(&fx.home));
+        let loaded = Workspace::load(&dir).unwrap();
+        loaded.ensure_own(&fx.home).unwrap();
+        assert_eq!(loaded.profile.mode, Mode::Light);
+        assert_ne!(
+            loaded.profile.id.as_deref(),
+            Some("00000000000000000000000000000000")
+        );
+        // The first workspace is still the user's.
+        assert!(!Workspace::load(&own.dir).unwrap().is_foreign(&fx.home));
+        // A global workspace is never in question.
+        let (global, _) = open(&fx, "acme", false);
+        assert!(!global.is_foreign(&fx.home) && global.profile.id.is_none());
+    }
+
+    #[test]
     fn local_workspace_lives_in_an_absolute_dot_meow() {
         let fx = fixture();
         let (ws, created) = open(&fx, "webapp", true);
         assert!(created && ws.local);
         assert_eq!(ws.dir, fx.cwd.join(".meow"));
         assert!(ws.dir.is_absolute());
-        assert!(!fx.home.root().exists(), "--local must not create ~/.meow");
+        // ~/.meow holds only the mark that says this workspace is the
+        // user's own, nothing of the workspace itself.
+        let mark = ws.profile.id.clone().unwrap();
+        assert_eq!(
+            fs::read_to_string(fx.home.local_record_path()).unwrap(),
+            format!("{mark}\n")
+        );
+        assert!(!fx.home.workspaces_dir().exists());
 
         // Reopening under another name relabels the same directory, but only
         // once the new session records itself (after taking the lock).

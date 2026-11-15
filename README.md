@@ -133,7 +133,7 @@ cargo test                   # the full test suite
 |---|---|
 | `meow list` | Lists every saved workspace (and `./.meow/` of the current directory): whether its session is running, mode, host count, unfinished tasks, last activity. `meow ls` and a bare `meow` do the same (on a brand-new install, bare `meow` opens the interactive Cat Setup GUI first); inside a session use `meow list`. |
 | `meow delete <name>` | Deletes a saved workspace and everything in it (command log, graph, notes, AI chats, report), after asking. `--yes` skips the question; `--local` deletes `./.meow/` of the current directory. Refused while a session is open on it. `meow rm` does the same. |
-| `meow <name>` | Creates or resumes `~/.meow/workspaces/<name>/` and starts the session shell. `--local` uses `./.meow/` instead. |
+| `meow <name>` | Creates or resumes `~/.meow/workspaces/<name>/` and starts the session shell. `--local` uses `./.meow/` instead. A `./.meow/` that was already in the folder when you got it (a cloned repository, an unpacked archive) is not yours: meow says what it carries and opens it only after you answer yes, then in your default mode; helper commands refuse it until then, and `meow delete --local` removes it. Links inside a workspace folder are refused, never followed. |
 | `meow mode <light\|mild\|aggressive>` | Switches the discovery profile. |
 | `meow recon <target> [-- <nmap flags>]` | Queues a four-stage inventory of a host or CIDR range. Runs in the background of the session, one tool at a time. |
 | `meow map` | Opens the live topology map in your browser. `--no-open` prints the URL. |

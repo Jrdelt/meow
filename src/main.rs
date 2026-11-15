@@ -54,7 +54,10 @@ fn main() -> ExitCode {
 fn print_listing(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCode> {
     let mut workspaces = list_workspaces(home, cwd)?;
     for workspace in &mut workspaces {
-        workspace.state = if env.workspace.as_deref() == Some(workspace.dir.as_path()) {
+        workspace.state = if workspace.state == SessionState::NotYours {
+            // Came with the folder: nothing in it is read or contacted.
+            SessionState::NotYours
+        } else if env.workspace.as_deref() == Some(workspace.dir.as_path()) {
             SessionState::Current
         } else if ipc::is_live(&workspace.dir) {
             SessionState::Running
@@ -233,6 +236,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
+    workspace.ensure_own(&home)?;
     match command {
         Command::List
         | Command::Delete { .. }
@@ -405,6 +409,9 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
     let config = Config::load_or_create(home)?;
     let (mut workspace, created) =
         Workspace::open_or_create(home, cwd, name, local, config.default_mode)?;
+    if workspace.is_foreign(home) {
+        accept_foreign_workspace(home, &mut workspace, config.default_mode)?;
+    }
     let _lock = SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
         LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
         LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
@@ -536,6 +543,72 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
 
 /// Background tasks left unfinished by an earlier session: ask whether to
 /// resume them. Without a terminal nothing is started unattended.
+/// A `./.meow` that was already in the folder, made by someone else: says
+/// what it would bring and opens it only on an explicit yes.
+fn accept_foreign_workspace(
+    home: &MeowHome,
+    workspace: &mut Workspace,
+    default_mode: Mode,
+) -> Result<()> {
+    let size = |name: &str| {
+        std::fs::symlink_metadata(workspace.dir.join(name))
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+    };
+    println!(
+        "[!] {} is a meow workspace you did not make on this machine: it came with this folder.",
+        workspace.dir.display()
+    );
+    println!(
+        "    Its own mode is {}{}; if you accept it, it opens in your default mode ({default_mode}).",
+        workspace.profile.mode,
+        if workspace.profile.recon.is_empty() {
+            ""
+        } else {
+            ", with its own scan settings"
+        }
+    );
+    for (file, what) in [
+        ("state.db", "queued scans and cached lookups"),
+        (
+            "graph.json",
+            "hosts, findings and verdicts someone else recorded",
+        ),
+        ("replay.sh", "a log of commands"),
+        ("last_cwd", "the directory its shell starts in"),
+    ] {
+        if let Some(bytes) = size(file) {
+            println!(
+                "    It carries {what} ({file}, {} KB).",
+                bytes.div_ceil(1024)
+            );
+        }
+    }
+    println!(
+        "    Queued scans would run against targets its author chose once you leave light mode,"
+    );
+    println!(
+        "    and its findings may be marked confirmed without anyone here having checked them."
+    );
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "Not opened: there is no terminal to ask on. Run this in a terminal to accept it, \
+             or remove it with `meow delete --local`"
+        );
+    }
+    print!("[?] Use it as your own? [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("cannot read the answer")?;
+    if !answer.trim().to_ascii_lowercase().starts_with('y') {
+        bail!("Not opened. `meow delete --local` removes it; a new one is made the next time");
+    }
+    workspace.adopt(home, default_mode)
+}
+
 fn offer_resume(state: &coordinator::State) -> Result<()> {
     let unfinished = queue::unfinished(&state.db_lock())?;
     if unfinished.is_empty() {
