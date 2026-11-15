@@ -58,10 +58,10 @@ Before every push:
 
 ## Current Handoff State
 
-- **Active Phase & Step:** `v0.1.0` release: Cat Setup GUI (`src/wizard.rs`), hardening (`ISS-001`..`ISS-011`), installers & GitHub/local sync complete; `meow tools` (recon checks and offers to install its tools).
+- **Active Phase & Step:** `v0.1.1` released (pkg/tar.gz/zip, `meow update`). 2026-11 security audit: 5 of 14 areas reviewed, their findings fixed (`ISS-017`..`ISS-031`, on the branch, not yet released).
 - **Last Verified Commit:** See `git log -n 1 --oneline`.
-- **In-Progress / Partial Work:** None (`359` tests passing).
-- **Next Exact Action:** Log any newly discovered issues in `issue/issues.md`.
+- **In-Progress / Partial Work:** None (`391` tests passing). Open: `ISS-032`, `ISS-033` (Windows only).
+- **Next Exact Action:** Audit the areas not yet reviewed (parsers, terminal, C filter, outbound requests, AI/vault, CI, modes, shell shims), then release `v0.1.2`.
 - **Blockers / Notes:**
   - Add a crate only in the step that first uses it. Terminal control via
     `ratatui::crossterm` only (the HUD may read crossterm events; the PTY
