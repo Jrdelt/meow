@@ -1064,3 +1064,92 @@ fn session_observer_ignores_shadow_tools_in_cwd_and_path() {
         "observer executed a shadow binary from CWD or PATH"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn the_map_opener_never_sees_the_session_token() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home()).unwrap();
+    std::fs::write(
+        sandbox.home().join("config.toml"),
+        "[cve]\nenabled = false\n",
+    )
+    .unwrap();
+    // A stand-in for the desktop's opener that records what it is given.
+    let opener_dir = sandbox.project().join("opener");
+    std::fs::create_dir_all(&opener_dir).unwrap();
+    for name in ["xdg-open", "open"] {
+        let path = opener_dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                opener_dir.join("args").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let script = r#"cat "$MEOW_WORKSPACE/runtime.json"; echo
+PATH="$OPENER_DIR:$PATH" "$MEOW_BIN" map
+sleep 0.3
+echo "opener-args: $(cat "$OPENER_DIR/args")"
+echo "opener-mode: $(stat -c %a "$MEOW_WORKSPACE/tmp/map.html" 2>/dev/null || stat -f %Lp "$MEOW_WORKSPACE/tmp/map.html")"
+echo "opener-page: $(tr '\n' ' ' < "$MEOW_WORKSPACE/tmp/map.html")"
+exit
+"#;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meow"))
+        .arg("acme")
+        .current_dir(sandbox.project())
+        .env("MEOW_HOME", sandbox.home())
+        .env("SHELL", "/bin/sh")
+        .env("MEOW_BIN", env!("CARGO_BIN_EXE_meow"))
+        .env("OPENER_DIR", &opener_dir)
+        .env_remove("MEOW_SESSION")
+        .env_remove("MEOW_WORKSPACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let text = stdout(&output);
+    assert!(output.status.success(), "{text}");
+    let token = text
+        .split("\"token\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("no token in runtime.json")
+        .to_owned();
+    assert_eq!(token.len(), 64);
+
+    // Program arguments are readable by every user on the machine: the
+    // opener is given a private file, not the URL with the token.
+    // The shell's prompt precedes each line of its output.
+    let after = |marker: &str| {
+        text.lines()
+            .filter(|line| !line.contains("$("))
+            .find_map(|line| line.split_once(marker).map(|(_, rest)| rest.trim()))
+            .unwrap_or_else(|| panic!("no {marker:?} in: {text}"))
+    };
+    let args = after("opener-args: ");
+    let page = sandbox.workspace("acme").join("tmp").join("map.html");
+    assert_eq!(Path::new(args), page.as_path(), "{text}");
+    assert!(!args.contains(&token) && !args.contains("token"), "{args}");
+    assert_eq!(after("opener-mode: "), "600", "{text}");
+    // The page behind it leads to the map.
+    let shown = after("opener-page: ");
+    assert!(shown.contains(&format!("/?token={token}")), "{shown}");
+    // It does not outlive the session.
+    assert!(!page.exists());
+}

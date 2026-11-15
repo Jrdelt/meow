@@ -87,8 +87,30 @@ pub fn map_url(port: u16, token: &str) -> String {
     format!("http://127.0.0.1:{port}/?token={token}")
 }
 
-/// Opens `url` in the default browser. Returns false if no opener could be
-/// started (headless machine, SSH session).
+/// The page `meow map` hands to the desktop's opener, in the workspace's
+/// `tmp` folder.
+pub const OPENER_FILE: &str = "map.html";
+
+/// A page that sends the browser on to `url`. The opener is given this
+/// file's path, never the URL: a program's arguments can be read by every
+/// user on the machine for as long as it runs, and the URL carries the
+/// session token. The file is as private as `runtime.json` beside it.
+pub fn opener_page(url: &str) -> String {
+    debug_assert!(url
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '?' | '=')));
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>meow map</title>\n\
+         <meta name=\"referrer\" content=\"no-referrer\">\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={url}\"></head>\n\
+         <body><p>Opening the meow map. If nothing happens, \
+         <a href=\"{url}\" rel=\"noreferrer\">open it here</a>.</p></body></html>\n"
+    )
+}
+
+/// Opens `url` (a URL, or the path of a page) in the default browser.
+/// Returns false if no opener could be started (headless machine, SSH
+/// session).
 pub fn open_in_browser(url: &str) -> bool {
     use std::process::{Command, Stdio};
     let mut command = if cfg!(target_os = "macos") {
@@ -136,6 +158,14 @@ mod tests {
             map_url(8765, &token),
             format!("http://127.0.0.1:8765/?token={token}")
         );
+        // The opener's page leads there and nowhere else.
+        let page = opener_page(&map_url(8765, &token));
+        assert_eq!(
+            page.matches(&format!("http://127.0.0.1:8765/?token={token}"))
+                .count(),
+            2
+        );
+        assert!(!page.contains("<script"));
     }
 
     #[test]

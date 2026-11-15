@@ -361,10 +361,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 );
             };
             let url = webui::map_url(info.port, &info.token);
-            if !no_open && webui::open_in_browser(&url) {
+            // The opener gets the path of a private page that leads to the
+            // map, never the URL: program arguments are visible to every
+            // user on the machine, and the URL holds the session token.
+            let page = workspace.tmp_dir().join(webui::OPENER_FILE);
+            let opened = !no_open
+                && meow::workspace::write_private_atomic(
+                    &page,
+                    webui::opener_page(&url).as_bytes(),
+                )
+                .is_ok()
+                && webui::open_in_browser(&page.to_string_lossy());
+            if opened {
                 println!(
                     "[+] Opened the topology map of '{}' in your browser (127.0.0.1:{})",
                     workspace.name, info.port
+                );
+                println!(
+                    "[+] No browser tab? `meow map --no-open` prints the address to open by hand."
                 );
             } else {
                 println!("[+] Open this URL in a browser on this machine (it contains the session token):");

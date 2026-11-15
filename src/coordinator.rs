@@ -97,6 +97,10 @@ struct RuntimeFile(PathBuf);
 impl Drop for RuntimeFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        // The page `meow map` gave the browser holds the same token.
+        if let Some(workspace) = self.0.parent() {
+            let _ = std::fs::remove_file(workspace.join("tmp").join(webui::OPENER_FILE));
+        }
     }
 }
 
