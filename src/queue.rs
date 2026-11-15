@@ -514,6 +514,13 @@ fn validate_flags_inner(
                     }
                     i += 2;
                     continue;
+                } else if !inline.starts_with(|c: char| c.is_ascii_digit()) {
+                    // nmap reads `-po`, `-pri` or `-pro` as shortened long
+                    // options (--port-ratio, --privileged, --proxies), not
+                    // as ports: the next value would become a scan target.
+                    bail!(
+                        "write the port list after a space: '-p {inline}' (attached to '-p' it must start with a digit)"
+                    );
                 } else if is_port_spec(inline) {
                     i += 1;
                     continue;
@@ -1851,6 +1858,7 @@ mod tests {
             &["-Pn", "-p", "22,80,443", "-T4", "--open"],
             &["-p-", "-sU", "--top-ports=100", "--max-retries", "2"],
             &["-p80-90", "-PS22,443", "-PA", "-n", "--reason"],
+            &["-p", "T:80,U:53", "-p", "http,ssh"],
             &[
                 "--min-rate",
                 "100",
@@ -1915,6 +1923,18 @@ mod tests {
             &["--top-ports=70000"],
             &["--exclude", "-iL"],
             &["-p", "80\n443"],
+            // nmap would read these as --port-ratio, --packet-trace,
+            // --privileged and --proxies, taking the next value with them.
+            &["-po", "-p", "2130706434"],
+            &["-po"],
+            &["-pa"],
+            &["-packet-trace"],
+            &["-pri"],
+            &["-privileged"],
+            &["-pro", "-p", "http"],
+            &["-proxies"],
+            &["-pT:80"],
+            &["-phttp"],
         ] {
             assert!(
                 validate_nmap_flags(&strings(blocked)).is_err(),
