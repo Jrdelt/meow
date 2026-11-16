@@ -1635,23 +1635,23 @@ impl Workspace {
     }
 }
 
+#[cfg(windows)]
 fn is_local_absolute_dir_path(dir: &Path) -> bool {
+    use std::path::{Component, Prefix};
     if !dir.is_absolute() {
         return false;
     }
-    #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        let mut comps = dir.components();
-        if !matches!(
-            (comps.next(), comps.next()),
-            (Some(Component::Prefix(p)), Some(Component::RootDir))
-                if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-        ) {
-            return false;
-        }
-    }
-    true
+    let mut comps = dir.components();
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Prefix(p)), Some(Component::RootDir))
+            if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    )
+}
+
+#[cfg(not(windows))]
+fn is_local_absolute_dir_path(dir: &Path) -> bool {
+    dir.is_absolute() && !dir.to_string_lossy().starts_with(r"\\")
 }
 
 fn dir_name(dir: &Path) -> String {

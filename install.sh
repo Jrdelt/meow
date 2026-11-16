@@ -268,12 +268,12 @@ fetch() {
     else
         # wget follows a redirect to http:// even with --https-only, so it
         # follows none; bound the stream to max_dl bytes while checking status.
-        wget_err=$(
-            { wget --https-only --max-redirect=0 -q -O - "$1" || echo $? >&3; } \
-                | head -c "$((max_dl + 1))" >"$2"
-        ) 3>&1
-        if [ -n "$wget_err" ]; then
-            rm -f "$2"
+        wget_rc="$2.rc"
+        rm -f "$wget_rc"
+        { wget --https-only --max-redirect=0 -q -O - "$1" || echo $? >"$wget_rc"; } \
+            | head -c "$((max_dl + 1))" >"$2"
+        if [ -f "$wget_rc" ]; then
+            rm -f "$2" "$wget_rc"
             return 1
         fi
         actual_dl=$(wc -c <"$2" | tr -d ' ')
