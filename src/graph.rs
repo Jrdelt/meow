@@ -158,6 +158,10 @@ pub struct Port {
     pub paths: PathNode,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// How sure the source was that said what this port is (service,
+    /// product, version). A less sure one does not replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identified: Option<Confidence>,
 }
 
 impl Port {
@@ -200,41 +204,67 @@ impl Port {
         label
     }
 
-    fn absorb(&mut self, other: Port) {
+    /// Takes over what `other` knows. Returns whether anything changed.
+    ///
+    /// What a port is (service, product, version) is replaced only by a
+    /// source at least as sure as the one that said it: a line of text in
+    /// the terminal does not rewrite what a scanner's probe recorded.
+    fn absorb(&mut self, other: Port) -> bool {
+        let mut changed = false;
         // "open" is never downgraded by a weaker observation.
-        if !other.state.is_empty() && (other.is_open() || !self.is_open()) {
+        if !other.state.is_empty()
+            && (other.is_open() || !self.is_open())
+            && self.state != other.state
+        {
             self.state = other.state;
+            changed = true;
         }
-        for (mine, theirs) in [
-            (&mut self.service, other.service),
-            (&mut self.product, other.product),
-            (&mut self.version, other.version),
-            (&mut self.extra_info, other.extra_info),
-        ] {
-            if theirs.is_some() {
-                *mine = theirs;
+        let names_it = [
+            &other.service,
+            &other.product,
+            &other.version,
+            &other.extra_info,
+        ]
+        .iter()
+        .any(|field| field.is_some());
+        if names_it && other.identified >= self.identified {
+            for (mine, theirs) in [
+                (&mut self.service, other.service),
+                (&mut self.product, other.product),
+                (&mut self.version, other.version),
+                (&mut self.extra_info, other.extra_info),
+            ] {
+                if theirs.is_some() && *mine != theirs {
+                    *mine = theirs;
+                    changed = true;
+                }
             }
+            self.identified = other.identified;
         }
         for cpe in other.cpes {
             if self.cpes.len() >= MAX_CPES_PER_PORT {
                 break;
             }
-            self.cpes.insert(cpe);
+            changed |= self.cpes.insert(cpe);
         }
         for san in other.tls_sans {
             if self.tls_sans.len() >= MAX_TLS_SANS_PER_PORT {
                 break;
             }
-            self.tls_sans.insert(san);
+            changed |= self.tls_sans.insert(san);
         }
-        if other.http.is_some() {
+        if other.http.is_some() && self.http != other.http {
             self.http = other.http;
+            changed = true;
         }
-        let mut budget = MAX_PATH_NODES.saturating_sub(self.paths.count());
+        let before = self.paths.count();
+        let mut budget = MAX_PATH_NODES.saturating_sub(before);
         merge_paths(&mut self.paths, other.paths, &mut budget);
+        changed |= self.paths.count() != before;
         for fact in other.facts {
-            push_fact(&mut self.facts, fact);
+            changed |= push_fact(&mut self.facts, fact);
         }
+        changed
     }
 }
 
@@ -572,6 +602,8 @@ pub struct Graph {
 struct Tally {
     weight: usize,
     full: bool,
+    /// Set when the observation being applied made a new host or port.
+    created: bool,
 }
 
 impl PartialEq for Tally {
@@ -777,6 +809,17 @@ fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
     true
 }
 
+/// What an advisory adds to `graph.json`, counted like an observation.
+fn advisory_weight(advisory: &Advisory) -> usize {
+    let references: usize = advisory.references.iter().map(String::len).sum();
+    2 * (advisory.id.len()
+        + advisory.title.len()
+        + advisory.matched.len()
+        + advisory.record.evidence.len()
+        + references)
+        + 2 * ITEM_OVERHEAD
+}
+
 impl Observation {
     /// An upper estimate of what recording this adds to `graph.json`: its
     /// text (escaped it is at most twice as long) and the structure around
@@ -932,7 +975,8 @@ impl Graph {
             graph.cleaned = gone;
         }
         graph.version = GRAPH_VERSION;
-        graph.tally.weight = graph.measure();
+        // At least what the file itself weighed: that is known exactly.
+        graph.tally.weight = graph.measure().max(text.len());
         Ok(graph)
     }
 
@@ -953,6 +997,9 @@ impl Graph {
                 })
                 .sum()
         }
+        fn names<'a>(list: impl Iterator<Item = &'a String>) -> usize {
+            list.map(|name| 2 * name.len() + 8).sum()
+        }
         let hosts: usize = self
             .hosts
             .values()
@@ -960,9 +1007,27 @@ impl Graph {
                 let ports: usize = host
                     .ports
                     .values()
-                    .map(|port| ITEM_OVERHEAD + facts(&port.facts) + paths(&port.paths))
+                    .map(|port| {
+                        ITEM_OVERHEAD
+                            + facts(&port.facts)
+                            + paths(&port.paths)
+                            + names(port.tls_sans.iter())
+                            + names(port.cpes.iter())
+                    })
                     .sum();
-                ITEM_OVERHEAD + facts(&host.facts) + ports
+                let advisories: usize = host.advisories.iter().map(advisory_weight).sum();
+                let not_open: usize = host
+                    .not_open
+                    .values()
+                    .map(|group| ITEM_OVERHEAD + 2 * group.ports.len())
+                    .sum();
+                ITEM_OVERHEAD
+                    + 2 * host.address.len()
+                    + names(host.hostnames.iter())
+                    + facts(&host.facts)
+                    + ports
+                    + advisories
+                    + not_open
             })
             .sum();
         hosts + facts(&self.notes)
@@ -1055,7 +1120,9 @@ impl Graph {
                 port.facts = port_facts;
                 let pkey = port.key();
                 match ports.get_mut(&pkey) {
-                    Some(existing) => existing.absorb(port),
+                    Some(existing) => {
+                        existing.absorb(port);
+                    }
                     None => {
                         ports.insert(pkey, port);
                     }
@@ -1148,11 +1215,19 @@ impl Graph {
             .unwrap_or(key)
     }
 
+    /// The host at `address`, made if it is not there yet. A new host has
+    /// a weight like everything else the graph holds, and a graph that has
+    /// all the hosts it can keep says so.
     fn host_entry(&mut self, address: &str) -> Option<&mut Host> {
         let addr = HostAddr::parse(address)?;
         let key = self.resolve(&addr);
-        if !self.hosts.contains_key(&key) && self.hosts.len() >= MAX_HOSTS {
-            return None;
+        if !self.hosts.contains_key(&key) {
+            if self.hosts.len() >= MAX_HOSTS {
+                self.tally.full = true;
+                return None;
+            }
+            self.tally.weight += ITEM_OVERHEAD + 2 * key.len();
+            self.tally.created = true;
         }
         Some(self.hosts.entry(key.clone()).or_insert_with(|| Host {
             address: key,
@@ -1164,9 +1239,16 @@ impl Graph {
         let protocol = normalize_protocol(protocol)?;
         let pkey = port_key(number, &protocol);
         let host = self.host_entry(address)?;
-        if !host.ports.contains_key(&pkey) && host.ports.len() >= MAX_PORTS_PER_HOST {
+        let known = host.ports.contains_key(&pkey);
+        if !known && host.ports.len() >= MAX_PORTS_PER_HOST {
             return None;
         }
+        let key = host.address.clone();
+        if !known {
+            self.tally.weight += ITEM_OVERHEAD;
+            self.tally.created = true;
+        }
+        let host = self.hosts.get_mut(&key)?;
         Some(host.ports.entry(pkey).or_insert_with(|| Port {
             number,
             protocol,
@@ -1238,7 +1320,9 @@ impl Graph {
             }
             for (port_key, port) in named.ports {
                 match host.ports.get_mut(&port_key) {
-                    Some(existing) => existing.absorb(port),
+                    Some(existing) => {
+                        existing.absorb(port);
+                    }
                     None => {
                         if host.ports.len() < MAX_PORTS_PER_HOST {
                             host.ports.insert(port_key, port);
@@ -1272,7 +1356,10 @@ impl Graph {
             self.tally.full = true;
             return false;
         }
-        let changed = self.record(observation);
+        self.tally.created = false;
+        // A new host or port is a change too, whatever became of the rest:
+        // the session then saves it, and it has been weighed.
+        let changed = self.record(observation) | self.tally.created;
         if changed {
             self.tally.weight += weight;
         }
@@ -1349,7 +1436,6 @@ impl Graph {
                 let Some(entry) = self.port_entry(&address, port, &protocol) else {
                     return false;
                 };
-                let before = entry.clone();
                 let incoming = Port {
                     number: port,
                     protocol: entry.protocol.clone(),
@@ -1363,12 +1449,15 @@ impl Graph {
                         .map(|c| clean(c))
                         .filter(|c| !c.is_empty())
                         .collect(),
+                    identified: Some(record.confidence),
                     ..Port::default()
                 };
-                entry.absorb(incoming);
+                // What changed is asked of the update itself. Comparing the
+                // port before and after meant copying it, its whole path
+                // tree included, for every mention of it.
+                let changed = entry.absorb(incoming);
                 let claim = format!("{} {}", entry.label(), entry.state);
-                push_fact(&mut entry.facts, Fact { claim, record });
-                *entry != before
+                changed | push_fact(&mut entry.facts, Fact { claim, record })
             }
             Observation::TlsSan {
                 address,
@@ -1564,6 +1653,12 @@ impl Graph {
         let Some(advisory) = sanitize_advisory(advisory, true) else {
             return false;
         };
+        // Advisories count towards what the graph can hold like anything
+        // else: thousands of matches for one product do not go unweighed.
+        if self.tally.weight.saturating_add(advisory_weight(&advisory)) > MAX_GRAPH_WEIGHT {
+            self.tally.full = true;
+            return false;
+        }
         let Some(host) = self.host_entry(address) else {
             return false;
         };
@@ -1589,10 +1684,12 @@ impl Graph {
                 *existing != before
             }
             None => {
+                let weight = advisory_weight(&advisory);
                 if host.advisories.len() >= MAX_ADVISORIES_PER_HOST {
                     return false;
                 }
                 host.advisories.push(advisory);
+                self.tally.weight += weight;
                 true
             }
         }
@@ -1617,10 +1714,19 @@ impl Graph {
     /// Adds a host-level fact that did not come from a parser (for example
     /// a CISA KEV listing found during CVE grounding).
     pub fn add_host_fact(&mut self, address: &str, fact: Fact) -> bool {
-        match self.host_entry(address) {
+        let weight = 2 * (fact.claim.len() + fact.record.evidence.len()) + ITEM_OVERHEAD;
+        if self.tally.weight.saturating_add(weight) > MAX_GRAPH_WEIGHT {
+            self.tally.full = true;
+            return false;
+        }
+        let added = match self.host_entry(address) {
             Some(host) => push_fact(&mut host.facts, fact),
             None => false,
+        };
+        if added {
+            self.tally.weight += weight;
         }
+        added
     }
 
     /// Operator verdict on an advisory (`Confirmed`, `FalsePositive`, or
@@ -1979,6 +2085,14 @@ mod tests {
             Source::PtyRegex,
             Confidence::Medium
         )));
+        // The second claimant becomes a host (that is a change), without
+        // the name.
+        assert!(graph.apply(hostname(
+            "10.0.0.66",
+            "app.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
         assert!(!graph.apply(hostname(
             "10.0.0.66",
             "app.lab.local",
@@ -2088,6 +2202,206 @@ mod tests {
         assert!(graph
             .set_advisory_status("10.0.0.5", "CVE-0000-0000", VerificationStatus::Confirmed)
             .is_err());
+    }
+
+    #[test]
+    fn hosts_and_ports_made_by_a_mention_are_weighed_and_saved() {
+        // A bare address of a site: `http://h1.x:8001/`. It records no
+        // path, and used to count as "nothing changed" and weigh nothing.
+        let root = |host: usize, port: u16| Observation::Path {
+            address: format!("h{host}.x"),
+            port,
+            scheme: "http".into(),
+            path: "/".into(),
+            status: None,
+            record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Low, &"x".repeat(60)),
+        };
+        let mut graph = Graph::default();
+        let before = graph.tally.weight;
+        assert!(
+            graph.apply(root(1, 8001)),
+            "a new host and port is a change"
+        );
+        let first = graph.tally.weight - before;
+        assert!(first >= 2 * ITEM_OVERHEAD, "both were weighed: {first}");
+        assert!(!graph.apply(root(1, 8001)), "said again, nothing changes");
+        assert_eq!(graph.tally.weight - before, first);
+        assert!(graph.apply(root(1, 8002)), "a new port");
+
+        // 400 names times 1,000 ports of such mentions: the graph says it
+        // is full before it holds more than a file can, and still saves.
+        let mut graph = Graph::default();
+        'flood: for host in 0..400 {
+            for port in 1..=1000u16 {
+                graph.apply(root(host, port));
+                if graph.is_full() {
+                    break 'flood;
+                }
+            }
+        }
+        assert!(graph.is_full(), "the budget saw the flood coming");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.save(&file).expect("what was recorded can be written");
+        let loaded = Graph::load(&file).unwrap();
+        assert_eq!(loaded.hosts.len(), graph.hosts.len());
+        // Loaded, it weighs at least what the file does.
+        assert!(loaded.tally.weight >= std::fs::metadata(&file).unwrap().len() as usize);
+    }
+
+    #[test]
+    fn a_full_host_list_says_so_and_advisories_have_a_weight() {
+        let mut graph = Graph::default();
+        for host in 0..MAX_HOSTS {
+            graph.apply(Observation::Host {
+                address: format!("h{host}.x"),
+                os: None,
+                mac: None,
+                record: rec(Source::LogRegex),
+            });
+        }
+        assert_eq!(graph.hosts.len(), MAX_HOSTS);
+        assert!(!graph.is_full());
+        // One more is refused, and no longer in silence.
+        assert!(!graph.apply(port("10.0.0.5", 22, "ssh", None)));
+        assert!(graph.is_full());
+        assert!(!graph.hosts.contains_key("10.0.0.5"));
+
+        let mut graph = Graph::default();
+        graph.apply(port("10.0.0.5", 443, "https", None));
+        let before = graph.tally.weight;
+        assert!(graph.add_advisory("10.0.0.5", advisory("CVE-2021-23017")));
+        assert!(graph.tally.weight > before + ITEM_OVERHEAD);
+        // What is measured after loading counts them too.
+        assert!(graph.measure() >= graph.tally.weight - before);
+    }
+
+    #[test]
+    fn text_does_not_rewrite_what_a_probe_recorded() {
+        let observed = |source: Source, confidence: Confidence, product: &str, version: &str| {
+            Observation::Port {
+                address: "10.0.0.9".into(),
+                port: 22,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("ssh".into()),
+                product: Some(product.into()),
+                version: Some(version.into()),
+                extra_info: None,
+                cpes: vec![],
+                record: EvidenceRecord::observed(
+                    source,
+                    confidence,
+                    &format!("{product} {version}"),
+                ),
+            }
+        };
+        let mut graph = Graph::default();
+        graph.apply(observed(
+            Source::NmapXml,
+            Confidence::High,
+            "OpenSSH",
+            "8.2p1",
+        ));
+        // A banner shown in the terminal says otherwise.
+        assert!(graph.apply(observed(
+            Source::PtyRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "9.9p2"
+        )));
+        let port = &graph.hosts["10.0.0.9"].ports["22/tcp"];
+        assert_eq!(port.version.as_deref(), Some("8.2p1"), "the probe stands");
+        assert_eq!(port.identified, Some(Confidence::High));
+        // What the text said is still kept, as what it is.
+        assert_eq!(port.facts.len(), 2);
+        assert!(
+            port.facts[1].claim.contains("8.2p1")
+                || port.facts[1].record.evidence.contains("9.9p2")
+        );
+        // A new probe does update it.
+        graph.apply(observed(
+            Source::NmapXml,
+            Confidence::High,
+            "OpenSSH",
+            "9.6p1",
+        ));
+        assert_eq!(
+            graph.hosts["10.0.0.9"].ports["22/tcp"].version.as_deref(),
+            Some("9.6p1")
+        );
+        // Text about a port nothing has probed still names it.
+        let mut graph = Graph::default();
+        graph.apply(observed(
+            Source::PtyRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "9.9p2",
+        ));
+        graph.apply(observed(
+            Source::LogRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "9.9p3",
+        ));
+        assert_eq!(
+            graph.hosts["10.0.0.9"].ports["22/tcp"].version.as_deref(),
+            Some("9.9p3")
+        );
+        // And it survives saving and loading.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.apply(observed(
+            Source::NmapXml,
+            Confidence::High,
+            "OpenSSH",
+            "8.2p1",
+        ));
+        graph.save(&file).unwrap();
+        let mut loaded = Graph::load(&file).unwrap();
+        loaded.apply(observed(
+            Source::PtyRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "1.0",
+        ));
+        assert_eq!(
+            loaded.hosts["10.0.0.9"].ports["22/tcp"].version.as_deref(),
+            Some("8.2p1")
+        );
+    }
+
+    #[test]
+    fn many_mentions_of_a_port_with_many_paths_stay_quick() {
+        let mut graph = Graph::default();
+        for index in 0..4000 {
+            graph.apply(path(
+                "10.0.0.5",
+                81,
+                &format!("/a/{index}/{}", "p".repeat(40)),
+                200,
+            ));
+        }
+        let mention = || Observation::Port {
+            address: "10.0.0.5".into(),
+            port: 81,
+            protocol: "tcp".into(),
+            state: "unverified".into(),
+            service: None,
+            product: None,
+            version: None,
+            extra_info: None,
+            cpes: vec![],
+            record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Low, "10.0.0.5:81"),
+        };
+        let started = std::time::Instant::now();
+        let mut changed = 0;
+        for _ in 0..20_000 {
+            changed += usize::from(graph.apply(mention()));
+        }
+        // Copying and comparing the port each time took 6 ms a mention.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert!(changed <= 1, "a repeat changes nothing: {changed}");
     }
 
     #[test]

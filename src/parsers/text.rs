@@ -115,7 +115,14 @@ impl TextParser {
     pub fn feed(&mut self, line: &str) -> Vec<Observation> {
         let line = line.trim_end();
         let mut out = Vec::new();
-        if line.is_empty() || line.len() > MAX_LINE {
+        // An empty line ends a scan report and a block of headers: what
+        // comes after it is not about that host or that address any more.
+        if line.is_empty() {
+            self.scan_host = None;
+            self.web = None;
+            return out;
+        }
+        if line.len() > MAX_LINE {
             return out;
         }
 
@@ -196,6 +203,15 @@ impl TextParser {
                 record: EvidenceRecord::observed(Source::HttpHeader, Confidence::Medium, line),
             });
             return out;
+        }
+
+        // Headers follow their request directly, with at most a status line
+        // in between. Any other line ends them.
+        if !line
+            .trim_start_matches(['<', '>', ' '])
+            .starts_with("HTTP/")
+        {
+            self.web = None;
         }
 
         // URLs first; what remains of the line is searched for host:port.
@@ -363,6 +379,53 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
                 serde_json::to_value(VerificationStatus::Observed).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn a_report_or_a_block_of_headers_ends_where_its_text_ends() {
+        let about = |text: &str| -> Vec<String> {
+            TextParser::parse(Source::PtyRegex, text)
+                .iter()
+                .filter_map(|o| match o {
+                    Observation::Port { address, port, .. } => Some(format!("{address}:{port}")),
+                    Observation::Http {
+                        address,
+                        port,
+                        server,
+                        location,
+                        ..
+                    } => Some(format!(
+                        "{address}:{port} {}",
+                        server.as_deref().or(location.as_deref()).unwrap_or("")
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        // A scan report as nmap prints it: the rows belong to its host.
+        assert_eq!(
+            about("Nmap scan report for 10.0.0.5\nHost is up.\nPORT STATE SERVICE\n22/tcp open ssh\n80/tcp open http\n"),
+            ["10.0.0.5:22", "10.0.0.5:80"]
+        );
+        // After the empty line that ends it, a stray row is nobody's.
+        assert_eq!(
+            about("Nmap scan report for 10.0.0.5\n22/tcp open ssh\n\nlater, in a web page:\n8443/tcp open https nginx 1.14.0\n"),
+            ["10.0.0.5:22"]
+        );
+        // Headers of a request, with its status line, belong to its address.
+        assert_eq!(
+            about("$ curl -I http://10.0.0.5:8080/\nHTTP/1.1 302 Found\nServer: nginx\nLocation: /login\n"),
+            ["10.0.0.5:8080 nginx", "10.0.0.5:8080 /login"]
+        );
+        // Not after other text, and not after an empty line.
+        assert_eq!(
+            about("see http://10.0.0.5:8080/ for details\nsome prose in between\nServer: forged\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            about("GET http://10.0.0.5:8080/\n\nServer: forged\n"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
