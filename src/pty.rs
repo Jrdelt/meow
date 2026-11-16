@@ -59,7 +59,9 @@ pub struct SessionOutcome {
 /// the platform default.
 pub fn resolve_shell(configured: Option<&str>, env_shell: Option<&str>) -> String {
     fn non_empty(value: Option<&str>) -> Option<&str> {
-        value.map(str::trim).filter(|s| !s.is_empty())
+        value
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
     }
     if let Some(shell) = non_empty(configured) {
         return shell.to_owned();
@@ -223,11 +225,28 @@ fn sync_size(master: &SharedMaster) {
 // ---------------------------------------------------------------------------
 
 /// PTY -> display, plus a best-effort copy to the tap. Returns at EOF.
+#[cfg(test)]
 fn pump_output(
-    mut pty: impl Read,
-    mut display: impl Write,
+    pty: impl Read,
+    display: impl Write,
     tap: &SyncSender<Vec<u8>>,
     dropped: &AtomicU64,
+) {
+    pump_output_while(
+        pty,
+        display,
+        Some(tap.clone()),
+        dropped,
+        &AtomicBool::new(true),
+    );
+}
+
+fn pump_output_while(
+    mut pty: impl Read,
+    mut display: impl Write,
+    mut tap: Option<SyncSender<Vec<u8>>>,
+    dropped: &AtomicU64,
+    active: &AtomicBool,
 ) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
@@ -241,8 +260,16 @@ fn pump_output(
         // Display first and unconditionally; a closed stdout must not stop
         // the shell from being drained.
         let _ = display.write_all(chunk).and_then(|()| display.flush());
-        if let Err(TrySendError::Full(_)) = tap.try_send(chunk.to_vec()) {
-            dropped.fetch_add(1, Ordering::Relaxed);
+        if !active.load(Ordering::Acquire) {
+            // Once the session has closed past DRAIN_GRACE, drop the tap
+            // sender so stray background-job bytes never reach the sink.
+            tap = None;
+            continue;
+        }
+        if let Some(sender) = &tap {
+            if let Err(TrySendError::Full(_)) = sender.try_send(chunk.to_vec()) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -271,19 +298,19 @@ fn pump_input(mut input: impl Read, pty: &mut dyn Write) {
 /// Ctrl-D as end-of-input while it is waiting at an empty prompt, so an EOF
 /// sent during startup or while a command runs is lost.
 fn signal_end_of_input(pty: &mut dyn Write, session_over: &AtomicBool) {
-    const END_OF_LINE_THEN_EOF: &[u8] = b"\n\x04";
+    const CLEAR_LINE_THEN_EOF: &[u8] = b"\x15\x04";
     const EOF: &[u8] = b"\x04";
     const RETRY: Duration = Duration::from_millis(250);
 
     if !cfg!(unix) {
         return; // dropping the writer closes the ConPTY input pipe
     }
-    let mut bytes = END_OF_LINE_THEN_EOF;
+    let mut bytes = EOF;
     while !session_over.load(Ordering::Relaxed) {
         if pty.write_all(bytes).and_then(|()| pty.flush()).is_err() {
             break;
         }
-        bytes = EOF;
+        bytes = CLEAR_LINE_THEN_EOF;
         thread::sleep(RETRY);
     }
 }
@@ -406,10 +433,12 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
         command.env(key, value);
     }
 
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .with_context(|| format!("cannot start the shell '{}'", spec.program))?;
+    let mut child = pair.slave.spawn_command(command).with_context(|| {
+        format!(
+            "cannot start the shell '{}'",
+            crate::evidence::sanitize(&spec.program, 200)
+        )
+    })?;
     drop(pair.slave); // only the shell keeps the slave side open
 
     let io_setup = pair
@@ -441,8 +470,31 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
     let dropped = Arc::new(AtomicU64::new(0));
     let (drained_tx, drained_rx) = mpsc::channel::<()>();
     let output_dropped = Arc::clone(&dropped);
+    let display_open = Arc::new(AtomicBool::new(true));
+    let pump_display_open = Arc::clone(&display_open);
+    struct GatedStdout(Arc<AtomicBool>);
+    impl Write for GatedStdout {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.0.load(Ordering::Acquire) {
+                return Ok(buf.len());
+            }
+            io::stdout().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if !self.0.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            io::stdout().flush()
+        }
+    }
     thread::spawn(move || {
-        pump_output(reader, io::stdout(), &tap_tx, &output_dropped);
+        pump_output_while(
+            reader,
+            GatedStdout(Arc::clone(&pump_display_open)),
+            Some(tap_tx),
+            &output_dropped,
+            &pump_display_open,
+        );
         let _ = drained_tx.send(());
     });
     // Blocks in `read` on stdin; if the session ends first, the thread ends
@@ -461,6 +513,7 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
     // The shell is gone. Give the output pump a moment to reach EOF; a
     // background job that still holds the PTY must not keep the session open.
     let drained = drained_rx.recv_timeout(DRAIN_GRACE).is_ok();
+    display_open.store(false, Ordering::Release);
     drop(watcher);
     drop(guard);
 
@@ -497,6 +550,11 @@ mod tests {
         );
         assert_eq!(
             resolve_shell(Some("  "), Some("")),
+            resolve_shell(None, None)
+        );
+        // Control characters (NUL, LF, ESC) in configured or env shells are rejected.
+        assert_eq!(
+            resolve_shell(Some("/bin/zsh\0bad"), Some("/bin/bash\x1b[2J")),
             resolve_shell(None, None)
         );
         #[cfg(unix)]
@@ -621,6 +679,26 @@ mod tests {
         signal_end_of_input(&mut pty, &over);
         watcher.join().unwrap();
         #[cfg(unix)]
-        assert!(received.lock().unwrap().starts_with(b"\n\x04\x04\x04"));
+        assert!(received.lock().unwrap().starts_with(b"\x04\x15\x04"));
+    }
+
+    #[test]
+    fn post_session_output_is_drained_without_feeding_tap() {
+        let (tx, rx) = mpsc::sync_channel(TAP_QUEUE);
+        let (sink, lines) = collecting_sink();
+        let worker = spawn_tap_worker(rx, sink);
+        let dropped = AtomicU64::new(0);
+        let active = AtomicBool::new(false);
+        let mut display = Vec::new();
+        pump_output_while(
+            Cursor::new(b"stray background line\r\n".to_vec()),
+            &mut display,
+            Some(tx),
+            &dropped,
+            &active,
+        );
+        let stats = worker.join().unwrap();
+        assert_eq!(stats.lines_emitted, 0);
+        assert!(lines.lock().unwrap().is_empty());
     }
 }

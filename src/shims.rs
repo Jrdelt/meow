@@ -21,7 +21,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::workspace::{create_private_dir, private_open_options, write_private_atomic, Workspace};
+use crate::workspace::{
+    create_private_subdir, private_open_options, write_private_atomic, Workspace,
+};
 
 const REPLAY_HEADER: &str = "\
 # meow replay log. One entry per command:
@@ -33,12 +35,15 @@ const REPLAY_HEADER: &str = "\
 /// Shared by bash and zsh: re-read the mode from `profile.toml`.
 const SH_REFRESH_MODE: &str = r##"_meow_refresh_mode() {
   local line
-  [[ -r $_meow_profile ]] || return 0
+  [[ -f $_meow_profile && ! -L $_meow_profile ]] || return 0
   while IFS= read -r line; do
     case $line in
       'mode = "'*'"')
         line=${line#'mode = "'}
-        export MEOW_MODE=${line%'"'}
+        line=${line%'"'}
+        case $line in
+          light | mild | aggressive) export MEOW_MODE=$line ;;
+        esac
         ;;
     esac
   done < "$_meow_profile"
@@ -87,11 +92,12 @@ typeset -g _meow_pending=
 @RATE_WARNING@
 # Stage 1: before the command runs.
 _meow_preexec() {
-  local cmd=${1:-$3}
+  local cmd=${1-}
+  [[ -n $cmd ]] || cmd=${3-}
   _meow_pending=1
   _meow_rate_warning "$cmd"
-  {
-    print -r -- "# [CWD] $PWD"
+  [[ ! -L $_meow_replay ]] && {
+    print -r -- "# [CWD] ${PWD//[$'\r\n']/ }"
     if [[ -z $cmd ]] || [[ -o hist_ignore_space && $cmd == ' '* ]]; then
       print -r -- '# [UNRECORDED] command kept out of the shell history'
     else
@@ -103,11 +109,14 @@ _meow_preexec() {
 # Stage 2: after it has finished, before the next prompt.
 _meow_precmd() {
   local code=$?
+  if [[ ${precmd_functions[1]-} != _meow_precmd ]]; then
+    precmd_functions=(_meow_precmd ${precmd_functions[@]:+${precmd_functions[@]:#_meow_precmd}})
+  fi
   if [[ -n $_meow_pending ]]; then
     _meow_pending=
-    print -r -- "# [EXIT] $code" 2>/dev/null >> "$_meow_replay"
+    [[ ! -L $_meow_replay ]] && print -r -- "# [EXIT] $code" 2>/dev/null >> "$_meow_replay"
   fi
-  print -r -- "$PWD" 2>/dev/null >| "$_meow_last_cwd"
+  [[ $PWD == *[$'\r\n']* || -L $_meow_last_cwd ]] || print -r -- "$PWD" 2>/dev/null >| "$_meow_last_cwd"
   _meow_refresh_mode
   return $code
 }
@@ -116,7 +125,7 @@ autoload -Uz add-zsh-hook
 add-zsh-hook preexec _meow_preexec
 add-zsh-hook precmd _meow_precmd
 # Run first so $? is still the command's own exit code.
-precmd_functions=(_meow_precmd ${precmd_functions:#_meow_precmd})
+precmd_functions=(_meow_precmd ${precmd_functions[@]:+${precmd_functions[@]:#_meow_precmd}})
 "##;
 
 const BASH_RC: &str = r##"# meow session shim (generated, rewritten at every session start).
@@ -138,15 +147,20 @@ _meow_cwd=$PWD
 
 @REFRESH_MODE@
 @RATE_WARNING@
-# Sets _meow_h_num / _meow_h_cmd from the newest history entry.
+# Sets _meow_h_num / _meow_h_cmd from the newest history entry without
+# touching BASH_REMATCH.
 _meow_history_last() {
-  local entry re='^[[:space:]]*([0-9]+)[* ] (.*)$'
+  local entry trimmed rest
   _meow_h_num= _meow_h_cmd=
   entry=$(HISTTIMEFORMAT='' builtin history 1 2>/dev/null)
-  if [[ $entry =~ $re ]]; then
-    _meow_h_num=${BASH_REMATCH[1]}
-    _meow_h_cmd=${BASH_REMATCH[2]}
-  fi
+  trimmed=${entry#"${entry%%[![:space:]]*}"}
+  _meow_h_num=${trimmed%%[!0-9]*}
+  [[ -n $_meow_h_num ]] || return 0
+  rest=${trimmed#"$_meow_h_num"}
+  case $rest in
+    '* '* | '  '*) _meow_h_cmd=${rest#??} ;;
+    *) _meow_h_num= ;;
+  esac
 }
 
 # A command line is identified by a new history number, so duplicates must
@@ -169,25 +183,25 @@ _meow_fix_histcontrol() {
 _meow_preexec() {
   _meow_history_last
   _meow_rate_warning "$_meow_h_cmd"
-  {
-    printf '# [CWD] %s\n' "$PWD"
+  [[ ! -L $_meow_replay ]] && {
+    printf '# [CWD] %s\n' "${PWD//[$'\r\n']/ }"
     if [[ -n $_meow_h_num && $_meow_h_num != "$_meow_histnum" ]]; then
       printf '%s\n' "$_meow_h_cmd"
     else
       printf '%s\n' '# [UNRECORDED] command kept out of the shell history'
     fi
   } 2>/dev/null >> "$_meow_replay"
-  printf '1\n' 2>/dev/null >| "$_meow_pending"
+  [[ ! -L $_meow_pending ]] && printf '1\n' 2>/dev/null >| "$_meow_pending"
 }
 
 # Stage 2: runs from PROMPT_COMMAND after the command has finished.
 _meow_precmd() {
   local code=$?
-  if [[ -s $_meow_pending ]]; then
-    printf '# [EXIT] %s\n' "$code" 2>/dev/null >> "$_meow_replay"
+  if [[ -f $_meow_pending && ! -L $_meow_pending && -s $_meow_pending ]]; then
+    [[ ! -L $_meow_replay ]] && printf '# [EXIT] %s\n' "$code" 2>/dev/null >> "$_meow_replay"
     : 2>/dev/null >| "$_meow_pending"
   fi
-  printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
+  [[ $PWD == *[$'\r\n']* || -L $_meow_last_cwd ]] || printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
   _meow_refresh_mode
   _meow_history_last
   _meow_histnum=$_meow_h_num
@@ -200,8 +214,8 @@ _meow_precmd_legacy() {
   local code=$?
   _meow_history_last
   if [[ -n $_meow_ready && -n $_meow_h_num && $_meow_h_num != "$_meow_histnum" ]]; then
-    {
-      printf '# [CWD] %s\n' "$_meow_cwd"
+    [[ ! -L $_meow_replay ]] && {
+      printf '# [CWD] %s\n' "${_meow_cwd//[$'\r\n']/ }"
       printf '%s\n' "$_meow_h_cmd"
       printf '# [EXIT] %s\n' "$code"
     } 2>/dev/null >> "$_meow_replay"
@@ -209,7 +223,7 @@ _meow_precmd_legacy() {
   _meow_ready=1
   _meow_histnum=$_meow_h_num
   _meow_cwd=$PWD
-  printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
+  [[ $PWD == *[$'\r\n']* || -L $_meow_last_cwd ]] || printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
   _meow_refresh_mode
   return $code
 }
@@ -238,6 +252,8 @@ $global:__meow = @{
     LastCwd = @LAST_CWD@
     Profile = @PROFILE@
     LastId  = 0
+    LastErr = $(if ($global:Error.Count -gt 0) { $global:Error[0] } else { $null })
+    Utf8    = (New-Object System.Text.UTF8Encoding $false)
     Cwd     = (Get-Location).ProviderPath
     Prompt  = $function:prompt
 }
@@ -249,20 +265,52 @@ function global:prompt {
     $ok = $?
     $code = $global:LASTEXITCODE
     try {
+        $isSafeTarget = {
+            param([string]$p)
+            if ([System.IO.File]::Exists($p) -or [System.IO.Directory]::Exists($p)) {
+                $attr = [System.IO.File]::GetAttributes($p)
+                return -not ($attr -band [System.IO.FileAttributes]::ReparsePoint) -and -not ($attr -band [System.IO.FileAttributes]::Directory)
+            }
+            return $true
+        }
+        $errTop = if ($global:Error.Count -gt 0) { $global:Error[0] } else { $null }
+        $newErr = $errTop -and -not [object]::ReferenceEquals($errTop, $global:__meow.LastErr)
+        $global:__meow.LastErr = $errTop
         $last = Get-History -Count 1
         if ($last -and $last.Id -ne $global:__meow.LastId) {
             $global:__meow.LastId = $last.Id
-            $exit = if ($ok) { 0 } elseif ($code) { $code } else { 1 }
-            $entry = "# [CWD] $($global:__meow.Cwd)`n$($last.CommandLine)`n# [EXIT] $exit`n"
-            [System.IO.File]::AppendAllText($global:__meow.Replay, $entry)
+            $exit = if ($ok) {
+                0
+            } elseif ($newErr -and $errTop.FullyQualifiedErrorId -ne 'NativeCommandError') {
+                1
+            } elseif ($code) {
+                $code
+            } else {
+                1
+            }
+            $cleanCwd = ($global:__meow.Cwd -replace "[\r\n]+", " ")
+            $recordedCmd = if ($last.CommandLine -match '^\s') {
+                '# [UNRECORDED] command kept out of the shell history'
+            } else {
+                $last.CommandLine
+            }
+            $entry = "# [CWD] $cleanCwd`n$recordedCmd`n# [EXIT] $exit`n"
+            if (& $isSafeTarget $global:__meow.Replay) {
+                [System.IO.File]::AppendAllText($global:__meow.Replay, $entry, $global:__meow.Utf8)
+            }
         }
         $location = Get-Location
         if ($location.Provider.Name -eq 'FileSystem') {
             $global:__meow.Cwd = $location.ProviderPath
-            [System.IO.File]::WriteAllText($global:__meow.LastCwd, "$($location.ProviderPath)`n")
+            if ($location.ProviderPath -notmatch "[\r\n]" -and (& $isSafeTarget $global:__meow.LastCwd)) {
+                [System.IO.File]::WriteAllText($global:__meow.LastCwd, "$($location.ProviderPath)`n", $global:__meow.Utf8)
+            }
         }
-        foreach ($line in [System.IO.File]::ReadAllLines($global:__meow.Profile)) {
-            if ($line -match '^mode = "(.+)"$') { $env:MEOW_MODE = $Matches[1] }
+        $profInfo = New-Object System.IO.FileInfo($global:__meow.Profile)
+        if ($profInfo.Exists -and -not ($profInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and $profInfo.Length -le 65536) {
+            foreach ($line in [System.IO.File]::ReadAllLines($global:__meow.Profile, $global:__meow.Utf8)) {
+                if ($line -match '^mode = "(light|mild|aggressive)"$') { $env:MEOW_MODE = $Matches[1] }
+            }
         }
     } catch { }
     $global:LASTEXITCODE = $code
@@ -327,16 +375,48 @@ fn utf8(path: &Path) -> Result<&str> {
 }
 
 fn ensure_replay_log(path: &Path) -> Result<()> {
-    match private_open_options()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => file
-            .write_all(REPLAY_HEADER.as_bytes())
-            .with_context(|| format!("cannot write {}", path.display())),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("cannot create {}", path.display())),
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "{} is a symbolic link; refusing to write replay log",
+                    path.display()
+                );
+            }
+            if !meta.is_file() {
+                anyhow::bail!(
+                    "{} is not a regular file; refusing to write replay log",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if meta.nlink() > 1 {
+                    anyhow::bail!(
+                        "{} has multiple hard links; refusing to write replay log",
+                        path.display()
+                    );
+                }
+                let file = private_open_options()
+                    .write(true)
+                    .open(path)
+                    .with_context(|| format!("cannot open {}", path.display()))?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("cannot set permissions on {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut file = private_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .with_context(|| format!("cannot create {}", path.display()))?;
+            file.write_all(REPLAY_HEADER.as_bytes())
+                .with_context(|| format!("cannot write {}", path.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("cannot inspect {}", path.display())),
     }
 }
 
@@ -358,7 +438,8 @@ pub fn prepare(
     }
 
     let dir = workspace.tmp_dir().join("shell");
-    create_private_dir(&dir)?;
+    create_private_subdir(&workspace.tmp_dir())?;
+    create_private_subdir(&dir)?;
     ensure_replay_log(&workspace.replay_path())?;
 
     let quote: fn(&str) -> String = match kind {
@@ -410,10 +491,16 @@ pub fn prepare(
             launch.args = vec!["--rcfile".to_owned(), utf8(&dir.join("bashrc"))?.to_owned()];
         }
         ShellKind::PowerShell => {
-            write("init.ps1", POWERSHELL_INIT)?;
+            // Windows PowerShell 5.1 parses BOM-less .ps1 files in the legacy
+            // ANSI codepage; prepending a UTF-8 BOM preserves non-ASCII paths.
+            let mut content = vec![0xEF, 0xBB, 0xBF];
+            content.extend_from_slice(fill(POWERSHELL_INIT)?.as_bytes());
+            write_private_atomic(&dir.join("init.ps1"), &content)?;
             launch.args = vec![
                 "-NoLogo".to_owned(),
                 "-NoExit".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
                 "-File".to_owned(),
                 utf8(&dir.join("init.ps1"))?.to_owned(),
             ];
@@ -570,11 +657,25 @@ mod tests {
         let init = ws.tmp_dir().join("shell").join("init.ps1");
         assert_eq!(
             launch.args,
-            ["-NoLogo", "-NoExit", "-File", init.to_str().unwrap()]
+            [
+                "-NoLogo",
+                "-NoExit",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                init.to_str().unwrap()
+            ]
+        );
+        let bytes = fs::read(&init).unwrap();
+        assert_eq!(
+            &bytes[..3],
+            b"\xEF\xBB\xBF",
+            "init.ps1 must carry UTF-8 BOM"
         );
         let script = read(&init);
         assert!(script.contains("function global:prompt"));
         assert!(script.contains("$global:LASTEXITCODE"));
+        assert!(script.contains("ReferenceEquals"));
         assert!(script.contains("it''s home"), "{script}");
         assert_filled(&script);
     }
@@ -607,5 +708,43 @@ mod tests {
             assert_eq!(mode(&path), 0o600, "{}", path.display());
         }
         assert_eq!(mode(&ws.replay_path()), 0o600);
+    }
+
+    #[test]
+    fn replay_log_refuses_symlinks_and_hooks_guard_mode_and_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = workspace(&tmp);
+        prepare(&ws, "bash", None).unwrap();
+        let bash_hooks = read(ws.tmp_dir().join("shell").join("hooks.bash"));
+        assert!(bash_hooks.contains("[[ -f $_meow_profile && ! -L $_meow_profile ]]"));
+        assert!(bash_hooks.contains("light | mild | aggressive) export MEOW_MODE=$line"));
+        assert!(bash_hooks.contains("[[ ! -L $_meow_replay ]]"));
+
+        prepare(&ws, "pwsh.exe", None).unwrap();
+        let ps_init = read(ws.tmp_dir().join("shell").join("init.ps1"));
+        assert!(ps_init.contains("ReparsePoint"));
+        assert!(ps_init.contains(r#"^mode = "(light|mild|aggressive)"$"#));
+        assert!(ps_init.contains("# [UNRECORDED] command kept out of the shell history"));
+
+        #[cfg(unix)]
+        {
+            let target = tmp.path().join("outside-replay.sh");
+            fs::write(&target, "secret").unwrap();
+            fs::remove_file(ws.replay_path()).unwrap();
+            std::os::unix::fs::symlink(&target, ws.replay_path()).unwrap();
+            let err = prepare(&ws, "bash", None).unwrap_err();
+            assert!(
+                err.to_string().contains("symbolic link"),
+                "expected symlink refusal, got: {err:#}"
+            );
+
+            fs::remove_file(ws.replay_path()).unwrap();
+            fs::hard_link(&target, ws.replay_path()).unwrap();
+            let err = prepare(&ws, "bash", None).unwrap_err();
+            assert!(
+                err.to_string().contains("hard links"),
+                "expected hardlink refusal, got: {err:#}"
+            );
+        }
     }
 }

@@ -18,6 +18,7 @@ pub mod location;
 pub mod lock;
 pub mod mode;
 pub mod observer;
+pub mod osint;
 pub mod parsers;
 pub mod pty;
 pub mod queue;

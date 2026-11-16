@@ -55,9 +55,15 @@ fn probed_version(port: &Port) -> Option<String> {
     let version = port.version.as_ref()?;
     let probed = port.facts.iter().any(|fact| {
         fact.record.confidence >= Confidence::Medium
+            && !fact.claim.starts_with("nmap script ")
             && matches!(
                 fact.record.source,
-                Source::NmapXml | Source::PtyRegex | Source::LogRegex
+                Source::NmapXml
+                    | Source::HttpHeader
+                    | Source::SshKex
+                    | Source::TlsCert
+                    | Source::PtyRegex
+                    | Source::LogRegex
             )
     });
     let from_cpe = port
@@ -110,6 +116,26 @@ fn route_evidence(graph: &Graph, host: &Host) -> Option<String> {
     })
 }
 
+pub fn backport_note_for(host: &Host, port_key: Option<&str>) -> Option<&'static str> {
+    if let Some(p) = port_key.and_then(|key| host.ports.get(key)) {
+        for field in [
+            p.version.as_deref(),
+            p.extra_info.as_deref(),
+            p.http.as_ref().and_then(|h| h.server.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(note) = crate::osint::distro_backport_note(field) {
+                return Some(note);
+            }
+        }
+    }
+    host.os
+        .as_deref()
+        .and_then(crate::osint::distro_backport_note)
+}
+
 /// Builds the checklist for one advisory on one host.
 pub fn for_advisory(graph: &Graph, host: &Host, advisory: &Advisory) -> Checklist {
     let port = advisory.port.as_ref().and_then(|key| host.ports.get(key));
@@ -121,6 +147,10 @@ pub fn for_advisory(graph: &Graph, host: &Host, advisory: &Advisory) -> Checklis
             Some("Marked false positive by the operator".to_owned())
         }
         _ => None,
+    };
+    let verdict_missing = match backport_note_for(host, advisory.port.as_deref()) {
+        Some(note) => format!("still an unverified hypothesis ({note})"),
+        None => "still an unverified hypothesis".to_owned(),
     };
     let items = vec![
         check(
@@ -168,12 +198,7 @@ pub fn for_advisory(graph: &Graph, host: &Host, advisory: &Advisory) -> Checklis
                 }),
             "the matched port has not been seen open",
         ),
-        check(
-            "Operator verdict",
-            false,
-            verdict,
-            "still an unverified hypothesis",
-        ),
+        check("Operator verdict", false, verdict, &verdict_missing),
     ];
     Checklist { items }
 }

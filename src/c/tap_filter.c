@@ -50,7 +50,7 @@ static void line_push(tap_state_t *st, const uint8_t *bytes, uint32_t n)
 /* Backspace: remove the last whole character. */
 static void line_pop(tap_state_t *st)
 {
-    if (st->alt_screen || st->pending_cr) {
+    if (st->alt_screen || st->pending_cr || st->line_truncated) {
         return;
     }
     while (st->line_len > 0) {
@@ -69,12 +69,40 @@ static void line_mark_bad(tap_state_t *st)
     if (st->pending_cr) {
         line_reset(st);
     }
-    st->line_bad++;
+    if (st->line_bad < 255u) {
+        st->line_bad++;
+    }
 }
 
 static uint8_t ascii_lower(uint8_t c)
 {
     return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+}
+
+static int equals_ci(const uint8_t *s, uint32_t n, const char *lit)
+{
+    uint32_t i = 0;
+
+    while (lit[i] != '\0') {
+        if (i >= n || ascii_lower(s[i]) != (uint8_t)lit[i]) {
+            return 0;
+        }
+        i++;
+    }
+    return i == n;
+}
+
+static int ends_with_ci(const uint8_t *s, uint32_t n, const char *suffix)
+{
+    uint32_t m = 0;
+
+    while (suffix[m] != '\0') {
+        m++;
+    }
+    if (m == 0 || m > n) {
+        return 0;
+    }
+    return equals_ci(s + (n - m), m, suffix);
 }
 
 static int contains_ci(const uint8_t *hay, uint32_t n, const char *needle)
@@ -102,20 +130,80 @@ static int contains_ci(const uint8_t *hay, uint32_t n, const char *needle)
     return 0;
 }
 
+static int is_secret_prefix(const uint8_t *prefix, uint32_t plen)
+{
+    return equals_ci(prefix, plen, "password:") ||
+           equals_ci(prefix, plen, "passphrase:") ||
+           equals_ci(prefix, plen, "pass phrase:") ||
+           equals_ci(prefix, plen, "passcode:") ||
+           equals_ci(prefix, plen, "token:") ||
+           equals_ci(prefix, plen, "secret:") ||
+           ends_with_ci(prefix, plen, "'s password:") ||
+           ends_with_ci(prefix, plen, "enter password:") ||
+           ends_with_ci(prefix, plen, "enter passphrase:") ||
+           ends_with_ci(prefix, plen, "enter pass phrase:") ||
+           ends_with_ci(prefix, plen, "enter pem pass phrase:") ||
+           ends_with_ci(prefix, plen, "enter passcode:") ||
+           ends_with_ci(prefix, plen, "enter token:") ||
+           ends_with_ci(prefix, plen, "enter secret:") ||
+           ends_with_ci(prefix, plen, "api key:") ||
+           ends_with_ci(prefix, plen, "api-key:") ||
+           ends_with_ci(prefix, plen, "secret key:") ||
+           ends_with_ci(prefix, plen, "client secret:") ||
+           ends_with_ci(prefix, plen, "access token:") ||
+           ends_with_ci(prefix, plen, "bearer token:") ||
+           ends_with_ci(prefix, plen, "auth token:") ||
+           ends_with_ci(prefix, plen, "refresh token:") ||
+           contains_ci(prefix, plen, "[sudo] password") ||
+           contains_ci(prefix, plen, "password for ") ||
+           contains_ci(prefix, plen, "passphrase for ") ||
+           contains_ci(prefix, plen, "pass phrase for ");
+}
+
 /*
  * Interactive secret prompt: mentions a password/passphrase and ends with
- * ':' (sudo, su, ssh, ssh-keygen, openssl, ...). Requiring the trailing
- * colon keeps ordinary output that merely mentions passwords.
+ * ':' (sudo, su, ssh, ssh-keygen, openssl, ...), or contains an interactive
+ * secret prompt prefix ending at ':' followed by echoed input on the same line.
  */
 static int is_secret_prompt(const uint8_t *line, uint32_t len)
 {
-    if (len == 0 || line[len - 1] != ':') {
+    uint32_t start = 0;
+    const uint8_t *trimmed;
+    uint32_t tlen;
+    uint32_t colon;
+
+    while (start < len && (line[start] == ' ' || line[start] == '\t')) {
+        start++;
+    }
+    if (start >= len) {
         return 0;
     }
-    return contains_ci(line, len, "password") ||
-           contains_ci(line, len, "passphrase") ||
-           contains_ci(line, len, "pass phrase") ||
-           contains_ci(line, len, "passcode");
+    trimmed = line + start;
+    tlen = len - start;
+
+    if (trimmed[tlen - 1] == ':') {
+        if (contains_ci(trimmed, tlen, "password") ||
+            contains_ci(trimmed, tlen, "passphrase") ||
+            contains_ci(trimmed, tlen, "pass phrase") ||
+            contains_ci(trimmed, tlen, "passcode") ||
+            contains_ci(trimmed, tlen, "api key") ||
+            contains_ci(trimmed, tlen, "api-key") ||
+            contains_ci(trimmed, tlen, "secret key") ||
+            contains_ci(trimmed, tlen, "client secret") ||
+            contains_ci(trimmed, tlen, "access token") ||
+            contains_ci(trimmed, tlen, "bearer token") ||
+            contains_ci(trimmed, tlen, "auth token") ||
+            ends_with_ci(trimmed, tlen, "token:") ||
+            equals_ci(trimmed, tlen, "secret:")) {
+            return 1;
+        }
+    }
+    for (colon = 0; colon < tlen; colon++) {
+        if (trimmed[colon] == ':' && is_secret_prefix(trimmed, colon + 1u)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void line_emit(tap_state_t *st, tap_out_t *out)
@@ -196,13 +284,17 @@ static void c0_execute(tap_state_t *st, uint8_t b, tap_out_t *out)
 }
 
 /* C0 handling shared by the ESCAPE / ESC_INTER / CSI states: VT500 executes
- * controls in the middle of a sequence; CAN and SUB abort it. */
+ * controls in the middle of a sequence; CAN, SUB and LF end an incomplete
+ * sequence so it cannot bleed into the next line. */
 static void c0_in_sequence(tap_state_t *st, uint8_t b, tap_out_t *out)
 {
-    if (b == 0x18 || b == 0x1A) {
+    if (b == 0x18u || b == 0x1Au) {
         st->mode = TAP_GROUND;
     } else {
         c0_execute(st, b, out);
+        if (b == 0x0Au) {
+            st->mode = TAP_GROUND;
+        }
     }
 }
 
@@ -357,10 +449,20 @@ static void csi_dispatch(tap_state_t *st, uint8_t final)
     if (st->csi_private != 0) {
         return;
     }
-    if (final == 'K' && st->csi_first == 2) {
-        line_reset(st); /* EL 2: erase whole line (spinner redraw) */
+    if (final == 'K' && (st->csi_first == 2 || (st->csi_first == 0 && st->pending_cr))) {
+        line_reset(st); /* EL 2 or CR + EL 0: erase whole line (spinner redraw) */
     } else if (final == 'G' && st->csi_first <= 1) {
         st->pending_cr = 1; /* CHA 1: cursor to column 1, same as bare CR */
+    } else if (final == 'C' && !st->alt_screen) {
+        /* CUF (CSI <n> C): Windows ConPTY translates runs of spaces into cursor-forward. */
+        uint32_t n = (st->csi_first == 0) ? 1u : st->csi_first;
+        const uint8_t sp = ' ';
+        if (n > 256u) {
+            n = 256u;
+        }
+        while (n-- > 0) {
+            line_push(st, &sp, 1);
+        }
     }
 }
 

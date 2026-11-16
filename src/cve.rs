@@ -51,7 +51,7 @@ const OSV_MAX_DETAILS: usize = 25;
 const MAX_REFERENCES: usize = 5;
 
 /// `[cve]` section of `config.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct CveSettings {
     pub enabled: bool,
@@ -60,6 +60,18 @@ pub struct CveSettings {
     pub nvd_url: String,
     pub osv_url: String,
     pub kev_url: String,
+}
+
+impl std::fmt::Debug for CveSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CveSettings")
+            .field("enabled", &self.enabled)
+            .field("nvd_api_key", &self.api_key().map(|_| "<redacted>"))
+            .field("nvd_url", &self.nvd_url)
+            .field("osv_url", &self.osv_url)
+            .field("kev_url", &self.kev_url)
+            .finish()
+    }
 }
 
 impl Default for CveSettings {
@@ -110,7 +122,28 @@ pub fn cmp_versions(a: &str, b: &str) -> Ordering {
     }
 
     fn is_prerelease_tag(tag: &str) -> bool {
-        matches!(tag, "alpha" | "beta" | "rc" | "pre" | "dev" | "preview")
+        matches!(
+            tag,
+            "alpha" | "beta" | "rc" | "pre" | "dev" | "devel" | "preview"
+        )
+    }
+
+    fn has_distro_tag(text: &str, tag: &str) -> bool {
+        let bytes = text.as_bytes();
+        let tbytes = tag.as_bytes();
+        if bytes.len() <= tbytes.len() {
+            return false;
+        }
+        for i in 0..=(bytes.len() - tbytes.len() - 1) {
+            if &bytes[i..i + tbytes.len()] == tbytes {
+                let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic();
+                let next_ok = bytes[i + tbytes.len()].is_ascii_digit();
+                if prev_ok && next_ok {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn strip_distro_revision(text: &str) -> &str {
@@ -123,11 +156,12 @@ pub fn cmp_versions(a: &str, b: &str) -> Ordering {
         let lower = rev.to_ascii_lowercase();
         let is_distro = lower.starts_with(|c: char| c.is_ascii_digit())
             || lower.contains("ubuntu")
-            || lower.contains("deb")
-            || lower.contains("el")
             || lower.contains("redhat")
             || lower.contains("centos")
             || lower.contains("amzn")
+            || has_distro_tag(&lower, "deb")
+            || has_distro_tag(&lower, "el")
+            || has_distro_tag(&lower, "fc")
             || (lower.starts_with('r') && lower[1..].starts_with(|c: char| c.is_ascii_digit()));
         if is_distro {
             base
@@ -193,6 +227,8 @@ pub fn cmp_versions(a: &str, b: &str) -> Ordering {
             (Some(VerToken::Patch(l)), Some(VerToken::Patch(r))) => l.cmp(r),
             (Some(VerToken::Pre(_)), _) => Ordering::Less,
             (_, Some(VerToken::Pre(_))) => Ordering::Greater,
+            (Some(VerToken::Num(0)), Some(VerToken::Patch(_))) => Ordering::Less,
+            (Some(VerToken::Patch(_)), Some(VerToken::Num(0))) => Ordering::Greater,
             (Some(VerToken::Num(_)), Some(VerToken::Patch(_))) => Ordering::Greater,
             (Some(VerToken::Patch(_)), Some(VerToken::Num(_))) => Ordering::Less,
             (Some(VerToken::Num(0)), None) | (None, Some(VerToken::Num(0))) => Ordering::Equal,
@@ -818,6 +854,9 @@ pub struct Grounding {
     /// Host-level facts (for example "CVE-x is listed in CISA KEV").
     pub facts: Vec<Fact>,
     pub lookups: usize,
+    /// True when pagination caps, detail caps, or detail fetch errors left
+    /// the lookup incomplete so stale advisories should not be pruned.
+    pub partial: bool,
     /// One line per lookup that failed.
     pub errors: Vec<String>,
 }
@@ -862,6 +901,7 @@ async fn read_json_bounded(mut response: reqwest::Response, label: &str) -> Resu
 fn validate_osv_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 128
+        || matches!(id, "." | "..")
         || !id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -871,12 +911,123 @@ fn validate_osv_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn extract_osv_versions(details: &Value, package: &Package) -> (Option<String>, Option<String>) {
+    let Some(affected) = details.get("affected").and_then(Value::as_array) else {
+        return (None, None);
+    };
+    let (purl_base, purl_ver) = match package.purl.as_deref() {
+        Some(purl) => {
+            let core = purl.split(['?', '#']).next().unwrap_or(purl);
+            match core.rsplit_once('@') {
+                Some((base, ver)) => (Some(base), Some(ver)),
+                None => (Some(core), None),
+            }
+        }
+        None => (None, None),
+    };
+    let target_ver = if !package.version.is_empty() {
+        Some(package.version.as_str())
+    } else {
+        purl_ver
+    };
+
+    let mut fixed_candidates: Vec<String> = Vec::new();
+    let mut last_candidates: Vec<String> = Vec::new();
+
+    for entry in affected {
+        if let Some(pkg) = entry.get("package") {
+            let matches_pkg = if let Some(base) = purl_base {
+                text_field(pkg, "purl")
+                    .is_some_and(|p| p.eq_ignore_ascii_case(base) || base.starts_with(&p))
+                    || text_field(pkg, "name").is_some_and(|n| {
+                        base.to_ascii_lowercase()
+                            .ends_with(&format!("/{}", n.to_ascii_lowercase()))
+                    })
+            } else {
+                let name_ok =
+                    text_field(pkg, "name").is_none_or(|n| n.eq_ignore_ascii_case(&package.name));
+                let eco_ok = package.ecosystem.is_empty()
+                    || text_field(pkg, "ecosystem")
+                        .is_none_or(|e| e.eq_ignore_ascii_case(&package.ecosystem));
+                name_ok && eco_ok
+            };
+            if !matches_pkg {
+                continue;
+            }
+        }
+        for range in entry
+            .get("ranges")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(kind) = text_field(range, "type") else {
+                continue;
+            };
+            if !matches!(kind.as_str(), "SEMVER" | "ECOSYSTEM") {
+                continue;
+            }
+            let mut intro: Option<String> = None;
+            for event in range
+                .get("events")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(i) = text_field(event, "introduced") {
+                    intro = Some(i);
+                } else if let Some(fixed) = text_field(event, "fixed") {
+                    let covers = match target_ver {
+                        Some(ver) => {
+                            let after_intro = intro
+                                .as_deref()
+                                .is_none_or(|i| i == "0" || cmp_versions(ver, i) != Ordering::Less);
+                            after_intro && cmp_versions(ver, &fixed) == Ordering::Less
+                        }
+                        None => true,
+                    };
+                    if covers {
+                        fixed_candidates.push(fixed);
+                    }
+                    intro = None;
+                } else if let Some(last) = text_field(event, "last_affected") {
+                    let covers = match target_ver {
+                        Some(ver) => {
+                            let after_intro = intro
+                                .as_deref()
+                                .is_none_or(|i| i == "0" || cmp_versions(ver, i) != Ordering::Less);
+                            after_intro && cmp_versions(ver, &last) != Ordering::Greater
+                        }
+                        None => true,
+                    };
+                    if covers {
+                        last_candidates.push(last);
+                    }
+                    intro = None;
+                }
+            }
+        }
+    }
+
+    let fixed_in = fixed_candidates
+        .into_iter()
+        .min_by(|a, b| cmp_versions(a, b));
+    let last_affected = last_candidates
+        .into_iter()
+        .max_by(|a, b| cmp_versions(a, b));
+    (fixed_in, last_affected)
+}
+
 impl CveClient {
     pub fn new(settings: CveSettings, db: Arc<Mutex<Db>>) -> Result<Self> {
+        crate::ai::validate_cloud_url(&settings.nvd_url).context("invalid cve.nvd_url")?;
+        crate::ai::validate_cloud_url(&settings.osv_url).context("invalid cve.osv_url")?;
+        crate::ai::validate_cloud_url(&settings.kev_url).context("invalid cve.kev_url")?;
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(STALL_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("security-audit-client")
             .build()
             .context("cannot create the HTTP client")?;
@@ -925,18 +1076,21 @@ impl CveClient {
         }
     }
 
-    async fn nvd_query(&self, param: &str, value: &str) -> Result<Vec<NvdCve>> {
+    async fn nvd_query_paged(&self, param: &str, value: &str) -> Result<(Vec<NvdCve>, bool)> {
+        crate::ai::validate_cloud_url(&self.settings.nvd_url)?;
         // `nvd2`: answers cached before platform conditions were kept are
         // not reused.
         let key = cache_key(&format!("nvd2:{param}"), value);
         if let Some(found) = self
             .cached(&key, DAY)
-            .and_then(|body| serde_json::from_str(&body).ok())
+            .and_then(|body| serde_json::from_str::<Vec<NvdCve>>(&body).ok())
         {
-            return Ok(found);
+            let maybe_truncated = found.len() >= NVD_PAGE_SIZE * NVD_MAX_PAGES;
+            return Ok((found, maybe_truncated));
         }
         let mut found = Vec::new();
         let mut start_index = 0usize;
+        let mut truncated = true;
         for _ in 0..NVD_MAX_PAGES {
             let body = {
                 let mut last = self.nvd_gate.lock().await;
@@ -957,7 +1111,10 @@ impl CveClient {
                     request = request.query(&[("isVulnerable", "")]);
                 }
                 if let Some(api_key) = self.settings.api_key() {
-                    request = request.header("apiKey", api_key);
+                    let mut val = reqwest::header::HeaderValue::from_str(api_key)
+                        .context("invalid characters in NVD API key")?;
+                    val.set_sensitive(true);
+                    request = request.header("apiKey", val);
                 }
                 let response = request.send().await;
                 *last = Some(Instant::now());
@@ -982,20 +1139,22 @@ impl CveClient {
             }
             start_index += page_items;
             if page_items < NVD_PAGE_SIZE || start_index >= total {
+                truncated = false;
                 break;
             }
         }
         self.store(&key, &serde_json::to_string(&found)?);
-        Ok(found)
+        Ok((found, truncated))
     }
 
     pub async fn nvd_by_cpe(&self, cpe23: &str) -> Result<Vec<NvdCve>> {
-        self.nvd_query("cpeName", cpe23).await
+        self.nvd_query_paged("cpeName", cpe23).await.map(|(v, _)| v)
     }
 
     pub async fn nvd_by_keyword(&self, product: &str, version: &str) -> Result<Vec<NvdCve>> {
-        self.nvd_query("keywordSearch", &format!("{product} {version}"))
+        self.nvd_query_paged("keywordSearch", &format!("{product} {version}"))
             .await
+            .map(|(v, _)| v)
     }
 
     /// CVE ids in the CISA KEV catalog, from a local copy refreshed every
@@ -1007,6 +1166,7 @@ impl CveClient {
             return Ok(found);
         }
         let fetched: Result<Value> = async {
+            crate::ai::validate_cloud_url(&self.settings.kev_url)?;
             let response = self.http.get(&self.settings.kev_url).send().await?;
             if !response.status().is_success() {
                 bail!("HTTP {}", response.status());
@@ -1035,9 +1195,8 @@ impl CveClient {
         }
     }
 
-    /// Queries OSV for several packages at once, following
-    /// `next_page_token`. Returns `(package index, vulnerability id)` pairs.
-    pub async fn osv_batch(&self, packages: &[Package]) -> Result<Vec<(usize, String)>> {
+    async fn osv_batch_paged(&self, packages: &[Package]) -> Result<(Vec<(usize, String)>, bool)> {
+        crate::ai::validate_cloud_url(&self.settings.osv_url)?;
         let url = format!(
             "{}/v1/querybatch",
             self.settings.osv_url.trim_end_matches('/')
@@ -1100,12 +1259,19 @@ impl CveClient {
             }
             pending = next;
         }
-        Ok(found)
+        Ok((found, !pending.is_empty()))
+    }
+
+    /// Queries OSV for several packages at once, following
+    /// `next_page_token`. Returns `(package index, vulnerability id)` pairs.
+    pub async fn osv_batch(&self, packages: &[Package]) -> Result<Vec<(usize, String)>> {
+        self.osv_batch_paged(packages).await.map(|(found, _)| found)
     }
 
     /// Full OSV record for one id (cached for a day).
     pub async fn osv_details(&self, id: &str) -> Result<Value> {
         validate_osv_id(id)?;
+        crate::ai::validate_cloud_url(&self.settings.osv_url)?;
         let key = cache_key("osv", id);
         if let Some(found) = self
             .cached(&key, DAY)
@@ -1133,8 +1299,8 @@ impl CveClient {
 
     /// Runs every lookup [`plan`] produces for `host`. Never fails as a
     /// whole: problems are reported per lookup in [`Grounding::errors`], and
-    /// after the first network failure the remaining lookups are skipped so
-    /// an offline machine is not kept waiting.
+    /// after two consecutive failures NVD lookups stop so an offline or
+    /// rate-limited session is not kept waiting.
     pub async fn ground(&self, host: &Host) -> Grounding {
         let lookups = plan(host);
         let mut grounding = Grounding {
@@ -1155,9 +1321,12 @@ impl CveClient {
         let family = host_family(host);
         let mut packages: Vec<(Package, Option<String>)> = Vec::new();
         // One slow answer is not an outage: the next lookup is still tried.
-        // After a second failure the rest is skipped.
-        let mut failures = 0;
-        let mut offline = false;
+        // After a second failure NVD is skipped; OSV is only skipped when
+        // transport itself failed (not when NVD returned HTTP 429/5xx).
+        let mut nvd_failures = 0usize;
+        let mut transport_failures = 0usize;
+        let mut nvd_stopped = false;
+        let mut network_offline = false;
         for lookup in &lookups {
             let (query, product, version, port) = match lookup {
                 Lookup::Package { package, port } => {
@@ -1186,23 +1355,36 @@ impl CveClient {
                     port,
                 ),
             };
-            if offline {
+            if nvd_stopped {
+                grounding.partial = true;
                 continue;
             }
             let matched_by_nvd = matches!(lookup, Lookup::Cpe { .. });
             let result = match lookup {
-                Lookup::Cpe { cpe, .. } => self.nvd_by_cpe(cpe).await,
-                _ => self.nvd_by_keyword(&product, &version).await,
+                Lookup::Cpe { cpe, .. } => self.nvd_query_paged("cpeName", cpe).await,
+                _ => {
+                    self.nvd_query_paged("keywordSearch", &format!("{product} {version}"))
+                        .await
+                }
             };
-            let found = match result {
-                Ok(found) => found,
+            let (found, truncated) = match result {
+                Ok(pair) => pair,
                 Err(error) => {
-                    grounding.errors.push(format!("{query}: {error:#}"));
-                    failures += 1;
-                    offline = failures >= 2;
+                    let msg = format!("{error:#}");
+                    let is_http_status = msg.contains("NVD answered HTTP ");
+                    grounding.errors.push(format!("{query}: {msg}"));
+                    nvd_failures += 1;
+                    nvd_stopped = nvd_failures >= 2;
+                    if !is_http_status {
+                        transport_failures += 1;
+                        network_offline = transport_failures >= 2;
+                    }
                     continue;
                 }
             };
+            if truncated {
+                grounding.partial = true;
+            }
             for cve in found {
                 // NVD matched cpeName itself, but also returns records that
                 // name the product only as a platform, or only on another
@@ -1211,8 +1393,17 @@ impl CveClient {
                 else {
                     continue;
                 };
+                let backport = crate::checklist::backport_note_for(host, Some(port));
+                let title = match backport {
+                    Some(note) => format!("{} [{note}]", cve.description),
+                    None => cve.description,
+                };
                 let evidence = json!({
-                    "query": query, "id": cve.id, "vulnStatus": cve.status, "cvss": cve.cvss,
+                    "query": query,
+                    "id": cve.id,
+                    "vulnStatus": cve.status,
+                    "cvss": cve.cvss,
+                    "distro_backport_note": backport,
                 })
                 .to_string();
                 push_advisory(
@@ -1220,7 +1411,7 @@ impl CveClient {
                     Advisory {
                         kev: cve.kev || kev.contains(&cve.id),
                         id: cve.id,
-                        title: cve.description,
+                        title,
                         severity: cve.severity,
                         cvss: cve.cvss,
                         matched: query.clone(),
@@ -1238,64 +1429,79 @@ impl CveClient {
             }
         }
 
-        if !packages.is_empty() && !offline {
-            let list: Vec<Package> = packages.iter().map(|(p, _)| p.clone()).collect();
-            match self.osv_batch(&list).await {
-                Ok(hits) => {
-                    for (index, id) in hits.into_iter().take(OSV_MAX_DETAILS) {
-                        let (package, port) = &packages[index];
-                        let details = self.osv_details(&id).await.unwrap_or(Value::Null);
-                        let aliases: Vec<String> = details
-                            .get("aliases")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|a| a.as_str().map(str::to_owned))
-                            .collect();
-                        let title = text_field(&details, "summary")
-                            .or_else(|| text_field(&details, "details"))
-                            .unwrap_or_else(|| format!("{id} affects {}", package.label()));
-                        let confidence = if package.declared {
-                            Confidence::Medium
-                        } else {
-                            Confidence::Low
-                        };
-                        let evidence =
-                            json!({ "query": package.label(), "id": id, "aliases": aliases })
-                                .to_string();
-                        push_advisory(
-                            &mut grounding,
-                            Advisory {
-                                kev: kev.contains(&id) || aliases.iter().any(|a| kev.contains(a)),
-                                id,
-                                title,
-                                severity: details
-                                    .pointer("/database_specific/severity")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
-                                cvss: None,
-                                matched: package.label(),
-                                fixed_in: None,
-                                last_affected: None,
-                                port: port.clone(),
-                                references: details
-                                    .get("references")
-                                    .and_then(Value::as_array)
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(|r| text_field(r, "url"))
-                                    .take(MAX_REFERENCES)
-                                    .collect(),
-                                record: EvidenceRecord::hypothesis(
-                                    Source::OsvApi,
-                                    confidence,
-                                    &evidence,
-                                ),
-                            },
-                        );
+        if !packages.is_empty() {
+            if network_offline {
+                grounding.partial = true;
+            } else {
+                let list: Vec<Package> = packages.iter().map(|(p, _)| p.clone()).collect();
+                match self.osv_batch_paged(&list).await {
+                    Ok((hits, page_truncated)) => {
+                        if page_truncated || hits.len() > OSV_MAX_DETAILS {
+                            grounding.partial = true;
+                        }
+                        for (index, id) in hits.into_iter().take(OSV_MAX_DETAILS) {
+                            let (package, port) = &packages[index];
+                            let details = match self.osv_details(&id).await {
+                                Ok(details) => details,
+                                Err(_) => {
+                                    grounding.partial = true;
+                                    Value::Null
+                                }
+                            };
+                            let (fixed_in, last_affected) = extract_osv_versions(&details, package);
+                            let aliases: Vec<String> = details
+                                .get("aliases")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|a| a.as_str().map(str::to_owned))
+                                .collect();
+                            let title = text_field(&details, "summary")
+                                .or_else(|| text_field(&details, "details"))
+                                .unwrap_or_else(|| format!("{id} affects {}", package.label()));
+                            let confidence = if package.declared {
+                                Confidence::Medium
+                            } else {
+                                Confidence::Low
+                            };
+                            let evidence =
+                                json!({ "query": package.label(), "id": id, "aliases": aliases })
+                                    .to_string();
+                            push_advisory(
+                                &mut grounding,
+                                Advisory {
+                                    kev: kev.contains(&id)
+                                        || aliases.iter().any(|a| kev.contains(a)),
+                                    id,
+                                    title,
+                                    severity: details
+                                        .pointer("/database_specific/severity")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                    cvss: None,
+                                    matched: package.label(),
+                                    fixed_in,
+                                    last_affected,
+                                    port: port.clone(),
+                                    references: details
+                                        .get("references")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|r| text_field(r, "url"))
+                                        .take(MAX_REFERENCES)
+                                        .collect(),
+                                    record: EvidenceRecord::hypothesis(
+                                        Source::OsvApi,
+                                        confidence,
+                                        &evidence,
+                                    ),
+                                },
+                            );
+                        }
                     }
+                    Err(error) => grounding.errors.push(format!("OSV: {error:#}")),
                 }
-                Err(error) => grounding.errors.push(format!("OSV: {error:#}")),
             }
         }
 
@@ -1334,7 +1540,8 @@ pub struct Merged {
 }
 
 /// Merges one host's grounding into the graph. After a lookup that reached
-/// every source, unverified matches it did not return are removed.
+/// every source without truncation, unverified matches it did not return are
+/// removed.
 pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Grounding) -> Merged {
     let mut merged = Merged::default();
     let known: BTreeSet<String> = graph
@@ -1351,7 +1558,7 @@ pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Groundi
     for fact in &grounding.facts {
         graph.add_host_fact(address, fact.clone());
     }
-    if grounding.lookups > 0 && grounding.errors.is_empty() {
+    if grounding.lookups > 0 && grounding.errors.is_empty() && !grounding.partial {
         let current: BTreeSet<String> = grounding.advisories.iter().map(|a| a.id.clone()).collect();
         merged.dropped = graph.drop_stale_advisories(address, &current);
     }
@@ -1528,6 +1735,7 @@ mod tests {
             ("1.18.0", "1.18.0", Equal),
             ("1.9", "1.10", Less),
             ("8.2", "8.2p1", Less),
+            ("8.2.0", "8.2p1", Less),
             ("8.2p1", "8.10", Less),
             ("1.1.1", "1.1.1k", Less),
             ("2.4.41", "2.4.9", Greater),
@@ -1543,6 +1751,8 @@ mod tests {
             assert_eq!(cmp_versions(a, b), expected, "{a} vs {b}");
             assert_eq!(cmp_versions(b, a), expected.reverse(), "{b} vs {a}");
         }
+        assert!(validate_osv_id(".").is_err());
+        assert!(validate_osv_id("..").is_err());
     }
 
     #[test]
@@ -2355,5 +2565,93 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 201);
         assert_eq!(found.last().unwrap().id, "CVE-2025-9999");
+    }
+
+    #[test]
+    fn settings_debug_redacts_api_key_and_devel_versions_stay_distinct() {
+        let settings = CveSettings {
+            nvd_api_key: Some("super-secret-nvd-key".into()),
+            ..CveSettings::default()
+        };
+        let rendered = format!("{settings:?}");
+        assert!(!rendered.contains("super-secret-nvd-key"));
+        assert!(rendered.contains("<redacted>"));
+
+        assert_eq!(cmp_versions("1.2.3-devel", "1.2.3"), Ordering::Less);
+        assert_ne!(cmp_versions("1.2.3-debug", "1.2.3"), Ordering::Equal);
+        assert_eq!(cmp_versions("2.4.52-deb11u3", "2.4.52"), Ordering::Equal);
+        assert_eq!(cmp_versions("2.4.52-el8_4", "2.4.52"), Ordering::Equal);
+    }
+
+    #[tokio::test]
+    async fn nvd_rate_limit_does_not_skip_osv_and_osv_extracts_fixed_in() {
+        let app = Router::new()
+            .route(
+                "/kev",
+                get(|| async { Json(json!({ "vulnerabilities": [] })) }),
+            )
+            .route(
+                "/nvd",
+                get(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+            )
+            .route(
+                "/osv/v1/querybatch",
+                axum::routing::post(|| async {
+                    Json(json!({
+                        "results": [
+                            { "vulns": [{ "id": "GHSA-jq-fixed" }] },
+                            { "vulns": [] }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/osv/v1/vulns/{id}",
+                get(|| async {
+                    Json(json!({
+                        "id": "GHSA-jq-fixed",
+                        "summary": "jQuery XSS",
+                        "affected": [{
+                            "package": { "name": "jquery", "ecosystem": "npm" },
+                            "ranges": [{
+                                "type": "SEMVER",
+                                "events": [
+                                    { "introduced": "1.0.0" },
+                                    { "fixed": "3.5.0" }
+                                ]
+                            }]
+                        }]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let c = client(&base, None).with_nvd_pace(Duration::from_millis(1));
+        let grounding = c.ground(&sample_host()).await;
+        assert!(
+            grounding
+                .advisories
+                .iter()
+                .any(|a| a.id == "GHSA-jq-fixed" && a.fixed_in.as_deref() == Some("3.5.0")),
+            "OSV should still run and extract fixed_in when NVD returns 429: {grounding:?}"
+        );
+
+        // Partial grounding with no explicit errors must not drop stale advisories.
+        let mut graph = Graph::default();
+        graph.hosts.insert("10.0.0.5".into(), sample_host());
+        graph.add_advisory("10.0.0.5", matched("CVE-2026-8888", false, None, None));
+        let partial_grounding = Grounding {
+            lookups: 1,
+            partial: true,
+            ..Grounding::default()
+        };
+        let res = merge(&mut graph, "10.0.0.5", &partial_grounding);
+        assert_eq!(res.dropped, 0);
+        assert!(graph.hosts["10.0.0.5"]
+            .advisories
+            .iter()
+            .any(|a| a.id == "CVE-2026-8888"));
     }
 }

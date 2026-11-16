@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use fd_lock::RwLock;
@@ -37,8 +37,7 @@ impl Drop for SessionLock {
 
 #[derive(Debug)]
 pub enum LockError {
-    /// Another live process holds the lock. `pid` is best effort: it is
-    /// unreadable on Windows while the file is locked.
+    /// Another live process holds the lock. `pid` is best effort.
     Held {
         pid: Option<u32>,
     },
@@ -68,43 +67,132 @@ impl std::error::Error for LockError {
     }
 }
 
+fn refused_lock(path: &Path, what: &str) -> LockError {
+    LockError::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} {what}; refusing to use it as a lock file",
+            path.display()
+        ),
+    ))
+}
+
+fn refuse_lock_symlink(path: &Path) -> Result<bool, LockError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(refused_lock(path, "is a symbolic link")),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(LockError::Io(error)),
+    }
+}
+
+fn open_readonly_lock(path: &Path) -> Result<Option<File>, LockError> {
+    if !refuse_lock_symlink(path)? {
+        return Ok(None);
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Never follow a symbolic link and never wait on a FIFO/device node.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(LockError::Io(error)),
+    };
+    let meta = file.metadata().map_err(LockError::Io)?;
+    if !meta.is_file() {
+        return Err(refused_lock(path, "is not a regular file"));
+    }
+    Ok(Some(file))
+}
+
+fn read_pid_from_file(file: &mut File) -> Option<u32> {
+    let mut buf = String::new();
+    let _ = file.seek(SeekFrom::Start(0));
+    if (&*file).take(32).read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        // On Windows fd-lock holds a mandatory byte-range lock on [0, 1);
+        // seeking to byte 1 reads the ASCII PID written past byte 0.
+        buf.clear();
+        file.seek(SeekFrom::Start(1)).ok()?;
+        (&*file).take(32).read_to_string(&mut buf).ok()?;
+    }
+    buf.trim().parse().ok().filter(|&pid| pid != 0)
+}
+
 impl SessionLock {
     /// Takes the exclusive lock on `path` without blocking and records this
     /// process id in the file for diagnostics.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
-        let file = private_open_options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(LockError::Io)?;
+        // The file is truncated and written below, so a link in its place
+        // (a workspace folder someone else prepared) is never followed: not
+        // a symbolic link, and not a second hard link to another file.
+        let _ = refuse_lock_symlink(path)?;
+        let mut options = private_open_options();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path).map_err(LockError::Io)?;
+        let meta = file.metadata().map_err(LockError::Io)?;
+        if !meta.is_file() {
+            return Err(refused_lock(path, "is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() > 1 {
+                return Err(refused_lock(path, "has a second hard link"));
+            }
+        }
         let mut lock = RwLock::new(file);
+        let mut acquired = false;
 
         for attempt in 0..3 {
             match lock.try_write() {
                 Ok(mut guard) => {
+                    // Leading space at byte 0 keeps the ASCII PID outside
+                    // fd-lock's mandatory [0, 1) byte-range lock on Windows,
+                    // written in a single call so readers never see partial bytes.
+                    let line = format!(" {}\n", std::process::id());
                     let written = guard
                         .set_len(0)
-                        .and_then(|()| writeln!(guard, "{}", std::process::id()))
+                        .and_then(|()| guard.seek(SeekFrom::Start(0)).map(|_| ()))
+                        .and_then(|()| guard.write_all(line.as_bytes()))
                         .and_then(|()| guard.flush());
+                    if let Err(error) = written {
+                        drop(guard);
+                        return Err(LockError::Io(error));
+                    }
                     // Dropping the guard would unlock. Forgetting it keeps the
                     // lock tied to the open file, which `SessionLock` now owns.
                     std::mem::forget(guard);
-                    written.map_err(LockError::Io)?;
+                    acquired = true;
                     break;
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
                     if attempt < 2 {
                         std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
                     }
-                    return Err(LockError::Held {
-                        pid: read_pid(path),
-                    });
                 }
                 Err(error) => return Err(LockError::Io(error)),
-            };
+            }
+        }
+        if !acquired {
+            let mut file = lock.into_inner();
+            return Err(LockError::Held {
+                pid: read_pid_from_file(&mut file),
+            });
         }
         Ok(Self { file: lock })
     }
@@ -112,23 +200,61 @@ impl SessionLock {
     /// True when an exclusive `SessionLock` is currently held on `path`.
     /// Read-only: never creates, truncates or modifies `path`.
     pub fn is_held(path: &Path) -> bool {
-        let Ok(file) = File::open(path) else {
-            return false;
+        matches!(Self::check_free(path), Err(LockError::Held { .. }))
+    }
+
+    /// Fails with [`LockError::Held`] when an exclusive lock is held on `path`,
+    /// or [`LockError::Io`] if `path` is a symbolic link or non-regular file.
+    /// Never creates, truncates, or writes `path`.
+    pub fn check_free(path: &Path) -> Result<(), LockError> {
+        let Some(file) = open_readonly_lock(path)? else {
+            return Ok(());
         };
         let lock = RwLock::new(file);
-        let held = match lock.try_read() {
-            Ok(guard) => {
-                drop(guard);
-                false
+        for attempt in 0..3 {
+            match lock.try_read() {
+                Ok(guard) => {
+                    drop(guard);
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                Err(error) => return Err(LockError::Io(error)),
             }
-            Err(error) => error.kind() == io::ErrorKind::WouldBlock,
-        };
-        held
+        }
+        let mut file = lock.into_inner();
+        Err(LockError::Held {
+            pid: read_pid_from_file(&mut file),
+        })
+    }
+
+    /// Reads the PID recorded in a held `session.lock` file, if any.
+    pub fn holder_pid(path: &Path) -> Option<u32> {
+        match Self::check_free(path) {
+            Err(LockError::Held { pid }) => pid,
+            _ => None,
+        }
     }
 }
 
+/// The process id written into the lock file at `path` by whoever took the
+/// lock last. Reads past byte 0 so Windows mandatory `[0, 1)` byte-range locks
+/// do not block reading the holder PID.
+pub fn holder_pid(path: &Path) -> Option<u32> {
+    read_pid(path)
+}
+
 fn read_pid(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    let mut file = open_readonly_lock(path).ok()??;
+    read_pid_from_file(&mut file)
 }
 
 #[cfg(test)]
@@ -191,6 +317,33 @@ mod tests {
         assert_eq!(read_pid(&path), Some(std::process::id()));
         drop(held);
         assert!(!SessionLock::is_held(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_place_of_the_lock_file_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "keep me").unwrap();
+
+        // A symbolic link: refused, the file it names keeps its content.
+        let path = dir.path().join("session.lock");
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert!(matches!(SessionLock::acquire(&path), Err(LockError::Io(_))));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep me");
+        assert!(!SessionLock::is_held(&path));
+        fs::remove_file(&path).unwrap();
+
+        // A second hard link to another file: refused before truncating.
+        fs::hard_link(&outside, &path).unwrap();
+        assert!(matches!(SessionLock::acquire(&path), Err(LockError::Io(_))));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep me");
+        fs::remove_file(&path).unwrap();
+
+        // An ordinary lock file still works.
+        let lock = SessionLock::acquire(&path).unwrap();
+        assert!(SessionLock::is_held(&path));
+        drop(lock);
     }
 
     #[cfg(unix)]
@@ -265,5 +418,41 @@ mod tests {
         child.wait().unwrap();
         let _lock = SessionLock::acquire(&path).expect("lock survived its dead holder");
         assert_eq!(read_pid(&path), Some(std::process::id()));
+        assert_eq!(holder_pid(&path), Some(std::process::id()));
+        assert_eq!(SessionLock::holder_pid(&path), Some(std::process::id()));
+    }
+
+    #[test]
+    fn pid_is_written_past_byte_zero_and_zero_pid_is_ignored() {
+        let (_dir, path) = lock_file();
+        let held = SessionLock::acquire(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.starts_with(' '),
+            "byte 0 must be a space outside Windows [0, 1) lock range: {raw:?}"
+        );
+        assert_eq!(holder_pid(&path), Some(std::process::id()));
+        drop(held);
+
+        fs::write(&path, " 0\n").unwrap();
+        assert_eq!(holder_pid(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_at_lock_path_never_blocks_acquire_or_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("session.lock");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        assert!(matches!(SessionLock::acquire(&fifo), Err(LockError::Io(_))));
+        assert!(matches!(
+            SessionLock::check_free(&fifo),
+            Err(LockError::Io(_))
+        ));
+        assert!(!SessionLock::is_held(&fifo));
+        assert_eq!(holder_pid(&fifo), None);
+        assert_eq!(SessionLock::holder_pid(&fifo), None);
     }
 }

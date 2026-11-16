@@ -29,7 +29,11 @@ use crate::evidence::sanitize;
 use crate::mode::Mode;
 use crate::queue;
 use crate::setup;
-use crate::workspace::{validate_name, Config, MeowHome};
+use crate::tools;
+use crate::workspace::{read_private_bounded, validate_name, Config, MeowHome};
+
+const MAX_EDIT_CHARS: usize = 4096;
+const MAX_WIZARD_CONFIG_BYTES: u64 = 256 * 1024;
 
 /// Crisp 7-bit Cat + wordmark ASCII banner for `meow --help` and `--plain`.
 pub const CAT_CLI_BANNER: &str = concat!(
@@ -222,6 +226,8 @@ pub struct Wizard {
     pub env_key_source: Option<String>,
     pub cve_enabled: bool,
     pub nvd_api_key: Option<String>,
+    pub location_enabled: bool,
+    pub location_map: bool,
     pub launch_workspace: String,
 
     // Live probes & system checks
@@ -238,13 +244,15 @@ impl Wizard {
     pub fn load(home: &MeowHome, first_run: bool) -> Result<Self> {
         let config_file = home.config_path();
         let ai_file = home.ai_path();
-        let mut config = if config_file.is_file() {
-            let text = std::fs::read_to_string(&config_file)
-                .with_context(|| format!("cannot read {}", config_file.display()))?;
-            toml::from_str::<Config>(&text)
-                .with_context(|| format!("invalid {}", config_file.display()))?
-        } else {
-            Config::default()
+        let mut config = match std::fs::symlink_metadata(&config_file) {
+            Ok(_) => {
+                let text = read_private_bounded(&config_file, MAX_WIZARD_CONFIG_BYTES)?;
+                crate::workspace::parse_toml::<Config>(&text, &config_file)?
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("cannot read {}", config_file.display()))
+            }
         };
         config.ai.user_file = Some(ai_file.clone());
         config.recon.wordlist_dir = Some(home.root().join("wordlists"));
@@ -258,14 +266,15 @@ impl Wizard {
 
         let has_any_key = own.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
             || effective.api_key().is_some();
-        let cloud_choice =
-            if !has_any_key && own.cloud_provider.is_none() && own.cloud_url.is_none() {
-                CloudChoice::LocalOnly
-            } else if effective.provider() == CloudProvider::Anthropic {
-                CloudChoice::Claude
-            } else {
-                CloudChoice::OpenRouter
-            };
+        let cloud_choice = if own.disable_cloud
+            || (!has_any_key && own.cloud_provider.is_none() && own.cloud_url.is_none())
+        {
+            CloudChoice::LocalOnly
+        } else if effective.provider() == CloudProvider::Anthropic {
+            CloudChoice::Claude
+        } else {
+            CloudChoice::OpenRouter
+        };
 
         let mode_cursor = match config.default_mode {
             Mode::Light => 0,
@@ -277,7 +286,8 @@ impl Wizard {
             CloudChoice::Claude => 1,
             CloudChoice::OpenRouter => 2,
         };
-        let launch_cursor = usize::from(first_run);
+        // Row 0 on Launch is optional WorkspaceName; Row 1 is the primary Save action.
+        let launch_cursor = 1;
         let tools = scan_tools(&config, home);
 
         let welcome = if first_run {
@@ -309,6 +319,8 @@ impl Wizard {
             env_key_source: env_key_source.map(|s| sanitize(&s, 80)),
             cve_enabled: config.cve.enabled,
             nvd_api_key: config.cve.nvd_api_key.filter(|k| !k.trim().is_empty()),
+            location_enabled: config.location.enabled,
+            location_map: config.location.map,
             launch_workspace: String::new(),
             discovered_local: Vec::new(),
             tools,
@@ -332,14 +344,8 @@ impl Wizard {
             Step::Mode => 3,
             Step::LocalAi => 6 + self.discovered_local.len(),
             Step::CloudAi => 8,
-            Step::Toolkit => 3,
-            Step::Launch => {
-                if self.first_run {
-                    4
-                } else {
-                    3
-                }
-            }
+            Step::Toolkit => 5,
+            Step::Launch => 4,
         }
     }
 
@@ -388,6 +394,9 @@ impl Wizard {
                 );
             }
             CloudChoice::Claude => {
+                let cleared = prev != CloudChoice::Claude
+                    && prev != CloudChoice::LocalOnly
+                    && self.cloud_api_key.take().is_some();
                 self.cloud_url = anthropic::API_URL.to_owned();
                 if !self.cloud_model.starts_with("claude-") {
                     self.cloud_model = anthropic::DEFAULT_MODEL.to_owned();
@@ -401,12 +410,17 @@ impl Wizard {
                         .map(|m| (*m).to_owned())
                         .collect();
                 }
-                self.set_status(
-                    "Switched to Anthropic Claude API. Select 'Cloud API Key' below to paste your key.",
-                    false,
-                );
+                let msg = if cleared {
+                    "Switched to Anthropic Claude API (previous service key cleared). Paste your Claude key below."
+                } else {
+                    "Switched to Anthropic Claude API. Select 'Cloud API Key' below to paste your key."
+                };
+                self.set_status(msg, false);
             }
             CloudChoice::OpenRouter => {
+                let cleared = prev != CloudChoice::OpenRouter
+                    && prev != CloudChoice::LocalOnly
+                    && self.cloud_api_key.take().is_some();
                 let defaults = AiSettings::default();
                 if anthropic::is_claude_api(&self.cloud_url) || self.cloud_url.trim().is_empty() {
                     self.cloud_url = defaults.cloud_url;
@@ -418,10 +432,12 @@ impl Wizard {
                     self.research_model = defaults.research_model;
                 }
                 self.cloud_fallbacks.clear();
-                self.set_status(
-                    "Switched to OpenRouter / OpenAI-compatible API. Select 'Cloud API Key' to paste your key.",
-                    false,
-                );
+                let msg = if cleared {
+                    "Switched to OpenRouter / OpenAI-compatible API (previous service key cleared). Paste your key below."
+                } else {
+                    "Switched to OpenRouter / OpenAI-compatible API. Select 'Cloud API Key' to paste your key."
+                };
+                self.set_status(msg, false);
             }
         }
     }
@@ -476,8 +492,11 @@ impl Wizard {
                 if trimmed.is_empty() {
                     self.cloud_api_key = None;
                     self.set_status("Cloud API key cleared.", false);
-                } else if trimmed.chars().any(char::is_control) {
-                    self.set_status("API key must not contain control characters.", true);
+                } else if trimmed.len() > 512 || trimmed.chars().any(char::is_control) {
+                    self.set_status(
+                        "API key must be at most 512 bytes and contain no control characters.",
+                        true,
+                    );
                 } else {
                     let key = trimmed.to_owned();
                     if self.cloud_choice == CloudChoice::LocalOnly {
@@ -494,13 +513,30 @@ impl Wizard {
             }
             EditField::CloudUrl => match ai::validate_cloud_url(trimmed) {
                 Ok(url) => {
+                    let host_of = |raw: &str| {
+                        reqwest::Url::parse(raw)
+                            .ok()
+                            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+                            .unwrap_or_default()
+                    };
+                    let old_host = host_of(&self.cloud_url);
+                    let new_host = host_of(&url);
+                    let mut cleared = false;
+                    if !old_host.is_empty() && old_host != new_host {
+                        cleared = self.cloud_api_key.take().is_some();
+                    }
                     if anthropic::is_claude_api(&url) {
                         self.select_cloud_choice(CloudChoice::Claude);
-                    } else if self.cloud_choice == CloudChoice::LocalOnly {
+                    } else if self.cloud_choice != CloudChoice::OpenRouter {
                         self.select_cloud_choice(CloudChoice::OpenRouter);
                     }
                     self.cloud_url = url.clone();
-                    self.set_status(format!("Cloud service URL set to {url}"), false);
+                    let note = if cleared {
+                        " (previous host's API key cleared)"
+                    } else {
+                        ""
+                    };
+                    self.set_status(format!("Cloud service URL set to {url}{note}"), false);
                 }
                 Err(err) => {
                     self.set_status(format!("{err:#}"), true);
@@ -538,8 +574,11 @@ impl Wizard {
                 if trimmed.is_empty() {
                     self.nvd_api_key = None;
                     self.set_status("NVD API key cleared (6.5s anonymous pacing).", false);
-                } else if trimmed.chars().any(char::is_control) {
-                    self.set_status("NVD API key must not contain control characters.", true);
+                } else if trimmed.len() > 512 || trimmed.chars().any(char::is_control) {
+                    self.set_status(
+                        "NVD API key must be at most 512 bytes and contain no control characters.",
+                        true,
+                    );
                 } else {
                     let summary = setup::masked(trimmed);
                     self.nvd_api_key = Some(trimmed.to_owned());
@@ -575,9 +614,11 @@ impl Wizard {
     /// Handles pasted text (such as pasting an API key or URL).
     pub fn on_paste(&mut self, text: &str) {
         if let Some(edit) = &mut self.editing {
+            let remaining = MAX_EDIT_CHARS.saturating_sub(edit.buffer.chars().count());
             let cleaned: String = text
                 .chars()
                 .filter(|c| !matches!(c, '\r' | '\n') && !c.is_control())
+                .take(remaining)
                 .collect();
             edit.buffer.push_str(&cleaned);
         }
@@ -616,7 +657,9 @@ impl Wizard {
                     if key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
-                KeyCode::Char(ch) if !ch.is_control() => {
+                KeyCode::Char(ch)
+                    if !ch.is_control() && edit.buffer.chars().count() < MAX_EDIT_CHARS =>
+                {
                     edit.buffer.push(ch);
                 }
                 _ => {}
@@ -804,30 +847,50 @@ impl Wizard {
                     self.start_edit(EditField::NvdApiKey);
                     WizardAction::None
                 }
+                2 => {
+                    self.location_enabled = !self.location_enabled;
+                    self.set_status(
+                        format!(
+                            "Public IP location lookup {}.",
+                            if self.location_enabled {
+                                "enabled (skipped automatically when VPN is active)"
+                            } else {
+                                "disabled (local GeoIP only)"
+                            }
+                        ),
+                        false,
+                    );
+                    WizardAction::None
+                }
+                3 => {
+                    self.location_map = !self.location_map;
+                    self.set_status(
+                        format!(
+                            "Satellite map tiles {}.",
+                            if self.location_map {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ),
+                        false,
+                    );
+                    WizardAction::None
+                }
                 _ => {
                     self.rescan_tools();
                     WizardAction::None
                 }
             },
-            Step::Launch => {
-                if self.first_run {
-                    match row {
-                        0 => {
-                            self.start_edit(EditField::WorkspaceName);
-                            WizardAction::None
-                        }
-                        1 => self.request_save(),
-                        2 => WizardAction::TestConnections,
-                        _ => WizardAction::Quit,
-                    }
-                } else {
-                    match row {
-                        0 => self.request_save(),
-                        1 => WizardAction::TestConnections,
-                        _ => WizardAction::Quit,
-                    }
+            Step::Launch => match row {
+                0 => {
+                    self.start_edit(EditField::WorkspaceName);
+                    WizardAction::None
                 }
-            }
+                1 => self.request_save(),
+                2 => WizardAction::TestConnections,
+                _ => WizardAction::Quit,
+            },
         }
     }
 
@@ -836,9 +899,9 @@ impl Wizard {
             return;
         };
         if let Ok(home) = MeowHome::at(root) {
-            let mut cfg = std::fs::read_to_string(&self.config_file)
+            let mut cfg = read_private_bounded(&self.config_file, MAX_WIZARD_CONFIG_BYTES)
                 .ok()
-                .and_then(|t| toml::from_str::<Config>(&t).ok())
+                .and_then(|t| crate::workspace::parse_toml::<Config>(&t, &self.config_file).ok())
                 .unwrap_or_default();
             cfg.recon.wordlist_dir = Some(home.root().join("wordlists"));
             self.tools = scan_tools(&cfg, &home);
@@ -915,6 +978,7 @@ impl Wizard {
 
     /// Builds an in-memory `AiOverrides` representing the wizard's choices.
     pub fn build_ai_overrides(&self) -> AiOverrides {
+        let disable_cloud = self.cloud_choice == CloudChoice::LocalOnly;
         let (provider, url, fallbacks, api_key) = match self.cloud_choice {
             CloudChoice::LocalOnly => (None, None, None, None),
             CloudChoice::Claude => (
@@ -939,11 +1003,13 @@ impl Wizard {
             cloud_provider: provider,
             cloud_fallbacks: fallbacks,
             api_key,
+            disable_cloud,
         }
     }
 
     /// Runs live connection checks against the currently configured `[L]` and `[C]`.
     pub fn test_connections(&mut self) {
+        let local_only = self.cloud_choice == CloudChoice::LocalOnly;
         let preview = AiSettings {
             local_url: self.local_url.clone(),
             local_model: self.local_model.clone(),
@@ -956,9 +1022,8 @@ impl Wizard {
             },
             cloud_fallbacks: (self.cloud_choice == CloudChoice::Claude)
                 .then(|| self.cloud_fallbacks.clone()),
-            openrouter_api_key: (self.cloud_choice != CloudChoice::LocalOnly)
-                .then(|| self.cloud_api_key.clone())
-                .flatten(),
+            openrouter_api_key: (!local_only).then(|| self.cloud_api_key.clone()).flatten(),
+            disable_cloud: local_only,
             user_file: None,
             ..AiSettings::default()
         };
@@ -991,11 +1056,12 @@ impl Wizard {
 
     /// Atomically persists `config.toml` and `ai.toml` with `0600` permissions.
     pub fn save(&self, home: &MeowHome) -> Result<WizardOutcome> {
-        Config::save_setup_preferences(
+        Config::save_setup_preferences_with_location(
             home,
             self.default_mode,
             self.cve_enabled,
             self.nvd_api_key.as_deref(),
+            Some((self.location_enabled, self.location_map)),
         )?;
         let overrides = self.build_ai_overrides();
         overrides.save(&home.ai_path())?;
@@ -1009,62 +1075,10 @@ impl Wizard {
 // Local toolkit detection
 // ---------------------------------------------------------------------------
 
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
-}
-
 /// Rejects CLI subcommand names so `meow <name>` opens a workspace session
 /// rather than dispatching to a subcommand.
 fn validate_launch_workspace(raw: &str) -> Result<String, String> {
-    let valid = validate_name(raw)?;
-    const RESERVED_COMMANDS: &[&str] = &[
-        "list", "ls", "setup", "update", "delete", "rm", "mode", "recon", "map", "hud", "add",
-        "report", "help",
-    ];
-    if RESERVED_COMMANDS.contains(&valid.to_ascii_lowercase().as_str()) {
-        return Err(format!(
-            "'{valid}' is a meow subcommand; choose another workspace name"
-        ));
-    }
-    Ok(valid)
-}
-
-fn find_program_on_path(program: &str) -> Option<PathBuf> {
-    let prog_path = Path::new(program);
-    if prog_path.components().count() > 1 {
-        return is_executable_file(prog_path).then(|| prog_path.to_path_buf());
-    }
-    let paths = env::var_os("PATH")?;
-    for dir in env::split_paths(&paths) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        #[cfg(windows)]
-        if prog_path.extension().is_none() {
-            for ext in [".exe", ".cmd", ".bat"] {
-                let with_ext = dir.join(format!("{program}{ext}"));
-                if is_executable_file(&with_ext) {
-                    return Some(with_ext);
-                }
-            }
-        }
-        let direct = dir.join(program);
-        if is_executable_file(&direct) {
-            return Some(direct);
-        }
-    }
-    None
+    validate_name(raw)
 }
 
 fn tool_hint(name: &str) -> &'static str {
@@ -1073,6 +1087,7 @@ fn tool_hint(name: &str) -> &'static str {
             "nmap" => "brew install nmap",
             "katana" => "brew install katana",
             "feroxbuster" => "brew install feroxbuster",
+            "geoip" => "run `meow tools` or ./install.sh --tools-only",
             _ => "run ./install.sh or place a .txt wordlist in ~/.meow/wordlists",
         }
     } else if cfg!(target_os = "windows") {
@@ -1080,6 +1095,7 @@ fn tool_hint(name: &str) -> &'static str {
             "nmap" => "winget install Insecure.Nmap",
             "katana" => "go install github.com/projectdiscovery/katana/cmd/katana@v1.1.2",
             "feroxbuster" => "cargo install feroxbuster --locked",
+            "geoip" => "run `meow tools` or .\\install.ps1 -ToolsOnly",
             _ => "run .\\install.ps1 or place a .txt wordlist in ~/.meow/wordlists",
         }
     } else {
@@ -1087,6 +1103,7 @@ fn tool_hint(name: &str) -> &'static str {
             "nmap" => "install nmap with your package manager (or ./install.sh)",
             "katana" => "go install github.com/projectdiscovery/katana/cmd/katana@v1.1.2",
             "feroxbuster" => "cargo install feroxbuster --locked (or ./install.sh)",
+            "geoip" => "run `meow tools` or ./install.sh --tools-only",
             _ => "run ./install.sh or place a .txt wordlist in ~/.meow/wordlists",
         }
     }
@@ -1109,7 +1126,7 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
         ),
     ] {
         let short = label.split_whitespace().next().unwrap_or(bin);
-        let found = find_program_on_path(bin).map(|p| sanitize(&p.display().to_string(), 120));
+        let found = tools::find_program(bin).map(|p| sanitize(&p.display().to_string(), 120));
         out.push(ToolCheck {
             name: label.to_owned(),
             found,
@@ -1125,6 +1142,23 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
         name: "web wordlist (SecLists common.txt)".to_owned(),
         found: wordlist,
         hint: tool_hint("wordlist").to_owned(),
+    });
+    let geo_path = {
+        let db = Path::new(&config.location.database);
+        if db.is_absolute() {
+            db.to_path_buf()
+        } else {
+            home.root().join(db)
+        }
+    };
+    let geo_found = std::fs::symlink_metadata(&geo_path)
+        .ok()
+        .filter(|m| m.is_file() && !m.file_type().is_symlink())
+        .map(|_| sanitize(&geo_path.display().to_string(), 120));
+    out.push(ToolCheck {
+        name: "GeoIP database (DB-IP City Lite)".to_owned(),
+        found: geo_found,
+        hint: tool_hint("geoip").to_owned(),
     });
     out
 }
@@ -1454,30 +1488,42 @@ fn step_items(wizard: &Wizard) -> (&'static str, Vec<ListItem<'static>>) {
                     checkbox(wizard.cve_enabled)
                 )),
                 ListItem::new(format!("NVD API Key (opt):   {nvd_desc}")),
+                ListItem::new(format!(
+                    "{} Public IP Location Lookup (auto-disabled on VPN)",
+                    checkbox(wizard.location_enabled)
+                )),
+                ListItem::new(format!(
+                    "{} Satellite Map Tiles (EOX Sentinel-2 cloudless)",
+                    checkbox(wizard.location_map)
+                )),
                 ListItem::new("[Re-scan Local Scanners & Wordlists (r)]".to_owned()),
             ];
-            ("CVE Radar & Recon Toolkit", items)
+            ("CVE Radar, Location & Toolkit", items)
         }
         Step::Launch => {
-            let mut items = Vec::new();
-            if wizard.first_run {
-                let ws = if wizard.launch_workspace.is_empty() {
-                    "(optional -- press Enter to name e.g. 'homelab')".to_owned()
-                } else {
-                    format!("{}  (will open session on save!)", wizard.launch_workspace)
-                };
-                items.push(ListItem::new(format!("First Workspace:  {ws}")));
-                let action = if wizard.launch_workspace.is_empty() {
-                    "[ Save Setup & Finish (s) ]"
-                } else {
-                    "[ Save Setup & Launch Workspace! (s) ]"
-                };
-                items.push(ListItem::new(action.to_owned()));
+            let ws_label = if wizard.first_run {
+                "First Workspace:  "
             } else {
-                items.push(ListItem::new("[ Save Setup & Exit (s) ]".to_owned()));
-            }
-            items.push(ListItem::new("[ Test AI Connections Now (t) ]".to_owned()));
-            items.push(ListItem::new("[ Quit Without Saving (q) ]".to_owned()));
+                "Launch Workspace: "
+            };
+            let ws = if wizard.launch_workspace.is_empty() {
+                "(optional -- press Enter to name e.g. 'homelab')".to_owned()
+            } else {
+                format!("{}  (will open session on save!)", wizard.launch_workspace)
+            };
+            let save_label = if !wizard.launch_workspace.is_empty() {
+                "[ Save Setup & Launch Workspace! (s) ]"
+            } else if wizard.first_run {
+                "[ Save Setup & Finish (s) ]"
+            } else {
+                "[ Save Setup & Exit (s) ]"
+            };
+            let items = vec![
+                ListItem::new(format!("{ws_label}{ws}")),
+                ListItem::new(save_label.to_owned()),
+                ListItem::new("[ Test AI Connections Now (t) ]".to_owned()),
+                ListItem::new("[ Quit Without Saving (q) ]".to_owned()),
+            ];
             ("Launchpad & Connection Check", items)
         }
     }
@@ -1576,10 +1622,14 @@ fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
                 CloudChoice::Claude => "Anthropic Claude API",
                 CloudChoice::OpenRouter => "OpenRouter / OpenAI-compatible",
             };
-            let key_desc = secret_summary(
-                wizard.cloud_api_key.as_deref(),
-                wizard.env_key_source.as_deref(),
-            );
+            let key_desc = if wizard.cloud_choice == CloudChoice::LocalOnly {
+                "disabled (local-only mode overrides environment keys)".to_owned()
+            } else {
+                secret_summary(
+                    wizard.cloud_api_key.as_deref(),
+                    wizard.env_key_source.as_deref(),
+                )
+            };
             let lines = vec![
                 Line::from(vec![
                     Span::styled("Mode:     ", DIM),
@@ -1589,7 +1639,9 @@ fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
                     Span::styled("API Key:  ", DIM),
                     Span::styled(
                         key_desc,
-                        if wizard.cloud_api_key.is_some() || wizard.env_key_source.is_some() {
+                        if wizard.cloud_choice != CloudChoice::LocalOnly
+                            && (wizard.cloud_api_key.is_some() || wizard.env_key_source.is_some())
+                        {
                             GOOD
                         } else {
                             WARN
@@ -1649,6 +1701,19 @@ fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
             } else {
                 wizard.local_model.as_str()
             };
+            let key_summary = if wizard.cloud_choice == CloudChoice::LocalOnly {
+                "disabled (local-only mode)".to_owned()
+            } else {
+                secret_summary(
+                    wizard.cloud_api_key.as_deref(),
+                    wizard.env_key_source.as_deref(),
+                )
+            };
+            let loc_summary = match (wizard.location_enabled, wizard.location_map) {
+                (true, true) => "enabled + satellite map tiles",
+                (true, false) => "enabled (map tiles off)",
+                (false, _) => "disabled (offline GeoIP only)",
+            };
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("Default mode:  ", DIM),
@@ -1664,10 +1729,7 @@ fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
                 ]),
                 Line::from(vec![
                     Span::styled("Cloud API key: ", DIM),
-                    Span::raw(secret_summary(
-                        wizard.cloud_api_key.as_deref(),
-                        wizard.env_key_source.as_deref(),
-                    )),
+                    Span::raw(key_summary),
                 ]),
                 Line::from(vec![
                     Span::styled("CVE grounding: ", DIM),
@@ -1676,6 +1738,10 @@ fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
                     } else {
                         "disabled"
                     }),
+                ]),
+                Line::from(vec![
+                    Span::styled("Location/map:  ", DIM),
+                    Span::raw(loc_summary),
                 ]),
                 Line::from(vec![
                     Span::styled("Config files:  ", DIM),
@@ -1752,10 +1818,10 @@ struct WizardTerminalGuard;
 impl Drop for WizardTerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-        ratatui::restore();
         let _ = std::io::stdout()
-            .write_all(b"\x1b[?1049l\x1b[?1000l\x1b[?2004l\x1b[?25h")
+            .write_all(b"\x1b[?2004l\x1b[?1000l\x1b[?25h")
             .and_then(|()| std::io::stdout().flush());
+        ratatui::restore();
     }
 }
 
@@ -2030,6 +2096,125 @@ mod tests {
         assert!(agg.contains("( >'w'< )"));
         assert!(validate_launch_workspace("update").is_err());
         assert!(validate_launch_workspace("setup").is_err());
+        assert!(validate_launch_workspace("tools").is_err());
         assert_eq!(validate_launch_workspace("catlab").unwrap(), "catlab");
+    }
+
+    #[test]
+    fn local_only_location_toggles_and_edit_caps_persist_across_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+
+        // Select LocalOnly explicitly and toggle both [location] preferences off.
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 0;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_choice, CloudChoice::LocalOnly);
+
+        wiz.on_key(key(KeyCode::Char('4')));
+        wiz.cursors[Step::Toolkit.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.cursors[Step::Toolkit.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        assert!(!wiz.location_enabled);
+        assert!(!wiz.location_map);
+
+        // Paste cap at MAX_EDIT_CHARS and workspace launch on non-first-run setup.
+        wiz.on_key(key(KeyCode::Char('5')));
+        wiz.cursors[Step::Launch.index()] = 0;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste(&"a".repeat(6_000));
+        assert_eq!(wiz.editing.as_ref().unwrap().buffer.len(), MAX_EDIT_CHARS);
+        wiz.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        wiz.on_paste("recheck-lab");
+        wiz.on_key(key(KeyCode::Enter));
+
+        let outcome = wiz.save(&home).unwrap();
+        assert_eq!(
+            outcome,
+            WizardOutcome::Saved {
+                launch_workspace: Some("recheck-lab".into())
+            }
+        );
+
+        let cfg = Config::load_or_create(&home).unwrap();
+        assert!(!cfg.location.enabled);
+        assert!(!cfg.location.map);
+        let eff = cfg.ai.effective();
+        assert!(eff.disable_cloud);
+        assert_eq!(eff.api_key(), None);
+
+        let reloaded = Wizard::load(&home, false).unwrap();
+        assert_eq!(reloaded.cloud_choice, CloudChoice::LocalOnly);
+        assert!(!reloaded.location_enabled);
+        assert!(!reloaded.location_map);
+    }
+
+    #[test]
+    fn switching_cloud_provider_or_host_clears_key_and_broken_config_hides_secrets() {
+        const CLAUDE_KEY: &str = "sk-ant-never-leak-to-other-host-7711";
+        const NVD_SECRET: &str = "nvd-secret-in-broken-toml-9922";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+
+        // Enter a Claude key on Step 3 -> auto-selects Claude.
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste(CLAUDE_KEY);
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_choice, CloudChoice::Claude);
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(CLAUDE_KEY));
+
+        // Switching provider from Claude to OpenRouter clears the Claude key!
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_choice, CloudChoice::OpenRouter);
+        assert_eq!(wiz.cloud_api_key, None);
+        assert_eq!(wiz.build_ai_overrides().api_key, None);
+
+        // Set an OpenRouter key, then change CloudUrl to a different host -> clears key!
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste("sk-or-v1-host-bound-key-5544");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            wiz.cloud_api_key.as_deref(),
+            Some("sk-or-v1-host-bound-key-5544")
+        );
+
+        wiz.cursors[Step::CloudAi.index()] = 4;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        wiz.on_paste("https://api.together.xyz/v1");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_url, "https://api.together.xyz/v1");
+        assert_eq!(wiz.cloud_api_key, None);
+
+        // Oversized (> 512 bytes) keys are rejected.
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste(&"k".repeat(513));
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key, None);
+
+        // Broken config.toml with an NVD secret fails Wizard::load without echoing the secret (ISS-029).
+        Config::load_or_create(&home).unwrap();
+        crate::workspace::write_private_atomic(
+            &home.config_path(),
+            format!("[cve]\nnvd_api_key = \"{NVD_SECRET}\" broken_syntax\n").as_bytes(),
+        )
+        .unwrap();
+        let err = match Wizard::load(&home, false) {
+            Ok(_) => panic!("broken config.toml must fail Wizard::load"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(
+            !err.contains(NVD_SECRET),
+            "parse error leaked config secret: {err}"
+        );
     }
 }

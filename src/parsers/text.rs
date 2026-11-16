@@ -16,6 +16,9 @@ use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::graph::Observation;
 
 const MAX_LINE: usize = 4096;
+/// How many addresses of sites, and how many `host:port` mentions, one line
+/// may yield. A line packed with hundreds says nothing a scan would.
+const MAX_PER_LINE: usize = 16;
 
 static URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>\\^`{|}]+"#).expect("valid regex"));
@@ -38,6 +41,17 @@ static ENDPOINT_V6: LazyLock<Regex> = LazyLock::new(|| {
 static HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:[<>] )?(server|location):\s*(\S.*)$").expect("valid regex")
 });
+static HEADER_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[<>] )?[A-Za-z0-9-]+:\s+\S").expect("valid regex"));
+
+fn is_http_continuation(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("HTTP/")
+        || trimmed.starts_with("< HTTP/")
+        || trimmed.starts_with("> ")
+        || trimmed.starts_with("* ")
+        || HEADER_LINE.is_match(trimmed)
+}
 
 /// Addresses that say nothing about the lab: wildcard binds, loopback,
 /// multicast and broadcast.
@@ -115,7 +129,11 @@ impl TextParser {
     pub fn feed(&mut self, line: &str) -> Vec<Observation> {
         let line = line.trim_end();
         let mut out = Vec::new();
+        // An empty line ends a scan report and a block of headers: what
+        // comes after it is not about that host or that address any more.
         if line.is_empty() || line.len() > MAX_LINE {
+            self.scan_host = None;
+            self.web = None;
             return out;
         }
 
@@ -184,6 +202,10 @@ impl TextParser {
             return out;
         }
 
+        if line.starts_with("Nmap done:") || line.starts_with("$ ") || line.starts_with("# ") {
+            self.scan_host = None;
+        }
+
         if let (Some((address, port, scheme)), Some(found)) = (&self.web, HEADER.captures(line)) {
             let value = found[2].trim().to_owned();
             let is_server = found[1].eq_ignore_ascii_case("server");
@@ -193,18 +215,31 @@ impl TextParser {
                 scheme: scheme.clone(),
                 server: is_server.then(|| value.clone()),
                 location: (!is_server).then_some(value),
-                record: EvidenceRecord::observed(Source::HttpHeader, Confidence::Medium, line),
+                record: self.record(Confidence::Medium, line),
             });
             return out;
+        }
+
+        // Headers follow their request directly (status line, curl trace
+        // prefixes, or other header fields). Any other line ends them.
+        if !is_http_continuation(line) {
+            self.web = None;
         }
 
         // URLs first; what remains of the line is searched for host:port.
         let mut rest = String::with_capacity(line.len());
         let mut last = 0;
+        // With several addresses on a line, each keeps itself as evidence,
+        // not a copy of the whole line.
+        let crowded = URL.find_iter(line).nth(1).is_some();
+        let mut sites = 0;
         for found in URL.find_iter(line) {
             rest.push_str(&line[last..found.start()]);
             rest.push(' ');
             last = found.end();
+            if sites == MAX_PER_LINE {
+                continue;
+            }
             let text = found
                 .as_str()
                 .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
@@ -216,13 +251,14 @@ impl TextParser {
             }
             let address = url.host.canonical();
             self.web = Some((address.clone(), url.port, url.scheme.clone()));
+            sites += 1;
             out.push(Observation::Path {
                 address,
                 port: url.port,
                 scheme: url.scheme,
                 path: url.path,
                 status: None,
-                record: self.record(Confidence::Low, line),
+                record: self.record(Confidence::Low, if crowded { text } else { line }),
             });
         }
         rest.push_str(&line[last..]);
@@ -230,7 +266,13 @@ impl TextParser {
         let mentions = ENDPOINT_V4
             .captures_iter(&rest)
             .chain(ENDPOINT_V6.captures_iter(&rest));
+        let crowded = crowded
+            || ENDPOINT_V4.find_iter(&rest).count() + ENDPOINT_V6.find_iter(&rest).count() > 1;
+        let mut kept = 0;
         for found in mentions {
+            if kept == MAX_PER_LINE {
+                break;
+            }
             let Some(endpoint) = Endpoint::parse(&found[1]) else {
                 continue;
             };
@@ -251,8 +293,9 @@ impl TextParser {
                 version: None,
                 extra_info: None,
                 cpes: Vec::new(),
-                record: self.record(Confidence::Low, line),
+                record: self.record(Confidence::Low, if crowded { &found[1] } else { line }),
             });
+            kept += 1;
         }
         out
     }
@@ -315,10 +358,7 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
         );
 
         let app = &graph.hosts["10.0.0.5"];
-        assert_eq!(
-            app.hostnames.iter().collect::<Vec<_>>(),
-            ["app.lab.local", "sso.lab.local"]
-        );
+        assert_eq!(app.hostnames.iter().collect::<Vec<_>>(), ["app.lab.local"]);
         let ssh = &app.ports["22/tcp"];
         assert_eq!(ssh.service.as_deref(), Some("ssh"));
         assert_eq!(ssh.product.as_deref(), Some("OpenSSH"));
@@ -369,6 +409,97 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
     }
 
     #[test]
+    fn a_line_packed_with_addresses_yields_a_bounded_number_of_short_facts() {
+        // One 4 KB line: 95 site addresses and 95 host:port mentions.
+        let line: String = (0..95)
+            .map(|n| {
+                format!(
+                    "http://h{n}.example:8{:03}/a 10.9.{}.{}:81 ",
+                    n,
+                    n / 200,
+                    n % 200 + 1
+                )
+            })
+            .collect::<String>();
+        assert!(line.len() < MAX_LINE && line.len() > 3000, "{}", line.len());
+        let mut parser = TextParser::new(Source::PtyRegex);
+        let found = parser.feed(&line);
+        let sites = found
+            .iter()
+            .filter(|o| matches!(o, Observation::Path { .. }))
+            .count();
+        let mentions = found
+            .iter()
+            .filter(|o| matches!(o, Observation::Port { .. }))
+            .count();
+        assert_eq!((sites, mentions), (MAX_PER_LINE, MAX_PER_LINE));
+        // None of them carries a copy of the whole line.
+        for observation in &found {
+            let evidence = match observation {
+                Observation::Path { record, .. } | Observation::Port { record, .. } => {
+                    &record.evidence
+                }
+                other => panic!("{other:?}"),
+            };
+            assert!(evidence.len() < 64, "{evidence}");
+        }
+        // A line about one thing keeps itself as evidence, as before.
+        let found = parser.feed("panel moved to http://10.0.0.5:8080/admin last week");
+        match &found[0] {
+            Observation::Path { record, .. } => assert!(record.evidence.contains("last week")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_report_or_a_block_of_headers_ends_where_its_text_ends() {
+        let about = |text: &str| -> Vec<String> {
+            TextParser::parse(Source::PtyRegex, text)
+                .iter()
+                .filter_map(|o| match o {
+                    Observation::Port { address, port, .. } => Some(format!("{address}:{port}")),
+                    Observation::Http {
+                        address,
+                        port,
+                        server,
+                        location,
+                        ..
+                    } => Some(format!(
+                        "{address}:{port} {}",
+                        server.as_deref().or(location.as_deref()).unwrap_or("")
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        // A scan report as nmap prints it: the rows belong to its host.
+        assert_eq!(
+            about("Nmap scan report for 10.0.0.5\nHost is up.\nPORT STATE SERVICE\n22/tcp open ssh\n80/tcp open http\n"),
+            ["10.0.0.5:22", "10.0.0.5:80"]
+        );
+        // After the empty line that ends it, a stray row is nobody's.
+        assert_eq!(
+            about("Nmap scan report for 10.0.0.5\n22/tcp open ssh\n\nlater, in a web page:\n8443/tcp open https nginx 1.14.0\n"),
+            ["10.0.0.5:22"]
+        );
+        // Headers of a request, with its status line and intermediate headers,
+        // belong to its address.
+        assert_eq!(
+            about("$ curl -I http://10.0.0.5:8080/\nHTTP/1.1 302 Found\nDate: Mon, 16 Nov 2026 00:00:00 GMT\nContent-Type: text/html\nServer: nginx\nLocation: /login\n"),
+            ["10.0.0.5:8080 nginx", "10.0.0.5:8080 /login"]
+        );
+        // Not after other text, and not after an empty line.
+        assert_eq!(
+            about("see http://10.0.0.5:8080/ for details\nsome prose in between\nServer: forged\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            about("GET http://10.0.0.5:8080/\n\nServer: forged\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn headers_without_a_preceding_url_are_ignored() {
         let mut parser = TextParser::new(Source::PtyRegex);
         assert!(parser.feed("Server: nginx").is_empty());
@@ -384,5 +515,10 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
             2
         );
         assert_eq!(parser.feed("< Server: Apache").len(), 1);
+        assert!(parser.feed("unrelated shell output").is_empty());
+        assert!(
+            parser.feed("Server: FakeAfterReset").is_empty(),
+            "unrelated line must clear sticky web context"
+        );
     }
 }

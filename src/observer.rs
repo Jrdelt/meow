@@ -121,10 +121,11 @@ fn listener_from(protocol: &str, local: &str) -> Option<Listener> {
     // `*:22` and `*.22` mean every address.
     let local = local.replace("*:", "0.0.0.0:").replace("[*]:", "[::]:");
     let endpoint = Endpoint::parse(&local)?;
+    let port = endpoint.port.filter(|&port| port > 0)?;
     Some(Listener {
         protocol,
         address: endpoint.host.ip()?.to_string(),
-        port: endpoint.port?,
+        port,
     })
 }
 
@@ -187,6 +188,7 @@ pub mod linux {
 
     /// `ip route show` / `ip -6 route show`
     pub fn routes(text: &str, ipv6: bool, out: &mut Vec<Route>) {
+        let mut last_destination: Option<String> = None;
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
             let Some(first) = fields.first() else {
@@ -196,6 +198,7 @@ pub mod linux {
                 *first,
                 "unreachable" | "blackhole" | "prohibit" | "broadcast" | "local" | "multicast"
             ) {
+                last_destination = None;
                 continue;
             }
             let after = |key: &str| {
@@ -204,10 +207,16 @@ pub mod linux {
                     .position(|f| *f == key)
                     .and_then(|i| fields.get(i + 1))
             };
-            let (Some(destination), Some(interface)) = (
-                canonical_destination(first, ipv6),
-                after("dev").and_then(|d| clean_if_name(d)),
-            ) else {
+            let destination = if *first == "nexthop" {
+                last_destination.clone()
+            } else {
+                let dest = canonical_destination(first, ipv6);
+                last_destination.clone_from(&dest);
+                dest
+            };
+            let (Some(destination), Some(interface)) =
+                (destination, after("dev").and_then(|d| clean_if_name(d)))
+            else {
                 continue;
             };
             push_unique(
@@ -249,18 +258,53 @@ pub mod linux {
         }
     }
 
+    /// `/proc/net/arp`
+    pub fn proc_arp(text: &str, out: &mut Vec<Neighbor>) {
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // IP address  HW type  Flags  HW address  Mask  Device
+            if fields.len() < 6 || fields[2] == "0x0" {
+                continue;
+            }
+            let (Some(address), Some(mac), Some(interface)) = (
+                canonical_ip(fields[0]),
+                clean_mac(fields[3]),
+                clean_if_name(fields[5]),
+            ) else {
+                continue;
+            };
+            push_unique(
+                out,
+                Neighbor {
+                    address,
+                    mac: Some(mac),
+                    interface,
+                },
+            );
+        }
+    }
+
     /// `ss -H -ltn` (tcp) or `ss -H -lun` (udp)
     pub fn listeners(text: &str, protocol: &str, out: &mut Vec<Listener>) {
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
             // State Recv-Q Send-Q Local:Port Peer:Port
             let Some(local) = fields.get(3) else { continue };
-            // "127.0.0.53%lo:53" carries the interface as a zone.
+            // "127.0.0.53%lo:53" or "[fe80::1%eth0]:53" carries the interface as a zone.
             let local = match local.split_once('%') {
-                Some((address, rest)) => match rest.rsplit_once(':') {
-                    Some((_, port)) => format!("{address}:{port}"),
-                    None => continue,
-                },
+                Some((address, rest)) => {
+                    if address.starts_with('[') {
+                        match rest.rsplit_once("]:") {
+                            Some((_, port)) => format!("{address}]:{port}"),
+                            None => continue,
+                        }
+                    } else {
+                        match rest.rsplit_once(':') {
+                            Some((_, port)) => format!("{address}:{port}"),
+                            None => continue,
+                        }
+                    }
+                }
                 None => (*local).to_owned(),
             };
             let local = if local.contains("]:") || local.matches(':').count() == 1 {
@@ -277,7 +321,7 @@ pub mod linux {
 }
 
 // ---------------------------------------------------------------------------
-// macOS / BSD: ifconfig, netstat, arp
+// macOS / BSD: ifconfig, netstat, arp, ndp
 // ---------------------------------------------------------------------------
 
 pub mod macos {
@@ -469,6 +513,38 @@ pub mod macos {
         }
     }
 
+    /// `ndp -an`
+    pub fn ndp_neighbors(text: &str, out: &mut Vec<Neighbor>) {
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // Neighbor Linklayer-Address Netif Expire St Flgs Prbs
+            if fields.len() < 3 || fields[0] == "Neighbor" {
+                continue;
+            }
+            let (Some(address), Some(mac), Some(interface)) = (
+                canonical_ip(fields[0]),
+                clean_mac(fields[1]),
+                clean_if_name(fields[2]),
+            ) else {
+                continue;
+            };
+            let Ok(ip) = IpAddr::from_str(&address) else {
+                continue;
+            };
+            if ip.is_multicast() || ip.is_loopback() || ip.is_unspecified() {
+                continue;
+            }
+            push_unique(
+                out,
+                Neighbor {
+                    address,
+                    mac: Some(mac),
+                    interface,
+                },
+            );
+        }
+    }
+
     /// `netstat -an -p tcp`: local addresses are `addr.port`.
     pub fn listeners(text: &str, out: &mut Vec<Listener>) {
         for line in text.lines() {
@@ -485,6 +561,9 @@ pub mod macos {
             let Ok(port) = port.parse::<u16>() else {
                 continue;
             };
+            if port == 0 {
+                continue;
+            }
             let address = match address {
                 "*" if fields[0] == "tcp4" => "0.0.0.0".to_owned(),
                 "*" => "::".to_owned(),
@@ -511,7 +590,7 @@ pub mod macos {
 
 pub mod windows {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn prefix_from_mask(mask: Ipv4Addr) -> Option<u8> {
         let value = u32::from(mask);
@@ -519,12 +598,15 @@ pub mod windows {
     }
 
     /// One adapter from `ipconfig /all`: its name, what kind of link it is,
-    /// and its IPv4 addresses.
+    /// its hardware description, and its IPv4/IPv6 addresses.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Adapter {
         pub name: String,
+        pub description: String,
         pub kind: &'static str,
         pub addresses: Vec<Ipv4Addr>,
+        pub prefixes: Vec<(Ipv4Addr, u8)>,
+        pub ipv6_addresses: Vec<String>,
     }
 
     /// The kind of link an adapter is, from its heading and description.
@@ -564,7 +646,9 @@ pub mod windows {
             "drahtlos",
             "sans fil",
             "inalámbric",
-        ]) {
+            "inalambric",
+        ]) || (text.contains("inal") && text.contains("mbric"))
+        {
             "wifi"
         } else if has(&["ethernet", "gbe", "realtek pcie"]) {
             "ethernet"
@@ -575,16 +659,18 @@ pub mod windows {
 
     /// `ipconfig /all`. Headings are localised, so blocks are found by
     /// shape: an adapter heading starts at column 0 and ends with `:`; its
-    /// lines are indented. "IPv4" is not translated in most languages.
+    /// lines are indented. "IPv4" and "IPv6" are not translated in most languages.
     pub fn adapters(text: &str) -> Vec<Adapter> {
         let mut out: Vec<Adapter> = Vec::new();
         let mut words = String::new();
+        let mut awaiting_mask = false;
         for line in text.lines() {
             let trimmed = line.trim_end();
             if trimmed.is_empty() {
                 continue;
             }
             if !line.starts_with(char::is_whitespace) {
+                awaiting_mask = false;
                 if let Some(heading) = trimmed.strip_suffix(':') {
                     // "Wireless LAN adapter Wi-Fi" -> "Wi-Fi"; other languages
                     // keep the whole heading.
@@ -596,8 +682,11 @@ pub mod windows {
                     words = heading.to_owned();
                     out.push(Adapter {
                         name,
+                        description: String::new(),
                         kind: adapter_kind(heading),
                         addresses: Vec::new(),
+                        prefixes: Vec::new(),
+                        ipv6_addresses: Vec::new(),
                     });
                 }
                 continue;
@@ -605,63 +694,171 @@ pub mod windows {
             let Some(adapter) = out.last_mut() else {
                 continue;
             };
-            if let Some((_, value)) = trimmed.split_once(": ") {
-                // The description line names the hardware ("Intel Wi-Fi 6E").
+            if let Some((label, value)) = trimmed.split_once(": ") {
+                let value_trimmed = value.trim();
+                // The first non-address text description names the hardware ("Intel Wi-Fi 6E").
+                if adapter.description.is_empty()
+                    && !label.contains("DNS")
+                    && !label.contains("IPv4")
+                    && !label.contains("IPv6")
+                    && !value_trimmed.is_empty()
+                    && value_trimmed.contains(' ')
+                    && Ipv4Addr::from_str(value_trimmed).is_err()
+                {
+                    adapter.description = value_trimmed.to_owned();
+                }
                 if adapter.kind == "other" {
                     words.push(' ');
                     words.push_str(value);
                     adapter.kind = adapter_kind(&words);
                 }
                 if trimmed.contains("IPv4") {
-                    let value = value.split('(').next().unwrap_or("").trim();
-                    if let Ok(ip) = Ipv4Addr::from_str(value) {
+                    let clean = value.split('(').next().unwrap_or("").trim();
+                    if let Ok(ip) = Ipv4Addr::from_str(clean) {
                         adapter.addresses.push(ip);
+                        adapter.prefixes.push((ip, 32));
+                        awaiting_mask = true;
+                    }
+                } else if awaiting_mask {
+                    awaiting_mask = false;
+                    if let Ok(mask) = Ipv4Addr::from_str(value_trimmed) {
+                        if mask.octets()[0] >= 128 {
+                            if let Some(prefix) = prefix_from_mask(mask) {
+                                if let Some((_, last_prefix)) = adapter.prefixes.last_mut() {
+                                    *last_prefix = prefix;
+                                }
+                            }
+                        }
+                    }
+                } else if trimmed.contains("IPv6")
+                    && !label.contains("IAID")
+                    && !label.contains("DUID")
+                {
+                    let clean = value
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .split('%')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if let Ok(ip) = Ipv6Addr::from_str(clean) {
+                        let prefix = if ip.is_loopback() { 128 } else { 64 };
+                        push_unique(&mut adapter.ipv6_addresses, format!("{ip}/{prefix}"));
                     }
                 }
             }
         }
-        out.retain(|adapter| !adapter.addresses.is_empty());
+        out.retain(|adapter| !adapter.addresses.is_empty() || !adapter.ipv6_addresses.is_empty());
         out
     }
 
     /// Gives the interfaces found in the routing table (`if-<address>`)
-    /// their adapter's name and kind, everywhere they are referred to.
+    /// their adapter's name and kind, merges multi-address adapters, and
+    /// materialises `/32` tunnel adapters that have no on-link subnet route.
     pub fn name_interfaces(
         adapters: &[Adapter],
-        interfaces: &mut [Interface],
+        interfaces: &mut Vec<Interface>,
         routes: &mut [Route],
         neighbors: &mut [Neighbor],
     ) {
         for adapter in adapters {
-            for ip in &adapter.addresses {
+            let fallback = adapter
+                .addresses
+                .first()
+                .map(|ip| format!("if-{ip}"))
+                .unwrap_or_else(|| "adapter".to_owned());
+            let new = sanitize_name(&adapter.name).unwrap_or(fallback);
+
+            for (ip, mask_prefix) in &adapter.prefixes {
                 let old = format!("if-{ip}");
-                let Some(interface) = interfaces.iter_mut().find(|i| i.name == old) else {
-                    continue;
-                };
-                if interface.kind != "loopback" {
-                    interface.kind = adapter.kind.to_owned();
-                }
-                let new = sanitize_name(&adapter.name).unwrap_or_else(|| old.clone());
-                interface.name = new.clone();
                 for route in routes.iter_mut().filter(|r| r.interface == old) {
                     route.interface = new.clone();
                 }
                 for neighbor in neighbors.iter_mut().filter(|n| n.interface == old) {
                     neighbor.interface = new.clone();
                 }
+
+                if let Some(old_idx) = interfaces.iter().position(|i| i.name == old) {
+                    if let Some(target_idx) = interfaces
+                        .iter()
+                        .position(|i| i.name == new && i.name != old)
+                    {
+                        let removed = interfaces.remove(old_idx);
+                        let target_idx = if old_idx < target_idx {
+                            target_idx - 1
+                        } else {
+                            target_idx
+                        };
+                        for addr in removed.addresses {
+                            push_unique(&mut interfaces[target_idx].addresses, addr);
+                        }
+                    } else {
+                        if interfaces[old_idx].kind != "loopback" {
+                            interfaces[old_idx].kind = adapter.kind.to_owned();
+                        }
+                        interfaces[old_idx].name = new.clone();
+                    }
+                }
+
+                let entry = match interfaces.iter_mut().find(|i| i.name == new) {
+                    Some(existing) => existing,
+                    None => {
+                        interfaces.push(Interface {
+                            name: new.clone(),
+                            kind: if ip.is_loopback() {
+                                "loopback".to_owned()
+                            } else {
+                                adapter.kind.to_owned()
+                            },
+                            up: true,
+                            addresses: Vec::new(),
+                        });
+                        interfaces.last_mut().expect("just pushed")
+                    }
+                };
+                if entry.kind == "other" && adapter.kind != "other" {
+                    entry.kind = adapter.kind.to_owned();
+                }
+                let has_ip = entry
+                    .addresses
+                    .iter()
+                    .filter_map(|a| IpNetwork::from_str(a).ok())
+                    .any(|net| net.ip() == IpAddr::V4(*ip));
+                if !has_ip {
+                    push_unique(&mut entry.addresses, format!("{ip}/{mask_prefix}"));
+                }
+            }
+
+            if !adapter.ipv6_addresses.is_empty() {
+                let entry = match interfaces.iter_mut().find(|i| i.name == new) {
+                    Some(existing) => existing,
+                    None => {
+                        interfaces.push(Interface {
+                            name: new.clone(),
+                            kind: adapter.kind.to_owned(),
+                            up: true,
+                            addresses: Vec::new(),
+                        });
+                        interfaces.last_mut().expect("just pushed")
+                    }
+                };
+                for v6 in &adapter.ipv6_addresses {
+                    push_unique(&mut entry.addresses, v6.clone());
+                }
             }
         }
     }
 
     fn sanitize_name(name: &str) -> Option<String> {
-        let clean: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        let clean = crate::evidence::sanitize(name, 64);
         let clean = clean.trim().to_owned();
         (!clean.is_empty()).then_some(clean)
     }
 
     /// `route print -4`. Column headings are localised, so rows are
     /// recognised by shape: destination, netmask, gateway, interface, metric.
-    /// Interfaces are named after their address (`if-192.168.1.5`).
+    /// Interfaces are named after their address (`if-<local>`).
     pub fn routes(text: &str, interfaces: &mut Vec<Interface>, out: &mut Vec<Route>) {
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -692,8 +889,9 @@ pub mod windows {
             if local.is_loopback() {
                 entry.kind = "loopback".to_owned();
             }
-            // An on-link route for a real subnet reveals the interface's own prefix.
-            if gateway.is_none() && prefix > 0 {
+            // An on-link route for a real local subnet (not a /0 default or /1
+            // VPN split-tunnel route) reveals the interface's own prefix.
+            if gateway.is_none() && (8..32).contains(&prefix) {
                 push_unique(&mut entry.addresses, format!("{local}/{prefix}"));
             }
             push_unique(
@@ -702,6 +900,74 @@ pub mod windows {
                     destination: format!("{destination}/{prefix}"),
                     gateway: gateway.map(|g| g.to_string()),
                     interface: name,
+                },
+            );
+        }
+    }
+
+    /// `route print -6`. Maps interface indices from the `Interface List`
+    /// block to named adapters when possible, and parses active IPv6 routes.
+    pub fn routes_v6(
+        text: &str,
+        adapters: &[Adapter],
+        interfaces: &mut [Interface],
+        out: &mut Vec<Route>,
+    ) {
+        let mut if_names: std::collections::BTreeMap<u32, String> =
+            std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some((idx_part, rest)) = trimmed.split_once("...") {
+                if let Ok(idx) = idx_part.trim().parse::<u32>() {
+                    let desc = rest.rsplit("......").next().unwrap_or(rest).trim();
+                    if let Some(adapter) = adapters.iter().find(|a| {
+                        (!a.description.is_empty() && desc.eq_ignore_ascii_case(&a.description))
+                            || desc.eq_ignore_ascii_case(&a.name)
+                    }) {
+                        if let Some(name) = sanitize_name(&adapter.name) {
+                            if_names.insert(idx, name);
+                        }
+                    } else if desc.to_ascii_lowercase().contains("loopback") {
+                        if let Some(lo) = interfaces.iter().find(|i| i.kind == "loopback") {
+                            if_names.insert(idx, lo.name.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            // If Metric Network-Destination Gateway
+            if fields.len() < 4 {
+                continue;
+            }
+            let (Ok(if_idx), Ok(_metric)) = (fields[0].parse::<u32>(), fields[1].parse::<u32>())
+            else {
+                continue;
+            };
+            let Some(destination) = canonical_destination(fields[2], true) else {
+                continue;
+            };
+            let Ok(network) = IpNetwork::from_str(&destination) else {
+                continue;
+            };
+            let IpAddr::V6(dest_ip) = network.ip() else {
+                continue;
+            };
+            if dest_ip.is_multicast() || network.prefix() == 128 {
+                continue;
+            }
+            let Some(if_name) = if_names.get(&if_idx).cloned() else {
+                continue;
+            };
+            let gateway = (fields.len() == 4)
+                .then(|| canonical_ip(fields[3]))
+                .flatten();
+            push_unique(
+                out,
+                Route {
+                    destination,
+                    gateway,
+                    interface: if_name,
                 },
             );
         }
@@ -918,7 +1184,8 @@ pub fn active_vpns(local: &LocalNet) -> Vec<(String, bool)> {
                 .map(|route| route.destination.as_str())
                 .collect();
             let all = through.iter().any(|d| matches!(*d, "0.0.0.0/0" | "::/0"))
-                || (through.contains(&"0.0.0.0/1") && through.contains(&"128.0.0.0/1"));
+                || (through.contains(&"0.0.0.0/1") && through.contains(&"128.0.0.0/1"))
+                || (through.contains(&"::/1") && through.contains(&"8000::/1"));
             (interface.name.clone(), all)
         })
         .collect()
@@ -1097,6 +1364,7 @@ fn vpn_carries(local: &LocalNet, interface: &Interface) -> String {
         .filter(|network| is_host_route(network) && !is_bookkeeping(network))
         .count();
     let halves = ["0.0.0.0/1", "128.0.0.0/1"];
+    let halves_v6 = ["::/1", "8000::/1"];
     if routes.iter().any(|r| is_default_route(r)) {
         return "carries the default route".to_owned();
     }
@@ -1104,6 +1372,9 @@ fn vpn_carries(local: &LocalNet, interface: &Interface) -> String {
         // The usual way a VPN client takes everything without replacing
         // the default route.
         return "carries all IPv4 traffic (0.0.0.0/1 and 128.0.0.0/1)".to_owned();
+    }
+    if halves_v6.iter().all(|half| networks.contains(half)) {
+        return "carries all IPv6 traffic (::/1 and 8000::/1)".to_owned();
     }
     let mut parts: Vec<String> = Vec::new();
     if !networks.is_empty() {
@@ -1459,7 +1730,20 @@ fn push_note(notes: &mut Vec<String>, note: &str) {
     }
 }
 
+const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const MAX_CMD_STDOUT: u64 = 2 * 1024 * 1024;
+
 fn run_from(program: &str, args: &[&str], dirs: &[&str], notes: &mut Vec<String>) -> String {
+    run_from_with_timeout(program, args, dirs, CMD_TIMEOUT, notes)
+}
+
+fn run_from_with_timeout(
+    program: &str,
+    args: &[&str],
+    dirs: &[&str],
+    timeout: std::time::Duration,
+    notes: &mut Vec<String>,
+) -> String {
     let Some(resolved) = resolve_in_dirs(program, dirs, cfg!(windows)) else {
         push_note(
             notes,
@@ -1472,40 +1756,79 @@ fn run_from(program: &str, args: &[&str], dirs: &[&str], notes: &mut Vec<String>
             .filter(|dir| !dir.is_empty() && Path::new(dir).is_absolute()),
     )
     .unwrap_or_default();
-    let result = Command::new(&resolved)
-        .args(args)
+    let mut cmd = Command::new(&resolved);
+    cmd.args(args)
         .env("PATH", safe_path)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     let command = format!("{program} {}", args.join(" "));
     let command = command.trim();
-    match result {
-        // The exit code alone is not a failure: some of these tools print a
-        // usable table and still exit non-zero (for example when one entry
-        // cannot be read). The parsers ignore what they do not recognise.
-        Ok(output) => {
-            let text = String::from_utf8_lossy(&output.stdout).into_owned();
-            if text.trim().is_empty() && !output.status.success() {
-                push_note(
-                    notes,
-                    &format!("`{command}` failed ({}) and printed nothing", output.status),
-                );
-            }
-            text
-        }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             push_note(
                 notes,
                 &format!("`{program}` is not installed in the system directories"),
             );
-            String::new()
+            return String::new();
         }
         Err(error) => {
             push_note(notes, &format!("`{command}` could not be run: {error}"));
-            String::new()
+            return String::new();
         }
+    };
+    let reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = stdout.take(MAX_CMD_STDOUT + 1).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    push_note(notes, &format!("`{command}` timed out"));
+                    return String::new();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                push_note(notes, &format!("`{command}` could not be run: {error}"));
+                return String::new();
+            }
+        }
+    };
+    let mut stdout = reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    if stdout.len() as u64 > MAX_CMD_STDOUT {
+        stdout.truncate(MAX_CMD_STDOUT as usize);
     }
+    // The exit code alone is not a failure: some of these tools print a
+    // usable table and still exit non-zero (for example when one entry
+    // cannot be read). The parsers ignore what they do not recognise.
+    let text = String::from_utf8_lossy(&stdout).into_owned();
+    if text.trim().is_empty() && !status.success() {
+        push_note(
+            notes,
+            &format!("`{command}` failed ({status}) and printed nothing"),
+        );
+    }
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,13 +1919,42 @@ pub mod system {
     }
 }
 
+/// Reads up to `max_bytes` from a local OS identification file without
+/// blocking on FIFOs/devices or allocating unbounded memory. Follows standard
+/// OS symlinks such as `/etc/os-release -> ../usr/lib/os-release`.
+fn read_bounded_system_file(path: &Path, max_bytes: u64) -> String {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(path) else {
+        return String::new();
+    };
+    let Ok(meta) = file.metadata() else {
+        return String::new();
+    };
+    if !meta.is_file() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Asks this machine what it is. Cheap local lookups only; anything that
 /// cannot be read is left empty and shown as "not known".
 fn read_system() -> SystemInfo {
+    const SYSTEM_FILE_MAX: u64 = 64 * 1024;
     // These are extras: a tool that is missing here is not worth a warning.
     let mut unused = Vec::new();
     let mut ask = |program: &str, args: &[&str]| run(program, args, &mut unused);
-    let file = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let file = |path: &str| read_bounded_system_file(Path::new(path), SYSTEM_FILE_MAX);
     let (kind, (os, version)) = if cfg!(target_os = "macos") {
         (
             system::mac_kind(&ask("sysctl", &["-n", "hw.model"])).to_owned(),
@@ -1611,7 +1963,7 @@ fn read_system() -> SystemInfo {
     } else if cfg!(windows) {
         (
             String::new(),
-            system::windows_ver(&ask("cmd", &["/C", "ver"])),
+            system::windows_ver(&ask("cmd", &["/D", "/C", "ver"])),
         )
     } else {
         let kind = system::chassis_kind(
@@ -1639,6 +1991,18 @@ fn read_system() -> SystemInfo {
 pub fn system_info() -> SystemInfo {
     static SYSTEM: std::sync::OnceLock<SystemInfo> = std::sync::OnceLock::new();
     SYSTEM.get_or_init(read_system).clone()
+}
+
+fn macos_hardware_ports_cached(notes: &mut Vec<String>) -> String {
+    static PORTS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(cached) = PORTS.get() {
+        return cached.clone();
+    }
+    let output = run("networksetup", &["-listallhardwareports"], notes);
+    if !output.trim().is_empty() {
+        let _ = PORTS.set(output.clone());
+    }
+    output
 }
 
 /// Reads the local tables once. `targets` are the known lab hosts, used for
@@ -1676,6 +2040,12 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
             &mut local.routes,
         );
         linux::neighbors(&run("ip", &["neigh", "show"], notes), &mut local.neighbors);
+        if let Ok(proc_arp) = std::fs::read_to_string("/proc/net/arp") {
+            linux::proc_arp(&proc_arp, &mut local.neighbors);
+        }
+        if local.neighbors.is_empty() {
+            macos::neighbors(&run("arp", &["-an"], notes), &mut local.neighbors);
+        }
         linux::listeners(
             &run("ss", &["-H", "-ltn"], notes),
             "tcp",
@@ -1702,6 +2072,12 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
             &mut local.routes,
             &mut local.neighbors,
         );
+        windows::routes_v6(
+            &run("route", &["print", "-6"], notes),
+            &adapters,
+            &mut local.interfaces,
+            &mut local.routes,
+        );
         windows::listeners(
             &run("netstat", &["-an", "-p", "tcp"], notes),
             &mut local.listeners,
@@ -1712,13 +2088,11 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
         if cfg!(target_os = "macos") {
             // The names alone cannot tell a MacBook's Wi-Fi (en0) from a
             // desktop's Ethernet (also en0); macOS can, from local settings.
-            macos::hardware_ports(
-                &run("networksetup", &["-listallhardwareports"], notes),
-                &mut local.interfaces,
-            );
+            macos::hardware_ports(&macos_hardware_ports_cached(notes), &mut local.interfaces);
         }
         macos::routes(&run("netstat", &["-rn"], notes), &mut local.routes);
         macos::neighbors(&run("arp", &["-an"], notes), &mut local.neighbors);
+        macos::ndp_neighbors(&run("ndp", &["-an"], notes), &mut local.neighbors);
         macos::listeners(
             &run("netstat", &["-an", "-p", "tcp"], notes),
             &mut local.listeners,
@@ -2896,5 +3270,159 @@ mod tests {
         let serialized = serde_json::to_string(&machine_report(&local)).unwrap();
         assert!(!serialized.contains('\x1b') && !serialized.contains('\x07'));
         assert!(!summary(&local).chars().any(char::is_control));
+    }
+
+    #[test]
+    fn windows_slash32_vpns_split_defaults_and_ipv6_routes_are_preserved() {
+        let mut local = LocalNet::default();
+        // A split-default WireGuard/Wintun VPN on Windows has /1 routes and no
+        // /24 on-link subnet route; its /32 address must come from ipconfig
+        // without being corrupted into /1, and OEM-mangled Spanish Wi-Fi plus
+        // multi-IP adapters must merge cleanly.
+        windows::routes(
+            "IPv4 Route Table\nActive Routes:\n\
+             Network Destination        Netmask          Gateway       Interface  Metric\n\
+             \x20         0.0.0.0        128.0.0.0         On-link         10.5.0.2      5\n\
+             \x20       128.0.0.0        128.0.0.0         On-link         10.5.0.2      5\n\
+             \x20     192.168.1.0    255.255.255.0         On-link      192.168.1.5     25\n\
+             \x20     192.168.2.0    255.255.255.0         On-link      192.168.2.5     25\n",
+            &mut local.interfaces,
+            &mut local.routes,
+        );
+        let adapters = windows::adapters(
+            "Adaptador de LAN inal\u{fffd}mbrica Wi-Fi:\r\n\
+             \x20  Description . . . . . . . . . . . : Intel(R) Wi-Fi 6E AX211\r\n\
+             \x20  IPv4 Address. . . . . . . . . . . : 192.168.1.5(Preferred)\r\n\
+             \x20  Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n\
+             \x20  IPv4 Address. . . . . . . . . . . : 192.168.2.5(Preferred)\r\n\
+             \x20  Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n\
+             \r\n\
+             Unknown adapter wg0:\r\n\
+             \x20  Description . . . . . . . . . . . : WireGuard Tunnel\r\n\
+             \x20  IPv4 Address. . . . . . . . . . . : 10.5.0.2(Preferred)\r\n\
+             \x20  Subnet Mask . . . . . . . . . . . : 255.255.255.255\r\n\
+             \x20  IPv6 Address. . . . . . . . . . . : fd00:10:5::2(Preferred)\r\n",
+        );
+        windows::name_interfaces(
+            &adapters,
+            &mut local.interfaces,
+            &mut local.routes,
+            &mut local.neighbors,
+        );
+        windows::routes_v6(
+            "Interface List\n\
+             \x20 7...00 00 00 00 00 00 ......WireGuard Tunnel\n\
+             IPv6 Route Table\nActive Routes:\n\
+             \x20If Metric Network Destination      Gateway\n\
+             \x20 7      5 ::/1                     On-link\n\
+             \x20 7      5 8000::/1                 On-link\n",
+            &adapters,
+            &mut local.interfaces,
+            &mut local.routes,
+        );
+
+        let wg = local.interfaces.iter().find(|i| i.name == "wg0").unwrap();
+        assert_eq!(wg.kind, "vpn");
+        assert_eq!(wg.addresses, ["10.5.0.2/32", "fd00:10:5::2/64"]);
+        assert_eq!(active_vpns(&local), [("wg0".to_owned(), true)]);
+
+        let wifi: Vec<_> = local
+            .interfaces
+            .iter()
+            .filter(|i| i.kind == "wifi")
+            .collect();
+        assert_eq!(wifi.len(), 1, "multi-IP Wi-Fi adapter must merge into one");
+        assert_eq!(wifi[0].addresses, ["192.168.1.5/24", "192.168.2.5/24"]);
+    }
+
+    #[test]
+    fn linux_ecmp_zoned_listeners_and_macos_ndp_are_parsed() {
+        let mut routes = Vec::new();
+        linux::routes(
+            "default proto static metric 100\n\
+             \tnexthop via 192.168.1.1 dev eth0 weight 1\n\
+             \tnexthop via 10.10.14.1 dev tun0 weight 1\n",
+            false,
+            &mut routes,
+        );
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].destination, "0.0.0.0/0");
+        assert_eq!(routes[0].interface, "eth0");
+        assert_eq!(routes[1].interface, "tun0");
+
+        let mut listeners = Vec::new();
+        linux::listeners(
+            "LISTEN 0 128 [fe80::1%eth0]:53 [::]:*\n\
+             LISTEN 0 128 0.0.0.0:0 0.0.0.0:*\n",
+            "tcp",
+            &mut listeners,
+        );
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(
+            (listeners[0].address.as_str(), listeners[0].port),
+            ("fe80::1", 53)
+        );
+
+        let mut mac_listeners = Vec::new();
+        macos::listeners(
+            "tcp4       0      0  *.0                    *.*                    LISTEN\n",
+            &mut mac_listeners,
+        );
+        assert!(mac_listeners.is_empty());
+
+        let mut ndp = Vec::new();
+        macos::ndp_neighbors(
+            "Neighbor                        Linklayer Address  Netif Expire    St Flgs Prbs\n\
+             fe80::1%en0                     0:11:22:33:44:55   en0   23h59m50s S  R\n\
+             fd00::9                         (incomplete)       en0   expired   I\n",
+            &mut ndp,
+        );
+        assert_eq!(
+            ndp,
+            [Neighbor {
+                address: "fe80::1".into(),
+                mac: Some("0:11:22:33:44:55".into()),
+                interface: "en0".into(),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_observer_tool_times_out_without_hanging() {
+        let mut notes = Vec::new();
+        let out = run_from_with_timeout(
+            "sh",
+            &["-c", "sleep 2"],
+            SYSTEM_DIRS,
+            std::time::Duration::from_millis(60),
+            &mut notes,
+        );
+        assert_eq!(out, "");
+        assert_eq!(notes, ["`sh -c sleep 2` timed out"]);
+    }
+
+    #[test]
+    fn bounded_system_file_reader_caps_size_and_skips_non_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("os-release");
+        std::fs::write(&big, "A".repeat(2048)).unwrap();
+        let text = read_bounded_system_file(&big, 256);
+        assert_eq!(text.len(), 256);
+        assert_eq!(read_bounded_system_file(tmp.path(), 256), "");
+
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let link = tmp.path().join("os-release-link");
+            std::os::unix::fs::symlink(&big, &link).unwrap();
+            assert_eq!(read_bounded_system_file(&link, 128).len(), 128);
+
+            let fifo = tmp.path().join("os-release-fifo");
+            let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+            assert_eq!(read_bounded_system_file(&fifo, 128), "");
+        }
     }
 }

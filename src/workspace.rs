@@ -9,7 +9,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -40,6 +40,8 @@ pub const LOCK_FILE: &str = "session.lock";
 /// Port and token of the running session; present only while one is open.
 pub const RUNTIME_FILE: &str = "runtime.json";
 const NAME_MAX: usize = 64;
+/// Longer than any path a shell reports as its directory.
+const LAST_CWD_MAX: u64 = 64 * 1024;
 
 /// Device names Windows refuses as file or directory names.
 const WINDOWS_RESERVED: &[&str] = &[
@@ -62,7 +64,8 @@ default_mode = "light"
 # address, asking the service below once and again when the network
 # changes. The request carries nothing about you or your targets; the
 # service sees only the address it comes from. Nothing is looked up while
-# a VPN carries all traffic. Set to false to turn it off.
+# a VPN carries all traffic. Set to false to turn it off: no place is looked
+# up and no map picture is fetched, for this machine or for a selected server.
 enabled = true
 # url = "https://ipinfo.io/json"
 # Show the estimate on a small satellite map with a pin and a circle for the
@@ -111,6 +114,10 @@ research_model = "anthropic/claude-opus-5.5"
 # Hard daily caps for the cloud tiers; when reached, [C] answers locally.
 max_daily_usd = 1.0
 max_daily_calls = 20
+# Your own notes stay on this machine: a note is free text, and nothing can
+# recognise a password that is written like a word. true sends them (masked
+# like everything else) with requests that leave this machine.
+# cloud_notes = false
 "#;
 
 /// Validates a workspace name so it is a safe single directory name on
@@ -133,8 +140,17 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
     if WINDOWS_RESERVED.contains(&stem.as_str()) {
         return Err(format!("'{raw}' is a reserved device name on Windows"));
     }
+    if RESERVED_COMMANDS.contains(&raw.to_ascii_lowercase().as_str()) {
+        return Err(format!("'{raw}' is a reserved meow subcommand name"));
+    }
     Ok(raw.to_owned())
 }
+
+/// CLI subcommand names and aliases that cannot be used as workspace names.
+pub const RESERVED_COMMANDS: &[&str] = &[
+    "list", "ls", "delete", "rm", "setup", "update", "tools", "add", "recon", "cve", "ask", "note",
+    "verdict", "map", "hud", "mode", "resume", "report", "help", "version",
+];
 
 fn checked_name(raw: &str) -> Result<String> {
     validate_name(raw).map_err(|reason| anyhow!("invalid workspace name '{raw}': {reason}"))
@@ -200,6 +216,11 @@ impl MeowHome {
         &self.0
     }
 
+    /// The marks of the `./.meow` workspaces this user made or accepted.
+    pub fn local_record_path(&self) -> PathBuf {
+        self.0.join(LOCAL_RECORD_FILE)
+    }
+
     pub fn config_path(&self) -> PathBuf {
         self.0.join(CONFIG_FILE)
     }
@@ -218,13 +239,26 @@ impl MeowHome {
     }
 
     /// Absolute `./.meow` of `cwd`, refused when it is the base directory
-    /// itself (running `--local` from the home directory).
+    /// itself (running `--local` from the home directory) or lies inside it.
+    /// The two are compared as the folders they really are: either path may
+    /// reach the same place through a link (a linked `/home`, a `MEOW_HOME`
+    /// kept in a dotfiles folder), and then the names differ.
     pub fn local_dir(&self, cwd: &Path) -> Result<PathBuf> {
         let dir = std::path::absolute(cwd.join(LOCAL_DIR))
             .with_context(|| format!("cannot resolve {}", cwd.display()))?;
-        if dir == self.0 {
+        let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let base = real(&self.0);
+        // `./.meow` may not exist yet; its folder does.
+        let local = fs::canonicalize(&dir).unwrap_or_else(|_| real(cwd).join(LOCAL_DIR));
+        if local == base || dir == self.0 {
             bail!(
                 "{} is meow's own data directory; run --local from a project directory",
+                dir.display()
+            );
+        }
+        if local.starts_with(&base) || dir.starts_with(&self.0) {
+            bail!(
+                "{} is inside meow's own data directory; run --local from a project directory",
                 dir.display()
             );
         }
@@ -236,8 +270,9 @@ impl MeowHome {
 // Private files and directories
 // ---------------------------------------------------------------------------
 
-/// `OpenOptions` that create files as `0600` on Unix. On Windows, files
-/// inherit the restricted ACL of the workspace directory.
+/// `OpenOptions` that create files as `0600` on Unix and refuse to follow
+/// symbolic links (`O_NOFOLLOW`). On Windows, files inherit the restricted
+/// ACL of the workspace directory.
 pub fn private_open_options() -> OpenOptions {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
@@ -245,13 +280,93 @@ pub fn private_open_options() -> OpenOptions {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     options
+}
+
+/// Parses a settings file. The error names the file, the line and what is
+/// wrong, and never quotes the file: the toml crate's own message shows the
+/// whole offending line, which would print a key from `ai.toml` or
+/// `config.toml`, or control bytes from a profile that came with a folder.
+pub fn parse_toml<T: serde::de::DeserializeOwned>(text: &str, path: &Path) -> Result<T> {
+    toml::from_str(text).map_err(|error| {
+        let what = without_values(&crate::evidence::sanitize(error.message(), 300));
+        match error.span() {
+            Some(span) => {
+                let before = text.get(..span.start).unwrap_or(text);
+                let line = before.matches('\n').count() + 1;
+                anyhow!("invalid {}: line {line}: {what}", path.display())
+            }
+            None => anyhow!("invalid {}: {what}", path.display()),
+        }
+    })
+}
+
+/// A parser message without the value it complains about. "invalid type:
+/// string "..."" and "unknown variant `...`" repeat what the file holds.
+fn without_values(message: &str) -> String {
+    for kind in ["invalid type: ", "invalid value: "] {
+        let Some(rest) = message.strip_prefix(kind) else {
+            continue;
+        };
+        let (found, expected) = match rest.rfind(", expected ") {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, ""),
+        };
+        let found: String = found
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == ' ')
+            .collect();
+        return format!("{kind}{}{expected}", found.trim_end());
+    }
+    if message.starts_with("unknown variant ") {
+        return match message.rfind(", expected ") {
+            Some(at) => format!("unknown value{}", &message[at..]),
+            None => "unknown value".to_owned(),
+        };
+    }
+    message.to_owned()
+}
+
+/// Reads a small text file meow keeps, without following a link left in
+/// its place and without taking in more than `max` bytes. A folder someone
+/// else prepared can therefore not make the read wait (a pipe) or fill
+/// memory (`/dev/zero`, a huge file).
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<String> {
+    use std::io::Read;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Without O_NONBLOCK, opening a pipe waits for someone to write.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::other("is a link"));
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("is not a regular file"));
+    }
+    if meta.len() > max {
+        return Err(io::Error::other("is larger than meow writes it"));
+    }
+    let mut text = String::new();
+    file.take(max + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max {
+        return Err(io::Error::other("is larger than meow writes it"));
+    }
+    Ok(text)
 }
 
 /// Creates `path` (and missing parents) as a private directory and
 /// re-applies the restriction if it already existed.
 pub fn create_private_dir(path: &Path) -> Result<()> {
+    refuse_symlink(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -262,12 +377,94 @@ pub fn create_private_dir(path: &Path) -> Result<()> {
     builder
         .create(path)
         .with_context(|| format!("cannot create {}", path.display()))?;
+    refuse_symlink(path)?;
     restrict_dir(path).with_context(|| format!("cannot restrict {}", path.display()))
+}
+
+/// [`create_private_dir`] for a folder inside a workspace (`tmp`, `chats`,
+/// `tmp/shell`): a link standing in its place is refused, so nothing is
+/// created, chmod-ed or written wherever it points.
+pub fn create_private_subdir(path: &Path) -> Result<()> {
+    refuse_symlink(path)?;
+    create_private_dir(path)
+}
+
+/// How deep a workspace folder may nest, and how many entries it may hold.
+const MAX_TREE_DEPTH: usize = 32;
+const MAX_TREE_ENTRIES: usize = 16_384;
+
+/// Everything inside a workspace must be a file or folder of its own. A
+/// folder the user did not make (a cloned repository, an unpacked archive)
+/// can carry links in place of `session.lock`, `tmp`, `chats` or
+/// `replay.sh`; meow would then write, truncate, chmod or read wherever
+/// they point. Fails on the first symbolic link, special file, or file with
+/// a second hard link. `meow delete` still removes such a folder.
+pub fn refuse_links_inside(root: &Path) -> Result<()> {
+    fn walk(dir: &Path, depth: usize, seen: &mut usize) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            bail!("{} is nested too deeply for a workspace", dir.display());
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read {}", dir.display()))
+            }
+        };
+        for entry in entries {
+            *seen = seen.saturating_add(1);
+            if *seen > MAX_TREE_ENTRIES {
+                bail!(
+                    "{} contains too many entries for a workspace",
+                    root_label(dir)
+                );
+            }
+            let path = entry
+                .with_context(|| format!("cannot read {}", dir.display()))?
+                .path();
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("cannot inspect {}", path.display()))?;
+            let kind = meta.file_type();
+            let refuse = |what: &str| {
+                anyhow!(
+                    "{} {what} inside a workspace, which meow never follows. Remove it, \
+                     or delete the workspace with `meow delete`",
+                    path.display()
+                )
+            };
+            if kind.is_symlink() {
+                return Err(refuse("is a symbolic link"));
+            }
+            #[cfg(unix)]
+            verify_unix_owner_meta(&meta, &path)
+                .with_context(|| format!("refusing {}", path.display()))?;
+            if kind.is_dir() {
+                walk(&path, depth + 1, seen)?;
+            } else if kind.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() > 1 {
+                        return Err(refuse("has a second hard link"));
+                    }
+                }
+            } else {
+                return Err(refuse("is a special file"));
+            }
+        }
+        Ok(())
+    }
+    fn root_label(dir: &Path) -> String {
+        dir.display().to_string()
+    }
+    let mut seen = 0usize;
+    walk(root, 0, &mut seen)
 }
 
 /// Atomically replaces `path` with `contents` via a `0600` temp file in the
 /// same directory (same filesystem, so the rename cannot cross mounts).
 pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    refuse_file_symlink(path)?;
     let dir = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
@@ -282,9 +479,36 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn verify_unix_owner_meta(meta: &fs::Metadata, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by uid {}, expected current uid {}",
+                path.display(),
+                meta.uid(),
+                euid
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let current = fs::symlink_metadata(path)?.permissions().mode() & 0o7777;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symbolic link", path.display()),
+        ));
+    }
+    verify_unix_owner_meta(&meta, path)?;
+    let current = meta.permissions().mode() & 0o7777;
     if current != mode {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
@@ -301,57 +525,440 @@ fn restrict_file(path: &Path) -> io::Result<()> {
     set_mode(path, 0o600)
 }
 
-/// Re-applies `0700` / `0600` to everything under `root`. Symlinks are
-/// skipped so a planted link cannot redirect the chmod outside the workspace.
+/// Re-applies `0700` / `0600` to everything under `root`. Links are not
+/// chmod-ed through; [`refuse_links_inside`] has refused them before this,
+/// and transient `NotFound` errors on disappearing temp files are ignored.
 #[cfg(unix)]
 fn enforce_private_tree(root: &Path) -> io::Result<()> {
     restrict_dir(root)?;
     for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            enforce_private_tree(&entry.path())?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let res = if kind.is_dir() {
+            enforce_private_tree(&entry.path())
         } else if kind.is_file() {
-            restrict_file(&entry.path())?;
+            restrict_file(&entry.path())
+        } else {
+            Ok(())
+        };
+        match res {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
-/// Replaces the directory ACL with a single inheritable full-control entry
-/// for the current user (`icacls /inheritance:r /grant:r`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_valid_windows_sid(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("S-1-") else {
+        return false;
+    };
+    !rest.is_empty()
+        && s.len() <= 184
+        && rest.starts_with(|c: char| c.is_ascii_digit())
+        && rest.ends_with(|c: char| c.is_ascii_digit())
+        && !rest.contains("--")
+        && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
+/// True when `owner_sid` is the current user's SID, the current process
+/// token's default owner SID (which is `S-1-5-32-544` `BUILTIN\Administrators`
+/// when elevated), or `NT AUTHORITY\SYSTEM` (`S-1-5-18`). Any folder or file
+/// created by another unprivileged Windows account fails this check.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_trusted_windows_owner_sid(owner_sid: &str, user_sid: &str, token_owner_sid: &str) -> bool {
+    is_valid_windows_sid(owner_sid)
+        && (owner_sid.eq_ignore_ascii_case(user_sid)
+            || owner_sid.eq_ignore_ascii_case(token_owner_sid)
+            || owner_sid.eq_ignore_ascii_case("S-1-5-18"))
+}
+
+#[cfg(windows)]
+fn windows_system32_dir() -> PathBuf {
+    use std::path::{Component, Prefix};
+    let valid_root = |raw: &std::ffi::OsStr| -> Option<PathBuf> {
+        let p = PathBuf::from(raw);
+        let mut comps = p.components();
+        if !matches!(
+            comps.next(),
+            Some(Component::Prefix(pr)) if matches!(pr.kind(), Prefix::Disk(_))
+        ) {
+            return None;
+        }
+        if !matches!(comps.next(), Some(Component::RootDir)) {
+            return None;
+        }
+        if comps.any(|c| !matches!(c, Component::Normal(_))) {
+            return None;
+        }
+        Some(p)
+    };
+    std::env::var_os("SystemRoot")
+        .and_then(|v| valid_root(&v))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+}
+
+#[cfg(windows)]
+fn windows_system32_exe(name: &str) -> io::Result<PathBuf> {
+    let exe = windows_system32_dir().join(format!("{name}.exe"));
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot find {}", exe.display()),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_powershell_exe() -> io::Result<PathBuf> {
+    let exe = windows_system32_dir()
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot find {}", exe.display()),
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct WindowsIdentitySids {
+    user: String,
+    token_owner: String,
+}
+
+#[cfg(windows)]
+fn current_windows_identity() -> io::Result<&'static WindowsIdentitySids> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static IDENTITY: OnceLock<WindowsIdentitySids> = OnceLock::new();
+    if let Some(cached) = IDENTITY.get() {
+        return Ok(cached);
+    }
+
+    let resolved = (|| -> Option<WindowsIdentitySids> {
+        let ps = windows_powershell_exe().ok()?;
+        let out = Command::new(ps)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+                 $id = [System.Security.Principal.WindowsIdentity]::GetCurrent(); \
+                 Write-Output $id.User.Value; \
+                 Write-Output $id.Owner.Value",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        let mut lines = text.lines().map(str::trim).filter(|s| !s.is_empty());
+        let user = lines.next()?.to_owned();
+        let owner = lines.next().unwrap_or(user.as_str()).to_owned();
+        if is_valid_windows_sid(&user) && is_valid_windows_sid(&owner) {
+            Some(WindowsIdentitySids {
+                user,
+                token_owner: owner,
+            })
+        } else {
+            None
+        }
+    })();
+
+    let identity = match resolved {
+        Some(id) => id,
+        None => {
+            let whoami = Command::new(windows_system32_exe("whoami")?)
+                .args(["/user", "/fo", "csv", "/nh"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()?;
+            if !whoami.status.success() {
+                return Err(io::Error::other("whoami /user failed"));
+            }
+            let line = String::from_utf8_lossy(&whoami.stdout);
+            let sid = line
+                .trim()
+                .rsplit_once(',')
+                .map(|(_, s)| s.trim().trim_matches('"'))
+                .filter(|s| is_valid_windows_sid(s))
+                .ok_or_else(|| io::Error::other("whoami /user did not return a valid S-1-... SID"))?
+                .to_owned();
+            WindowsIdentitySids {
+                token_owner: sid.clone(),
+                user: sid,
+            }
+        }
+    };
+
+    let _ = IDENTITY.set(identity);
+    IDENTITY
+        .get()
+        .ok_or_else(|| io::Error::other("failed to cache Windows user SID"))
+}
+
+/// Runs a PowerShell ACL script against `path` (passed via `MEOW_ACL_PATH`,
+/// never interpolated into `-Command`), verifying NTFS owner SID and replacing
+/// the DACL so no pre-existing explicit ACEs for `Everyone` or other accounts
+/// survive (`ISS-032`).
+#[cfg(windows)]
+fn run_windows_acl_script(path: &Path, script: &str) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symbolic link", path.display()),
+        ));
+    }
+    let id = current_windows_identity()?;
+    let out = Command::new(windows_powershell_exe()?)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .env("MEOW_ACL_PATH", path)
+        .env("MEOW_USER_SID", &id.user)
+        .env("MEOW_TOKEN_OWNER_SID", &id.token_owner)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let code = out.status.code().unwrap_or(-1);
+    let detail = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    match code {
+        2 => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a link or reparse point", path.display()),
+        )),
+        3 => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} belongs to another Windows account; refusing to trust it",
+                path.display()
+            ),
+        )),
+        _ => Err(io::Error::other(if detail.is_empty() {
+            format!(
+                "Windows ACL enforcement failed on {} (exit {code})",
+                path.display()
+            )
+        } else {
+            format!(
+                "Windows ACL enforcement failed on {}: {}",
+                path.display(),
+                crate::evidence::sanitize(&detail, 240)
+            )
+        })),
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_owner(path: &Path) -> io::Result<()> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$item = Get-Item -LiteralPath $env:MEOW_ACL_PATH -Force
+if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { exit 2 }
+$sec = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+$owner = $sec.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($owner -ne $env:MEOW_USER_SID -and $owner -ne $env:MEOW_TOKEN_OWNER_SID -and $owner -ne 'S-1-5-18') {
+    exit 3
+}
+"#;
+    run_windows_acl_script(path, SCRIPT)
+}
+
+/// Verifies that `path` is owned by the current Windows user and replaces its
+/// DACL from scratch with a protected DACL granting full control only to the
+/// current user SID, `SYSTEM`, and `Administrators` (wiping any pre-existing
+/// explicit ACEs for `Everyone` or other users).
 #[cfg(windows)]
 fn restrict_dir(path: &Path) -> io::Result<()> {
-    use std::process::{Command, Stdio};
-
-    let whoami = Command::new("whoami").stderr(Stdio::null()).output()?;
-    let user = String::from_utf8_lossy(&whoami.stdout).trim().to_owned();
-    if !whoami.status.success() || user.is_empty() {
-        return Err(io::Error::other("whoami could not name the current user"));
-    }
-    let status = Command::new("icacls")
-        .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(format!("{user}:(OI)(CI)F"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("icacls failed with {status}")))
-    }
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$item = Get-Item -LiteralPath $env:MEOW_ACL_PATH -Force
+if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { exit 2 }
+if (-not $item.PSIsContainer) { exit 4 }
+$ownerSec = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+$owner = $ownerSec.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($owner -ne $env:MEOW_USER_SID -and $owner -ne $env:MEOW_TOKEN_OWNER_SID -and $owner -ne 'S-1-5-18') {
+    exit 3
+}
+$acl = New-Object System.Security.AccessControl.DirectorySecurity
+$acl.SetAccessRuleProtection($true, $false)
+$inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$none = [System.Security.AccessControl.PropagationFlags]::None
+$full = [System.Security.AccessControl.FileSystemRights]::FullControl
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+foreach ($s in @($env:MEOW_USER_SID, 'S-1-5-18', 'S-1-5-32-544')) {
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($s)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $full, $inherit, $none, $allow)))
+}
+[System.IO.Directory]::SetAccessControl($item.FullName, $acl)
+"#;
+    run_windows_acl_script(path, SCRIPT)
 }
 
 #[cfg(windows)]
-fn restrict_file(_path: &Path) -> io::Result<()> {
-    Ok(()) // files inherit the directory ACL
+fn restrict_file(path: &Path) -> io::Result<()> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$item = Get-Item -LiteralPath $env:MEOW_ACL_PATH -Force
+if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { exit 2 }
+if ($item.PSIsContainer) { exit 4 }
+$ownerSec = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+$owner = $ownerSec.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($owner -ne $env:MEOW_USER_SID -and $owner -ne $env:MEOW_TOKEN_OWNER_SID -and $owner -ne 'S-1-5-18') {
+    exit 3
+}
+$acl = New-Object System.Security.AccessControl.FileSecurity
+$acl.SetAccessRuleProtection($true, $false)
+$full = [System.Security.AccessControl.FileSystemRights]::FullControl
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+foreach ($s in @($env:MEOW_USER_SID, 'S-1-5-18', 'S-1-5-32-544')) {
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($s)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $full, $allow)))
+}
+[System.IO.File]::SetAccessControl($item.FullName, $acl)
+"#;
+    run_windows_acl_script(path, SCRIPT)
 }
 
+/// Verifies ownership of `root` and every entry inside it without following
+/// reparse points, sets a clean protected DACL on `root`, and resets explicit
+/// ACEs on every child so all descendants inherit solely from `root`.
 #[cfg(windows)]
 fn enforce_private_tree(root: &Path) -> io::Result<()> {
-    restrict_dir(root) // inheritable entry covers every child
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$rootItem = Get-Item -LiteralPath $env:MEOW_ACL_PATH -Force
+if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { exit 2 }
+if (-not $rootItem.PSIsContainer) { exit 4 }
+$checkOwner = {
+    param($it)
+    $sec = $it.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+    $own = $sec.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($own -ne $env:MEOW_USER_SID -and $own -ne $env:MEOW_TOKEN_OWNER_SID -and $own -ne 'S-1-5-18') {
+        exit 3
+    }
+}
+& $checkOwner $rootItem
+$rootAcl = New-Object System.Security.AccessControl.DirectorySecurity
+$rootAcl.SetAccessRuleProtection($true, $false)
+$inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$none = [System.Security.AccessControl.PropagationFlags]::None
+$full = [System.Security.AccessControl.FileSystemRights]::FullControl
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+foreach ($s in @($env:MEOW_USER_SID, 'S-1-5-18', 'S-1-5-32-544')) {
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($s)
+    $rootAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $full, $inherit, $none, $allow)))
+}
+[System.IO.Directory]::SetAccessControl($rootItem.FullName, $rootAcl)
+
+$queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
+$queue.Enqueue([System.IO.DirectoryInfo]$rootItem)
+while ($queue.Count -gt 0) {
+    $dir = $queue.Dequeue()
+    foreach ($child in $dir.EnumerateFileSystemInfos()) {
+        if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { exit 2 }
+        & $checkOwner $child
+        if ($child -is [System.IO.DirectoryInfo]) {
+            $cAcl = New-Object System.Security.AccessControl.DirectorySecurity
+            $cAcl.SetAccessRuleProtection($false, $false)
+            [System.IO.Directory]::SetAccessControl($child.FullName, $cAcl)
+            $queue.Enqueue([System.IO.DirectoryInfo]$child)
+        } else {
+            $cAcl = New-Object System.Security.AccessControl.FileSecurity
+            $cAcl.SetAccessRuleProtection($false, $false)
+            [System.IO.File]::SetAccessControl($child.FullName, $cAcl)
+        }
+    }
+}
+"#;
+    run_windows_acl_script(root, SCRIPT)
+}
+
+/// Reads a regular workspace/config file without following symlinks and
+/// enforces an explicit `max_bytes` upper bound.
+pub(crate) fn read_private_bounded(path: &Path, max_bytes: u64) -> Result<String> {
+    refuse_file_symlink(path)?;
+    #[cfg(windows)]
+    verify_windows_owner(path).with_context(|| format!("refusing {}", path.display()))?;
+    let mut options = private_open_options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("cannot stat {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    verify_unix_owner_meta(&meta, path).with_context(|| format!("refusing {}", path.display()))?;
+    if meta.len() > max_bytes {
+        bail!(
+            "{} exceeds maximum size ({max_bytes} bytes)",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{} exceeds maximum size ({max_bytes} bytes)",
+            path.display()
+        );
+    }
+    String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
 /// A workspace root must be a real directory, never a symlink: a cloned
@@ -363,9 +970,35 @@ fn refuse_symlink(dir: &Path) -> Result<()> {
             dir.display()
         ),
         Ok(meta) if !meta.is_dir() => bail!("{} exists and is not a directory", dir.display()),
-        _ => Ok(()),
+        #[cfg(unix)]
+        Ok(meta) => {
+            verify_unix_owner_meta(&meta, dir)
+                .with_context(|| format!("refusing {}", dir.display()))?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        Ok(_) => {
+            verify_windows_owner(dir).with_context(|| format!("refusing {}", dir.display()))?;
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("cannot inspect {}", dir.display())),
     }
 }
+
+pub(crate) fn refuse_file_symlink(path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!(
+            "{} is a symbolic link; refusing to use it in a workspace",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // config.toml
@@ -391,6 +1024,8 @@ impl Config {
     pub fn load_or_create(home: &MeowHome) -> Result<Self> {
         create_private_dir(home.root())?;
         let path = home.config_path();
+        refuse_file_symlink(&path)?;
+        refuse_file_symlink(&home.ai_path())?;
         match private_open_options()
             .write(true)
             .create_new(true)
@@ -403,10 +1038,8 @@ impl Config {
             Err(e) => return Err(e).with_context(|| format!("cannot create {}", path.display())),
         }
         restrict_file(&path).with_context(|| format!("cannot restrict {}", path.display()))?;
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        let mut config: Config =
-            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        let text = read_private_bounded(&path, MAX_CONFIG_BYTES)?;
+        let mut config: Config = parse_toml(&text, &path)?;
         // Each user's own AI setup lives beside the config, not in it.
         config.ai.user_file = Some(home.ai_path());
         config.recon.wordlist_dir = Some(home.root().join("wordlists"));
@@ -421,17 +1054,42 @@ impl Config {
         cve_enabled: bool,
         nvd_api_key: Option<&str>,
     ) -> Result<()> {
+        Self::save_setup_preferences_with_location(
+            home,
+            default_mode,
+            cve_enabled,
+            nvd_api_key,
+            None,
+        )
+    }
+
+    /// Updates `default_mode`, `[cve]` (`enabled`, `nvd_api_key`), and
+    /// optionally `[location]` (`enabled`, `map`) in `config.toml` atomically.
+    pub fn save_setup_preferences_with_location(
+        home: &MeowHome,
+        default_mode: Mode,
+        cve_enabled: bool,
+        nvd_api_key: Option<&str>,
+        location_prefs: Option<(bool, bool)>,
+    ) -> Result<()> {
         let _ = Self::load_or_create(home)?;
         let path = home.config_path();
-        let existing =
-            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let existing = read_private_bounded(&path, MAX_CONFIG_BYTES)?;
         let clean_key = nvd_api_key.map(str::trim).filter(|k| !k.is_empty());
-        let updated = update_config_toml(&existing, default_mode, cve_enabled, clean_key)?;
-        let parsed: Config = toml::from_str(&updated)
-            .with_context(|| format!("refusing to write invalid {}", path.display()))?;
+        let updated = update_config_toml(
+            &existing,
+            default_mode,
+            cve_enabled,
+            clean_key,
+            location_prefs,
+        )?;
+        let parsed: Config = parse_toml(&updated, &path).context("refusing to write the change")?;
         if parsed.default_mode != default_mode
             || parsed.cve.enabled != cve_enabled
             || parsed.cve.nvd_api_key.as_deref() != clean_key
+            || location_prefs.is_some_and(|(loc_en, loc_map)| {
+                parsed.location.enabled != loc_en || parsed.location.map != loc_map
+            })
         {
             bail!(
                 "refusing to write {}: updated preferences did not round-trip cleanly",
@@ -471,6 +1129,7 @@ fn update_config_toml(
     default_mode: Mode,
     cve_enabled: bool,
     nvd_api_key: Option<&str>,
+    location_prefs: Option<(bool, bool)>,
 ) -> Result<String> {
     let encoded_key = match nvd_api_key.map(str::trim).filter(|k| !k.is_empty()) {
         Some(key) => {
@@ -490,12 +1149,17 @@ fn update_config_toml(
     let mut saw_cve = false;
     let mut wrote_enabled = false;
     let mut wrote_nvd_key = false;
+    let mut saw_location = false;
+    let mut wrote_loc_enabled = false;
+    let mut wrote_loc_map = false;
 
     let flush_section = |sec: &str,
                          out: &mut Vec<String>,
                          wrote_mode: &mut bool,
                          wrote_enabled: &mut bool,
-                         wrote_nvd_key: &mut bool| {
+                         wrote_nvd_key: &mut bool,
+                         wrote_loc_enabled: &mut bool,
+                         wrote_loc_map: &mut bool| {
         if sec.is_empty() && !*wrote_mode {
             out.push(mode_line.clone());
             *wrote_mode = true;
@@ -510,6 +1174,17 @@ fn update_config_toml(
                 }
                 *wrote_nvd_key = true;
             }
+        } else if sec == "location" {
+            if let Some((loc_en, loc_map)) = location_prefs {
+                if !*wrote_loc_enabled {
+                    out.push(format!("enabled = {loc_en}"));
+                    *wrote_loc_enabled = true;
+                }
+                if !*wrote_loc_map {
+                    out.push(format!("map = {loc_map}"));
+                    *wrote_loc_map = true;
+                }
+            }
         }
     };
 
@@ -522,10 +1197,14 @@ fn update_config_toml(
                 &mut wrote_mode,
                 &mut wrote_enabled,
                 &mut wrote_nvd_key,
+                &mut wrote_loc_enabled,
+                &mut wrote_loc_map,
             );
             section = header_name.to_owned();
             if section == "cve" && !trimmed.starts_with("[[") {
                 saw_cve = true;
+            } else if section == "location" && !trimmed.starts_with("[[") {
+                saw_location = true;
             }
             out.push(line.to_owned());
             continue;
@@ -553,6 +1232,22 @@ fn update_config_toml(
             }
             continue;
         }
+        if let Some((loc_en, loc_map)) = location_prefs {
+            if section == "location" && is_toml_key(trimmed, "enabled") {
+                if !wrote_loc_enabled {
+                    out.push(format!("enabled = {loc_en}"));
+                    wrote_loc_enabled = true;
+                }
+                continue;
+            }
+            if section == "location" && is_toml_key(trimmed, "map") {
+                if !wrote_loc_map {
+                    out.push(format!("map = {loc_map}"));
+                    wrote_loc_map = true;
+                }
+                continue;
+            }
+        }
         out.push(line.to_owned());
     }
 
@@ -562,6 +1257,8 @@ fn update_config_toml(
         &mut wrote_mode,
         &mut wrote_enabled,
         &mut wrote_nvd_key,
+        &mut wrote_loc_enabled,
+        &mut wrote_loc_map,
     );
     if !saw_cve {
         if !out.last().is_some_and(String::is_empty) {
@@ -571,6 +1268,16 @@ fn update_config_toml(
         out.push(enabled_line);
         if let Some(encoded) = &encoded_key {
             out.push(format!("nvd_api_key = {encoded}"));
+        }
+    }
+    if let Some((loc_en, loc_map)) = location_prefs {
+        if !saw_location {
+            if !out.last().is_some_and(String::is_empty) {
+                out.push(String::new());
+            }
+            out.push("[location]".to_owned());
+            out.push(format!("enabled = {loc_en}"));
+            out.push(format!("map = {loc_map}"));
         }
     }
 
@@ -593,13 +1300,76 @@ pub struct Profile {
     /// Tool flags for this workspace; they win over `config.toml`.
     #[serde(skip_serializing_if = "PresetOverride::is_empty")]
     pub recon: PresetOverride,
+    /// A random mark a `./.meow` workspace gets when this user makes or
+    /// accepts it. `~/.meow/local-workspaces` lists this user's marks, so a
+    /// `./.meow` that came with a folder (a cloned repository, an unpacked
+    /// archive) is told apart from the user's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
+
+/// The file in `~/.meow` that lists the marks of this user's `./.meow`
+/// workspaces, one per line.
+const LOCAL_RECORD_FILE: &str = "local-workspaces";
+/// More marks than anyone makes; a larger file is not read further.
+const LOCAL_RECORD_MAX: u64 = 1024 * 1024;
+
+fn new_mark() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("no secure random source: {e}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+const MAX_LOCAL_MARKS: usize = 4096;
+
+fn is_valid_mark(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn own_marks(home: &MeowHome) -> Vec<String> {
+    let Ok(text) = read_bounded(&home.local_record_path(), LOCAL_RECORD_MAX) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| is_valid_mark(line))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether a `./.meow` with this profile was made or accepted by this user.
+fn is_own_local(home: &MeowHome, profile: &Profile) -> bool {
+    profile
+        .id
+        .as_deref()
+        .is_some_and(|id| is_valid_mark(id) && own_marks(home).iter().any(|own| own == id))
+}
+
+fn remember_mark(home: &MeowHome, mark: &str) -> Result<()> {
+    if !is_valid_mark(mark) {
+        bail!("invalid workspace mark");
+    }
+    create_private_dir(home.root())?;
+    let mut marks = own_marks(home);
+    marks.retain(|known| known != mark);
+    marks.push(mark.to_owned());
+    if marks.len() > MAX_LOCAL_MARKS {
+        marks.drain(..marks.len() - MAX_LOCAL_MARKS);
+    }
+    write_private_atomic(
+        &home.local_record_path(),
+        (marks.join("\n") + "\n").as_bytes(),
+    )
+}
+
+/// A profile is a few lines; a larger file is not one meow wrote.
+const PROFILE_MAX: u64 = 64 * 1024;
 
 impl Profile {
     fn read(path: &Path) -> Result<Self> {
-        let text =
-            fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))
+        let text = read_bounded(path, PROFILE_MAX)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        parse_toml(&text, path)
     }
 }
 
@@ -632,12 +1402,13 @@ impl Workspace {
             home.workspace_dir(&name)
         };
         refuse_symlink(&dir)?;
+        refuse_links_inside(&dir)?;
 
         let profile_path = dir.join(PROFILE_FILE);
         let existed = profile_path.is_file();
         create_private_dir(&dir)?;
-        create_private_dir(&dir.join("tmp"))?;
-        create_private_dir(&dir.join("chats"))?;
+        create_private_subdir(&dir.join("tmp"))?;
+        create_private_subdir(&dir.join("chats"))?;
         enforce_private_tree(&dir)
             .with_context(|| format!("cannot restrict permissions under {}", dir.display()))?;
 
@@ -648,9 +1419,14 @@ impl Workspace {
                 name: name.clone(),
                 mode: default_mode,
                 recon: PresetOverride::default(),
+                // A new `./.meow` is this user's own from the start.
+                id: if local { Some(new_mark()?) } else { None },
             }
         };
         profile.name = name.clone();
+        if let (false, Some(mark)) = (existed, &profile.id) {
+            remember_mark(home, mark)?;
+        }
 
         let workspace = Self {
             name,
@@ -662,6 +1438,38 @@ impl Workspace {
             workspace.save_profile()?;
         }
         Ok((workspace, !existed))
+    }
+
+    /// True for a `./.meow` this user neither made nor accepted: it came
+    /// with the folder. What it carries (its mode, queued scans, verdicts,
+    /// the directory its shell starts in) was chosen by someone else.
+    pub fn is_foreign(&self, home: &MeowHome) -> bool {
+        self.local && !is_own_local(home, &self.profile)
+    }
+
+    /// Fails for a `./.meow` that is not this user's, saying how to review
+    /// or remove it. Helper commands call this before touching it.
+    pub fn ensure_own(&self, home: &MeowHome) -> Result<()> {
+        if self.is_foreign(home) {
+            bail!(
+                "{} was not made by you on this machine: it came with this folder. \
+                 Review and accept it with `meow <name> --local` in a terminal, \
+                 or remove it with `meow delete --local`",
+                self.dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Accepts a `./.meow` that came with a folder as this user's own. Its
+    /// stored mode is replaced by `mode` (the user's default), so nothing it
+    /// has queued runs until the user chooses a mode that sends packets.
+    pub fn adopt(&mut self, home: &MeowHome, mode: Mode) -> Result<()> {
+        let mark = new_mark()?;
+        self.profile.id = Some(mark.clone());
+        self.profile.mode = mode;
+        self.save_profile()?;
+        remember_mark(home, &mark)
     }
 
     /// Records that a session now owns this workspace: stores the name it was
@@ -682,6 +1490,7 @@ impl Workspace {
         let dir = std::path::absolute(dir)
             .with_context(|| format!("cannot resolve {}", dir.display()))?;
         refuse_symlink(&dir)?;
+        refuse_links_inside(&dir)?;
         let profile_path = dir.join(PROFILE_FILE);
         if !profile_path.is_file() {
             bail!("no meow workspace at {}", dir.display());
@@ -736,6 +1545,15 @@ impl Workspace {
         self.dir.join(RUNTIME_FILE)
     }
 
+    /// Removes what a session that was killed left behind: its
+    /// `runtime.json` and the page `meow map` wrote, both with its token.
+    /// Called by a new session as soon as it holds the lock, so helpers do
+    /// not take the old port for the new session while it starts.
+    pub fn forget_last_session(&self) {
+        let _ = fs::remove_file(self.runtime_path());
+        let _ = fs::remove_file(self.tmp_dir().join(crate::webui::OPENER_FILE));
+    }
+
     pub fn tmp_dir(&self) -> PathBuf {
         self.dir.join("tmp")
     }
@@ -751,7 +1569,7 @@ impl Workspace {
     /// The directory the previous session ended in, if it was recorded and
     /// still exists.
     pub fn restored_cwd(&self) -> Option<PathBuf> {
-        let text = fs::read_to_string(self.last_cwd_path()).ok()?;
+        let text = read_bounded(&self.last_cwd_path(), LAST_CWD_MAX).ok()?;
         // Windows PowerShell may prepend a byte-order mark.
         let text = text.trim_start_matches('\u{feff}');
         let dir = PathBuf::from(text.trim_end_matches(['\r', '\n']));
@@ -770,9 +1588,16 @@ impl Workspace {
 }
 
 fn dir_name(dir: &Path) -> String {
-    dir.file_name()
+    let raw = dir
+        .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let sanitized = crate::evidence::sanitize(&raw, NAME_MAX);
+    if sanitized.is_empty() {
+        "local".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 /// Picks the workspace directory a helper subcommand targets. Explicit flags
@@ -818,6 +1643,8 @@ pub enum SessionState {
     Running,
     /// The listing was asked for from inside this workspace's session.
     Current,
+    /// A `./.meow` that came with the folder: not this user's, not read.
+    NotYours,
 }
 
 impl SessionState {
@@ -826,6 +1653,7 @@ impl SessionState {
             SessionState::Closed => "-",
             SessionState::Running => "running",
             SessionState::Current => "this session",
+            SessionState::NotYours => "not yours",
         }
     }
 }
@@ -859,7 +1687,7 @@ pub fn list_workspaces(home: &MeowHome, cwd: &Path) -> Result<Vec<WorkspaceSumma
                 let Some(name) = name.to_str().and_then(|n| validate_name(n).ok()) else {
                     continue;
                 };
-                if let Some(summary) = summarize(&entry.path(), Some(name), false) {
+                if let Some(summary) = summarize(home, &entry.path(), Some(name), false) {
                     found.push(summary);
                 }
             }
@@ -868,7 +1696,7 @@ pub fn list_workspaces(home: &MeowHome, cwd: &Path) -> Result<Vec<WorkspaceSumma
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", root.display())),
     }
     if let Ok(local) = home.local_dir(cwd) {
-        found.extend(summarize(&local, None, true));
+        found.extend(summarize(home, &local, None, true));
     }
     found.sort_by(|a, b| {
         b.last_active
@@ -878,24 +1706,51 @@ pub fn list_workspaces(home: &MeowHome, cwd: &Path) -> Result<Vec<WorkspaceSumma
     Ok(found)
 }
 
-fn summarize(dir: &Path, name: Option<String>, local: bool) -> Option<WorkspaceSummary> {
-    let is_real_dir = fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir());
+fn summarize(
+    home: &MeowHome,
+    dir: &Path,
+    name: Option<String>,
+    local: bool,
+) -> Option<WorkspaceSummary> {
+    let dir_meta = fs::symlink_metadata(dir).ok()?;
+    if !dir_meta.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    if verify_unix_owner_meta(&dir_meta, dir).is_err() {
+        return None;
+    }
     let profile_path = dir.join(PROFILE_FILE);
-    if !is_real_dir || !profile_path.is_file() {
+    if !fs::symlink_metadata(&profile_path).is_ok_and(|meta| meta.is_file()) {
         return None;
     }
     let profile = Profile::read(&profile_path).ok();
     let name = name
         .or_else(|| profile.as_ref().and_then(|p| validate_name(&p.name).ok()))
         .unwrap_or_else(|| dir_name(dir));
+    // A `./.meow` that came with the folder is listed, but its graph and
+    // database are someone else's files: they are not opened for a count.
+    let foreign = local && !profile.as_ref().is_some_and(|p| is_own_local(home, p));
     Some(WorkspaceSummary {
         name,
         dir: dir.to_path_buf(),
         local,
-        state: SessionState::Closed,
+        state: if foreign {
+            SessionState::NotYours
+        } else {
+            SessionState::Closed
+        },
         mode: profile.map(|p| p.mode),
-        hosts: count_hosts(&dir.join("graph.json")),
-        unfinished_tasks: crate::queue::count_unfinished(&dir.join("state.db")),
+        hosts: if foreign {
+            0
+        } else {
+            count_hosts(&dir.join("graph.json"))
+        },
+        unfinished_tasks: if foreign {
+            0
+        } else {
+            crate::queue::count_unfinished(&dir.join("state.db"))
+        },
         last_active: last_active(dir),
     })
 }
@@ -915,29 +1770,34 @@ pub fn find_for_deletion(
         }
         None => (home.local_dir(cwd)?, None),
     };
-    summarize(&dir, checked, name.is_none()).ok_or_else(|| match name {
+    summarize(home, &dir, checked, name.is_none()).ok_or_else(|| match name {
         Some(name) => anyhow!("There is no workspace named '{name}' (`meow list` shows them)"),
         None => anyhow!("There is no workspace in {}", dir.display()),
     })
 }
 
-/// Fails while a session is open on the workspace. Taking its lock for a
-/// moment is the proof that none is.
+/// Fails while a session is open on the workspace. Checks `session.lock`
+/// read-only so `meow delete` never creates, follows, or truncates the lock
+/// file (even inside an unaccepted `./.meow` workspace).
 pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
     use crate::lock::{LockError, SessionLock};
-    match SessionLock::acquire(&workspace.dir.join(LOCK_FILE)) {
-        Ok(_released_at_once) => Ok(()),
-        Err(error @ LockError::Held { .. }) => Err(anyhow!(
+    let lock = workspace.dir.join(LOCK_FILE);
+    if SessionLock::is_held(&lock) {
+        let error = LockError::Held {
+            pid: crate::lock::holder_pid(&lock),
+        };
+        bail!(
             "Workspace '{}' is {error}; exit that session first",
             workspace.name
-        )),
-        Err(error) => Err(anyhow!("Workspace '{}': {error}", workspace.name)),
+        );
     }
+    Ok(())
 }
 
 /// Removes the workspace directory with everything in it: replay log,
 /// graph, state, notes, chats and report. Refused while a session is open.
 pub fn delete(workspace: &WorkspaceSummary) -> Result<()> {
+    refuse_symlink(&workspace.dir)?;
     ensure_closed(workspace)?;
     fs::remove_dir_all(&workspace.dir)
         .with_context(|| format!("cannot delete {}", workspace.dir.display()))
@@ -945,7 +1805,7 @@ pub fn delete(workspace: &WorkspaceSummary) -> Result<()> {
 
 /// Number of hosts in a `graph.json`, read without validating the rest.
 fn count_hosts(graph: &Path) -> usize {
-    fs::read_to_string(graph)
+    read_bounded(graph, crate::graph::MAX_GRAPH_BYTES)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|json| {
@@ -959,11 +1819,14 @@ fn count_hosts(graph: &Path) -> usize {
 /// Newest modification time among the directory and its top-level entries
 /// (`replay.sh` and `profile.toml` change as the session is used).
 fn last_active(dir: &Path) -> Option<SystemTime> {
-    let own = fs::metadata(dir).and_then(|meta| meta.modified()).ok();
+    let own = fs::symlink_metadata(dir)
+        .and_then(|meta| meta.modified())
+        .ok();
     let children = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
+        .take(256)
         .filter_map(|entry| entry.metadata().and_then(|meta| meta.modified()).ok());
     own.into_iter().chain(children).max()
 }
@@ -1103,6 +1966,7 @@ mod tests {
                 name: "acme".into(),
                 mode: Mode::Light,
                 recon: PresetOverride::default(),
+                id: None,
             }
         );
 
@@ -1198,14 +2062,158 @@ mod tests {
         assert!(err.to_string().contains("symbolic link"), "{err:#}");
         assert!(Workspace::load(&fx.cwd.join(".meow")).is_err());
 
-        // A symlink inside a workspace is not chmod-ed through.
+        // A link anywhere inside a workspace is refused, never followed:
+        // nothing outside is chmod-ed, written, truncated or removed.
         let (ws, _) = open(&fx, "acme", false);
-        std::os::unix::fs::symlink(&outside, ws.tmp_dir().join("link")).unwrap();
-        std::os::unix::fs::symlink(&secret, ws.dir.join("keylink")).unwrap();
         chmod(&outside, 0o755);
-        Workspace::load(&ws.dir).unwrap();
+        fs::write(outside.join(".zshrc"), "mine").unwrap();
+        let inside = |name: &str| ws.dir.join(name);
+        for (link, target) in [
+            (ws.tmp_dir().join("link"), &outside),
+            (inside("keylink"), &secret),
+            (inside("session.lock"), &secret),
+            (inside("replay.sh"), &secret),
+            (inside("last_cwd"), &secret),
+            (inside("state.db"), &secret),
+            (inside("graph.json"), &secret),
+        ] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let err = Workspace::load(&ws.dir).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("symbolic link"),
+                "{link:?}: {err:#}"
+            );
+            let err = Workspace::open_or_create(&fx.home, &fx.cwd, "acme", false, Mode::Light)
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("symbolic link"),
+                "{link:?}: {err:#}"
+            );
+            fs::remove_file(&link).unwrap();
+        }
+        // The folders meow creates itself, replaced by links to a folder
+        // that holds the user's own shell start-up file.
+        for dir in ["chats", "tmp"] {
+            fs::remove_dir_all(inside(dir)).unwrap();
+            std::os::unix::fs::symlink(&outside, inside(dir)).unwrap();
+            assert!(Workspace::load(&ws.dir).is_err(), "{dir}");
+            assert!(
+                Workspace::open_or_create(&fx.home, &fx.cwd, "acme", false, Mode::Light).is_err(),
+                "{dir}"
+            );
+            assert!(create_private_subdir(&inside(dir)).is_err(), "{dir}");
+            fs::remove_file(inside(dir)).unwrap();
+        }
         assert_eq!(mode_of(&outside), 0o755);
         assert_eq!(mode_of(&secret), 0o644);
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "k");
+        assert_eq!(fs::read_to_string(outside.join(".zshrc")).unwrap(), "mine");
+
+        // SQLite sidecars and shell init files are also refused if symlinked.
+        let (ws_extra, _) = open(&fx, "extra", false);
+        fs::create_dir_all(ws_extra.tmp_dir().join("shell")).unwrap();
+        for rel in [
+            "state.db-wal",
+            "state.db-shm",
+            "state.db-journal",
+            "tmp/shell/.zshenv",
+            "tmp/shell/init.ps1",
+        ] {
+            let link = ws_extra.dir.join(rel);
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            assert!(Workspace::load(&ws_extra.dir).is_err(), "{rel}");
+            assert!(
+                Workspace::open_or_create(&fx.home, &fx.cwd, "extra", false, Mode::Light).is_err(),
+                "{rel}"
+            );
+            fs::remove_file(&link).unwrap();
+        }
+
+        // Such a folder can still be deleted; what its links name stays.
+        let (trap, _) = open(&fx, "trap", false);
+        std::os::unix::fs::symlink(&secret, trap.dir.join("session.lock")).unwrap();
+        std::os::unix::fs::symlink(&outside, trap.dir.join("tmp").join("shell")).unwrap();
+        let found = find_for_deletion(&fx.home, &fx.cwd, Some("trap")).unwrap();
+        delete(&found).unwrap();
+        assert!(!trap.dir.exists());
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "k");
+        assert_eq!(fs::read_to_string(outside.join(".zshrc")).unwrap(), "mine");
+
+        // A second hard link to a file is refused too (an unpacked archive
+        // can carry one), and so is a special file.
+        let (ws, _) = open(&fx, "acme", false);
+        fs::hard_link(&secret, ws.dir.join("replay.sh")).unwrap();
+        let err = Workspace::load(&ws.dir).unwrap_err();
+        assert!(format!("{err:#}").contains("hard link"), "{err:#}");
+        fs::remove_file(ws.dir.join("replay.sh")).unwrap();
+        Workspace::load(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn a_dot_meow_that_came_with_a_folder_is_not_the_users_until_accepted() {
+        let fx = fixture();
+        // One the user makes here is theirs, on every later open.
+        let (own, created) = open(&fx, "mine", true);
+        assert!(created && !own.is_foreign(&fx.home));
+        own.ensure_own(&fx.home).unwrap();
+        let (again, created) = open(&fx, "mine", true);
+        assert!(!created && !again.is_foreign(&fx.home));
+        assert!(!Workspace::load(&own.dir).unwrap().is_foreign(&fx.home));
+
+        // A folder that arrives with a .meow already in it (a cloned
+        // repository): aggressive mode, its own settings, a mark it made up,
+        // a graph and a database.
+        let cloned = fx.cwd.join("cloned");
+        let dir = cloned.join(".meow");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("profile.toml"),
+            "name = \"demo\"\nmode = \"aggressive\"\nid = \"00000000000000000000000000000000\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("graph.json"), "{ not even json").unwrap();
+        fs::write(dir.join("state.db"), "not a database").unwrap();
+        let (mut ws, created) =
+            Workspace::open_or_create(&fx.home, &cloned, "review", true, Mode::Light).unwrap();
+        assert!(!created && ws.is_foreign(&fx.home));
+        assert_eq!(ws.profile.mode, Mode::Aggressive);
+        // Helper commands refuse it, saying what to do.
+        let error = Workspace::load(&dir)
+            .unwrap()
+            .ensure_own(&fx.home)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("came with this folder"),
+            "{error:#}"
+        );
+        // The listing names it without opening its graph or database.
+        let listed = list_workspaces(&fx.home, &cloned).unwrap();
+        let entry = listed.iter().find(|w| w.local).unwrap();
+        assert_eq!(entry.state, SessionState::NotYours);
+        assert_eq!((entry.hosts, entry.unfinished_tasks), (0, 0));
+        assert!(format_listing(&listed, SystemTime::now()).contains("not yours"));
+        // It can be deleted unseen, and checking whether it is closed does not
+        // create a `session.lock` file inside it.
+        let candidate = find_for_deletion(&fx.home, &cloned, None).unwrap();
+        ensure_closed(&candidate).unwrap();
+        assert!(!dir.join(LOCK_FILE).exists());
+
+        // Accepted: the user's own from now on, in the user's default mode
+        // and under a mark the folder's author could not know.
+        ws.adopt(&fx.home, Mode::Light).unwrap();
+        assert!(!ws.is_foreign(&fx.home));
+        let loaded = Workspace::load(&dir).unwrap();
+        loaded.ensure_own(&fx.home).unwrap();
+        assert_eq!(loaded.profile.mode, Mode::Light);
+        assert_ne!(
+            loaded.profile.id.as_deref(),
+            Some("00000000000000000000000000000000")
+        );
+        // The first workspace is still the user's.
+        assert!(!Workspace::load(&own.dir).unwrap().is_foreign(&fx.home));
+        // A global workspace is never in question.
+        let (global, _) = open(&fx, "acme", false);
+        assert!(!global.is_foreign(&fx.home) && global.profile.id.is_none());
     }
 
     #[test]
@@ -1215,7 +2223,14 @@ mod tests {
         assert!(created && ws.local);
         assert_eq!(ws.dir, fx.cwd.join(".meow"));
         assert!(ws.dir.is_absolute());
-        assert!(!fx.home.root().exists(), "--local must not create ~/.meow");
+        // ~/.meow holds only the mark that says this workspace is the
+        // user's own, nothing of the workspace itself.
+        let mark = ws.profile.id.clone().unwrap();
+        assert_eq!(
+            fs::read_to_string(fx.home.local_record_path()).unwrap(),
+            format!("{mark}\n")
+        );
+        assert!(!fx.home.workspaces_dir().exists());
 
         // Reopening under another name relabels the same directory, but only
         // once the new session records itself (after taking the lock).
@@ -1252,6 +2267,157 @@ mod tests {
         assert!(Path::new(&env[1].1).is_absolute());
         assert_eq!(Path::new(&env[1].1), ws.dir);
         assert_eq!(env[2], ("MEOW_MODE".to_owned(), "mild".into()));
+    }
+
+    #[test]
+    fn a_new_session_forgets_what_a_killed_one_left() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", false);
+        fs::write(ws.runtime_path(), "{}").unwrap();
+        fs::create_dir_all(ws.tmp_dir()).unwrap();
+        let page = ws.tmp_dir().join(crate::webui::OPENER_FILE);
+        fs::write(&page, "old token").unwrap();
+        ws.forget_last_session();
+        assert!(!ws.runtime_path().exists());
+        assert!(!page.exists());
+        // Nothing to forget is fine too.
+        ws.forget_last_session();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_is_refused_in_the_data_directory_however_it_is_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join(".meow")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        // The base directory is named through the link, the current
+        // directory by its real name, as the system reports it.
+        let home = MeowHome::at(tmp.path().join("link").join(".meow")).unwrap();
+        let own = "meow's own data directory";
+        let error = home.local_dir(&real).unwrap_err().to_string();
+        assert!(error.contains(own), "{error}");
+        assert!(find_for_deletion(&home, &real, None).is_err());
+        assert!(Workspace::open_or_create(&home, &real, "", true, Mode::Light).is_err());
+        // And the other way round.
+        let home = MeowHome::at(real.join(".meow")).unwrap();
+        let error = home
+            .local_dir(&tmp.path().join("link"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(own), "{error}");
+        // Inside the data directory is refused as well.
+        fs::create_dir_all(real.join(".meow").join("workspaces")).unwrap();
+        for inside in [real.join(".meow"), real.join(".meow").join("workspaces")] {
+            let error = home.local_dir(&inside).unwrap_err().to_string();
+            assert!(
+                error.contains("inside meow's own data directory"),
+                "{error}"
+            );
+        }
+        // A project directory is fine, existing `./.meow` or not.
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        assert_eq!(home.local_dir(&project).unwrap(), project.join(".meow"));
+        fs::create_dir_all(project.join(".meow")).unwrap();
+        assert_eq!(home.local_dir(&project).unwrap(), project.join(".meow"));
+    }
+
+    #[test]
+    fn a_settings_error_names_the_line_and_never_shows_it() {
+        const KEY: &str = "FAKE-PLACEHOLDER-KEY-0000-1111-2222";
+        let path = Path::new("/home/someone/.meow/config.toml");
+        let samples = [
+            // The closing quote is missing.
+            (format!("[cve]\nenabled = true\nnvd_api_key = \"{KEY}\n"), 3),
+            // The key twice.
+            (
+                format!("[cve]\nnvd_api_key = \"{KEY}\"\nnvd_api_key = \"{KEY}\"\n"),
+                3,
+            ),
+            // No quotes at all.
+            (format!("[cve]\nnvd_api_key = {KEY}\n"), 2),
+            // The key where a switch belongs.
+            (format!("[cve]\nenabled = \"{KEY}\"\n"), 2),
+            // The key where a mode belongs.
+            (format!("default_mode = \"{KEY}\"\n"), 1),
+            // Colour codes on a broken line.
+            ("name = \"a\"\n\u{1b}[31mmode = = \u{1b}[2J\n".to_owned(), 2),
+        ];
+        for (text, line) in samples {
+            let error = parse_toml::<Config>(&text, path).unwrap_err();
+            let shown = format!("{error:#}");
+            assert!(!shown.contains(KEY), "{shown}");
+            assert!(!shown.contains("PLACEHOLDER"), "{shown}");
+            assert!(!shown.contains('\u{1b}'), "{shown:?}");
+            assert!(!shown.contains('\n'), "{shown:?}");
+            assert!(
+                shown.starts_with(&format!(
+                    "invalid /home/someone/.meow/config.toml: line {line}: "
+                )),
+                "{shown}"
+            );
+            assert!(!shown.ends_with(": "), "says what is wrong: {shown}");
+        }
+        // A file that is fine still loads.
+        assert!(parse_toml::<Config>(CONFIG_TEMPLATE, path).is_ok());
+        assert_eq!(
+            without_values("invalid type: string \"abc, expected x\", expected a boolean"),
+            "invalid type: string, expected a boolean"
+        );
+        assert_eq!(
+            without_values("unknown variant `abc`, expected one of `light`, `mild`"),
+            "unknown value, expected one of `light`, `mild`"
+        );
+        assert_eq!(without_values("duplicate key `a`"), "duplicate key `a`");
+    }
+
+    #[test]
+    fn bounded_reads_take_small_regular_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("small");
+        fs::write(&file, "twelve bytes").unwrap();
+        assert_eq!(read_bounded(&file, 12).unwrap(), "twelve bytes");
+        assert!(read_bounded(&file, 11).is_err(), "one byte too many");
+        assert!(read_bounded(&tmp.path().join("missing"), 12).is_err());
+        assert!(read_bounded(tmp.path(), 12).is_err(), "a directory");
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(read_bounded(&link, 12).is_err(), "a link to a small file");
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+            assert!(read_bounded(&link, 12).is_err(), "a link to an endless one");
+            // The endless file itself: not a regular file, nothing is read.
+            assert!(read_bounded(Path::new("/dev/zero"), 12).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_does_not_read_a_huge_graph_or_profile() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", false);
+        // A graph far over the limit, sparse on disk: counted as no hosts
+        // without being read.
+        let graph = fs::File::create(ws.graph_path()).unwrap();
+        graph.set_len(crate::graph::MAX_GRAPH_BYTES + 1).unwrap();
+        assert_eq!(count_hosts(&ws.graph_path()), 0);
+        // A real one still counts.
+        fs::write(
+            ws.graph_path(),
+            r#"{"hosts":{"10.0.0.5":{},"10.0.0.6":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(count_hosts(&ws.graph_path()), 2);
+        // A profile that is a link elsewhere, or enormous, is not read.
+        let real = fs::read_to_string(ws.profile_path()).unwrap();
+        let big = fs::File::create(ws.profile_path()).unwrap();
+        big.set_len(PROFILE_MAX + 1).unwrap();
+        assert!(Profile::read(&ws.profile_path()).is_err());
+        fs::write(ws.profile_path(), &real).unwrap();
+        assert!(Profile::read(&ws.profile_path()).is_ok());
     }
 
     #[test]
@@ -1526,5 +2692,74 @@ mod tests {
         assert!(
             Config::save_setup_preferences(&fx.home, Mode::Light, true, Some("bad\nkey")).is_err()
         );
+    }
+
+    #[test]
+    fn windows_sid_and_owner_validation_reject_foreign_and_malformed_sids() {
+        let alice = "S-1-5-21-1000-2000-3000-1001";
+        let bob = "S-1-5-21-1000-2000-3000-1002";
+        let admins = "S-1-5-32-544";
+        assert!(is_valid_windows_sid(alice));
+        assert!(is_valid_windows_sid("S-1-5-18"));
+        assert!(is_valid_windows_sid(admins));
+        for bad in [
+            "",
+            "S-1-",
+            "S-1--5",
+            "S-1-5-",
+            "S-1-5-abc",
+            "S-1-5-18;icacls",
+            "Everyone",
+        ] {
+            assert!(!is_valid_windows_sid(bad), "accepted {bad:?}");
+        }
+
+        // Unprivileged Alice trusts her own SID and SYSTEM, never Bob or Everyone.
+        assert!(is_trusted_windows_owner_sid(alice, alice, alice));
+        assert!(is_trusted_windows_owner_sid("S-1-5-18", alice, alice));
+        assert!(!is_trusted_windows_owner_sid(bob, alice, alice));
+        assert!(!is_trusted_windows_owner_sid("S-1-1-0", alice, alice));
+        assert!(!is_trusted_windows_owner_sid(admins, alice, alice));
+
+        // Elevated Alice (token default owner = Administrators) trusts Alice,
+        // Administrators, and SYSTEM, and still rejects unprivileged Bob.
+        assert!(is_trusted_windows_owner_sid(alice, alice, admins));
+        assert!(is_trusted_windows_owner_sid(admins, alice, admins));
+        assert!(!is_trusted_windows_owner_sid(bob, alice, admins));
+    }
+
+    #[test]
+    fn local_workspace_marks_require_hex_deduplicate_and_refuse_symlinks() {
+        let fx = fixture();
+        assert!(validate_name("ls").is_err());
+        assert!(validate_name("rm").is_err());
+
+        let mark = "0123456789abcdef0123456789abcdef";
+        remember_mark(&fx.home, mark).unwrap();
+        remember_mark(&fx.home, mark).unwrap();
+        assert_eq!(own_marks(&fx.home), vec![mark.to_owned()]);
+
+        // Non-hex 32-char strings are never accepted or matched as marks.
+        let non_hex = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert!(remember_mark(&fx.home, non_hex).is_err());
+        fs::write(fx.home.local_record_path(), format!("{non_hex}\n{mark}\n")).unwrap();
+        assert_eq!(own_marks(&fx.home), vec![mark.to_owned()]);
+        assert!(!is_own_local(
+            &fx.home,
+            &Profile {
+                id: Some(non_hex.into()),
+                ..Profile::default()
+            }
+        ));
+
+        #[cfg(unix)]
+        {
+            let target = fx.cwd.join("target-marks");
+            fs::write(&target, format!("{mark}\n")).unwrap();
+            fs::remove_file(fx.home.local_record_path()).unwrap();
+            std::os::unix::fs::symlink(&target, fx.home.local_record_path()).unwrap();
+            assert!(own_marks(&fx.home).is_empty());
+            assert!(remember_mark(&fx.home, mark).is_err());
+        }
     }
 }

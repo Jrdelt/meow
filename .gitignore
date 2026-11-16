@@ -8,6 +8,13 @@ session.lock
 tmp/
 .env*
 .DS_Store
+# Local agent, planning, and test notes
+/AGENTS.md
+/CLAUDE.md
+/HANDOFF.md
+/SPEC.md
+/issue/
+/tests/
 # Keys and credentials never belong in this public repository.
 ai.toml
 *.pem

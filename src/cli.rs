@@ -223,9 +223,17 @@ impl Cli {
     /// inside another one. `active` is `SessionEnv::active_label()`.
     pub fn nesting_error(&self, active: Option<&str>) -> Option<String> {
         match active {
-            Some(active) if !active.is_empty() && self.starts_session() => Some(format!(
-                "Nested meow sessions are disabled (active: {active})"
-            )),
+            Some(active) if !active.is_empty() && self.starts_session() => {
+                let clean = crate::evidence::sanitize(active, 120);
+                let shown = if clean.is_empty() {
+                    "unknown"
+                } else {
+                    clean.as_str()
+                };
+                Some(format!(
+                    "Nested meow sessions are disabled (active: {shown})"
+                ))
+            }
             _ => None,
         }
     }
@@ -441,6 +449,20 @@ mod tests {
         assert_eq!(helper.nesting_error(Some("acme")), None);
         assert_eq!(parse(&["other"]).unwrap().nesting_error(None), None);
         assert_eq!(parse(&["other"]).unwrap().nesting_error(Some("")), None);
+        assert_eq!(
+            parse(&[])
+                .unwrap()
+                .nesting_error(Some("acme\x1b]52;c;X\x07\u{202e}"))
+                .as_deref(),
+            Some("Nested meow sessions are disabled (active: acme]52;c;X)")
+        );
+        assert_eq!(
+            parse(&[])
+                .unwrap()
+                .nesting_error(Some("\x1b\u{202e}"))
+                .as_deref(),
+            Some("Nested meow sessions are disabled (active: unknown)")
+        );
     }
 
     #[test]

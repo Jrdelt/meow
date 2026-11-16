@@ -70,9 +70,16 @@ fn classify(object: &Value) -> Option<Hit<'_>> {
     })
 }
 
+/// Maximum size of a single JSONL record accepted into DOM parsing.
+const MAX_LINE_BYTES: usize = 256 * 1024;
+
 /// Parses one JSONL line into observations; `None` if it holds nothing usable.
 pub fn parse_line(line: &str) -> Option<Vec<Observation>> {
-    let object: Value = serde_json::from_str(line.trim()).ok()?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let object: Value = serde_json::from_str(trimmed).ok()?;
     let hit = classify(&object)?;
     let url = WebUrl::parse(hit.url)?;
     let address = url.host.canonical();
@@ -178,15 +185,24 @@ not json at all
     }
 
     #[test]
-    fn feroxbuster_lines_become_paths_and_redirect_names() {
+    fn feroxbuster_lines_become_paths_and_redirect_targets() {
         let (observations, skipped) = parse(FEROX);
         assert_eq!(skipped, 3, "configuration, statistics and the broken line");
         let mut graph = Graph::default();
         graph.apply_all(observations);
 
         let host = &graph.hosts["10.0.0.5"];
-        assert!(host.hostnames.contains("admin.lab.local"));
+        // A redirect's target is kept as where the port sends visitors,
+        // not as a name of the host.
+        assert!(host.hostnames.is_empty());
         let port = &host.ports["8080/tcp"];
+        assert!(port
+            .http
+            .as_ref()
+            .unwrap()
+            .location
+            .as_deref()
+            .is_some_and(|location| location.contains("admin.lab.local")));
         assert_eq!(
             port.http.as_ref().unwrap().server.as_deref(),
             Some("Apache/2.4.41")
@@ -229,5 +245,13 @@ not json at all
         assert!(parse_line(r#"{"url": 5}"#).is_none());
         assert!(parse_line(r#"["http://10.0.0.7/"]"#).is_none());
         assert!(parse_line(r#"{"type":"response","url":"http://x/","status":99999}"#).is_some());
+
+        let huge = format!(
+            "{{\"url\":\"http://10.0.0.7/a\",\"pad\":\"{}\"}}\n{{\"url\":\"http://10.0.0.7/ok\",\"status_code\":200}}\n",
+            "x".repeat(MAX_LINE_BYTES + 100)
+        );
+        let (obs, skipped) = parse(&huge);
+        assert_eq!(skipped, 1);
+        assert_eq!(obs.len(), 1);
     }
 }

@@ -232,6 +232,11 @@ pub fn host_open_ports(host: &Host) -> String {
     }
 }
 
+fn parse_host_ip(address: &str) -> Option<IpAddr> {
+    let base = address.split('%').next().unwrap_or(address);
+    base.parse::<IpAddr>().ok()
+}
+
 /// True for a neighbour-table entry that stands for one device: a resolved,
 /// individual hardware address and an address that is not a group.
 fn is_single_device(address: &str, mac: &str) -> bool {
@@ -240,10 +245,10 @@ fn is_single_device(address: &str, mac: &str) -> bool {
         .next()
         .and_then(|octet| u8::from_str_radix(octet, 16).ok())
         .is_none_or(|octet| octet & 1 == 1);
-    let single_address = match address.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => !ip.is_multicast() && !ip.is_broadcast() && !ip.is_unspecified(),
-        Ok(IpAddr::V6(ip)) => !ip.is_multicast() && !ip.is_unspecified(),
-        Err(_) => false,
+    let single_address = match parse_host_ip(address) {
+        Some(IpAddr::V4(ip)) => !ip.is_multicast() && !ip.is_broadcast() && !ip.is_unspecified(),
+        Some(IpAddr::V6(ip)) => !ip.is_multicast() && !ip.is_unspecified(),
+        None => false,
     };
     !group_mac && single_address
 }
@@ -255,7 +260,7 @@ fn is_single_device(address: &str, mac: &str) -> bool {
 /// looked at the machine. There is no address to place it by, so it is
 /// listed and never drawn.
 pub fn only_mentioned(host: &Host) -> bool {
-    host.address.parse::<IpAddr>().is_err()
+    parse_host_ip(&host.address).is_none()
         && host.open_ports().count() == 0
         && host.advisories.is_empty()
         && host.os.is_none()
@@ -349,7 +354,7 @@ impl Topology {
         let index = self.graph.add_node(Node {
             id: id.clone(),
             kind,
-            label,
+            label: crate::evidence::sanitize(&label, 200),
         });
         self.index.insert(id, index);
         index
@@ -432,7 +437,7 @@ impl Topology {
                 continue;
             }
             let node = topology.node(host_id(&host.address), NodeKind::Host, host.label());
-            let Ok(ip) = host.address.parse::<IpAddr>() else {
+            let Some(ip) = parse_host_ip(&host.address) else {
                 continue; // known by name only: no route can be derived
             };
             let Some(route) = route_for(&graph.local, ip) else {
@@ -441,16 +446,17 @@ impl Topology {
             let interface = topology.interface(graph, &route.interface);
             match &route.gateway {
                 Some(gateway) => {
-                    let via = topology.gateway(graph, gateway);
-                    topology.edge(interface, via, "gateway");
-                    topology.edge(via, node, "routed");
+                    let gw = topology.gateway(graph, gateway);
+                    topology.edge(interface, gw, "gateway");
+                    topology.edge(gw, node, "routed");
                 }
                 None => {
+                    let host_addr = host.address.split('%').next().unwrap_or(&host.address);
                     let neighbour = graph
                         .local
                         .neighbors
                         .iter()
-                        .any(|n| n.address == host.address);
+                        .any(|n| n.address == host.address || n.address == host_addr);
                     topology.edge(
                         interface,
                         node,
@@ -495,14 +501,15 @@ impl Topology {
                 let mut caption = Role::You.title().to_owned();
                 if let Some(address) = primary_address(&graph.local) {
                     caption.push('\n');
-                    caption.push_str(&address);
+                    caption.push_str(&crate::evidence::sanitize(&address, 80));
                 }
                 let why = "the machine meow runs on".to_owned();
                 (Role::You, why, caption, None)
             }
             NodeKind::Interface => {
-                let name = node.id.strip_prefix("if:").unwrap_or(&node.id);
-                let interface = graph.local.interfaces.iter().find(|i| i.name == name);
+                let raw_name = node.id.strip_prefix("if:").unwrap_or(&node.id);
+                let interface = graph.local.interfaces.iter().find(|i| i.name == raw_name);
+                let clean_name = crate::evidence::sanitize(raw_name, 64);
                 let word = match interface.map(|i| i.kind.as_str()) {
                     Some("ethernet") => "LAN",
                     Some("wifi") => "Wi-Fi",
@@ -516,21 +523,22 @@ impl Topology {
                 // Windows names connections "Wi-Fi" or "Ethernet" already.
                 let says_it = [word, "wi-fi", "wlan", "ethernet", "vpn"]
                     .iter()
-                    .any(|w| name.to_lowercase().contains(&w.to_lowercase()));
+                    .any(|w| clean_name.to_lowercase().contains(&w.to_lowercase()));
                 let mut caption = if says_it {
-                    name.to_owned()
+                    clean_name.clone()
                 } else {
-                    format!("{word} {name}")
+                    format!("{word} {clean_name}")
                 };
                 if let Some(network) = &network {
                     caption.push('\n');
                     caption.push_str(network);
                 }
-                let why = format!("the network this machine is attached to through {name}");
+                let why = format!("the network this machine is attached to through {clean_name}");
                 (Role::Segment, why, caption, network)
             }
             NodeKind::Gateway => {
-                let address = node.id.strip_prefix("gw:").unwrap_or(&node.id);
+                let address =
+                    crate::evidence::sanitize(node.id.strip_prefix("gw:").unwrap_or(&node.id), 80);
                 let caption = format!("{}\n{address}", Role::Router.title());
                 (Role::Router, routed.to_owned(), caption, None)
             }
@@ -541,12 +549,13 @@ impl Topology {
                     return (Role::Client, why, node.label.clone(), None);
                 };
                 let (role, why) = host_role(graph, host);
-                let mut caption = format!("{}\n{}", role.title(), host.address);
+                let clean_addr = crate::evidence::sanitize(&host.address, 200);
+                let mut caption = format!("{}\n{clean_addr}", role.title());
                 if let Some(name) = host.hostnames.iter().find(|n| **n != host.address) {
                     caption.push('\n');
-                    caption.push_str(name);
+                    caption.push_str(&crate::evidence::sanitize(name, 200));
                 }
-                (role, why, caption, None)
+                (role, crate::evidence::sanitize(&why, 200), caption, None)
             }
         }
     }
@@ -573,16 +582,268 @@ impl Topology {
         found
     }
 
+    /// Compact port list for map node subtitles (`"22, 80, 9929/tcp"`).
+    fn host_ports_compact(host: &Host) -> String {
+        let open: Vec<_> = host.open_ports().collect();
+        if open.is_empty() {
+            return String::new();
+        }
+        let all_tcp = open.iter().all(|p| p.protocol == "tcp");
+        let shown: Vec<String> = open
+            .iter()
+            .take(5)
+            .map(|p| {
+                if all_tcp {
+                    p.number.to_string()
+                } else {
+                    p.key()
+                }
+            })
+            .collect();
+        let mut line = shown.join(", ");
+        if all_tcp {
+            line.push_str("/tcp");
+        }
+        if open.len() > 5 {
+            line.push_str(&format!(" +{}", open.len() - 5));
+        }
+        line
+    }
+
+    fn host_primary_hostname(host: &Host) -> Option<String> {
+        let (_, assoc_hosts) = Self::host_associated_names(host);
+        if let Some(first) = assoc_hosts.first() {
+            return Some(first.clone());
+        }
+        host.hostnames
+            .iter()
+            .filter(|n| **n != host.address)
+            .min_by_key(|n| (n.matches('.').count(), n.len()))
+            .map(|n| crate::evidence::sanitize(n, 160))
+    }
+
+    /// Extracts unique Associated Domains (registrable root domains, e.g. `nmap.org`)
+    /// and Associated Hosts (subdomains/hostnames, e.g. `scanme.nmap.org`) for a host.
+    pub fn host_associated_names(host: &Host) -> (Vec<String>, Vec<String>) {
+        let mut raw_names: BTreeSet<String> = BTreeSet::new();
+        for name in &host.hostnames {
+            if *name != host.address && parse_host_ip(name).is_none() {
+                raw_names.insert(name.clone());
+            }
+        }
+        for port in host.ports.values() {
+            for san in &port.tls_sans {
+                let trimmed = san.trim().trim_start_matches("*.").trim_end_matches('.');
+                if !trimmed.is_empty() && parse_host_ip(trimmed).is_none() {
+                    raw_names.insert(trimmed.to_ascii_lowercase());
+                }
+            }
+        }
+        for fact in &host.facts {
+            if let Some(rest) = fact
+                .claim
+                .strip_prefix("PTR record: ")
+                .or_else(|| fact.claim.strip_prefix("CNAME record: "))
+            {
+                let trimmed = rest.trim().trim_end_matches('.');
+                if !trimmed.is_empty() && parse_host_ip(trimmed).is_none() {
+                    raw_names.insert(trimmed.to_ascii_lowercase());
+                }
+            } else if fact.claim.starts_with("CT log subdomains for ") {
+                if let Some((_, list_part)) = fact.claim.split_once(": ") {
+                    let clean_part = list_part.split(" (+").next().unwrap_or(list_part);
+                    for item in clean_part.split(',') {
+                        let trimmed = item.trim().trim_start_matches("*.").trim_end_matches('.');
+                        if !trimmed.is_empty() && parse_host_ip(trimmed).is_none() {
+                            raw_names.insert(trimmed.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut domains: BTreeSet<String> = BTreeSet::new();
+        let mut sub_hosts: BTreeSet<String> = BTreeSet::new();
+        let mut apex_hosts: BTreeSet<String> = BTreeSet::new();
+
+        for name in &raw_names {
+            let clean = crate::evidence::sanitize(
+                name.trim().trim_start_matches("*.").trim_end_matches('.'),
+                160,
+            )
+            .to_ascii_lowercase();
+            if clean.is_empty() || parse_host_ip(&clean).is_some() {
+                continue;
+            }
+            if let Some(root) = crate::osint::root_domain(&clean) {
+                let clean_root = crate::evidence::sanitize(&root, 160);
+                domains.insert(clean_root.clone());
+                if clean != clean_root {
+                    sub_hosts.insert(clean);
+                } else {
+                    apex_hosts.insert(clean);
+                }
+            } else {
+                sub_hosts.insert(clean);
+            }
+        }
+
+        if sub_hosts.is_empty() {
+            sub_hosts.extend(apex_hosts);
+        }
+
+        (
+            domains.into_iter().collect(),
+            sub_hosts.into_iter().collect(),
+        )
+    }
+
+    fn host_trace_hops(
+        graph: &Graph,
+        host: &Host,
+        geo: Option<&crate::geoip::GeoDb>,
+    ) -> Vec<crate::osint::TraceHop> {
+        let local_gateway = graph
+            .local
+            .routes
+            .iter()
+            .find(|r| is_default_route(r))
+            .and_then(|r| r.gateway.as_deref());
+        let primary_name = Self::host_primary_hostname(host);
+        let trace_evidence = host
+            .facts
+            .iter()
+            .find(|f| f.record.source == crate::evidence::Source::Traceroute)
+            .map(|f| f.record.evidence.as_str());
+
+        let mut hops = match trace_evidence {
+            Some(ev) if !ev.is_empty() => crate::osint::parse_traceroute_detailed(
+                ev,
+                &host.address,
+                local_gateway,
+                primary_name.as_deref(),
+            ),
+            _ => Vec::new(),
+        };
+
+        if hops.is_empty() && !host.hops.is_empty() {
+            for (idx, h) in host.hops.iter().enumerate() {
+                let hop_num = (idx + 1) as u8;
+                let is_gw = local_gateway.is_some_and(|gw| gw == h);
+                let label = if h == "*" || h == "* * *" {
+                    Some("isp-transit / ICMP filtered".to_owned())
+                } else if is_gw || idx == 0 {
+                    Some("Local Router".to_owned())
+                } else if idx == 1 {
+                    Some("ISP Regional Node".to_owned())
+                } else {
+                    Some("ISP Backbone / Transit".to_owned())
+                };
+                hops.push(crate::osint::TraceHop {
+                    hop: hop_num,
+                    address: if h == "*" {
+                        "* * *".to_owned()
+                    } else {
+                        h.clone()
+                    },
+                    label,
+                    rtt_ms: None,
+                });
+            }
+        }
+
+        if !hops.is_empty() && !hops.iter().any(|h| h.address == host.address) {
+            let next_hop = hops.last().map_or(1, |h| h.hop.saturating_add(1));
+            hops.push(crate::osint::TraceHop {
+                hop: next_hop,
+                address: host.address.clone(),
+                label: primary_name.or_else(|| host.asn.clone()),
+                rtt_ms: None,
+            });
+        }
+
+        if let Some(db) = geo {
+            let total = hops.len();
+            for (idx, hop) in hops.iter_mut().enumerate() {
+                if hop.address == host.address {
+                    if hop.label.as_deref().is_none_or(|l| l == "Target Host") {
+                        if let Some(name) = Self::host_primary_hostname(host) {
+                            hop.label = Some(name);
+                        }
+                    }
+                    continue;
+                }
+                let Ok(ip) = hop.address.parse::<IpAddr>() else {
+                    continue;
+                };
+                if crate::osint::is_non_public_ip(ip) {
+                    continue;
+                }
+                let generic = hop.label.as_deref().is_none_or(|l| {
+                    matches!(
+                        l,
+                        "ISP Regional Node" | "ISP Backbone / Transit" | "Target Host"
+                    )
+                });
+                if !generic {
+                    continue;
+                }
+                if let Ok(Some(place)) = db.lookup(ip) {
+                    let loc = match (&place.city, &place.region) {
+                        (Some(c), Some(r)) if !c.is_empty() && !r.is_empty() => {
+                            Some(format!("{c}, {r}"))
+                        }
+                        (Some(c), _) if !c.is_empty() => Some(c.clone()),
+                        (None, Some(r)) if !r.is_empty() => Some(r.clone()),
+                        _ => place.country.clone(),
+                    };
+                    let net = place
+                        .network
+                        .as_deref()
+                        .or_else(|| (idx + 2 >= total).then_some(host.asn.as_deref()).flatten());
+                    hop.label = match (net, loc) {
+                        (Some(n), Some(l)) => {
+                            Some(crate::evidence::sanitize(&format!("{n} - {l}"), 80))
+                        }
+                        (None, Some(l)) if idx + 2 >= total => {
+                            Some(crate::evidence::sanitize(&format!("Edge Node - {l}"), 80))
+                        }
+                        (None, Some(l)) => Some(crate::evidence::sanitize(
+                            &format!("ISP Backbone - {l}"),
+                            80,
+                        )),
+                        (Some(n), None) => Some(crate::evidence::sanitize(n, 80)),
+                        (None, None) => hop.label.clone(),
+                    };
+                }
+            }
+        }
+
+        hops
+    }
+
     /// Elements for Cytoscape.js. Every node carries its role (which picture
     /// to draw), the reason for it and a caption; host nodes also carry the
     /// counts the map uses for highlighting.
     pub fn cytoscape(&self, graph: &Graph) -> Value {
+        self.cytoscape_with_geo(graph, None)
+    }
+
+    /// Elements for Cytoscape.js, enriched with offline GeoIP city/region
+    /// lookups when `geo` is available.
+    pub fn cytoscape_with_geo(&self, graph: &Graph, geo: Option<&crate::geoip::GeoDb>) -> Value {
+        let mut max_hop_count: usize = 0;
+        let mut best_rtt_ms: Option<f64> = None;
+        let mut primary_trace_hops: Vec<Value> = Vec::new();
+
         let mut nodes: Vec<Value> = self
             .nodes()
             .map(|node| {
                 let (role, why, caption, network) = self.drawing(graph, node);
                 let mut data = json!({
-                    "id": node.id, "label": node.label, "kind": node.kind,
+                    "id": crate::evidence::sanitize(&node.id, 220),
+                    "label": node.label,
+                    "kind": node.kind,
                     "role": role, "why": why, "caption": caption,
                 });
                 if let Some(network) = network {
@@ -597,7 +858,7 @@ impl Topology {
                         .iter()
                         .find(|i| i.name == name)
                         .map_or("other", |i| i.kind.as_str());
-                    data["link"] = json!(link);
+                    data["link"] = json!(crate::evidence::sanitize(link, 32));
                 }
                 let host = node
                     .id
@@ -610,9 +871,26 @@ impl Topology {
                             .filter(|a| a.record.verification_status == status)
                             .count()
                     };
-                    data["address"] = json!(host.address);
-                    data["headline"] = json!(host_headline(graph, host));
-                    data["ports_line"] = json!(host_open_ports(host));
+                    data["address"] = json!(crate::evidence::sanitize(&host.address, 200));
+                    data["headline"] =
+                        json!(crate::evidence::sanitize(&host_headline(graph, host), 240));
+                    data["ports_line"] =
+                        json!(crate::evidence::sanitize(&host_open_ports(host), 240));
+                    let compact = Self::host_ports_compact(host);
+                    if !compact.is_empty() {
+                        data["ports_compact"] =
+                            json!(crate::evidence::sanitize(&compact, 120));
+                    }
+                    if let Some(primary) = Self::host_primary_hostname(host) {
+                        data["primary_hostname"] = json!(primary);
+                    }
+                    let (assoc_domains, assoc_hosts) = Self::host_associated_names(host);
+                    if !assoc_domains.is_empty() {
+                        data["associated_domains"] = json!(assoc_domains);
+                    }
+                    if !assoc_hosts.is_empty() {
+                        data["associated_hosts"] = json!(assoc_hosts);
+                    }
                     data["open_ports"] = json!(host.open_ports().count());
                     data["hypotheses"] = json!(open(VerificationStatus::UnverifiedHypothesis));
                     data["confirmed"] = json!(open(VerificationStatus::Confirmed));
@@ -620,14 +898,79 @@ impl Topology {
                     data["ready"] = json!(checklist::host_research_ready(graph, host));
                     data["reachable"] = json!(self.reachable(&host.address));
                     // Known by name only: no address, so no route to derive.
-                    data["by_name"] = json!(host.address.parse::<IpAddr>().is_err());
+                    data["by_name"] = json!(parse_host_ip(&host.address).is_none());
+                    if let Some(asn) = &host.asn {
+                        data["asn"] = json!(crate::evidence::sanitize(asn, 200));
+                    }
+                    if let Some(bgp) = &host.bgp_prefix {
+                        data["bgp_prefix"] = json!(crate::evidence::sanitize(bgp, 80));
+                    }
+                    if let Some(country) = &host.country {
+                        data["country"] = json!(crate::evidence::sanitize(country, 32));
+                    }
+                    if let (Some(db), Some(ip)) = (geo, parse_host_ip(&host.address)) {
+                        if let Ok(Some(place)) = db.lookup(ip) {
+                            if let Some(city) = place.city.filter(|c| !c.is_empty()) {
+                                data["city"] = json!(crate::evidence::sanitize(&city, 80));
+                            }
+                            if data.get("country").is_none() {
+                                if let Some(cc) = place.country.filter(|c| !c.is_empty()) {
+                                    data["country"] = json!(crate::evidence::sanitize(&cc, 32));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ipv6_dns) = &host.ipv6_dns {
+                        data["ipv6_dns"] = json!(crate::evidence::sanitize(ipv6_dns, 200));
+                    }
+                    if let Some(waf) = &host.waf_cdn {
+                        data["waf_cdn"] = json!(crate::evidence::sanitize(waf, 120));
+                    }
+                    if !host.hops.is_empty() {
+                        data["hops"] = json!(host
+                            .hops
+                            .iter()
+                            .map(|h| crate::evidence::sanitize(h, 120))
+                            .collect::<Vec<_>>());
+                    }
+                    let trace_hops = Self::host_trace_hops(graph, host, geo);
+                    if !trace_hops.is_empty() {
+                        let hop_count = trace_hops.len();
+                        let rtt_ms = trace_hops.iter().rev().find_map(|h| h.rtt_ms);
+                        let serialized_hops: Vec<Value> = trace_hops
+                            .iter()
+                            .map(|h| {
+                                json!({
+                                    "hop": h.hop,
+                                    "address": crate::evidence::sanitize(&h.address, 80),
+                                    "label": h.label.as_deref().map(|l| crate::evidence::sanitize(l, 120)),
+                                    "rtt_ms": h.rtt_ms,
+                                    "formatted": crate::evidence::sanitize(&h.formatted(), 200),
+                                })
+                            })
+                            .collect();
+                        data["hop_count"] = json!(hop_count);
+                        if let Some(ms) = rtt_ms {
+                            data["rtt_ms"] = json!(ms);
+                            best_rtt_ms = Some(best_rtt_ms.map_or(ms, |prev| prev.max(ms)));
+                        }
+                        if hop_count > max_hop_count {
+                            max_hop_count = hop_count;
+                            primary_trace_hops = serialized_hops.clone();
+                        }
+                        data["trace_hops"] = json!(serialized_hops);
+                    }
                 }
                 json!({ "data": data })
             })
             .collect();
         let mut edges: Vec<Value> = self
-            .edges()
-            .iter()
+            .graph
+            .edge_indices()
+            .filter_map(|edge| {
+                let (from, to) = self.graph.edge_endpoints(edge)?;
+                Some((&self.graph[from], &self.graph[to], self.graph[edge]))
+            })
             .enumerate()
             .map(|(i, (from, to, kind))| {
                 json!({ "data": { "id": format!("e{i}"), "source": from.id, "target": to.id, "kind": kind } })
@@ -635,8 +978,16 @@ impl Topology {
             .collect();
         // Drawing only: a host no route leads to is tied to this machine
         // with an "unknown" link so it does not float free in the layout.
-        for node in self.nodes().filter(|n| n.kind == NodeKind::Host) {
-            let attached = self.edges().iter().any(|(_, to, _)| to.id == node.id);
+        for index in self.graph.node_indices() {
+            let node = &self.graph[index];
+            if node.kind != NodeKind::Host {
+                continue;
+            }
+            let attached = self
+                .graph
+                .edges_directed(index, petgraph::Direction::Incoming)
+                .next()
+                .is_some();
             if !attached {
                 edges.push(json!({ "data": {
                     "id": format!("u:{}", node.id), "source": LOCAL_ID, "target": node.id, "kind": "unknown",
@@ -650,6 +1001,13 @@ impl Topology {
         let mut neighbours: Vec<_> = graph.local.neighbors.iter().collect();
         neighbours.sort_by_key(|n| n.address.contains(':'));
         let mut seen = BTreeSet::new();
+        for host in graph.hosts.values() {
+            if let (Some(mac), Some(ip)) = (host.mac.as_deref(), parse_host_ip(&host.address)) {
+                if let Some(route) = route_for(&graph.local, ip) {
+                    seen.insert((format!("if:{}", route.interface), mac.to_lowercase()));
+                }
+            }
+        }
         let mut drawn = 0;
         let mut hidden: BTreeMap<String, usize> = BTreeMap::new();
         for neighbour in neighbours {
@@ -673,16 +1031,19 @@ impl Topology {
                 continue;
             }
             drawn += 1;
-            let id = format!("nb:{}", neighbour.address);
+            let addr = crate::evidence::sanitize(&neighbour.address, 80);
+            let clean_mac = crate::evidence::sanitize(mac, 32);
+            let clean_if = crate::evidence::sanitize(&neighbour.interface, 64);
+            let id = format!("nb:{addr}");
             nodes.push(json!({ "data": {
-                "id": id, "label": neighbour.address, "kind": "neighbour",
-                "role": Role::Client, "mac": mac, "interface": neighbour.interface,
-                "caption": format!("{}\n{}", Role::Client.title(), neighbour.address),
+                "id": id, "label": addr, "kind": "neighbour",
+                "role": Role::Client, "mac": clean_mac, "interface": clean_if,
+                "caption": format!("{}\n{addr}", Role::Client.title()),
                 "why": "it is in this machine's neighbour table (ARP or NDP) and \
                         nothing else is known about it; nothing was sent to it",
             } }));
             edges.push(json!({ "data": {
-                "id": format!("n:{}", neighbour.address), "source": segment, "target": id,
+                "id": format!("n:{addr}"), "source": segment, "target": id,
                 "kind": "neighbour",
             } }));
         }
@@ -697,15 +1058,26 @@ impl Topology {
         // the Internet cloud. Nothing is sent there to find that out.
         let defaults = self.default_routes(graph);
         if !defaults.is_empty() {
-            let via: Vec<&str> = defaults.iter().map(|(_, via)| via.as_str()).collect();
-            nodes.push(json!({ "data": {
+            let via: Vec<String> = defaults
+                .iter()
+                .map(|(_, via)| crate::evidence::sanitize(via, 120))
+                .collect();
+            let mut internet_data = json!({
                 "id": INTERNET_ID, "label": Role::Internet.title(), "kind": "internet",
                 "role": Role::Internet, "caption": Role::Internet.title(),
                 "why": format!(
                     "the default route sends everything that is not local through {}",
                     via.join(" and ")
                 ),
-            } }));
+            });
+            if max_hop_count > 0 {
+                internet_data["hop_count"] = json!(max_hop_count);
+                internet_data["trace_hops"] = json!(primary_trace_hops);
+            }
+            if let Some(ms) = best_rtt_ms {
+                internet_data["rtt_ms"] = json!(ms);
+            }
+            nodes.push(json!({ "data": internet_data }));
             for (i, (target, _)) in defaults.iter().enumerate() {
                 edges.push(json!({ "data": {
                     "id": format!("i{i}"), "source": INTERNET_ID, "target": target, "kind": "internet",
@@ -718,9 +1090,17 @@ impl Topology {
             .values()
             .filter(|host| only_mentioned(host))
             .map(|host| {
-                let ports: Vec<String> = host.ports.keys().cloned().collect();
+                let ports: Vec<String> = host
+                    .ports
+                    .keys()
+                    .map(|p| crate::evidence::sanitize(p, 32))
+                    .collect();
                 let paths: usize = host.ports.values().map(|port| port.paths.count()).sum();
-                json!({ "name": host.address, "ports": ports, "paths": paths })
+                json!({
+                    "name": crate::evidence::sanitize(&host.address, 200),
+                    "ports": ports,
+                    "paths": paths
+                })
             })
             .collect();
         json!({ "nodes": nodes, "edges": edges, "mentioned": mentioned })
@@ -732,7 +1112,7 @@ impl Topology {
             crate::evidence::sanitize(text, 200)
                 .replace('\\', "/")
                 .replace('"', "'")
-                .replace(['[', ']', '{', '}', '<', '>', '|', '`'], " ")
+                .replace(['[', ']', '{', '}', '<', '>', '|', '`', '#', ';', '&'], " ")
         }
         let mut out = String::from("graph LR\n");
         let name = |index: NodeIndex| format!("n{}", index.index());
@@ -1406,5 +1786,166 @@ mod tests {
             Topology::build(&Graph::default()).mermaid(),
             "graph LR\n    n0([\"this machine\"])\n"
         );
+    }
+
+    #[test]
+    fn zoned_ipv6_hosts_and_dual_stack_neighbours_are_handled_cleanly() {
+        let mut graph = lab();
+        graph.local.routes.push(Route {
+            destination: "fe80::/64".into(),
+            gateway: None,
+            interface: "eth0".into(),
+        });
+        let record = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "manual");
+        graph.apply(Observation::Host {
+            address: "fe80::20%eth0".into(),
+            os: None,
+            mac: None,
+            record: record.clone(),
+        });
+        // A known IPv4 host whose MAC also appears under an IPv6 NDP entry on
+        // the same interface must not be drawn a second time as `nb:fe80::99`.
+        graph.apply(Observation::Host {
+            address: "192.168.1.99".into(),
+            os: None,
+            mac: Some("aa:bb:cc:11:22:33".into()),
+            record,
+        });
+        graph.local.neighbors.push(Neighbor {
+            address: "fe80::99".into(),
+            mac: Some("AA:BB:CC:11:22:33".into()),
+            interface: "eth0".into(),
+        });
+
+        let topo = Topology::build(&graph);
+        assert!(!only_mentioned(&graph.hosts["fe80::20%eth0"]));
+        assert!(topo.reachable("fe80::20%eth0"));
+        let elements = topo.cytoscape(&graph);
+        let nodes = elements["nodes"].as_array().unwrap();
+        let zoned = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "host:fe80::20%eth0")
+            .unwrap();
+        assert_eq!(zoned["data"]["by_name"], false);
+        assert!(
+            !nodes.iter().any(|n| n["data"]["id"] == "nb:fe80::99"),
+            "dual-stack NDP entry for known host MAC was drawn twice"
+        );
+    }
+
+    #[test]
+    fn mermaid_and_cytoscape_strip_entity_escapes_and_hidden_controls() {
+        let mut graph = lab();
+        graph
+            .hosts
+            .get_mut("10.10.10.9")
+            .unwrap()
+            .hostnames
+            .insert("bad&quot;] click n0\u{202e}".into());
+        graph.local.neighbors.push(Neighbor {
+            address: "192.168.1.88".into(),
+            mac: Some("aa:bb:cc:dd:ee:ff\x1b[2J".into()),
+            interface: "eth0".into(),
+        });
+        let topo = Topology::build(&graph);
+        let mermaid = topo.mermaid();
+        assert!(
+            !mermaid.contains('&') && !mermaid.contains('\u{202e}'),
+            "{mermaid}"
+        );
+        let cyto = topo.cytoscape(&graph).to_string();
+        assert!(
+            !cyto.contains('\x1b') && !cyto.contains('\u{202e}'),
+            "{cyto}"
+        );
+    }
+
+    #[test]
+    fn cytoscape_includes_traceroute_hops_compact_ports_and_internet_transit_summary() {
+        let mut graph = lab();
+        let record = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "scan");
+        graph.apply(Observation::Host {
+            address: "45.33.32.156".into(),
+            os: Some("Linux".into()),
+            mac: None,
+            record: record.clone(),
+        });
+        graph.apply(Observation::Hostname {
+            address: "45.33.32.156".into(),
+            hostname: "scanme.org".into(),
+            record: record.clone(),
+        });
+        graph.apply(Observation::Hostname {
+            address: "45.33.32.156".into(),
+            hostname: "scanme.nmap.org".into(),
+            record: record.clone(),
+        });
+        for port in [22u16, 80, 9929] {
+            graph.apply(Observation::Port {
+                address: "45.33.32.156".into(),
+                port,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("tcp".into()),
+                product: None,
+                version: None,
+                extra_info: None,
+                cpes: Vec::new(),
+                record: record.clone(),
+            });
+        }
+        let trace_ev = "\
+Hop 1: 192.168.1.1          (Local Router)                     1.8 ms
+Hop 2: 173.230.159.1        (Linode Edge - Fremont, CA)       22.6 ms
+Hop 3: 45.33.32.156         (scanme.nmap.org)                 23.1 ms";
+        let trace_rec = EvidenceRecord::observed(Source::Traceroute, Confidence::Medium, trace_ev);
+        graph.apply(Observation::HostMeta {
+            address: "45.33.32.156".into(),
+            asn: Some("AS63949 · Akamai / Linode".into()),
+            bgp_prefix: Some("45.33.32.0/24".into()),
+            country: Some("US".into()),
+            ipv6_dns: None,
+            waf_cdn: None,
+            hops: vec!["192.168.1.1".into(), "173.230.159.1".into()],
+            record: trace_rec.clone(),
+        });
+        graph.apply(Observation::Fact {
+            address: "45.33.32.156".into(),
+            port: None,
+            protocol: "tcp".into(),
+            claim: "route path (3 hops (23.1 ms)): 192.168.1.1 -> 173.230.159.1 -> 45.33.32.156"
+                .into(),
+            record: trace_rec,
+        });
+
+        let topo = Topology::build(&graph);
+        let cyto = topo.cytoscape(&graph);
+        let nodes = cyto["nodes"].as_array().unwrap();
+        let host = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "host:45.33.32.156")
+            .unwrap();
+        assert_eq!(host["data"]["primary_hostname"], "scanme.nmap.org");
+        assert_eq!(
+            host["data"]["associated_domains"],
+            serde_json::json!(["nmap.org", "scanme.org"])
+        );
+        assert_eq!(
+            host["data"]["associated_hosts"],
+            serde_json::json!(["scanme.nmap.org"])
+        );
+        assert_eq!(host["data"]["ports_compact"], "22, 80, 9929/tcp");
+        assert_eq!(host["data"]["asn"], "AS63949 · Akamai / Linode");
+        assert_eq!(host["data"]["hop_count"], 3);
+        assert_eq!(host["data"]["rtt_ms"], 23.1);
+        assert_eq!(host["data"]["trace_hops"].as_array().unwrap().len(), 3);
+
+        let internet = nodes
+            .iter()
+            .find(|n| n["data"]["id"] == "internet")
+            .unwrap();
+        assert_eq!(internet["data"]["hop_count"], 3);
+        assert_eq!(internet["data"]["rtt_ms"], 23.1);
+        assert_eq!(internet["data"]["trace_hops"].as_array().unwrap().len(), 3);
     }
 }

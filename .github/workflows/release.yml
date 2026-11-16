@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -36,14 +40,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Manual release workflow runs must target refs/heads/main (got $GITHUB_REF)." >&2
+            exit 1
+          fi
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid SemVer version in Cargo.toml: '$version'" >&2
+            exit 1
+          fi
           tag="v$version"
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$tag" != "$GITHUB_REF_NAME" ]; then
             echo "The tag is $GITHUB_REF_NAME but Cargo.toml says $version." >&2
             exit 1
           fi
-          if [ "$GITHUB_EVENT_NAME" != push ] &&
-            [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+          if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
             echo "$tag is released already: raise the version in Cargo.toml first." >&2
             exit 1
           fi
@@ -53,10 +64,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          # A release made already (on github.com, or by an earlier run that
-          # stopped half-way) is kept; the builds are added to it.
+          # A draft release made already (on github.com, or by an earlier run
+          # that stopped half-way) is kept; the builds are added to it.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "The release exists already; adding the builds to it."
+            echo "The draft release exists already; adding the builds to it."
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
               --title "meow $TAG" --notes-file .github/release-notes.md
@@ -71,8 +82,8 @@ jobs:
         include:
           - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
           - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
-          - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: linux-x86_64, os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -86,50 +97,69 @@ jobs:
         with:
           persist-credentials: false
       - name: Rust toolchain
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add "${{ matrix.target }}"
+          rustup target add "$MATRIX_TARGET"
       - name: Build
         env:
           # Tells meow it is a release build, and which file is its own,
           # so `meow update` downloads releases instead of pulling code.
           MEOW_RELEASE_BUILD: ${{ matrix.name }}
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+          MATRIX_TARGET: ${{ matrix.target }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --locked --target "$MATRIX_TARGET"
       - name: Package and upload
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.draft.outputs.tag }}
+          MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          COPYFILE_DISABLE: "1"
         run: |
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "Refusing to clobber already-published release $TAG." >&2
+            exit 1
+          fi
           version=${TAG#v}
-          name="meow-$version-${{ matrix.name }}"
-          out="target/${{ matrix.target }}/release"
-          case "${{ matrix.name }}" in
+          name="meow-$version-$MATRIX_NAME"
+          out="target/$MATRIX_TARGET/release"
+          mkdir -p stage
+          cp LICENSE stage/LICENSE
+          cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
+          case "$MATRIX_NAME" in
           windows-*)
-            cp "$out/meow.exe" meow.exe
-            pwsh -NoProfile -Command "Compress-Archive -Path meow.exe -DestinationPath $name.zip"
+            cp "$out/meow.exe" stage/meow.exe
+            ARCHIVE_NAME="$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
-            tar -czf "$name.tar.gz" -C "$out" meow
+            cp "$out/meow" stage/meow
+            chmod 0755 stage/meow
+            tar -czf "$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
-          case "${{ matrix.name }}" in
+          case "$MATRIX_NAME" in
           macos-*)
             # Double-click installer: puts meow in /usr/local/bin.
             mkdir -p pkgroot/usr/local/bin
             cp "$out/meow" pkgroot/usr/local/bin/meow
-            pkgbuild --root pkgroot --identifier io.github.jrdelt.meow \
+            chmod -R u+rwX,go+rX,go-w pkgroot
+            chmod 0755 pkgroot/usr/local/bin/meow
+            pkgbuild --root pkgroot --ownership recommended \
+              --identifier io.github.jrdelt.meow \
               --version "$version" --install-location / "$name.pkg"
             files="$files $name.pkg"
             ;;
           esac
           for file in $files; do
             if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$file" >"$file.sha256"
+              sha256sum -- "$file" >"$file.sha256"
             else
-              shasum -a 256 "$file" >"$file.sha256"
+              shasum -a 256 -- "$file" >"$file.sha256"
             fi
             gh release upload "$TAG" "$file" "$file.sha256" \
               --repo "$GITHUB_REPOSITORY" --clobber
@@ -148,5 +178,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.draft.outputs.tag }}
         run: |
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "Invalid release tag: $TAG" >&2; exit 1 ;;
+          esac
           # Publishing makes the tag, at the commit that was built.
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag --latest
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

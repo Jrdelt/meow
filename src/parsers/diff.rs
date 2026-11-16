@@ -42,7 +42,8 @@ pub fn parse(text: &str) -> Vec<Observation> {
     let mut out = Vec::new();
     let mut current = FileDiff::default();
     let mut in_hunk = false;
-    for line in text.lines() {
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             std::mem::take(&mut current).finish(&mut out);
             in_hunk = false;
@@ -61,11 +62,13 @@ pub fn parse(text: &str) -> Vec<Observation> {
             current.added += 1;
             push_line(&mut current.block, line);
         } else if let Some(rest) = line.strip_prefix("--- ") {
-            if !in_hunk {
-                // A plain unified diff has no "diff --git" header.
+            let next_is_plus_header = lines.peek().is_some_and(|next| next.starts_with("+++ "));
+            if !in_hunk || next_is_plus_header {
+                // A plain unified diff has no "diff --git" header between files.
                 if !current.block.is_empty() {
                     std::mem::take(&mut current).finish(&mut out);
                 }
+                in_hunk = false;
                 if current.path.is_empty() && rest.trim() != "/dev/null" {
                     current.path = strip_side(rest).to_owned();
                 }
@@ -90,9 +93,13 @@ pub fn parse(text: &str) -> Vec<Observation> {
     out
 }
 
+const MAX_DIFF_BLOCK: usize = 64 * 1024;
+
 fn push_line(block: &mut String, line: &str) {
-    block.push_str(line);
-    block.push('\n');
+    if block.len() + line.len() < MAX_DIFF_BLOCK {
+        block.push_str(line);
+        block.push('\n');
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +154,7 @@ new file mode 100644
         assert_eq!(notes[0].0, "git diff: nginx/site.conf (+2 -1)");
         assert_eq!(
             notes[0].1,
-            "@@ -10,7 +10,8 @@ server {\n- server_tokens on;\n+ server_tokens off;\n+ add_header X-Frame-Options DENY;"
+            "@@ -10,7 +10,8 @@ server {\n-    server_tokens on;\n+    server_tokens off;\n+    add_header X-Frame-Options DENY;"
         );
         assert_eq!(notes[1].0, "git diff: new name.txt (+1 -1)");
         assert!(notes[1].1.contains("--- not a header, a removed line"));
@@ -155,13 +162,19 @@ new file mode 100644
 
     #[test]
     fn plain_unified_diffs_work_without_a_git_header() {
-        let text = "--- config.old\t2026-01-01\n+++ config.new\t2026-01-02\n@@ -1 +1 @@\n-debug = true\n+debug = false\n";
+        let text = "--- config.old\t2026-01-01\n+++ config.new\t2026-01-02\n@@ -1 +1 @@\n-debug = true\n+debug = false\n--- auth.old\t2026-01-01\n+++ auth.new\t2026-01-02\n@@ -1 +1 @@\n-allow_guest = true\n+allow_guest = false\n";
         assert_eq!(
             notes(text),
-            [(
-                "git diff: config.new (+1 -1)".to_owned(),
-                "@@ -1 +1 @@\n-debug = true\n+debug = false".to_owned()
-            )]
+            [
+                (
+                    "git diff: config.new (+1 -1)".to_owned(),
+                    "@@ -1 +1 @@\n-debug = true\n+debug = false".to_owned()
+                ),
+                (
+                    "git diff: auth.new (+1 -1)".to_owned(),
+                    "@@ -1 +1 @@\n-allow_guest = true\n+allow_guest = false".to_owned()
+                ),
+            ]
         );
         assert!(parse("just some text\n+ not a diff\n").is_empty());
     }

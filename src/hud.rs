@@ -15,7 +15,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -41,6 +45,9 @@ use crate::workspace::Workspace;
 
 const MAX_PATH_LINES: usize = 40;
 const MAX_FACT_LINES: usize = 60;
+/// The longest note the catch-up box takes from a paste: what the graph
+/// keeps of a note.
+const NOTE_MAX: usize = crate::evidence::EVIDENCE_MAX;
 
 /// What the coordinator pushes on every change.
 #[derive(Debug, Clone, Deserialize)]
@@ -61,13 +68,13 @@ pub struct Snapshot {
 impl Snapshot {
     /// Reads the workspace files directly, for when no session is running.
     pub fn offline(workspace: &Workspace) -> Result<Self> {
-        let tasks = if workspace.state_db_path().is_file() {
+        let tasks = if workspace.state_db_path().symlink_metadata().is_ok() {
             queue::tasks(&Db::open(&workspace.state_db_path())?, 20)?
         } else {
             Vec::new()
         };
         Ok(Self {
-            session: workspace.name.clone(),
+            session: sanitize(&workspace.name, 80),
             mode: workspace.profile.mode,
             graph: Graph::load(&workspace.graph_path())?,
             tasks,
@@ -173,8 +180,11 @@ impl Model {
         };
         match message.get("type").and_then(Value::as_str) {
             Some("state") => {
-                // Keep the selection on the same host across updates.
+                // Keep the selection on the same host and the same advisory
+                // across updates: a new match that ranks higher must not put
+                // another one under the cursor just before a verdict key.
                 let selected = self.selected_host().map(|h| h.address.clone());
+                let advisory = self.selected_advisory().map(|a| a.id.clone());
                 match serde_json::from_value::<Snapshot>(message["state"].clone()) {
                     Ok(mut snapshot) => {
                         snapshot.session = sanitize(&snapshot.session, 80);
@@ -191,6 +201,11 @@ impl Model {
                 if let Some(address) = selected {
                     if let Some(index) = self.hosts().iter().position(|h| h.address == address) {
                         self.host_index = index;
+                    }
+                }
+                if let Some(id) = advisory {
+                    if let Some(index) = self.advisories().iter().position(|a| a.id == id) {
+                        self.advisory_index = index;
                     }
                 }
                 self.clamp();
@@ -263,6 +278,32 @@ impl Model {
         Action::Send(command)
     }
 
+    /// Handles text pasted into the terminal. It is text for the catch-up
+    /// box and nothing else: a line break in it does not send the note, and
+    /// what follows does not run as keys (a mode, a verdict, an AI request).
+    /// With the box closed a paste does nothing.
+    pub fn on_paste(&mut self, text: &str) -> Action {
+        if let Some(note) = &mut self.note {
+            let need_space = !note.is_empty() && !note.ends_with(' ');
+            let room = NOTE_MAX.saturating_sub(note.len() + usize::from(need_space));
+            if room > 0 {
+                let clean = sanitize(text, room);
+                if !clean.is_empty() {
+                    if need_space {
+                        note.push(' ');
+                    }
+                    for ch in clean.chars() {
+                        if note.len() + ch.len_utf8() > NOTE_MAX {
+                            break;
+                        }
+                        note.push(ch);
+                    }
+                }
+            }
+        }
+        Action::None
+    }
+
     /// Handles one key press and says what, if anything, to do about it.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -275,7 +316,21 @@ impl Model {
                 KeyCode::Backspace => {
                     note.pop();
                 }
-                KeyCode::Char(ch) => note.push(ch),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    note.clear();
+                }
+                KeyCode::Delete => {
+                    note.clear();
+                }
+                KeyCode::Char(_)
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
+                KeyCode::Char(ch) if !ch.is_control() && !crate::evidence::is_hidden(ch) => {
+                    if note.len() + ch.len_utf8() <= NOTE_MAX {
+                        note.push(ch);
+                    }
+                }
                 KeyCode::Enter => {
                     let text = self.note.take().unwrap_or_default();
                     if text.trim().is_empty() {
@@ -297,6 +352,13 @@ impl Model {
         }
 
         let action = match key.code {
+            KeyCode::Char(_)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Action::None
+            }
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
@@ -1047,11 +1109,12 @@ async fn event_loop(
         tokio::select! {
             event = input.recv() => {
                 let Some(event) = event else { break };
-                let Event::Key(key) = event else { continue };
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match model.on_key(key) {
+                let action = match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => model.on_key(key),
+                    Event::Paste(text) => model.on_paste(&text),
+                    _ => continue,
+                };
+                match action {
                     Action::Quit => break,
                     Action::None => {}
                     Action::Send(command) => {
@@ -1089,6 +1152,7 @@ struct TerminalRestore;
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -1111,6 +1175,8 @@ pub fn run(workspace: &Workspace) -> Result<()> {
         let mut terminal =
             ratatui::try_init().context("cannot take over the terminal (is this a TTY?)")?;
         let _restore = TerminalRestore;
+        // A paste then arrives as one piece of text, not as key presses.
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
         event_loop(&mut terminal, &mut model, socket).await
     })
 }
@@ -1332,6 +1398,71 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_is_text_for_the_note_box_and_never_keys() {
+        let mut model = model();
+        let before = (model.host_index, model.advisory_index);
+        // With the box closed a paste does nothing: not `3` (aggressive),
+        // not `c` (confirm), not `C` (a cloud request), not `q`.
+        assert_eq!(model.on_paste("3cCRq\nf"), Action::None);
+        assert_eq!((model.host_index, model.advisory_index), before);
+        assert_eq!(model.note, None);
+
+        // With the box open it is appended as one line of text. The line
+        // break does not send the note, and what follows it is not run.
+        model.on_key(key(KeyCode::Char('n')));
+        model.on_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            model.on_paste("seen in scan\r\n3c\u{1b}[2J\tend"),
+            Action::None
+        );
+        assert_eq!(model.note.as_deref(), Some("x seen in scan 3c[2J end"));
+        // Only the Enter key sends it, whole.
+        match model.on_key(key(KeyCode::Enter)) {
+            Action::Send(Command::Note { text, .. }) => {
+                assert_eq!(text, "x seen in scan 3c[2J end")
+            }
+            other => panic!("{other:?}"),
+        }
+        // A paste longer than a note can be is cut, not sent in parts.
+        model.on_key(key(KeyCode::Char('n')));
+        model.on_paste(&"word ".repeat(2000));
+        assert!(model.note.as_ref().unwrap().len() <= NOTE_MAX);
+    }
+
+    #[test]
+    fn the_advisory_under_the_cursor_stays_the_same_one_across_updates() {
+        let mut model = model();
+        model.on_key(key(KeyCode::Tab));
+        model.on_key(key(KeyCode::Char('j')));
+        let chosen = model.selected_advisory().unwrap().id.clone();
+        assert_eq!(chosen, "CVE-2021-23017");
+        // A new match that ranks first arrives just before a verdict key.
+        let mut graph = graph();
+        graph.add_advisory(
+            "10.10.10.5",
+            Advisory {
+                id: "CVE-2026-9999".into(),
+                title: "new".into(),
+                severity: Some("CRITICAL".into()),
+                cvss: Some(10.0),
+                kev: true,
+                matched: "x".into(),
+                port: None,
+                fixed_in: None,
+                last_affected: None,
+                references: vec![],
+                record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
+            },
+        );
+        model.apply_message(&state_message(&graph));
+        assert_eq!(model.selected_advisory().unwrap().id, chosen);
+        match model.on_key(key(KeyCode::Char('c'))) {
+            Action::Send(Command::Verdict { advisory, .. }) => assert_eq!(advisory, chosen),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn keys_navigate_and_produce_commands() {
         let mut model = model();
         assert_eq!(model.on_key(key(KeyCode::Down)), Action::None);
@@ -1466,8 +1597,40 @@ mod tests {
         // Esc cancels, and an empty note is not sent.
         model.on_key(key(KeyCode::Char('n')));
         model.on_key(key(KeyCode::Char('x')));
+        // Ctrl/Alt modified characters do not insert into the note, and Ctrl+U clears it.
+        model.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        model.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
+        assert_eq!(model.note.as_deref(), Some("x"));
+        model.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(model.note.as_deref(), Some(""));
+        // Paste turns line breaks into spaces, strips control/hidden chars, and caps byte length at NOTE_MAX.
+        model.on_paste("hello\x1b\nworld");
+        assert_eq!(model.note.as_deref(), Some("hello world"));
+        model.on_paste(&"a".repeat(3_000));
+        assert_eq!(model.note.as_ref().unwrap().len(), NOTE_MAX);
         assert_eq!(model.on_key(key(KeyCode::Esc)), Action::None);
         assert_eq!(model.note, None);
+
+        // Multibyte UTF-8 pastes and hidden bidi overrides also stay strictly within NOTE_MAX bytes.
+        model.on_key(key(KeyCode::Char('n')));
+        model.on_paste(&"\u{202e}é".repeat(1_500));
+        let note = model.note.as_ref().unwrap();
+        assert!(note.len() <= NOTE_MAX);
+        assert!(!note.contains('\u{202e}'));
+        model.on_key(key(KeyCode::Esc));
+
+        // Ctrl/Alt-modified keys (other than Ctrl+C) never fire hotkeys in normal mode.
+        for ch in ['f', 'u', '1', '3', 'q', 'n', 'C'] {
+            assert_eq!(
+                model.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)),
+                Action::None
+            );
+            assert_eq!(
+                model.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT)),
+                Action::None
+            );
+        }
+
         model.on_key(key(KeyCode::Char('n')));
         assert_eq!(model.on_key(key(KeyCode::Enter)), Action::None);
     }
@@ -1529,7 +1692,10 @@ mod tests {
         let text = screen(&model, 140, 40);
         assert!(text.contains("read-only (no session running)"), "{text}");
         assert!(text.contains("10.10.10.5"), "{text}");
-        assert!(text.contains("recon 10.10.10.0/23 ports:pending"), "{text}");
+        assert!(
+            text.contains("recon 10.10.10.0/23 lan:pending dns:pending"),
+            "{text}"
+        );
 
         model.on_key(key(KeyCode::Tab));
         assert_eq!(model.on_key(key(KeyCode::Char('c'))), Action::None);

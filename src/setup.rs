@@ -8,7 +8,7 @@
 //!
 //! With flags it is scriptable; without any, on a terminal, it asks.
 
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -27,6 +27,10 @@ pub(crate) const LOCAL_SERVERS: &[(&str, &str)] = &[
     ("http://localhost:8080/v1", "llama.cpp"),
 ];
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_INPUT_BYTES: u64 = 4096;
+const MAX_SECRET_CHARS: usize = 4096;
+/// More models than any server offers; the rest of a list is not read.
+const MAX_MODELS: usize = 500;
 
 /// Said when Ctrl+V is pressed at a key prompt: terminals paste with other
 /// keys, and Ctrl+V itself would only add a "v".
@@ -74,15 +78,10 @@ impl SetupArgs {
     }
 }
 
-/// An `http://` or `https://` address of an OpenAI-compatible API, without a
-/// trailing slash.
+/// A loopback `http://` or `https://` address of a local OpenAI-compatible
+/// API, without a trailing slash.
 pub(crate) fn checked_url(raw: &str) -> Result<String> {
-    let url = raw.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        bail!("'{raw}' must start with http:// or https://");
-    }
-    Ok(url.to_owned())
+    crate::ai::validate_local_url(raw)
 }
 
 /// A key is shown by its last four characters only.
@@ -104,19 +103,45 @@ pub(crate) fn masked(key: &str) -> String {
 
 /// The current setup in a few lines. Never prints a key.
 pub fn describe(settings: &AiSettings, file: &Path) -> String {
-    let effective = settings.effective();
+    // Names and addresses come from files and, once, from a server's
+    // answer: none of it reaches the terminal as anything but text.
+    let clean = |text: &str| crate::evidence::sanitize(text, 200);
+    let mut effective = settings.effective();
+    for field in [
+        &mut effective.local_url,
+        &mut effective.local_model,
+        &mut effective.cloud_url,
+        &mut effective.cloud_model,
+        &mut effective.research_model,
+    ] {
+        *field = clean(field);
+    }
+    if let Some(chain) = &mut effective.cloud_fallbacks {
+        chain.iter_mut().for_each(|model| *model = clean(model));
+    }
     let model = match effective.local_model.as_str() {
         "" => "chosen by the server".to_owned(),
         model => model.to_owned(),
     };
-    let key = match (effective.api_key(), settings.key_source()) {
-        (Some(key), Some(source)) => format!("{} (from {source})", masked(&key)),
-        _ => "not set: [C] answers with the local model, [R] is unavailable".to_owned(),
+    let key = if effective.disable_cloud {
+        "disabled (local-only mode: [C] answers with the local model, [R] is unavailable)"
+            .to_owned()
+    } else {
+        match (effective.api_key(), settings.key_source()) {
+            (Some(key), Some(source)) => format!("{} (from {source})", masked(&key)),
+            _ => "not set: [C] answers with the local model, [R] is unavailable".to_owned(),
+        }
     };
     let claude = effective.provider() == CloudProvider::Anthropic;
     let service = match claude {
         true => "the Claude API".to_owned(),
         false => effective.cloud_url.clone(),
+    };
+    // The local tier sends real text only to this machine.
+    let off_machine = if crate::ai::is_loopback_url(&effective.local_url) {
+        ""
+    } else {
+        " (not this machine: what is sent there is masked)"
     };
     // What happens when a model declines a request: the Claude API only.
     let declined = match (claude, effective.fallbacks().as_slice()) {
@@ -126,7 +151,7 @@ pub fn describe(settings: &AiSettings, file: &Path) -> String {
     };
     format!(
         "Your AI setup ({}):\n\
-         \x20 [L] local model    {}, model: {model}\n\
+         \x20 [L] local model    {}{off_machine}, model: {model}\n\
          \x20 [C] cloud triage   {service}, model: {}\n\
          \x20 [R] research       model: {}\n\
          {declined}\
@@ -141,6 +166,7 @@ pub fn describe(settings: &AiSettings, file: &Path) -> String {
 /// Points the cloud tiers at the Claude API. Model names of another service
 /// mean nothing there, so they are replaced by the Claude defaults.
 fn use_claude(own: &mut AiOverrides, current: &AiSettings) {
+    own.disable_cloud = false;
     own.cloud_provider = Some(CloudProvider::Anthropic);
     own.cloud_url = Some(anthropic::API_URL.to_owned());
     if !current.cloud_model.starts_with("claude-") {
@@ -160,6 +186,7 @@ fn use_claude(own: &mut AiOverrides, current: &AiSettings) {
 /// back to this service's defaults.
 fn use_openai_style(own: &mut AiOverrides, current: &AiSettings, url: Option<String>) {
     let defaults = AiSettings::default();
+    own.disable_cloud = false;
     own.cloud_provider = Some(CloudProvider::OpenAi);
     let was_claude = anthropic::is_claude_api(&current.cloud_url);
     own.cloud_url = Some(url.unwrap_or(match was_claude {
@@ -180,18 +207,28 @@ pub(crate) fn parse_chain(text: &str) -> Vec<String> {
     text.split(',')
         .map(str::trim)
         .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("none"))
-        .map(str::to_owned)
+        .filter_map(model_name)
         .collect()
 }
 
-fn http() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(PROBE_TIMEOUT)
-        .timeout(PROBE_TIMEOUT * 3)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("security-audit-client")
-        .build()
-        .context("cannot create the HTTP client")
+/// A client for the service at `url`: one on this machine is reached
+/// directly, never through a proxy (see [`crate::ai::http_client`]).
+fn http(url: &str) -> Result<reqwest::Client> {
+    crate::ai::http_client(url, PROBE_TIMEOUT * 3)
+}
+
+/// A model name as a server gave it, safe to print and to store: whatever
+/// answers on the local model port chooses these words.
+fn model_name(id: &str) -> Option<String> {
+    let name = crate::evidence::sanitize(id, 120);
+    (!name.is_empty()).then_some(name)
+}
+
+fn validate_bearer_key(key: &str) -> Result<()> {
+    if key.trim().is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+        bail!("the configured API key is empty or contains control characters");
+    }
+    Ok(())
 }
 
 /// The models an OpenAI-compatible server offers (`GET <url>/models`).
@@ -199,12 +236,15 @@ fn http() -> Result<reqwest::Client> {
 pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     if key.is_some() {
         crate::ai::validate_cloud_url(url)?;
+    } else {
+        crate::ai::validate_local_url(url)?;
     }
-    let mut request = http()?.get(format!("{}/models", url.trim_end_matches('/')));
+    let mut request = http(url)?.get(format!("{}/models", url.trim_end_matches('/')));
     if let Some(key) = key {
+        validate_bearer_key(key)?;
         request = request.bearer_auth(key);
     }
-    let response = match request.send().await {
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("nothing is listening at {url}"),
         Err(error) if error.is_timeout() => bail!("{url} did not answer in time"),
@@ -217,9 +257,8 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     if !status.is_success() {
         bail!("{url} answered HTTP {}", status.as_u16());
     }
-    let body: Value = response
-        .json()
-        .await
+    let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
+    let body: Value = serde_json::from_slice(&body)
         .with_context(|| format!("{url} did not answer like an OpenAI-compatible API"))?;
     let models = body
         .get("data")
@@ -228,7 +267,8 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     Ok(models
         .iter()
         .filter_map(|model| model.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
+        .filter_map(model_name)
+        .take(MAX_MODELS)
         .collect())
 }
 
@@ -236,8 +276,9 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
 /// endpoint for exactly that (`/key`); other services are asked for their
 /// model list, which needs a valid key.
 pub async fn check_key(url: &str, key: &str) -> Result<()> {
+    validate_bearer_key(key)?;
     let base = crate::ai::validate_cloud_url(url)?;
-    let response = http()?
+    let response = http(&base)?
         .get(format!("{base}/key"))
         .bearer_auth(key)
         .send()
@@ -267,13 +308,15 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T> {
 /// says in plain words what happened. Returns whether everything set up
 /// works.
 pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> {
+    let clean = |text: &str| crate::evidence::sanitize(text, 200);
     let effective = settings.effective();
+    let safe_local_url = clean(&effective.local_url);
+    let safe_cloud_url = clean(&effective.cloud_url);
     let mut works = true;
     match block_on(list_models(&effective.local_url, None))? {
         Ok(models) => writeln!(
             out,
-            "[+] [L] {} answers with {} model(s){}",
-            effective.local_url,
+            "[+] [L] {safe_local_url} answers with {} model(s){}",
             models.len(),
             match models.first() {
                 Some(first) => format!(", for example {first}"),
@@ -282,8 +325,15 @@ pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> 
         )?,
         Err(error) => {
             works = false;
-            writeln!(out, "[!] [L] {error:#}")?;
+            writeln!(out, "[!] [L] {}", clean(&format!("{error:#}")))?;
         }
+    }
+    if effective.disable_cloud {
+        writeln!(
+            out,
+            "[+] [C] disabled (local-only mode: [C] answers locally)"
+        )?;
+        return Ok(works);
     }
     let claude = effective.provider() == CloudProvider::Anthropic;
     match effective.api_key() {
@@ -291,12 +341,12 @@ pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> 
         Some(key) if claude => {
             // The key first, then every model the setup names: a key is not
             // necessarily offered all of them.
-            let client = http()?;
             let url = &effective.cloud_url;
+            let client = http(url)?;
             match block_on(anthropic::list_models(&client, url, &key))? {
                 Ok(_) => writeln!(out, "[+] [C] the Claude API accepts your API key")?,
                 Err(error) => {
-                    writeln!(out, "[!] [C] {error:#}")?;
+                    writeln!(out, "[!] [C] {}", clean(&format!("{error:#}")))?;
                     return Ok(false);
                 }
             }
@@ -308,21 +358,26 @@ pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> 
                 if asked.contains(&model) {
                     continue;
                 }
+                let safe_model = clean(&model);
                 match block_on(anthropic::has_model(&client, url, &key, &model))? {
-                    Ok(()) => writeln!(out, "[+] [C] {model} is available to this key")?,
+                    Ok(()) => writeln!(out, "[+] [C] {safe_model} is available to this key")?,
                     Err(error) => {
                         works = false;
-                        writeln!(out, "[!] [C] {model}: {error:#}")?;
+                        writeln!(
+                            out,
+                            "[!] [C] {safe_model}: {}",
+                            clean(&format!("{error:#}"))
+                        )?;
                     }
                 }
                 asked.push(model);
             }
         }
         Some(key) => match block_on(check_key(&effective.cloud_url, &key))? {
-            Ok(()) => writeln!(out, "[+] [C] {} accepts your API key", effective.cloud_url)?,
+            Ok(()) => writeln!(out, "[+] [C] {safe_cloud_url} accepts your API key")?,
             Err(error) => {
                 works = false;
-                writeln!(out, "[!] [C] {error:#}")?;
+                writeln!(out, "[!] [C] {}", clean(&format!("{error:#}")))?;
             }
         },
     }
@@ -347,7 +402,10 @@ fn apply(
             let url = own.cloud_url.clone().unwrap_or_default();
             changed.push(format!("cloud service: {url}"));
         }
-        Some(other) => bail!("unknown provider '{other}': use claude or openrouter"),
+        Some(other) => bail!(
+            "unknown provider '{}': use claude or openrouter",
+            crate::evidence::sanitize(other, 80)
+        ),
         None => {}
     }
     if let Some(chain) = &args.fallback_models {
@@ -364,15 +422,17 @@ fn apply(
         own.local_url = Some(url);
     }
     if let Some(model) = &args.local_model {
-        changed.push(match model.trim() {
+        let clean = crate::evidence::sanitize(model, 120);
+        changed.push(match clean.as_str() {
             "" => "local model: chosen by the server".to_owned(),
             model => format!("local model: {model}"),
         });
-        own.local_model = Some(model.trim().to_owned());
+        own.local_model = Some(clean);
     }
     if let Some(url) = &args.cloud_url {
         let url = crate::ai::validate_cloud_url(url)?;
         changed.push(format!("cloud service: {url}"));
+        own.disable_cloud = false;
         // The address decides the protocol unless a provider was named.
         if args.provider.is_none() {
             own.cloud_provider = Some(match anthropic::is_claude_api(&url) {
@@ -390,10 +450,28 @@ fn apply(
             "research model",
         ),
     ] {
-        if let Some(model) = value.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if let Some(model) = value.as_deref().and_then(model_name) {
             changed.push(format!("{what}: {model}"));
-            *slot = Some(model.to_owned());
+            *slot = Some(model);
         }
+    }
+    // A key stays with the service it was entered for. Naming another
+    // service without giving its key does not send the old one there.
+    let host = |url: &str| {
+        url::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default()
+    };
+    let (before, after) = (
+        host(&current.cloud_url),
+        host(own.cloud_url.as_deref().unwrap_or(&current.cloud_url)),
+    );
+    if before != after && key_from_stdin.is_none() && own.api_key.take().is_some() {
+        changed.push(format!(
+            "API key removed from your setup file: it was entered for {before}. \
+             Give the key for {after} with --api-key-stdin"
+        ));
     }
     if args.forget_key {
         own.api_key = None;
@@ -404,6 +482,10 @@ fn apply(
         if key.is_empty() {
             bail!("no API key arrived on standard input");
         }
+        if key.len() > 512 || key.chars().any(char::is_control) {
+            bail!("the API key on standard input contains control characters or is too long");
+        }
+        own.disable_cloud = false;
         changed.push(format!("API key {}", masked(&key)));
         own.api_key = Some(key);
     }
@@ -415,7 +497,10 @@ fn ask(prompt: &str) -> Result<Option<String>> {
     print!("{prompt}");
     std::io::stdout().flush().ok();
     let mut line = String::new();
-    let read = std::io::stdin()
+    let stdin = std::io::stdin();
+    let read = stdin
+        .lock()
+        .take(MAX_INPUT_BYTES)
         .read_line(&mut line)
         .context("cannot read the answer")?;
     Ok((read > 0).then(|| line.trim().to_owned()))
@@ -425,6 +510,10 @@ struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableBracketedPaste
+        );
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
 }
@@ -433,8 +522,7 @@ impl Drop for RawModeGuard {
 /// cancelled (Esc, Ctrl-C) or typed nothing.
 fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     use ratatui::crossterm::event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        self, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
     };
     use ratatui::crossterm::{execute, terminal};
 
@@ -455,7 +543,8 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     // worked; the key itself never shows.
     let add = |secret: &mut String, text: &str| {
         let before = secret.chars().count();
-        secret.extend(text.chars().filter(|c| !c.is_control()));
+        let remaining = MAX_SECRET_CHARS.saturating_sub(before);
+        secret.extend(text.chars().filter(|c| !c.is_control()).take(remaining));
         print!("{}", "*".repeat(secret.chars().count() - before));
         std::io::stdout().flush().ok();
     };
@@ -490,7 +579,6 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
             Err(error) => break Err(error),
         }
     };
-    let _ = execute!(out, DisableBracketedPaste);
     drop(raw_guard);
     println!();
     let secret = outcome.context("cannot read from the terminal")?;
@@ -580,7 +668,7 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     )?
     .unwrap_or_default();
     own.local_url = Some(url);
-    own.local_model = Some(model);
+    own.local_model = Some(crate::evidence::sanitize(&model, 120));
     Ok(true)
 }
 
@@ -600,8 +688,12 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     use_claude(&mut next, &settings.effective());
     let default = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
     let effective = settings.effective();
-    let triage_now = default(&next.cloud_model, &effective.cloud_model);
-    let research_now = default(&next.research_model, &effective.research_model);
+    let triage_now =
+        crate::evidence::sanitize(&default(&next.cloud_model, &effective.cloud_model), 120);
+    let research_now = crate::evidence::sanitize(
+        &default(&next.research_model, &effective.research_model),
+        120,
+    );
     let chain_now = next.cloud_fallbacks.clone().unwrap_or_default();
     let triage = ask(&format!(
         "Model for [C] triage (press Enter to keep {triage_now}): "
@@ -616,16 +708,16 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
          (press Enter to keep {}; type none to leave it to the Claude API): ",
         match chain_now.as_slice() {
             [] => "none".to_owned(),
-            chain => chain.join(", "),
+            chain => crate::evidence::sanitize(&chain.join(", "), 200),
         }
     ))?
     .unwrap_or_default();
     next.api_key = Some(key);
-    if !triage.is_empty() {
-        next.cloud_model = Some(triage);
+    if let Some(clean) = model_name(&triage) {
+        next.cloud_model = Some(clean);
     }
-    if !research.is_empty() {
-        next.research_model = Some(research);
+    if let Some(clean) = model_name(&research) {
+        next.research_model = Some(clean);
     }
     if !chain.is_empty() {
         next.cloud_fallbacks = Some(parse_chain(&chain));
@@ -645,7 +737,7 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     // Coming from a Claude key, the address to propose is OpenRouter's.
     let proposed = match anthropic::is_claude_api(&effective.cloud_url) {
         true => AiSettings::default().cloud_url,
-        false => effective.cloud_url.clone(),
+        false => crate::evidence::sanitize(&effective.cloud_url, 200),
     };
     let url = ask(&format!(
         "Service address (press Enter to keep {proposed}): "
@@ -667,8 +759,10 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     let mut next = own.clone();
     use_openai_style(&mut next, &effective, Some(url));
     let kept = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
-    let triage_now = kept(&next.cloud_model, &effective.cloud_model);
-    let research_now = kept(&next.research_model, &effective.research_model);
+    let triage_now =
+        crate::evidence::sanitize(&kept(&next.cloud_model, &effective.cloud_model), 120);
+    let research_now =
+        crate::evidence::sanitize(&kept(&next.research_model, &effective.research_model), 120);
     let triage = ask(&format!(
         "Triage model (press Enter to keep {triage_now}): "
     ))?
@@ -679,11 +773,11 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     .unwrap_or_default();
     *own = next;
     own.api_key = Some(key);
-    if !triage.is_empty() {
-        own.cloud_model = Some(triage);
+    if let Some(clean) = model_name(&triage) {
+        own.cloud_model = Some(clean);
     }
-    if !research.is_empty() {
-        own.research_model = Some(research);
+    if let Some(clean) = model_name(&research) {
+        own.research_model = Some(clean);
     }
     Ok(true)
 }
@@ -742,7 +836,7 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
         && crate::wizard::can_run_tui()
     {
         match crate::wizard::run_setup(home)? {
-            crate::wizard::WizardOutcome::Saved { .. } => {
+            crate::wizard::WizardOutcome::Saved { launch_workspace } => {
                 let settings = Config::load_or_create(home)?.ai;
                 let file = home.ai_path();
                 println!(
@@ -751,6 +845,23 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
                     file.display()
                 );
                 print!("{}", describe(&settings, &file));
+                if let Some(name) = launch_workspace {
+                    let valid = crate::workspace::validate_name(&name)
+                        .map_err(|reason| anyhow::anyhow!("invalid workspace name: {reason}"))?;
+                    let exe = std::env::current_exe().context("cannot locate the meow binary")?;
+                    let cwd = std::env::current_dir()
+                        .context("cannot determine the current directory")?;
+                    let status = std::process::Command::new(exe)
+                        .arg(&valid)
+                        .current_dir(cwd)
+                        .status()
+                        .with_context(|| format!("cannot launch session '{valid}'"))?;
+                    let code = status
+                        .code()
+                        .and_then(|c| u8::try_from(c).ok())
+                        .unwrap_or(1);
+                    return Ok(ExitCode::from(code));
+                }
             }
             crate::wizard::WizardOutcome::Cancelled => {
                 println!("[+] Nothing changed.");
@@ -766,7 +877,10 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
     if args.changes_something() {
         let key = if args.api_key_stdin {
             let mut line = String::new();
-            std::io::stdin()
+            let stdin = std::io::stdin();
+            stdin
+                .lock()
+                .take(MAX_INPUT_BYTES)
                 .read_line(&mut line)
                 .context("cannot read the API key from standard input")?;
             Some(line)
@@ -881,6 +995,114 @@ mod tests {
         assert!(!refused.contains("wrong"));
     }
 
+    #[tokio::test]
+    async fn model_names_from_a_server_reach_the_terminal_as_text_only() {
+        // Whatever answers on the local model port: here with a title
+        // change, a clipboard write and a forged status line in one name.
+        const HOSTILE: &str =
+            "llama3\u{1b}]0;owned\u{7}\u{1b}]52;c;aGk=\u{7}\r\u{1b}[2K[+] [C] accepts your API key";
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                Json(json!({ "data": [ { "id": HOSTILE }, { "id": "\u{1b}\u{7}" }, { "id": "plain" } ] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let models = list_models(&url, None).await.unwrap();
+        assert_eq!(
+            models.len(),
+            2,
+            "a name of nothing but control codes is dropped"
+        );
+        assert_eq!(models[1], "plain");
+        assert!(models[0].starts_with("llama3]0;owned"), "{:?}", models[0]);
+        for model in &models {
+            assert!(!model.chars().any(char::is_control), "{model:?}");
+        }
+        // And a name already saved in the setup file, by an earlier version
+        // or by hand, is printed clean too.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        AiOverrides {
+            local_model: Some(HOSTILE.into()),
+            cloud_model: Some(format!("m{HOSTILE}")),
+            cloud_fallbacks: Some(vec![HOSTILE.into()]),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        let settings = AiSettings {
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let shown = describe(&settings, &file);
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
+        assert!(shown.contains("llama3]0;owned"));
+    }
+
+    #[test]
+    fn a_key_stays_with_the_service_it_was_entered_for() {
+        let claude = AiSettings {
+            cloud_url: anthropic::API_URL.into(),
+            ..AiSettings::default()
+        };
+        let stored = || AiOverrides {
+            cloud_url: Some(anthropic::API_URL.into()),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            api_key: Some("sk-ant-their-claude-key-ZZ99".into()),
+            ..AiOverrides::default()
+        };
+        // Another service by address, or by name: the Claude key is not
+        // taken along, and the answer says so without printing it.
+        for args in [
+            SetupArgs {
+                cloud_url: Some("https://llm.other-service.example/v1".into()),
+                ..SetupArgs::default()
+            },
+            SetupArgs {
+                provider: Some("openrouter".into()),
+                ..SetupArgs::default()
+            },
+        ] {
+            let mut own = stored();
+            let changed = apply(&args, &claude, &mut own, None).unwrap();
+            assert_eq!(own.api_key, None, "{changed:?}");
+            let said = changed.join("\n");
+            assert!(
+                said.contains(
+                    "API key removed from your setup file: it was entered for api.anthropic.com"
+                ),
+                "{said}"
+            );
+            assert!(!said.contains("ZZ99") && !said.contains("sk-ant"), "{said}");
+        }
+        // With the new service's key in the same call, that key is stored.
+        let mut own = stored();
+        let args = SetupArgs {
+            cloud_url: Some("https://llm.other-service.example/v1".into()),
+            api_key_stdin: true,
+            ..SetupArgs::default()
+        };
+        apply(&args, &claude, &mut own, Some(GOOD_KEY.into())).unwrap();
+        assert_eq!(own.api_key.as_deref(), Some(GOOD_KEY));
+        // A change that keeps the service keeps the key.
+        let mut own = stored();
+        let args = SetupArgs {
+            cloud_model: Some("claude-opus-5-5".into()),
+            cloud_url: Some(format!("{}/", anthropic::API_URL)),
+            ..SetupArgs::default()
+        };
+        apply(&args, &claude, &mut own, None).unwrap();
+        assert!(own.api_key.is_some());
+    }
+
     #[test]
     fn flags_change_only_what_they_name() {
         let mut own = AiOverrides {
@@ -924,6 +1146,7 @@ mod tests {
                 cloud_provider: None,
                 cloud_fallbacks: None,
                 api_key: Some(GOOD_KEY.into()),
+                disable_cloud: false,
             }
         );
 
@@ -1106,7 +1329,16 @@ mod tests {
             ..SetupArgs::default()
         };
         let changed = apply(&back, &settings.effective(), &mut own, None).unwrap();
-        assert_eq!(changed, ["cloud service: https://openrouter.ai/api/v1"]);
+        // The Claude key does not go along to the other service.
+        assert_eq!(
+            changed,
+            [
+                "cloud service: https://openrouter.ai/api/v1",
+                "API key removed from your setup file: it was entered for api.anthropic.com. \
+                 Give the key for openrouter.ai with --api-key-stdin"
+            ]
+        );
+        assert_eq!(own.api_key, None);
         own.save(&file).unwrap();
         let effective = settings.effective();
         assert_eq!(effective.provider(), CloudProvider::OpenAi);
@@ -1169,5 +1401,58 @@ mod tests {
         );
         // A short key is not even hinted at.
         assert_eq!(masked("abc123"), "set");
+    }
+
+    #[test]
+    fn stdin_keys_and_cli_models_reject_control_chars_and_sanitize_check_output() {
+        let base = AiSettings::default();
+        for bad_key in ["sk-bad\0key", "sk-bad\rkey", &"k".repeat(513)] {
+            let mut own = AiOverrides::default();
+            let args = SetupArgs {
+                api_key_stdin: true,
+                ..SetupArgs::default()
+            };
+            assert!(
+                apply(&args, &base, &mut own, Some(bad_key.to_owned())).is_err(),
+                "must reject malformed stdin key len={}",
+                bad_key.len()
+            );
+            assert_eq!(own.api_key, None);
+        }
+
+        let mut own = AiOverrides::default();
+        let args = SetupArgs {
+            local_model: Some("qwen\x1b]2;pwn\x07".into()),
+            cloud_model: Some("claude-sonnet\x1b[2J".into()),
+            research_model: Some("claude-opus\u{202e}evil".into()),
+            provider: Some("claude".into()),
+            fallback_models: Some("claude-haiku\x1b[31m, \x1b\x07".into()),
+            ..SetupArgs::default()
+        };
+        let summary = apply(&args, &base, &mut own, None).unwrap().join("\n");
+        assert!(!summary.chars().any(|c| c.is_control() && c != '\n'));
+        assert_eq!(own.local_model.as_deref(), Some("qwen]2;pwn"));
+        assert_eq!(own.cloud_model.as_deref(), Some("claude-sonnet[2J"));
+        assert_eq!(own.research_model.as_deref(), Some("claude-opusevil"));
+        assert_eq!(
+            own.cloud_fallbacks.as_deref(),
+            Some(&["claude-haiku[31m".to_owned()][..])
+        );
+
+        // `check()` never writes raw escape sequences from tampered settings to the terminal.
+        let hostile_settings = AiSettings {
+            local_url: "http://127.0.0.1:1/v1\x1b]0;owned\x07".into(),
+            local_model: "m\x1b[2J".into(),
+            disable_cloud: true,
+            user_file: None,
+            ..AiSettings::default()
+        };
+        let mut out = Vec::new();
+        let _ = check(&hostile_settings, &mut out).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.chars().any(|c| c.is_control() && c != '\n'),
+            "{rendered:?}"
+        );
     }
 }

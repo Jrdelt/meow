@@ -5,15 +5,17 @@
 //! The schema version lives in `PRAGMA user_version`; each entry of
 //! [`MIGRATIONS`] upgrades the database by exactly one version.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{config::DbConfig, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::workspace::private_open_options;
 
-const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+const MAX_CVE_CACHE_ROWS: i64 = 4096;
 
 /// Append-only: never edit or reorder an entry that has shipped.
 const MIGRATIONS: &[&str] = &[
@@ -73,24 +75,139 @@ const MIGRATIONS: &[&str] = &[
          response    TEXT NOT NULL,
          created_utc TEXT NOT NULL
      ) WITHOUT ROWID;",
+    // 5: what each recon stage's own tool reported, for the stages after it.
+    "ALTER TABLE task_stages ADD COLUMN found TEXT NOT NULL DEFAULT '';",
+    // 6: index for fast unfinished-task and active-stage lookups.
+    "CREATE INDEX IF NOT EXISTS idx_task_stages_status ON task_stages(status, task_id);",
 ];
+
+fn inspect_sqlite_entry(candidate: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(candidate) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot inspect {}", candidate.display()));
+        }
+    };
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        bail!(
+            "{} is a symbolic link; refusing to open SQLite database",
+            candidate.display()
+        );
+    }
+    if !kind.is_file() {
+        bail!(
+            "{} is not a regular file; refusing to open SQLite database",
+            candidate.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            bail!(
+                "{} belongs to another user (uid {}); refusing to open SQLite database",
+                candidate.display(),
+                meta.uid()
+            );
+        }
+        if meta.nlink() > 1 {
+            bail!(
+                "{} has multiple hard links; refusing to open SQLite database",
+                candidate.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuses symbolic links, non-regular files, multi-hardlink files, and
+/// foreign-owned files on `path` and its SQLite `-wal`, `-shm`, and `-journal`
+/// sidecars.
+pub(crate) fn refuse_sqlite_symlinks(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut raw: OsString = path.as_os_str().to_owned();
+        raw.push(suffix);
+        inspect_sqlite_entry(&PathBuf::from(raw))?;
+    }
+    Ok(())
+}
+
+/// Applies defensive SQLite flags so untrusted schema objects (triggers/views)
+/// cannot invoke unsafe functions or mutate shadow tables.
+pub(crate) fn harden_connection(conn: &Connection) -> rusqlite::Result<()> {
+    harden(conn)?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    Ok(())
+}
 
 pub struct Db {
     conn: Connection,
+}
+
+/// Settings for a database file that may not be the one meow wrote (a
+/// workspace folder can be copied or handed on). meow's schema has no views
+/// and no triggers, so neither runs: a file that adds some cannot attach
+/// its own statements to meow's, or make a plain count run for ever. The
+/// schema itself is not trusted to call functions with side effects.
+pub fn harden(conn: &Connection) -> rusqlite::Result<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    Ok(())
 }
 
 impl Db {
     /// Opens (creating if needed) the database at `path` and migrates it to
     /// the current schema.
     pub fn open(path: &Path) -> Result<Self> {
+        refuse_sqlite_symlinks(path)?;
         // Create the file ourselves so it is 0600 from the first byte;
         // SQLite gives the -wal and -shm files the same mode.
-        private_open_options()
+        let file = private_open_options()
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)
             .with_context(|| format!("cannot create {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        if !meta.is_file() {
+            bail!(
+                "{} is not a regular file; refusing to open SQLite database",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid {
+                bail!(
+                    "{} belongs to another user (uid {}); refusing to open SQLite database",
+                    path.display(),
+                    meta.uid()
+                );
+            }
+            if meta.nlink() > 1 {
+                bail!(
+                    "{} has multiple hard links; refusing to open SQLite database",
+                    path.display()
+                );
+            }
+            // Operate on the open descriptor (`fchmod`) rather than the path so
+            // a concurrent rename cannot redirect the permission change.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("cannot set permissions on {}", path.display()))?;
+        }
+        drop(file);
+        refuse_sqlite_symlinks(path)?;
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         Self::init(conn).with_context(|| format!("cannot initialise {}", path.display()))
@@ -102,6 +219,7 @@ impl Db {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        harden_connection(&conn)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // `journal_mode` returns the resulting mode as a row.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
@@ -113,7 +231,19 @@ impl Db {
     }
 
     fn migrate(&mut self) -> Result<()> {
-        let current = self.schema_version()? as usize;
+        let initial = self.schema_version()? as usize;
+        if initial > MIGRATIONS.len() {
+            bail!(
+                "database schema version {initial} is newer than this build of meow ({})",
+                MIGRATIONS.len()
+            );
+        }
+        if initial == MIGRATIONS.len() {
+            return Ok(());
+        }
+        let tx = Transaction::new(&mut self.conn, TransactionBehavior::Immediate)?;
+        let current: usize =
+            tx.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))? as usize;
         if current > MIGRATIONS.len() {
             bail!(
                 "database schema version {current} is newer than this build of meow ({})",
@@ -121,12 +251,11 @@ impl Db {
             );
         }
         for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-            let tx = self.conn.transaction()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("migration {} failed", index + 1))?;
             tx.pragma_update(None, "user_version", i64::try_from(index + 1)?)?;
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -173,6 +302,18 @@ impl Db {
              ON CONFLICT(key) DO UPDATE SET fetched_utc = excluded.fetched_utc, body = excluded.body",
             [key, &crate::timeutil::now_rfc3339(), body],
         )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cve_cache", [], |row| row.get(0))?;
+        if count > MAX_CVE_CACHE_ROWS {
+            let excess = count - MAX_CVE_CACHE_ROWS;
+            self.conn.execute(
+                "DELETE FROM cve_cache WHERE key IN (
+                     SELECT key FROM cve_cache ORDER BY fetched_utc ASC LIMIT ?1
+                 )",
+                [excess],
+            )?;
+        }
         Ok(())
     }
 
@@ -318,6 +459,85 @@ mod tests {
             let path = entry.unwrap().path();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
             assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn hardened_connections_disable_views_triggers_and_trusted_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(pragma(&db, "trusted_schema"), "0");
+            // Both `found` column (migration 5) and status index (migration 6) exist.
+            let found_default: String = db
+                .conn()
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_task_stages_status'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found_default, "idx_task_stages_status");
+            db.conn()
+                .execute(
+                    "INSERT INTO tasks (target, mode, created_utc) VALUES ('t', 'mild', 'now')",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO task_stages (task_id, stage, position, status, found)
+                     VALUES (1, 'ports', 0, 'done', '22/tcp')",
+                    [],
+                )
+                .unwrap();
+        }
+        // Inject a hostile trigger using an unhardened connection; a hardened
+        // connection must refuse to fire it or query views.
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "CREATE TRIGGER trap AFTER INSERT ON meta BEGIN
+                     INSERT INTO cve_cache (key, fetched_utc, body) VALUES ('pwn', 'now', 'x');
+                 END;
+                 CREATE VIEW trap_view AS SELECT 'view';",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.set_meta("safe", "1").unwrap();
+        assert_eq!(db.cache_get("pwn", None).unwrap(), None);
+        assert!(db
+            .conn()
+            .query_row("SELECT * FROM trap_view", [], |_| Ok(()))
+            .is_err());
+    }
+
+    #[test]
+    fn non_regular_and_linked_sqlite_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("dir.db");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(Db::open(&as_dir).is_err());
+
+        #[cfg(unix)]
+        {
+            let outside = dir.path().join("outside");
+            std::fs::write(&outside, "keep me").unwrap();
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let db_path = dir.path().join(format!("sym{suffix}_test.db"));
+                let sidecar = PathBuf::from(format!("{}{suffix}", db_path.display()));
+                std::os::unix::fs::symlink(&outside, &sidecar).unwrap();
+                assert!(Db::open(&db_path).is_err(), "accepted symlink {suffix}");
+                std::fs::remove_file(&sidecar).unwrap();
+            }
+
+            let hard = dir.path().join("hard.db");
+            std::fs::hard_link(&outside, &hard).unwrap();
+            assert!(Db::open(&hard).is_err(), "accepted hard-linked db");
+            std::fs::remove_file(&hard).unwrap();
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
         }
     }
 }

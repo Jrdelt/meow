@@ -6,7 +6,10 @@ use std::fmt;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+/// Ordered from the gentlest to the most active.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Passive only: zero outbound packets (default)
@@ -25,6 +28,24 @@ impl Mode {
             Mode::Mild => "mild",
             Mode::Aggressive => "aggressive",
         }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(Mode::Light),
+            "mild" => Some(Mode::Mild),
+            "aggressive" => Some(Mode::Aggressive),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+            .ok_or_else(|| format!("unknown mode '{s}' (expected light, mild or aggressive)"))
     }
 }
 

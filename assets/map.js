@@ -3,7 +3,32 @@
 (function () {
   'use strict';
 
-  var token = new URLSearchParams(location.search).get('token') || '';
+  function scriptToken() {
+    try {
+      var script = document.currentScript;
+      if (!script || !script.src) { return ''; }
+      return new URL(script.src, location.href).searchParams.get('token') || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  var token = new URLSearchParams(location.search).get('token') || scriptToken();
+  if (location.search && window.history && typeof window.history.replaceState === 'function') {
+    window.history.replaceState(null, '', location.pathname);
+  }
+  // A value only the session that served this page knows. Whatever answers
+  // on this port after the session has ended does not have it.
+  var pageKey = (document.querySelector('meta[name="meow-page"]') || {}).content || '';
+  var ended = false;
+  var hasOwn = Object.prototype.hasOwnProperty;
+  // Lookup tables keyed by host names and addresses: a host may be called
+  // `constructor` or `__proto__`, which every plain object already has.
+  function table() { return Object.create(null); }
+  function own(object, key) {
+    return object && hasOwn.call(object, key) ? object[key] : undefined;
+  }
+  var noteDrafts = table();
   var socket = null;
   var state = null;
   var selected = null;
@@ -18,8 +43,10 @@
   // machine uses (a VPN, a virtual network) hangs below you. A long row
   // scrolls left and right instead of shrinking.
   // Plenty of room between devices, so nothing looks cluttered.
-  var STEP = 240, SUB_STEP = 210;           // in the row; below you
-  var CLOUD_Y = -170, BAR_Y = 110, ROW_Y = 215;
+  var STEP = 250, SUB_STEP = 215;           // in the row; below you
+  var YOU_Y = -360, GW_Y = -190, EGRESS_Y = -20, CLOUD_Y = 155, TARGET_Y = 365;
+  var BAR_Y = 110, ROW_Y = 215;
+  var traceExpanded = false;
   // Room kept around the drawing, in screen pixels, and the zooms it is
   // shown at: never blown up past MAX_ZOOM, and never shrunk below
   // READABLE_ZOOM while the card can grow taller instead (up to CARD_MAX).
@@ -46,8 +73,22 @@
   ];
   var PICTURES = ROLES.map(function (role) { return role[0]; }).concat(['printer']);
 
+  function withToken(path) {
+    return token ? path + '?token=' + encodeURIComponent(token) : path;
+  }
+
+  function safeHttpUrl(url) {
+    if (typeof url !== 'string' || /[\u0000-\u001f\u007f]/.test(url)) { return false; }
+    try {
+      var parsed = new URL(url);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch (_) {
+      return false;
+    }
+  }
+
   function icon(role) {
-    return '/assets/icon-' + role + '.svg?token=' + encodeURIComponent(token);
+    return withToken('/assets/icon-' + role + '.svg');
   }
 
   var cy = cytoscape({
@@ -64,7 +105,7 @@
         'shape': 'rectangle', 'width': 76, 'height': 60, 'background-opacity': 0, 'border-width': 0,
         'background-fit': 'contain', 'background-clip': 'none',
         'label': 'data(text)', 'font-family': FONT, 'font-size': 13, 'color': TEXT, 'line-height': 1.3,
-        'text-wrap': 'wrap', 'text-max-width': 200, 'text-valign': 'bottom', 'text-halign': 'center',
+        'text-wrap': 'wrap', 'text-max-width': 230, 'text-valign': 'bottom', 'text-halign': 'center',
         'text-margin-y': 6, 'text-background-color': '#ffffff', 'text-background-opacity': 0.92,
         'text-background-padding': 2, 'underlay-shape': 'ellipse', 'underlay-padding': 14, 'underlay-opacity': 0,
         'overlay-padding': 8, 'overlay-opacity': 0, 'z-index': 10 } }
@@ -77,10 +118,27 @@
       { selector: 'node.kev', style: { 'underlay-opacity': 0.7, 'underlay-padding': 20 } },
       { selector: 'node.none', style: { 'color': '#6b7178' } },
       { selector: 'node.you', style: { 'font-weight': 700, 'color': '#1f6fb2' } },
-      { selector: 'node.hub', style: { 'width': 104, 'height': 80, 'font-size': 14 } },
+      { selector: 'node.hub', style: { 'width': 96, 'height': 74, 'font-size': 13.5 } },
+      { selector: 'node.egress', style: {
+        'width': 82, 'height': 64, 'font-size': 12.5, 'font-weight': 600, 'color': '#1f2d3d',
+        'text-max-width': 260 } },
       { selector: 'node.cloud', style: {
-        'width': 140, 'height': 98, 'text-valign': 'center', 'text-margin-y': 7, 'font-size': 15, 'font-weight': 700,
-        'color': '#1f2d3d' } },
+        'width': 148, 'height': 100, 'text-valign': 'bottom', 'text-margin-y': 4, 'font-size': 13, 'font-weight': 700,
+        'color': '#1f2d3d', 'text-max-width': 260 } },
+      { selector: 'node.hop', style: {
+        'width': 52, 'height': 42, 'font-size': 12, 'color': '#2b2f36',
+        'text-halign': 'right', 'text-valign': 'center', 'text-margin-x': 10, 'text-margin-y': 0,
+        'text-max-width': 360 } },
+      { selector: 'node.waf', style: {
+        'width': 74, 'height': 58, 'font-size': 12.5, 'font-weight': 600, 'color': '#1f5f8b',
+        'text-max-width': 240 } },
+      { selector: 'node.asn-box', style: {
+        'shape': 'round-rectangle', 'background-color': '#f4f7fb', 'background-opacity': 0.9,
+        'border-width': 2, 'border-style': 'dashed', 'border-color': '#4a6fa5',
+        'padding': 26, 'text-valign': 'top', 'text-halign': 'center', 'text-margin-y': -6,
+        'font-size': 13, 'font-weight': 700, 'color': '#1f2d3d', 'text-max-width': 360,
+        'text-background-color': '#ffffff', 'text-background-opacity': 0.96, 'text-background-padding': 4,
+        'z-index': 2 } },
       { selector: 'node.title', style: {
         'width': 1, 'height': 1, 'events': 'no', 'text-valign': 'top', 'text-halign': 'right',
         'text-margin-y': 0, 'font-weight': 700, 'font-size': 13, 'color': 'data(color)', 'text-max-width': 360 } },
@@ -155,16 +213,38 @@
     }
   }
 
+  var reconnectDelay = 2000;
+  var reconnectTimer = null;
   function connect() {
-    var ws = new WebSocket('ws://' + location.host + '/ws?token=' + encodeURIComponent(token));
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    if (ended) { return; }
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var ws = new WebSocket(proto + location.host + withToken('/ws'));
     socket = ws;
     ws.onopen = function () {
+      if (socket !== ws) { return; }
       byId('conn').textContent = 'live';
       byId('conn').className = 'badge on';
     };
     ws.onmessage = function (event) {
-      var message = JSON.parse(event.data);
+      if (socket !== ws) { return; }
+      var message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (_) {
+        return;
+      }
+      if (!message || typeof message !== 'object') { return; }
       if (message.type === 'state') {
+        if (!pageKey || message.key !== pageKey) {
+          // Not the session this page came from: another program now has
+          // its port. Nothing it sends is shown.
+          ended = true;
+          ws.close();
+          return;
+        }
+        reconnectDelay = 2000;
         state = message.state;
         render();
         // Where this machine is: asked once, when the map first opens.
@@ -173,26 +253,37 @@
           send({ cmd: 'locate' });
         }
       } else if (message.type === 'result' && !message.ok) {
-        flash(message.error);
+        flash(message.error || 'Command failed.');
       }
     };
     ws.onclose = function () {
-      byId('conn').textContent = 'session closed';
+      if (socket !== ws) { return; }
+      byId('conn').textContent = ended ? 'session ended' : 'session closed';
       byId('conn').className = 'badge off';
-      setTimeout(connect, 2000);
+      if (!ended) {
+        var wait = reconnectDelay;
+        reconnectDelay = Math.min(30000, Math.round(reconnectDelay * 1.5));
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, wait);
+      }
     };
   }
 
   function renderHeader() {
-    byId('session').textContent = state.session;
-    byId('avatar').textContent = state.session.slice(0, 1).toUpperCase();
-    byId('mode').textContent = 'mode ' + state.mode;
-    byId('mode').className = 'badge mode-' + state.mode;
+    var sessionName = String(state.session || '');
+    var mode = String(state.mode || 'light').replace(/[^a-z0-9_-]/gi, '');
+    byId('session').textContent = sessionName;
+    byId('avatar').textContent = sessionName.slice(0, 1).toUpperCase();
+    byId('mode').textContent = 'mode ' + mode;
+    byId('mode').className = 'badge mode-' + mode;
     // One line of status, like a finished lookup: what there is, what to do.
-    var hosts = Object.keys(state.graph.hosts);
+    var hostsMap = (state.graph && state.graph.hosts) || {};
+    var hosts = Object.keys(hostsMap);
     var confirmed = 0, open = 0;
     hosts.forEach(function (key) {
-      state.graph.hosts[key].advisories.forEach(function (advisory) {
+      var host = own(hostsMap, key);
+      if (!host) { return; }
+      (host.advisories || []).forEach(function (advisory) {
         if (advisory.verification_status === 'Confirmed') { confirmed += 1; }
         if (advisory.verification_status === 'UnverifiedHypothesis') { open += 1; }
       });
@@ -201,19 +292,19 @@
     parts.push(open + ' to verify');
     parts.push(confirmed + ' confirmed');
     byId('counts').textContent = parts.join(' · ');
-    document.title = 'meow: ' + state.session;
+    document.title = 'meow: ' + sessionName;
   }
 
   // Natural order for addresses: 10.0.0.9 before 10.0.0.10.
   function sortKey(data) {
-    return String(data.address || data.label || data.id).replace(/\d+/g, function (digits) {
+    return String((data && (data.address || data.label || data.id)) || '').replace(/\d+/g, function (digits) {
       return ('00000' + digits).slice(-6);
     });
   }
 
   // Turns the session's nodes and links into the illustration.
   function status(d) {
-    if (d.kind !== 'host') { return 'none'; }
+    if (!d || d.kind !== 'host') { return 'none'; }
     if (d.confirmed) { return 'bad'; }
     if (d.hypotheses) { return 'warn'; }
     return 'ok';
@@ -222,9 +313,11 @@
   var PRINTER = /(^|[\s,])(9100|515|631)\/tcp|ipp|printer|jetdirect/i;
 
   function plan(nodes, edges) {
-    var data = {}, out = {}, pos = {}, classes = {}, elements = [], lines = [], placed = {}, networkOf = {};
-    nodes.forEach(function (node) { data[node.data.id] = node.data; out[node.data.id] = []; });
-    edges.forEach(function (edge) {
+    var data = table(), out = table(), pos = table(), classes = table(), elements = [], lines = [],
+      placed = table(), networkOf = table(), asnBoxes = [];
+    (nodes || []).forEach(function (node) { data[node.data.id] = Object.assign({}, node.data); out[node.data.id] = []; });
+    if (!data.local) { data.local = { id: 'local', kind: 'local', label: 'You' }; out.local = []; }
+    (edges || []).forEach(function (edge) {
       var e = edge.data;
       if (out[e.source] && data[e.target]) { out[e.source].push({ to: e.target, kind: e.kind }); }
     });
@@ -247,34 +340,82 @@
       if (d.role === 'firewall') { return 'firewall'; }
       return d.role === 'server' ? 'server' : 'client';
     }
+
+    var internetVia = linked('internet', ['internet']);
+    var outside = [];
+    internetVia.forEach(function (g) {
+      linked(g, ['routed']).forEach(function (h) { if (outside.indexOf(h) < 0) { outside.push(h); } });
+    });
+    outside.sort(function (a, b) {
+      var aa = (data[a] && data[a].asn) || '', ab = (data[b] && data[b].asn) || '';
+      if (aa !== ab) { return aa < ab ? -1 : 1; }
+      return bySeverity(a, b);
+    });
+
+    function activeTraceSource() {
+      if (selected && data[selected] && data[selected].trace_hops && data[selected].trace_hops.length) {
+        return data[selected];
+      }
+      for (var i = 0; i < outside.length; i++) {
+        var od = data[outside[i]];
+        if (od && od.trace_hops && od.trace_hops.length) { return od; }
+      }
+      return data.internet || null;
+    }
+
     function caption(id) {
       var d = data[id], parts = [];
       if (id === 'local') {
-        parts.push('You');
         var mine = d.caption && d.caption.split('\n')[1];
-        if (mine) { parts.push(mine); }
+        parts.push(mine ? ('You · ' + mine) : 'You');
       } else if (id === 'internet') {
-        parts.push('Internet');
+        var ts = activeTraceSource();
+        var hc = (ts && ts.hop_count) || (d && d.hop_count) || 0;
+        var rtt = (ts && ts.rtt_ms !== undefined && ts.rtt_ms !== null) ? ts.rtt_ms
+          : ((d && d.rtt_ms !== undefined && d.rtt_ms !== null) ? d.rtt_ms : null);
+        var meta = [];
+        if (hc) { meta.push(hc + (hc === 1 ? ' hop' : ' hops')); }
+        if (rtt !== null) { meta.push(Math.round(rtt) + ' ms'); }
+        parts.push('Internet' + (meta.length ? ' (' + meta.join(' · ') + ')' : ''));
+        if ((ts && ts.trace_hops && ts.trace_hops.length) || hc) {
+          parts.push(traceExpanded ? '▴ hide traceroute' : '▾ click to expand traceroute');
+        }
+      } else if (d.kind === 'egress' || d.kind === 'hop' || d.kind === 'waf' || d.kind === 'asn') {
+        parts.push(d.label || id);
       } else if (d.kind === 'host') {
-        parts.push(d.address || d.label);
+        var dot = d.confirmed ? ' \ud83d\udd34' : (d.hypotheses ? ' \ud83d\udfe1' : (d.open_ports ? ' \ud83d\udfe2' : ''));
+        var primary = (d.primary_hostname && d.primary_hostname !== d.address)
+          ? (d.primary_hostname + ' (' + d.address + ')')
+          : (d.address || d.label);
+        parts.push(primary + dot);
+        var sub = [];
+        if (d.ports_compact) {
+          sub.push(d.ports_compact + (d.open_ports ? ' (' + d.open_ports + ' open)' : ''));
+        } else if (d.open_ports) {
+          sub.push(d.open_ports + ' open');
+        }
+        if (d.city) { sub.push(d.city); }
+        if (sub.length) { parts.push(sub.join(' · ')); }
         var counts = [];
         if (d.confirmed) { counts.push(d.confirmed + ' confirmed'); }
         if (d.hypotheses) { counts.push(d.hypotheses + ' to verify'); }
         if (counts.length) { parts.push(counts.join(' · ')); }
       } else if (d.kind === 'gateway') {
-        parts.push((internetVia.indexOf(id) >= 0 ? 'Router ' : 'Gateway ') + d.label);
+        parts.push('Gateway · ' + (d.label || id.replace(/^gw:/, '')));
       } else if (d.kind === 'interface') {
-        parts.push((d.caption || d.label).split('\n')[0]);
+        parts.push((d.caption || d.label || id).split('\n')[0]);
       } else {
-        parts.push(d.label);
+        parts.push(d.label || id);
       }
       return parts.join('\n');
     }
     function put(id, x, y, extra) {
       var d = data[id];
       pos[id] = { x: x, y: y };
-      classes[id] = [status(d)].concat(extra || []).join(' ');
-      if (!d.icon && d.kind !== 'title') { d.icon = picture(d); }
+      var cls = [status(d)];
+      if (d.kind === 'host' && d.kev) { cls.push('kev'); }
+      classes[id] = cls.concat(extra || []).join(' ');
+      if (!d.icon && d.kind !== 'title' && d.kind !== 'asn') { d.icon = picture(d); }
       placed[id] = true;
     }
     function link(from, to, color, kind, text) {
@@ -295,8 +436,7 @@
       return id;
     }
 
-    var internetVia = linked('internet', ['internet']);
-    var networks = nodes.filter(function (n) { return n.data.kind === 'interface'; }).map(function (n) { return n.data.id; });
+    var networks = (nodes || []).filter(function (n) { return n.data.kind === 'interface'; }).map(function (n) { return n.data.id; });
     function leadsOut(id) {
       return internetVia.indexOf(id) >= 0 || linked(id, ['gateway']).some(function (g) { return internetVia.indexOf(g) >= 0; });
     }
@@ -304,59 +444,159 @@
       networks.filter(function (n) { return ['vpn', 'virtual'].indexOf(data[n].link) < 0; })[0];
     var vpns = networks.filter(function (n) { return n !== home && data[n].link === 'vpn'; });
     var others = networks.filter(function (n) { return n !== home && vpns.indexOf(n) < 0; });
-    var own = vpns.concat(others);
+    var ownNets = vpns.concat(others);
 
-    // Your home network: the router under the Internet, every device in one
-    // row below it, you last.
+    // Top-down OPSEC & transit pipeline:
+    // [ You · 192.168.0.184 ]
+    //          ┆ (Wi-Fi en0)
+    // [ Gateway · 192.168.0.1 ]
+    //          │
+    // [ WAN Egress · 73.x.x.x (Comcast) ]
+    //          │
+    //    ☁️ Internet (8 hops · 23ms)
+    //          │
+    // ┌─ AS63949 · Akamai / Linode ──────┐
+    // │  🖥️ scanme.org (45.33.32.156) 🟡 │
+    // │     22, 80, 9929/tcp · Fremont   │
+    // └──────────────────────────────────┘
     var hub = null, rowLeft = 0;
     if (home) {
       var gateways = linked(home, ['gateway']).sort(bySeverity);
       hub = gateways[0] || home;
-      put(hub, 0, 0, ['hub', 'side']);
-      // Only this machine's own link is known; the others are drawn alike.
       var tree = data[home].link === 'wifi' ? 'straight wifi' : 'straight';
-      // The network's name goes under the router's own.
-      networkOf[hub] = caption(home) + (data[home].network ? ' · ' + data[home].network : '');
-      var rowIds = gateways.slice(1).concat(linked(home, ['neighbour', 'direct']).filter(function (id) {
-        return id !== hub && !placed[id];
-      }).sort(bySeverity)).concat(['local']);
-      rowLeft = -(rowIds.length - 1) / 2 * STEP;
-      rowIds.forEach(function (id, i) {
-        put(id, rowLeft + i * STEP, ROW_Y, id === 'local' ? ['you'] : []);
-      });
-      // One drop from the router to a bar, then one drop to each device.
-      if (rowIds.length === 1) {
-        link(hub, 'local', LINE.ethernet, tree);
-      } else {
-        link(hub, anchor(0, BAR_Y), LINE.ethernet, tree);
-        link(anchor(rowLeft, BAR_Y), anchor(-rowLeft, BAR_Y), LINE.ethernet, tree);
-        rowIds.forEach(function (id) { link(anchor(pos[id].x, BAR_Y), id, LINE.ethernet, tree); });
+      var homeLabel = caption(home);
+      put('local', 0, YOU_Y, ['you']);
+      put(hub, 0, GW_Y, ['hub', 'side']);
+      if (data[home].network) { networkOf[hub] = data[home].network; }
+      link('local', hub, LINE.ethernet, tree, '(' + homeLabel + ')');
+
+      // Local LAN peers hang to the left of the gateway so the vertical
+      // You -> Gateway -> WAN Egress -> Internet -> Target spine stays clean.
+      var lanPeers = gateways.slice(1).concat(linked(home, ['neighbour', 'direct']).filter(function (id) {
+        return id !== hub && id !== 'local' && !placed[id];
+      }).sort(bySeverity));
+      if (lanPeers.length) {
+        var barY = GW_Y + 85;
+        rowLeft = -lanPeers.length * STEP;
+        lanPeers.forEach(function (id, i) {
+          put(id, -(i + 1) * STEP, GW_Y + 150);
+        });
+        link(hub, anchor(0, barY), LINE.ethernet, tree);
+        link(anchor(rowLeft, barY), anchor(0, barY), LINE.ethernet, tree);
+        lanPeers.forEach(function (id) {
+          link(anchor(pos[id].x, barY), id, LINE.ethernet, tree);
+        });
       }
-      // The Internet straight above the router, joined to it like a modem,
-      // and what was reached there beside it.
+
       if (data.internet && internetVia.length) {
+        var vpnList = (state && state.machine && state.machine.vpn) || [];
+        var where = (state && state.location) || null;
+        var vpnAll = (where && where.status === 'hidden_by_vpn') || vpnList.some(function (line) {
+          return /default route|all IPv[46]/i.test(line);
+        });
+        if (vpnAll || vpnList.length) {
+          var vNames = vpnList.map(vpnName).join(', ') || 'VPN';
+          data['egress:wan'] = {
+            id: 'egress:wan', kind: 'egress', role: 'firewall', icon: 'firewall',
+            why: 'active VPN exit tunnel carrying outbound traffic',
+            label: 'VPN Exit · ' + vNames + '\n' + (vpnAll ? 'OPSEC: traffic tunneled' : 'split-tunnel VPN active'),
+            vpn: vNames
+          };
+          put('egress:wan', 0, EGRESS_Y, ['egress']);
+          link(hub, 'egress:wan', LINE.vpn, 'straight dashed', 'VPN');
+        } else {
+          var pubIp = (where && where.place && where.place.public_address) || '';
+          var isp = (where && where.place && (where.place.network || placeName(where.place))) || '';
+          var egressHead = 'WAN Egress' + (pubIp ? ' · ' + pubIp : '') + (isp ? ' (' + isp + ')' : '');
+          data['egress:wan'] = {
+            id: 'egress:wan', kind: 'egress', role: 'router', icon: 'router',
+            why: 'your public WAN egress IP and ISP seen by remote targets',
+            label: egressHead + '\nno VPN',
+            public_address: pubIp,
+            isp: isp
+          };
+          put('egress:wan', 0, EGRESS_Y, ['egress']);
+          link(hub, 'egress:wan', LINE.ethernet, 'straight');
+        }
+
         put('internet', 0, CLOUD_Y, ['cloud']);
-        link('internet', hub, LINE.ethernet, 'straight');
-        var outside = [];
-        internetVia.forEach(function (g) {
-          linked(g, ['routed']).forEach(function (h) { if (!placed[h] && outside.indexOf(h) < 0) { outside.push(h); } });
+        link('egress:wan', 'internet', vpnAll ? LINE.vpn : LINE.ethernet, vpnAll ? 'straight dashed' : 'straight');
+
+        var transitBottomId = 'internet';
+        var targetBaseY = TARGET_Y;
+        var ts = activeTraceSource();
+        var activeHops = (ts && ts.trace_hops) || [];
+        if (traceExpanded && activeHops.length) {
+          activeHops.forEach(function (hop, idx) {
+            var hopId = 'hop:' + hop.hop;
+            var rttText = (hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
+            var hopLabel = 'Hop ' + hop.hop + ': ' + hop.address +
+              (hop.label ? '  (' + hop.label + ')' : '') + '   ' + rttText;
+            data[hopId] = {
+              id: hopId, kind: 'hop', role: hop.address === '* * *' ? 'segment' : 'router',
+              icon: hop.address === '* * *' ? 'segment' : 'router',
+              why: 'intermediate traceroute hop ' + hop.hop,
+              label: hopLabel,
+              hop: hop
+            };
+            var hy = CLOUD_Y + 135 + idx * 92;
+            put(hopId, 0, hy, ['hop']);
+            link(transitBottomId, hopId, LINE.ethernet, 'straight');
+            transitBottomId = hopId;
+          });
+          targetBaseY = CLOUD_Y + 135 + activeHops.length * 92 + 125;
+        }
+
+        var shownOutside = outside.filter(function (h) { return !placed[h]; }).slice(0, 6);
+        outside.slice(6).forEach(function (h) { placed[h] = true; });
+        var asnSeen = table();
+        shownOutside.forEach(function (h, i) {
+          var hx = -(shownOutside.length - 1) / 2 * STEP + i * STEP;
+          var hd = data[h];
+          var hasWaf = !!(hd && hd.waf_cdn);
+          var hy = targetBaseY + (hasWaf ? 155 : 0);
+
+          if (hd && hd.asn) {
+            var asnId = 'asn:' + hd.asn;
+            if (!own(asnSeen, asnId)) {
+              var asnHeader = hd.asn + (hd.bgp_prefix ? ' · ' + hd.bgp_prefix : '');
+              var asnNodeData = {
+                id: asnId, kind: 'asn', role: 'segment',
+                why: 'autonomous system / cloud provider grouping sibling hosts',
+                label: asnHeader, text: asnHeader, asn: hd.asn, bgp_prefix: hd.bgp_prefix || ''
+              };
+              asnSeen[asnId] = asnNodeData;
+              asnBoxes.push({ group: 'nodes', data: asnNodeData, classes: 'asn-box' });
+            }
+            hd.parent = asnId;
+          }
+
+          put(h, hx, hy);
+          if (hasWaf) {
+            var wafId = 'waf:' + h;
+            data[wafId] = {
+              id: wafId, kind: 'waf', role: 'firewall', icon: 'firewall',
+              why: 'WAF / CDN proxy detected in front of ' + (hd.address || h),
+              label: 'WAF / CDN · ' + hd.waf_cdn,
+              waf: hd.waf_cdn,
+              target: hd.address || h
+            };
+            put(wafId, hx, targetBaseY - 10, ['waf']);
+            link(transitBottomId, wafId, LINE.ethernet, shownOutside.length === 1 ? 'straight' : 'down');
+            link(wafId, h, LINE.ethernet, 'straight');
+          } else {
+            link(transitBottomId, h, LINE.ethernet, shownOutside.length === 1 ? 'straight' : 'down');
+          }
         });
-        outside.sort(bySeverity).slice(0, 4).forEach(function (h, i) {
-          put(h, 230 + i * 200, CLOUD_Y - 20);
-          link('internet', h, LINE.ethernet, 'thin');
-        });
-        outside.slice(4).forEach(function (h) { placed[h] = true; });
       }
     } else {
       put('local', 0, 0, ['you']);
     }
 
-    // Networks only this machine is on (a VPN, a virtual network) hang
-    // below you, not off the router: the rest of your network does not use
-    // them. Each has its hub (the VPN's gateway, or a switch) and what is
-    // behind it underneath.
+    // Networks only this machine is on (a VPN, a virtual network) branch
+    // to the right of You so they stay clear of the vertical transit spine.
     var you = pos.local, hubs = [];
-    own.forEach(function (net) {
+    ownNets.forEach(function (net) {
       var color = LINE[data[net].link] || LINE.other;
       var hubId = data[net].link === 'vpn' ? (linked(net, ['gateway']).sort(bySeverity)[0] || net) : net;
       var members = (hubId !== net ? linked(hubId, ['routed']) : [])
@@ -368,16 +608,11 @@
       hubs.push({ net: net, hub: hubId, color: color, members: members,
         width: Math.max(1, Math.min(3, members.length)) * SUB_STEP });
     });
-    var hubY = you.y + 230;
-    // They end under you, so with you last in the row nothing sticks out
-    // past it: the sub-networks branch down and to the left.
-    var total = hubs.reduce(function (sum, h, k) { return sum + h.width + (k ? 60 : 0); }, 0);
-    var x0 = hubs.length ? you.x + hubs[hubs.length - 1].width / 2 - total : you.x;
+    var hubY = you.y + 170;
+    var x0 = you.x + STEP * 0.9;
     hubs.forEach(function (h, k) {
       x0 += (k ? hubs[k - 1].width / 2 + 60 : 0) + h.width / 2;
       put(h.hub, x0, hubY, ['hub']);
-      // A gateway is named as such, so it also gets its network's name;
-      // a network's own switch only needs the address range.
       networkOf[h.hub] = h.hub === h.net ? (data[h.net].network || '')
         : caption(h.net) + (data[h.net].network ? ' · ' + data[h.net].network : '');
       h.members.forEach(function (m, i) {
@@ -389,17 +624,16 @@
     if (hubs.length === 1) {
       link('local', hubs[0].hub, hubs[0].color, 'dashed down');
     } else if (hubs.length > 1) {
-      // A short bar under you, one dashed drop to each network.
-      var first = pos[hubs[0].hub].x, last = pos[hubs[hubs.length - 1].hub].x, barY = you.y + 110;
+      var first = pos[hubs[0].hub].x, last = pos[hubs[hubs.length - 1].hub].x, barY2 = you.y + 85;
       data.ownbar = { id: 'ownbar', kind: 'bar', width: last - first + 8 };
-      pos.ownbar = { x: (first + last) / 2, y: barY };
+      pos.ownbar = { x: (first + last) / 2, y: barY2 };
       classes.ownbar = 'ownbar';
-      link('local', anchor(you.x, barY), '#9aa3ad', 'thin');
-      hubs.forEach(function (h) { link(anchor(pos[h.hub].x, barY), h.hub, h.color, 'dashed down'); });
+      link('local', anchor(you.x, barY2), '#9aa3ad', 'thin');
+      hubs.forEach(function (h) { link(anchor(pos[h.hub].x, barY2), h.hub, h.color, 'dashed down'); });
     }
 
     // Hosts this machine has no route to, in a group of their own.
-    var rest = nodes.map(function (n) { return n.data.id; }).filter(function (id) {
+    var rest = (nodes || []).map(function (n) { return n.data.id; }).filter(function (id) {
       return !placed[id] && ['interface', 'internet'].indexOf(data[id].kind) < 0;
     }).sort(bySeverity);
     if (rest.length) {
@@ -408,6 +642,7 @@
       rest.forEach(function (h, i) { put(h, rowLeft + (i % 6) * SUB_STEP, y0 + Math.floor(i / 6) * 170); });
     }
 
+    asnBoxes.forEach(function (box) { elements.push(box); });
     Object.keys(pos).forEach(function (id) {
       var d = Object.assign({}, data[id]);
       d.text = d.kind === 'title' ? d.label
@@ -419,7 +654,13 @@
   }
 
   function renderGraph() {
-    var key = JSON.stringify(state.topology);
+    var key = JSON.stringify([
+      state.topology,
+      state.location && state.location.status,
+      state.location && state.location.place,
+      state.machine && state.machine.vpn,
+      traceExpanded
+    ]);
     if (key === drawn) { return; }
     var first = !drawn;
     drawn = key;
@@ -443,36 +684,39 @@
     var all = cy.elements();
     if (!all.length) { return; }
     var bb = all.boundingBox(), zoom = MAX_ZOOM, width = scroller.clientWidth;
+    if (!isFinite(bb.x1) || !isFinite(bb.y1)) { return; }
+    var bw = Math.max(1, bb.w || 0), bh = Math.max(1, bb.h || 0);
     card.style.height = '';
     card.style.maxHeight = '';
-    var short = Math.ceil(bb.h * READABLE_ZOOM + 2 * FIT_PADDING) - scroller.clientHeight;
+    var short = Math.ceil(bh * READABLE_ZOOM + 2 * FIT_PADDING) - scroller.clientHeight;
     if (short > 0) {
       card.style.maxHeight = 'none';
       card.style.height = Math.min(CARD_MAX, card.offsetHeight + short) + 'px';
     }
-    if (!scroller.clientHeight) { return; }
+    if (!scroller.clientHeight || !scroller.clientWidth) { return; }
     cy.resize();
     // Twice: a scrollbar, once there, takes some of the height.
     for (var pass = 0; pass < 2; pass++) {
       // As big as the height allows; smaller to fit the width, but only
       // down to READABLE_ZOOM: past that the row scrolls instead.
-      var fitWidth = (scroller.clientWidth - 2 * FIT_PADDING) / bb.w;
-      zoom = Math.min(MAX_ZOOM, (scroller.clientHeight - 2 * FIT_PADDING) / bb.h,
-        Math.max(fitWidth, READABLE_ZOOM));
-      width = Math.max(scroller.clientWidth, Math.ceil(bb.w * zoom + 2 * FIT_PADDING));
+      var fitWidth = (scroller.clientWidth - 2 * FIT_PADDING) / bw;
+      var fitHeight = (scroller.clientHeight - 2 * FIT_PADDING) / bh;
+      zoom = Math.max(0.05, Math.min(MAX_ZOOM, fitHeight, Math.max(fitWidth, READABLE_ZOOM)));
+      width = Math.max(scroller.clientWidth, Math.ceil(bw * zoom + 2 * FIT_PADDING));
       if (width > MAX_WIDTH) {
         width = MAX_WIDTH;
-        zoom = (MAX_WIDTH - 2 * FIT_PADDING) / bb.w;
+        zoom = Math.max(0.05, (MAX_WIDTH - 2 * FIT_PADDING) / bw);
       }
       if (canvas.style.width !== width + 'px') {
         canvas.style.width = width + 'px';
         cy.resize();
       }
     }
+    if (!zoom || !isFinite(zoom)) { return; }
     var height = scroller.clientHeight;
     cy.viewport({ zoom: zoom, pan: {
-      x: (width - bb.w * zoom) / 2 - bb.x1 * zoom,
-      y: (height - bb.h * zoom) / 2 - bb.y1 * zoom
+      x: (width - bw * zoom) / 2 - bb.x1 * zoom,
+      y: (height - bh * zoom) / 2 - bb.y1 * zoom
     } });
     var wide = width > scroller.clientWidth;
     byId('scroll-hint').hidden = !wide;
@@ -524,19 +768,29 @@
     return 'Estimated from ' + (place.public_address || 'your public address') +
       (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source + '.';
   }
-  // The pictures' licence asks for its credit, with its link: a short one
-  // under the map, the full wording in its tooltip.
+  // The pictures' licence asks for visible attribution and a link: Sentinel-2
+  // cloudless by EOX (CC BY 4.0 for 2016; CC BY-NC-SA 4.0 for later years)
+  // with modified Copernicus Sentinel data.
   function credit(view) {
     var box = el('span', 'attribution');
-    box.title = view.credit;
-    if (!view.credit_url) {
-      box.textContent = view.credit;
+    box.title = view.credit || '';
+    if (!safeHttpUrl(view.credit_url)) {
+      box.textContent = view.credit || '';
       return box;
     }
-    var link = box.appendChild(el('a', null, '\u00a9 EOX'));
+    var isEox = /(?:cloudless\.eox\.at|s2maps\.eu)/i.test(view.credit_url);
+    var yearMatch = /Sentinel data (\d{4})/i.exec(view.credit || '');
+    var year = yearMatch ? yearMatch[1] : '';
+    var licence = year && year !== '2016' ? 'CC BY-NC-SA 4.0' : 'CC BY 4.0';
+    var link = box.appendChild(el('a', null,
+      isEox ? 'Sentinel-2 cloudless by EOX (' + licence + ')' : (view.credit || view.credit_url)));
     link.href = view.credit_url;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
+    if (isEox) {
+      box.appendChild(document.createTextNode(
+        ' \u00b7 Contains modified Copernicus Sentinel data' + (year ? ' ' + year : '')));
+    }
     return box;
   }
 
@@ -572,7 +826,8 @@
       img.height = view.tile_size + 0.5;
       img.style.left = tile.left + 'px';
       img.style.top = tile.top + 'px';
-      img.src = '/map/tile/' + tile.z + '/' + tile.x + '/' + tile.y + '?token=' + encodeURIComponent(token);
+      img.src = withToken('/map/tile/' + encodeURIComponent(tile.z) + '/' +
+        encodeURIComponent(tile.x) + '/' + encodeURIComponent(tile.y));
     });
     var x = view.width / 2, y = view.height / 2;
     var marks = svg('svg', { 'class': 'marks', width: view.width, height: view.height,
@@ -605,10 +860,14 @@
   function dbCredit(box, target) {
     if (!target.credit) { return; }
     var line = box.appendChild(el('span', 'attribution'));
-    var link = line.appendChild(el('a', null, target.credit));
-    link.href = target.credit_url;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
+    if (safeHttpUrl(target.credit_url)) {
+      var link = line.appendChild(el('a', null, target.credit));
+      link.href = target.credit_url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+    } else {
+      line.textContent = target.credit;
+    }
   }
   // The address of the device selected on the drawing, if it has one.
   function selectedAddress() {
@@ -660,6 +919,17 @@
     fitStage();
     fitDrawing(false);
   });
+  // Extracts the VPN adapter name from `"{name} {cidr}: carries ..."` across
+  // Linux/macOS (`tun0`, `utun3`) and Windows (`WireGuard Tunnel`) + IPv6.
+  function vpnName(line) {
+    var text = String(line || '');
+    var split = /^(.*):\s+(?:carries\b|no route\b)/.exec(text);
+    if (split) {
+      var head = split[1].replace(/\s+\S+$/, '').trim();
+      if (head) { return head; }
+    }
+    return text.split(/\s+/)[0].replace(/:$/, '');
+  }
   function renderWhere() {
     var vpn = (state.machine && state.machine.vpn) || [];
     var where = state.location;
@@ -671,9 +941,9 @@
     // Top right: a blue pill when a VPN is up, the round map under it.
     var box = clear(byId('where')).appendChild(el('div', 'where-side'));
     if (vpn.length) {
-      var names = vpn.map(function (line) { return line.split(' ')[0]; }).join(', ');
+      var names = vpn.map(vpnName).join(', ');
       var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
-        return /default route|all IPv4/.test(line);
+        return /default route|all IPv[46]/i.test(line);
       });
       var pill = box.appendChild(el('span', 'vpn-pill', 'VPN ' + names + (all ? ' \u00b7 location hidden' : '')));
       pill.title = vpn.join('\n') + '\n' + (all
@@ -724,7 +994,7 @@
   function drawnAs(data) {
     var name = '';
     ROLES.forEach(function (role) { if (role[0] === data.role) { name = role[1]; } });
-    return el('div', 'dim drawn', name ? 'Shown as ' + name + ': ' + data.why + '.' : '');
+    return el('div', 'dim drawn', name && data.why ? 'Shown as ' + name + ': ' + data.why + '.' : '');
   }
 
   function renderList(target, items, empty, build) {
@@ -746,12 +1016,23 @@
   }
 
   // <details> keep the state the reader left them in across refreshes.
-  var unfolded = {};
+  var unfolded = table();
   function fold(key, className, openByDefault) {
     var box = el('details', className);
-    box.open = key in unfolded ? unfolded[key] : !!openByDefault;
+    box.open = hasOwn.call(unfolded, key) ? unfolded[key] : !!openByDefault;
     box.addEventListener('toggle', function () { unfolded[key] = box.open; });
     return box;
+  }
+
+  function selectedNodeData() {
+    if (!selected || !state) { return null; }
+    var node = cy.$id(selected);
+    if (node && !node.empty()) { return node.data(); }
+    var nodes = (state.topology && state.topology.nodes) || [];
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].data && nodes[i].data.id === selected) { return nodes[i].data; }
+    }
+    return null;
   }
 
   // "This machine": address -> type -> OS -> version, then a row per
@@ -762,9 +1043,7 @@
   function renderMachine() {
     var machine = state.machine || { vpn: [], sections: [] };
     var vpn = byId('vpn');
-    vpn.textContent = machine.vpn.length ? 'VPN ' + machine.vpn.map(function (line) {
-      return line.split(':')[0];
-    }).join(', ') : 'no VPN';
+    vpn.textContent = machine.vpn.length ? 'VPN ' + machine.vpn.map(vpnName).join(', ') : 'no VPN';
     vpn.className = machine.vpn.length ? 'badge ok' : 'badge';
     vpn.title = machine.vpn.join('\n') || 'No VPN interface with an address was found.';
 
@@ -814,25 +1093,112 @@
     renderWhere();
   }
 
-  // Every host as one row: what it is, and what there is to look at.
+  var MULTI_TLDS = ['co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au',
+    'co.nz', 'co.jp', 'ne.jp', 'or.jp', 'com.br', 'com.mx', 'co.za', 'co.in', 'com.sg', 'com.hk'];
+
+  function rootDomainOf(hostname) {
+    var clean = String(hostname || '').trim().replace(/^\*\./, '').replace(/\.$/, '').toLowerCase();
+    if (!clean || /^\d+\.\d+\.\d+\.\d+$/.test(clean) || clean.indexOf(':') >= 0) { return ''; }
+    var parts = clean.split('.');
+    if (parts.length < 2) { return ''; }
+    var lastTwo = parts[parts.length - 2] + '.' + parts[parts.length - 1];
+    if (parts.length >= 3 && MULTI_TLDS.indexOf(lastTwo) >= 0) {
+      return parts[parts.length - 3] + '.' + lastTwo;
+    }
+    return lastTwo;
+  }
+
+  function associatedNamesFor(host, data) {
+    if (data && ((data.associated_domains && data.associated_domains.length) ||
+        (data.associated_hosts && data.associated_hosts.length))) {
+      return {
+        domains: (data.associated_domains || []).slice(),
+        hosts: (data.associated_hosts || []).slice()
+      };
+    }
+    var raw = (host && host.hostnames) ? host.hostnames.slice() : [];
+    var dSet = table(), subSet = table(), apexSet = table();
+    raw.forEach(function (n) {
+      var clean = String(n || '').trim().replace(/^\*\./, '').replace(/\.$/, '').toLowerCase();
+      if (!clean || (host && clean === host.address)) { return; }
+      var root = rootDomainOf(clean);
+      if (root) {
+        dSet[root] = true;
+        if (clean !== root) { subSet[clean] = true; } else { apexSet[clean] = true; }
+      } else {
+        subSet[clean] = true;
+      }
+    });
+    var domains = Object.keys(dSet).sort();
+    var hostNames = Object.keys(subSet).sort();
+    if (!hostNames.length) { hostNames = Object.keys(apexSet).sort(); }
+    return { domains: domains, hosts: hostNames };
+  }
+
+  // Associated Hosts: Domains (e.g. nmap.org) and Hosts (e.g. scanme.nmap.org).
   function renderHosts() {
     var list = clear(byId('hosts'));
     var hosts = state.topology.nodes.filter(function (node) { return node.data.kind === 'host'; });
     hosts.sort(function (a, b) { return sortKey(a.data) < sortKey(b.data) ? -1 : 1; });
     if (!hosts.length) {
       list.appendChild(el('p', 'note', 'None yet. Work in the session shell, or import a scan with `meow add <file>`.'));
+    } else {
+      var selData = selectedNodeData();
+      var onlyAddr = selData && selData.kind === 'host' && selData.address ? selData.address : null;
+      var targetNodes = onlyAddr
+        ? hosts.filter(function (n) { return n.data.address === onlyAddr; })
+        : hosts;
+
+      var domainMap = table();
+      var hostRows = [];
+      targetNodes.forEach(function (node) {
+        var d = node.data;
+        var hObj = (state.graph && state.graph.hosts && own(state.graph.hosts, d.address)) || null;
+        var assoc = associatedNamesFor(hObj, d);
+        assoc.domains.forEach(function (dom) {
+          if (!own(domainMap, dom)) { domainMap[dom] = []; }
+          if (domainMap[dom].indexOf(d) < 0) { domainMap[dom].push(d); }
+        });
+        if (assoc.hosts.length) {
+          assoc.hosts.forEach(function (hName) {
+            hostRows.push({ label: hName, data: d });
+          });
+        } else {
+          hostRows.push({ label: d.address, data: d });
+        }
+      });
+
+      var domainKeys = Object.keys(domainMap).sort();
+      list.appendChild(el('h3', null, 'Domains'));
+      if (domainKeys.length) {
+        domainKeys.forEach(function (dom) {
+          var linkedNodes = domainMap[dom];
+          var firstNode = linkedNodes[0];
+          var domBtn = el('button', 'link', dom);
+          domBtn.addEventListener('click', function () { select(firstNode.id); });
+          var addrs = linkedNodes.map(function (n) { return n.address; }).join(', ');
+          var domLine = list.appendChild(row(domBtn, addrs, 'dim'));
+          if (firstNode.id === selected) { domLine.className += ' current'; }
+        });
+      } else {
+        list.appendChild(el('div', 'dim', 'None resolved'));
+      }
+
+      list.appendChild(el('h3', null, 'Hosts'));
+      hostRows.forEach(function (entry) {
+        var data = entry.data;
+        var name = el('button', 'link', entry.label);
+        name.addEventListener('click', function () { select(data.id); });
+        var facts = [];
+        if (entry.label !== data.address) { facts.push(data.address); }
+        facts.push(data.open_ports + (data.open_ports === 1 ? ' port' : ' ports'));
+        var kind = 'ok';
+        if (data.hypotheses) { facts.push(data.hypotheses + ' to verify'); kind = 'warn'; }
+        if (data.confirmed) { facts.push(data.confirmed + ' confirmed'); kind = 'bad'; }
+        var line = list.appendChild(row(name, marked(facts.join(' · '), kind)));
+        if (data.id === selected) { line.className += ' current'; }
+      });
     }
-    hosts.forEach(function (node) {
-      var data = node.data;
-      var name = el('button', 'link', data.address);
-      name.addEventListener('click', function () { select(data.id); });
-      var facts = [data.caption.split('\n')[0], data.open_ports + (data.open_ports === 1 ? ' port' : ' ports')];
-      var kind = 'ok';
-      if (data.hypotheses) { facts.push(data.hypotheses + ' to verify'); kind = 'warn'; }
-      if (data.confirmed) { facts.push(data.confirmed + ' confirmed'); kind = 'bad'; }
-      var line = list.appendChild(row(name, marked(facts.join(' · '), kind)));
-      if (data.id === selected) { line.className += ' current'; }
-    });
 
     // Names that were only printed in the session shell or a log, usually
     // inside a URL. Nothing was seen on them and no address is known, so
@@ -844,7 +1210,7 @@
       names.appendChild(el('p', 'note', 'These appeared in the terminal or a log, usually inside a URL. ' +
         'meow has not contacted them and they are not part of the network drawn above.'));
       mentioned.forEach(function (entry) {
-        var what = entry.ports.join(', ') || 'no port';
+        var what = (entry.ports || []).join(', ') || 'no port';
         if (entry.paths) { what += ' · ' + entry.paths + (entry.paths === 1 ? ' path' : ' paths'); }
         names.appendChild(row(entry.name, what, 'dim'));
       });
@@ -859,16 +1225,16 @@
     // The newest run of each target in full; earlier runs of the same
     // target (all kept in the workspace) fold away under it.
     var latest = [];
-    var earlier = {};
+    var earlier = table();
     (state.tasks || []).forEach(function (task) {
-      if (task.target in earlier) { earlier[task.target].push(task); return; }
+      if (hasOwn.call(earlier, task.target)) { earlier[task.target].push(task); return; }
       earlier[task.target] = [];
       latest.push(task);
     });
     renderList(byId('tasks'), latest, 'No recon tasks yet.', function (task) {
       var item = el('li');
       item.appendChild(el('div', 'label', 'recon ' + task.target));
-      task.stages.forEach(function (stage) {
+      (task.stages || []).forEach(function (stage) {
         var kind = { done: 'ok', running: 'warn', failed: 'bad', interrupted: 'bad' }[stage.status] || 'info';
         var line = item.appendChild(row(stage.stage, marked(stage.status, kind)));
         line.title = stage.detail || '';
@@ -885,7 +1251,7 @@
           var when = (run.created_utc || '').replace('T', ' ').slice(0, 16);
           var line = past.appendChild(el('div', 'fact'));
           line.appendChild(el('div', null, '#' + run.id + (when ? '  ' + when : '')));
-          line.appendChild(el('div', 'dim', run.stages.map(function (stage) {
+          line.appendChild(el('div', 'dim', (run.stages || []).map(function (stage) {
             return stage.stage + ' ' + stage.status;
           }).join(' · ')));
         });
@@ -896,18 +1262,20 @@
     var notices = (state.notices || []).slice(-25).reverse();
     renderList(byId('notices'), notices, 'Nothing yet.', function (notice) {
       var item = el('li');
-      item.appendChild(el('span', 'dim', notice.at.slice(11, 19) + ' '));
-      item.appendChild(document.createTextNode(notice.text));
+      item.appendChild(el('span', 'dim', String(notice.at || '').slice(11, 19) + ' '));
+      item.appendChild(document.createTextNode(String(notice.text || '')));
       return item;
     });
   }
 
   function pathTree(node, budget) {
     var list = el('ul', 'tree');
-    Object.keys(node.children || {}).forEach(function (name) {
+    var children = (node && node.children) || {};
+    Object.keys(children).forEach(function (name) {
       if (budget.left <= 0) { return; }
+      var child = own(children, name);
+      if (!child) { return; }
       budget.left -= 1;
-      var child = node.children[name];
       var hasChildren = child.children && Object.keys(child.children).length > 0;
       var item = el('li', null, '/' + name + (hasChildren ? '/' : ''));
       if (child.status) { item.appendChild(el('span', 'dim', ' ' + child.status)); }
@@ -936,7 +1304,7 @@
     text.appendChild(el('span', 'dim', where.join(' · ')));
 
     var status = advisory.verification_status;
-    var checks = ((state.checklists[address] || {})[advisory.id] || {});
+    var checks = own(own(state.checklists, address), advisory.id) || {};
     (checks.items || []).forEach(function (check) {
       var label = el('span', 'label', check.label);
       item.appendChild(row(label, marked(check.detail, check.done ? 'ok' : 'warn')));
@@ -966,8 +1334,8 @@
   // For the selected host, or for every host when none is selected.
   function renderAdvisory() {
     var box = clear(byId('advisory'));
-    var node = selected ? cy.$id(selected) : null;
-    var only = node && !node.empty() && node.data('address') ? node.data('address') : null;
+    var selData = selectedNodeData();
+    var only = selData && selData.address ? selData.address : null;
     byId('advisory-title').textContent = only ? 'Advisory for ' + only : 'Advisory';
     var groups = [
       { name: 'Confirmed', kind: 'bad', open: true, items: [] },
@@ -979,14 +1347,14 @@
     // What to do comes first: one line per piece of software, since one
     // update usually answers every advisory matched on it.
     var fixes = state.fixes || {};
-    var mine = {};
-    (state.graph.local.interfaces || []).forEach(function (iface) {
+    var mine = table();
+    ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
       (iface.addresses || []).forEach(function (cidr) { mine[cidr.split('/')[0]] = true; });
     });
     var plan = [];
     Object.keys(fixes).forEach(function (address) {
       if (only && address !== only) { return; }
-      fixes[address].forEach(function (fix) { plan.push({ address: address, fix: fix }); });
+      (own(fixes, address) || []).forEach(function (fix) { plan.push({ address: address, fix: fix }); });
     });
     if (plan.length) {
       var todo = box.appendChild(el('div', 'todo'));
@@ -1007,10 +1375,13 @@
         'Every entry below was matched by version number only and is not proof: a system that takes security updates ' +
         'from its vendor often has the fix under the same version number. After updating, scan again; what no longer matches is removed.'));
     }
-    Object.keys(state.graph.hosts).forEach(function (address) {
+    var hostsMap = (state.graph && state.graph.hosts) || {};
+    Object.keys(hostsMap).forEach(function (address) {
       if (only && address !== only) { return; }
+      var host = own(hostsMap, address);
+      if (!host) { return; }
       // Known-exploited first, then by severity score.
-      var ordered = state.graph.hosts[address].advisories.slice().sort(function (a, b) {
+      var ordered = (host.advisories || []).slice().sort(function (a, b) {
         return (b.kev ? 1 : 0) - (a.kev ? 1 : 0) || (b.cvss || 0) - (a.cvss || 0);
       });
       ordered.forEach(function (advisory) {
@@ -1019,7 +1390,8 @@
         groups[group].items.push({ address: address, advisory: advisory });
       });
     });
-    var notes = (state.graph.local.warnings || []).concat(state.graph.local.notes || []);
+    var localNet = (state.graph && state.graph.local) || {};
+    var notes = (localNet.warnings || []).concat(localNet.notes || []);
     var shown = 0;
     groups.forEach(function (group) {
       var count = group.name === 'Informational' ? notes.length : group.items.length;
@@ -1056,15 +1428,17 @@
   // The cards of a selected host: only the ones there is something to say in.
   function hostCards(host, data) {
     var cards = [];
+    var hostPorts = host.ports || {};
 
     // Each open port and its service; then the software that answered on
     // each (the versions); then what the scan tried that was not open.
     var ports = card('Open Ports');
     var versions = [], closed = [];
-    Object.keys(host.ports).sort(function (a, b) {
-      return host.ports[a].number - host.ports[b].number || (a < b ? -1 : 1);
+    Object.keys(hostPorts).sort(function (a, b) {
+      return hostPorts[a].number - hostPorts[b].number || (a < b ? -1 : 1);
     }).forEach(function (key) {
-      var port = host.ports[key];
+      var port = own(hostPorts, key);
+      if (!port) { return; }
       if (port.state !== 'open') { closed.push(key + ' (' + port.state + ')'); return; }
       var name = String(port.number) + (port.protocol === 'tcp' ? '' : '/' + port.protocol);
       var service = /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || 'open');
@@ -1080,8 +1454,10 @@
       versions.forEach(function (version) { ports.appendChild(row(version[0], version[1])); });
     }
     if (closed.length) { ports.appendChild(el('p', 'note', 'Seen before, not open now: ' + closed.join(', '))); }
-    Object.keys(host.not_open || {}).forEach(function (key) {
-      var group = host.not_open[key];
+    var notOpen = host.not_open || {};
+    Object.keys(notOpen).forEach(function (key) {
+      var group = own(notOpen, key);
+      if (!group) { return; }
       ports.appendChild(el('p', 'note', 'Tried and ' + group.state + ' (' + group.count + ' ' + group.protocol +
         (group.count === 1 ? ' port' : ' ports') + ')' + (group.ports ? ': ' + group.ports.split(',').join(', ') : '.')));
     });
@@ -1089,22 +1465,59 @@
 
     // What the web ports gave away: server headers, certificate names, paths.
     var web = card('Web');
-    Object.keys(host.ports).forEach(function (key) {
-      var port = host.ports[key];
+    Object.keys(hostPorts).forEach(function (key) {
+      var port = own(hostPorts, key);
+      if (!port) { return; }
       var paths = port.paths && port.paths.children && Object.keys(port.paths.children).length;
       var sans = port.tls_sans || [];
-      if (!port.http && !sans.length && !paths) { return; }
+      var http = port.http || null;
+      if (!http && !sans.length && !paths) { return; }
       web.appendChild(el('h3', null, key));
-      if (port.http && port.http.server) { web.appendChild(row('Server', port.http.server)); }
-      if (port.http && port.http.location) { web.appendChild(row('Redirects to', port.http.location)); }
+      if (http && http.server) { web.appendChild(row('Server', http.server)); }
+      if (http && http.powered_by) { web.appendChild(row('Powered by', http.powered_by)); }
+      if (http && http.title) { web.appendChild(row('Title', http.title)); }
+      if (http && http.waf) { web.appendChild(row('WAF / CDN', marked(http.waf, 'info'))); }
+      if (http && http.favicon_hash !== null && http.favicon_hash !== undefined) {
+        var fav = String(http.favicon_hash) + (http.favicon_framework ? ' (' + http.favicon_framework + ')' : '');
+        web.appendChild(row('Favicon hash', fav));
+      }
+      if (http && http.location) { web.appendChild(row('Redirects to', http.location)); }
+      if (http && http.security_headers && http.security_headers.length) {
+        web.appendChild(row('Security headers', marked(http.security_headers.join(', '), 'ok')));
+      }
+      if (http && http.missing_headers && http.missing_headers.length) {
+        web.appendChild(row('Missing headers', marked(http.missing_headers.join(', '), 'warn')));
+      }
+      if (http && http.tls_versions && http.tls_versions.length) {
+        var hasLegacy = http.tls_versions.some(function (v) { return v === 'TLS 1.0' || v === 'TLS 1.1'; });
+        web.appendChild(row('TLS versions', marked(http.tls_versions.join(', '), hasLegacy ? 'warn' : 'ok')));
+      }
+      if (http && http.tls_weak_ciphers && http.tls_weak_ciphers.length) {
+        web.appendChild(row('Weak TLS ciphers', marked(http.tls_weak_ciphers.join(', '), 'warn')));
+      }
+      if (http && (http.tls_subject || http.tls_issuer)) {
+        var certParts = [http.tls_subject, http.tls_issuer ? 'issuer ' + http.tls_issuer : null].filter(Boolean);
+        web.appendChild(row('TLS certificate', certParts.join(' · ')));
+      }
+      if (http && (http.tls_not_before || http.tls_not_after)) {
+        web.appendChild(row('Cert validity', [http.tls_not_before || '?', http.tls_not_after || '?'].join(' -> ')));
+      }
       sans.forEach(function (name) { web.appendChild(row('Certificate name', name)); });
+      if (http && http.robots_disallow && http.robots_disallow.length) {
+        web.appendChild(row('robots.txt disallow', http.robots_disallow.join(', ')));
+      }
+      if (http && http.security_txt) {
+        web.appendChild(row('security.txt', http.security_txt));
+      }
       if (paths) { web.appendChild(pathTree(port.paths, { left: 300 })); }
     });
     if (web.childNodes.length > 1) { cards.push(web); }
 
     var ai = card('Ask AI');
-    var ready = Object.keys(state.checklists[host.address] || {}).some(function (id) {
-      return state.checklists[host.address][id].research_ready;
+    var lists = own(state.checklists, host.address) || {};
+    var ready = Object.keys(lists).some(function (id) {
+      var list = own(lists, id);
+      return !!(list && list.research_ready);
     });
     var ask = ai.appendChild(el('div', 'actions'));
     [['local', '[L] Local'], ['cloud', '[C] Cloud triage'], ['research', '[R] Deep research']].forEach(function (tier) {
@@ -1137,8 +1550,10 @@
 
     var evidence = card('Evidence');
     var facts = (host.facts || []).slice();
-    Object.keys(host.ports).forEach(function (key) {
-      (host.ports[key].facts || []).forEach(function (fact) { facts.push(fact); });
+    Object.keys(hostPorts).forEach(function (key) {
+      var port = own(hostPorts, key);
+      if (!port) { return; }
+      (port.facts || []).forEach(function (fact) { facts.push(fact); });
     });
     facts.forEach(function (fact) {
       var line = evidence.appendChild(el('div', 'fact'));
@@ -1151,82 +1566,225 @@
     var note = card('Add a note');
     var box = note.appendChild(el('textarea'));
     box.placeholder = 'What you found by hand: credentials tried, versions seen, pkg:npm/name@1.2.3 ...';
+    if (hasOwn.call(noteDrafts, host.address)) {
+      box.value = noteDrafts[host.address];
+    }
+    box.addEventListener('input', function () {
+      if (box.value) {
+        noteDrafts[host.address] = box.value;
+      } else {
+        delete noteDrafts[host.address];
+      }
+    });
     var save = note.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Save note'));
     save.addEventListener('click', function () {
       if (box.value.trim()) {
         send({ cmd: 'note', address: host.address, text: box.value });
         box.value = '';
+        delete noteDrafts[host.address];
       }
     });
     cards.push(note);
     return cards;
   }
 
+  function downloadReport(urlPath, fallbackName) {
+    var link = document.createElement('a');
+    link.href = urlPath;
+    link.download = fallbackName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function formatHopLine(hop) {
+    if (hop && hop.formatted) { return hop.formatted; }
+    var rtt = (hop && hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
+    var lbl = (hop && hop.label) ? (' (' + hop.label + ') ') : ' ';
+    return 'Hop ' + (hop ? hop.hop : '?') + ': ' + (hop ? hop.address : '?') + lbl + rtt;
+  }
+
+  function appendTracerouteSection(container, traceHops, openByDefault) {
+    if (!traceHops || !traceHops.length) { return; }
+    var section = container.appendChild(fold('trace:hops', 'names', openByDefault));
+    section.appendChild(el('summary', null, 'Traceroute hops (' + traceHops.length + ')'));
+    var pre = section.appendChild(el('pre', 'reply'));
+    pre.textContent = traceHops.map(formatHopLine).join('\n');
+    var toggleWrap = section.appendChild(el('div', 'actions'));
+    var btn = toggleWrap.appendChild(el('button', null,
+      traceExpanded ? 'Collapse traceroute on map' : 'Expand traceroute on map'));
+    btn.addEventListener('click', function () {
+      traceExpanded = !traceExpanded;
+      drawn = '';
+      renderGraph();
+      renderDetail();
+    });
+  }
+
   // The selected node: its facts in the card beside the map, and for a host
   // one card per subject at the head of the cards below.
+  var lastDetailId = null;
   function renderDetail() {
     var detail = byId('detail');
     var cards = byId('host-cards');
-    // Keep a half-written note when the state refreshes.
-    var draft = cards.querySelector('textarea');
+    // Keep cursor/focus and per-host note draft across live refreshes.
+    var sameHost = selected && selected === lastDetailId;
+    var draft = sameHost ? cards.querySelector('textarea') : null;
     var draftText = draft ? draft.value : '';
     var hadFocus = draft && document.activeElement === draft;
+    var selStart = hadFocus ? draft.selectionStart : null;
+    var selEnd = hadFocus ? draft.selectionEnd : null;
+    lastDetailId = selected;
     clear(detail);
     clear(cards);
-    var node = selected ? cy.$id(selected) : null;
-    if (!node || node.empty()) {
+    var data = selectedNodeData();
+    if (!data) {
       byId('detail-title').textContent = 'Selected';
       detail.appendChild(el('p', 'note', 'Click a node on the map, or a host in the list below, to see what is ' +
         'known about it.'));
+      var wsExport = detail.appendChild(el('div', 'actions'));
+      var expAll = wsExport.appendChild(el('button', null, 'Export report (.md)'));
+      expAll.addEventListener('click', function () {
+        downloadReport('/api/report', 'engagement-report.md');
+      });
+      var printAll = wsExport.appendChild(el('button', null, 'Print / PDF'));
+      printAll.addEventListener('click', function () { window.print(); });
       return;
     }
-    var data = node.data();
-    var host = data.address ? state.graph.hosts[data.address] : null;
+    var host = data.address && state.graph ? own(state.graph.hosts, data.address) : null;
     if (host) {
+      if (sameHost && draftText) {
+        noteDrafts[host.address] = draftText;
+      }
       byId('detail-title').textContent = 'Host Info';
       // address -> type -> OS -> version, one row each.
-      var parts = data.headline.split(' -> ');
+      var parts = String(data.headline || '').split(' -> ');
       var guessed = / \(OS read off a service banner\)$/;
       var version = (parts[3] || '').replace(guessed, '');
       // Open ports have a card of their own; why the node is drawn as it is
       // and where the system came from are tooltips here.
-      detail.appendChild(row('Address', parts[0]));
-      detail.appendChild(row('Type', parts[1])).title = 'Drawn this way because ' + data.why + '.';
+      detail.appendChild(row('Address', parts[0] || host.address));
+      var typeRow = detail.appendChild(row('Type', parts[1] || 'not known'));
+      if (data.why) { typeRow.title = 'Drawn this way because ' + data.why + '.'; }
       var banner = guessed.test(parts[3] || '');
-      var system = detail.appendChild(row('System', banner ? marked(parts[2], 'info') : parts[2]));
+      var system = detail.appendChild(row('System', banner ? marked(parts[2] || 'not known', 'info') : (parts[2] || 'not known')));
       if (banner) { system.title = 'Read off a service banner, not reported by an OS scan.'; }
-      detail.appendChild(row('Version', version));
-      (host.hostnames || []).forEach(function (name) { detail.appendChild(row('Name', name)); });
+      detail.appendChild(row('Version', version || 'not known'));
+      var assoc = associatedNamesFor(host, data);
+      if (assoc.domains.length || assoc.hosts.length) {
+        detail.appendChild(el('h3', null, 'Associated Hosts'));
+        if (assoc.domains.length) {
+          detail.appendChild(row('Domains', assoc.domains.join('\n')));
+        }
+        if (assoc.hosts.length) {
+          detail.appendChild(row('Hosts', assoc.hosts.join('\n')));
+        }
+      }
+      if (data.city) { detail.appendChild(row('Location', data.city)); }
       if (host.mac) { detail.appendChild(row('Hardware address', host.mac)); }
-      detail.appendChild(row('Route', data.reachable ? marked('known', 'ok')
-        : marked(data.by_name ? 'address not known' : 'none known', 'warn')));
+      if (host.asn) {
+        var asnText = host.asn + (host.country ? ' (' + host.country + ')' : '');
+        detail.appendChild(row('ASN / Org', asnText));
+      }
+      if (host.bgp_prefix) {
+        detail.appendChild(row('BGP prefix', host.bgp_prefix));
+      }
+      if (host.ipv6_dns) {
+        var hasV6 = host.ipv6_dns.indexOf('no AAAA') === -1;
+        detail.appendChild(row('IPv6 DNS', marked(host.ipv6_dns, hasV6 ? 'ok' : 'info')));
+      }
+      if (host.waf_cdn) {
+        detail.appendChild(row('WAF / CDN', marked(host.waf_cdn, 'info')));
+      }
+      var traceHops = data.trace_hops || [];
+      var hops = host.hops || data.hops || [];
+      var hopTotal = data.hop_count || traceHops.length || hops.length;
+      if (hopTotal) {
+        var rttSuffix = (data.rtt_ms !== undefined && data.rtt_ms !== null) ? (' · ' + data.rtt_ms.toFixed(1) + ' ms') : '';
+        var routeRow = detail.appendChild(row('Route', marked(hopTotal + (hopTotal === 1 ? ' hop' : ' hops') + rttSuffix + ' -> ' + host.address, 'ok')));
+        if (hops.length) { routeRow.title = hops.concat([host.address]).join(' -> '); }
+        appendTracerouteSection(detail, traceHops, false);
+      } else {
+        detail.appendChild(row('Route', data.reachable ? marked('known', 'ok')
+          : marked(data.by_name ? 'address not known' : 'none known', 'warn')));
+      }
+      var exportActions = detail.appendChild(el('div', 'actions'));
+      var exportMd = exportActions.appendChild(el('button', null, 'Export report (.md)'));
+      exportMd.addEventListener('click', function () {
+        downloadReport('/api/report/' + encodeURIComponent(host.address), 'report-' + host.address + '.md');
+      });
+      var exportPdf = exportActions.appendChild(el('button', null, 'Print / PDF'));
+      exportPdf.addEventListener('click', function () { window.print(); });
       hostCards(host, data).forEach(function (one) { cards.appendChild(one); });
       var box = cards.querySelector('textarea');
-      if (box && draftText) { box.value = draftText; }
-      if (box && hadFocus) { box.focus(); }
+      if (box && hadFocus) {
+        box.focus();
+        if (typeof selStart === 'number' && typeof selEnd === 'number') {
+          try { box.setSelectionRange(selStart, selEnd); } catch (_) {}
+        }
+      }
       return;
     }
-    byId('detail-title').textContent = data.caption.split('\n')[0];
+    byId('detail-title').textContent = String(data.caption || data.label || data.id || 'Selected').split('\n')[0];
     if (data.kind === 'interface') {
-      var name = data.id.slice(3);
+      var name = String(data.id || '').slice(3);
       if (data.network) { detail.appendChild(row('Network', data.network)); }
-      (state.graph.local.interfaces || []).forEach(function (iface) {
+      ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
         if (iface.name !== name) { return; }
         detail.appendChild(row('Interface', name + ' (' + iface.kind + (iface.up ? ', up' : ', down') + ')'));
-        iface.addresses.forEach(function (address) { detail.appendChild(row('This machine', address)); });
+        (iface.addresses || []).forEach(function (address) { detail.appendChild(row('This machine', address)); });
       });
       if (data.hidden_neighbours) {
         detail.appendChild(el('p', 'note', data.hidden_neighbours + ' more devices in the neighbour table are not drawn.'));
       }
     } else if (data.kind === 'neighbour') {
-      detail.appendChild(row('Address', data.label));
-      detail.appendChild(row('Hardware address', data.mac));
-      detail.appendChild(row('Seen on', data.interface));
+      detail.appendChild(row('Address', data.label || ''));
+      detail.appendChild(row('Hardware address', data.mac || ''));
+      detail.appendChild(row('Seen on', data.interface || ''));
       detail.appendChild(el('p', 'note', 'It becomes a host once a scan, an imported file or the terminal output mentions it.'));
+    } else if (data.kind === 'egress') {
+      byId('detail-title').textContent = data.vpn ? 'VPN Exit' : 'Public WAN Egress';
+      if (data.vpn) {
+        detail.appendChild(row('Tunnel', marked(data.vpn, 'ok')));
+        detail.appendChild(row('OPSEC status', marked('VPN active', 'ok')));
+      } else {
+        detail.appendChild(row('Public IP', data.public_address || 'resolving...'));
+        detail.appendChild(row('ISP / Network', data.isp || 'not known'));
+        detail.appendChild(row('OPSEC status', marked('no VPN (direct WAN egress)', 'warn')));
+      }
+      detail.appendChild(el('p', 'note', 'This is the public egress point that remote targets see when meow connects to them.'));
     } else if (data.kind === 'internet') {
-      detail.appendChild(el('p', 'note', 'meow has sent nothing there to find this out.'));
+      byId('detail-title').textContent = 'Internet Transit';
+      var netHops = data.trace_hops || [];
+      if (data.hop_count) {
+        detail.appendChild(row('Transit hops', String(data.hop_count)));
+      }
+      if (data.rtt_ms !== undefined && data.rtt_ms !== null) {
+        detail.appendChild(row('Round-trip latency', data.rtt_ms.toFixed(1) + ' ms'));
+      }
+      if (netHops.length) {
+        appendTracerouteSection(detail, netHops, true);
+      } else {
+        detail.appendChild(el('p', 'note', 'Run `recon <target>` to measure intermediate traceroute hops and round-trip latency across the Internet.'));
+      }
+    } else if (data.kind === 'hop' && data.hop) {
+      byId('detail-title').textContent = 'Traceroute Hop ' + data.hop.hop;
+      detail.appendChild(row('Hop', String(data.hop.hop)));
+      detail.appendChild(row('Address', data.hop.address || '* * *'));
+      if (data.hop.label) { detail.appendChild(row('Node / Role', data.hop.label)); }
+      detail.appendChild(row('RTT latency', (data.hop.rtt_ms !== null && data.hop.rtt_ms !== undefined) ? (data.hop.rtt_ms.toFixed(1) + ' ms') : '—'));
+    } else if (data.kind === 'waf') {
+      byId('detail-title').textContent = 'WAF / CDN Edge';
+      detail.appendChild(row('Provider', marked(data.waf || 'WAF / CDN', 'info')));
+      if (data.target) { detail.appendChild(row('Protected origin', data.target)); }
+      detail.appendChild(el('p', 'note', 'Detected before directory scanning (`dirs`) runs so meow avoids wasting requests or getting your egress IP blocked by a strict WAF.'));
+    } else if (data.kind === 'asn') {
+      byId('detail-title').textContent = 'Cloud / ASN Group';
+      detail.appendChild(row('ASN / Provider', data.asn || data.label || ''));
+      if (data.bgp_prefix) { detail.appendChild(row('BGP prefix', data.bgp_prefix)); }
+      detail.appendChild(el('p', 'note', 'Sibling targets hosted in the same autonomous system are grouped together on the map.'));
     } else {
-      detail.appendChild(row('Name', data.label));
+      detail.appendChild(row('Name', data.label || data.id || ''));
     }
     detail.appendChild(drawnAs(data));
   }
@@ -1240,7 +1798,13 @@
   }
 
   cy.on('tap', 'node', function (event) {
-    select(event.target.id());
+    var id = event.target.id();
+    if (id === 'internet') {
+      traceExpanded = !traceExpanded;
+      drawn = '';
+      renderGraph();
+    }
+    select(id);
   });
   // Dragging the empty background scrolls the row, like the scrollbar.
   var dragFrom = null;

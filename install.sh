@@ -16,22 +16,33 @@
 # Nothing is installed that is already present, so it is safe to run again.
 
 set -eu
+unset CDPATH
 
 MIN_RUST_MINOR=89
 RUSTUP_URL="https://sh.rustup.rs"
 # The SecLists web-content wordlist (about 4,700 entries), pinned to an immutable commit.
 WORDLIST_URL="https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
-WORDLIST_SHA256="${MEOW_WORDLIST_SHA256:-78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52}"
+WORDLIST_SHA256="78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
+# The most a location database file may weigh, packed and unpacked.
+GEO_MAX_PACKED=209715200
+GEO_MAX_BYTES=536870912
 KATANA_GO="github.com/projectdiscovery/katana/cmd/katana@v1.1.2"
+FEROXBUSTER_VERSION="2.11.0"
 
 rustup_init=""
 wordlist_part=""
+geo_part=""
 cleanup() {
     [ -n "$rustup_init" ] && rm -f "$rustup_init"
     [ -n "$wordlist_part" ] && rm -f "$wordlist_part"
+    [ -n "$geo_part" ] && rm -f "$geo_part" "$geo_part.gz"
     return 0
 }
-trap cleanup EXIT INT TERM
+# Ctrl-C stops the script: without the exit the shell would carry on with
+# the next download or package install after cleaning up.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -40,6 +51,19 @@ die() {
     exit 1
 }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Strip empty and relative PATH segments so command lookups never run binaries from CWD.
+clean_path=""
+old_ifs=$IFS
+IFS=:
+for path_entry in ${PATH:-}; do
+    case "$path_entry" in
+    /*) clean_path="${clean_path:+$clean_path:}$path_entry" ;;
+    esac
+done
+IFS=$old_ifs
+PATH=$clean_path
+export PATH
 
 assume_yes=no
 dry_run=no
@@ -64,10 +88,18 @@ done
 
 # The tools need no source tree: meow runs this script from its own copy.
 if [ "$tools_only" = no ]; then
-    cd "$(dirname "$0")"
+    case "$0" in
+    /* | ./* | ../*) script_dir=$(dirname "$0") ;;
+    *) script_dir=$(dirname "./$0") ;;
+    esac
+    cd -- "$script_dir"
     if [ ! -f Cargo.toml ] || ! grep -q '^name = "meow"' Cargo.toml; then
         die "Run this script from the meow repository (Cargo.toml not found next to it)."
     fi
+else
+    # Nothing below needs the folder the user is in, and rustup's cargo and
+    # rustc would obey a rust-toolchain.toml found there.
+    cd / || die "Cannot change to the root directory."
 fi
 
 case "$(uname -s)" in
@@ -81,7 +113,7 @@ esac
 original_path=$PATH
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 # A toolchain installed by rustup may not be on PATH in this shell yet.
-if ! have cargo && [ -f "$cargo_home/env" ]; then
+if [ "$dry_run" = no ] && ! have cargo && [ -f "$cargo_home/env" ] && [ ! -L "$cargo_home/env" ]; then
     # shellcheck disable=SC1091
     . "$cargo_home/env"
 fi
@@ -139,7 +171,9 @@ rust_minor() {
 # --- What is missing ------------------------------------------------------
 
 need_compiler=no
-if [ "$os" = macos ]; then
+if [ "$tools_only" = yes ]; then
+    :
+elif [ "$os" = macos ]; then
     # /usr/bin/cc exists on every Mac but only works once the Command Line
     # Tools (or Xcode) are installed.
     xcode-select -p >/dev/null 2>&1 || need_compiler=yes
@@ -150,7 +184,9 @@ fi
 need_rust=no
 update_rust=no
 found_rust=""
-if ! have cargo || ! have rustc; then
+if [ "$tools_only" = yes ]; then
+    : # meow is not rebuilt, so Rust is not looked at.
+elif ! have cargo || ! have rustc; then
     need_rust=yes
 else
     found_rust=$(rust_minor)
@@ -188,6 +224,9 @@ for list in \
     /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt \
     /usr/share/wordlists/dirb/common.txt \
     /usr/share/dirb/wordlists/common.txt \
+    /opt/homebrew/share/meow/wordlists/common.txt \
+    /usr/local/share/meow/wordlists/common.txt \
+    /home/linuxbrew/.linuxbrew/share/meow/wordlists/common.txt \
     /opt/homebrew/share/seclists/Discovery/Web-Content/common.txt \
     /usr/local/share/seclists/Discovery/Web-Content/common.txt \
     /home/linuxbrew/.linuxbrew/share/seclists/Discovery/Web-Content/common.txt \
@@ -204,7 +243,8 @@ done
 # each month; a copy younger than 30 days is kept.
 geo_dir="$meow_home/geo"
 need_geo=$with_geo
-if [ -n "$(find "$geo_dir/dbip-city-lite.mmdb" -mtime -30 2>/dev/null)" ]; then
+if [ -n "$(find "$geo_dir/dbip-city-lite.mmdb" -mtime -30 2>/dev/null)" ] &&
+    [ -n "$(find "$geo_dir/dbip-asn-lite.mmdb" -mtime -30 2>/dev/null)" ]; then
     need_geo=no
 fi
 if [ "$need_geo" = yes ] && ! have gzip; then
@@ -218,10 +258,17 @@ if [ "$need_rust$need_wordlist$need_geo" != nonono ] && ! have curl && ! have wg
 fi
 
 fetch() {
+    case "$1" in
+    https://*) ;;
+    *) return 1 ;;
+    esac
+    max_dl=${3:-$GEO_MAX_PACKED}
     if have curl; then
-        curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"
+        curl --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 5 --max-filesize "$max_dl" -fsSL -o "$2" "$1"
     else
-        wget --https-only -q -O "$2" "$1"
+        # wget follows a redirect to http:// even with --https-only, so it
+        # follows none.
+        wget --https-only --max-redirect=0 -q -O "$2" "$1"
     fi
 }
 
@@ -348,16 +395,13 @@ fi
 
 if [ "$need_rust" = yes ]; then
     say "Installing Rust with rustup"
-    rustup_init=$(mktemp)
+    tmp_base=${TMPDIR:-/tmp}
+    tmp_base=${tmp_base%/}
+    rustup_init=$(mktemp "${tmp_base:-/tmp}/meow-rustup.XXXXXX")
     # Downloaded to a file first: a failed download must not run as an
     # empty script.
-    if have curl; then
-        curl --proto '=https' --tlsv1.2 -sSf -o "$rustup_init" "$RUSTUP_URL" ||
-            die "Could not download the Rust installer from $RUSTUP_URL."
-    else
-        wget --https-only -q -O "$rustup_init" "$RUSTUP_URL" ||
-            die "Could not download the Rust installer from $RUSTUP_URL."
-    fi
+    fetch "$RUSTUP_URL" "$rustup_init" 67108864 ||
+        die "Could not download the Rust installer from $RUSTUP_URL."
     sh "$rustup_init" -y --profile minimal --no-modify-path || die "The Rust installer failed."
     # shellcheck disable=SC1091
     . "$cargo_home/env"
@@ -400,7 +444,7 @@ install_tool() {
     feroxbuster)
         have cargo || return 1
         say "Building feroxbuster with cargo (a few minutes)"
-        cargo install feroxbuster --locked
+        cargo install feroxbuster --locked --version "$FEROXBUSTER_VERSION"
         ;;
     katana)
         if have go; then
@@ -432,48 +476,76 @@ fi
 
 if [ "$need_wordlist" = yes ]; then
     say "Downloading the wordlist"
-    mkdir -p "$wordlist_dir"
-    wordlist_part=$(mktemp "$wordlist_dir/.common.txt.XXXXXX")
-    if fetch "$WORDLIST_URL" "$wordlist_part" &&
-        [ -s "$wordlist_part" ] &&
-        ! grep -qi '<html' "$wordlist_part" &&
-        verify_sha256 "$wordlist_part" "$WORDLIST_SHA256"; then
-        mv "$wordlist_part" "$wordlist_dir/common.txt"
-        wordlist_part=""
-        say "Wordlist saved to $wordlist_dir/common.txt"
+    if [ -L "$meow_home" ] || [ -L "$wordlist_dir" ] || [ -L "$wordlist_dir/common.txt" ]; then
+        warn "Refusing to write wordlist through a symbolic link under $meow_home."
     else
-        rm -f "$wordlist_part"
-        wordlist_part=""
-        warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $wordlist_dir and meow will use it."
+        (umask 077 && mkdir -p "$meow_home" "$wordlist_dir")
+        chmod 0700 "$meow_home" "$wordlist_dir" 2>/dev/null || true
+        wordlist_part=$(mktemp "$wordlist_dir/.common.txt.XXXXXX")
+        if fetch "$WORDLIST_URL" "$wordlist_part" 16777216 &&
+            [ -s "$wordlist_part" ] &&
+            ! grep -qi '<html' "$wordlist_part" &&
+            verify_sha256 "$wordlist_part" "$WORDLIST_SHA256" &&
+            [ ! -L "$wordlist_dir/common.txt" ]; then
+            chmod 0600 "$wordlist_part" 2>/dev/null || true
+            mv "$wordlist_part" "$wordlist_dir/common.txt"
+            wordlist_part=""
+            say "Wordlist saved to $wordlist_dir/common.txt"
+        else
+            rm -f "$wordlist_part"
+            wordlist_part=""
+            warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $wordlist_dir and meow will use it."
+        fi
     fi
 fi
 
 # This month's file, or last month's early in a month before it is out.
 geo_get() {
     name=$1
-    this_month=$(date +%Y-%m)
-    last_month=$(date -d "$(date +%Y-%m-15) -1 month" +%Y-%m 2>/dev/null || date -v-1m +%Y-%m)
-    part=$(mktemp "$geo_dir/.$name.XXXXXX")
+    [ ! -L "$geo_dir/$name.mmdb" ] || return 1
+    year=$(date -u +%Y)
+    mon=$(date -u +%m)
+    mon_num=${mon#0}
+    this_month=$(printf '%04d-%02d' "$year" "$mon_num")
+    if [ "$mon_num" -eq 1 ]; then
+        last_month=$(printf '%04d-12' "$((year - 1))")
+    else
+        last_month=$(printf '%04d-%02d' "$year" "$((mon_num - 1))")
+    fi
+    geo_part=$(mktemp "$geo_dir/.$name.XXXXXX")
     for month in "$this_month" "$last_month"; do
-        if fetch "https://download.db-ip.com/free/$name-$month.mmdb.gz" "$part.gz" &&
-            gzip -dc "$part.gz" >"$part" &&
-            tail -c 100000 "$part" | grep -aq 'MaxMind.com'; then
-            rm -f "$part.gz"
-            mv "$part" "$geo_dir/$name.mmdb"
+        # Bounded at every step: the download, and what it unpacks to.
+        if fetch "https://download.db-ip.com/free/$name-$month.mmdb.gz" "$geo_part.gz" "$GEO_MAX_PACKED" &&
+            [ "$(wc -c <"$geo_part.gz")" -le "$GEO_MAX_PACKED" ] &&
+            gzip -dc "$geo_part.gz" | head -c "$((GEO_MAX_BYTES + 1))" >"$geo_part" &&
+            [ "$(wc -c <"$geo_part")" -le "$GEO_MAX_BYTES" ] &&
+            gzip -t "$geo_part.gz" >/dev/null 2>&1 &&
+            tail -c 100000 "$geo_part" | LC_ALL=C tr -cd '\40-\176\n' | grep -q 'MaxMind\.com' &&
+            [ ! -L "$geo_dir/$name.mmdb" ]; then
+            rm -f "$geo_part.gz"
+            chmod 0600 "$geo_part" 2>/dev/null || true
+            mv "$geo_part" "$geo_dir/$name.mmdb"
+            geo_part=""
             return 0
         fi
+        rm -f "$geo_part" "$geo_part.gz"
     done
-    rm -f "$part" "$part.gz"
+    geo_part=""
     return 1
 }
 
 if [ "$need_geo" = yes ]; then
     say "Downloading the location database (IP Geolocation by DB-IP, https://db-ip.com)"
-    mkdir -p "$geo_dir"
-    if geo_get dbip-city-lite && geo_get dbip-asn-lite; then
-        say "Location database saved to $geo_dir"
+    if [ -L "$meow_home" ] || [ -L "$geo_dir" ]; then
+        warn "Refusing to write location database through a symbolic link under $meow_home."
     else
-        warn "Could not download the location database from download.db-ip.com. The map still shows your own place; run this again later."
+        (umask 077 && mkdir -p "$meow_home" "$geo_dir")
+        chmod 0700 "$meow_home" "$geo_dir" 2>/dev/null || true
+        if geo_get dbip-city-lite && geo_get dbip-asn-lite; then
+            say "Location database saved to $geo_dir"
+        else
+            warn "Could not download the location database from download.db-ip.com. The map still shows your own place; run this again later."
+        fi
     fi
 fi
 

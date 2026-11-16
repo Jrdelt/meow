@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State as AxumState};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,6 +56,21 @@ use crate::workspace::{write_private_atomic, Config, Workspace};
 
 pub const FIRST_PORT: u16 = 8765;
 const PORT_ATTEMPTS: u16 = 100;
+/// Connections the server holds at once before one has shown the session
+/// token. Each takes a file descriptor of the session's own process, which
+/// also needs them for the terminal, the database and the scanners.
+const MAX_CONNECTIONS: usize = 64;
+/// Open WebSocket sessions held at once (separate from HTTP head slots).
+const MAX_WS_CONNECTIONS: usize = 32;
+/// How long a client may take to send a whole request head, on a new
+/// connection and between requests on one it keeps open.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time allowed for an HTTP request body + handler to complete.
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pause after a failed accept (out of descriptors) before trying again.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// `runtime.json` is about 110 bytes.
+const RUNTIME_MAX: u64 = 4096;
 const MAX_NOTICES: usize = 100;
 const TAP_QUEUE: usize = 4096;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -76,14 +91,18 @@ pub struct RuntimeInfo {
 }
 
 impl RuntimeInfo {
+    /// Reads `runtime.json`. Helpers and the listing read it before anything
+    /// else in a workspace, so a link, a pipe or a huge file in its place is
+    /// "no session" and never read through.
     pub fn read(path: &Path) -> Option<Self> {
-        let info: Self = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let text = crate::workspace::read_bounded(path, RUNTIME_MAX).ok()?;
+        let info: Self = serde_json::from_str(&text).ok()?;
         let valid_token = !info.token.is_empty()
             && info
                 .token
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
-        (info.port != 0 && valid_token).then_some(info)
+        (info.pid != 0 && info.port != 0 && valid_token).then_some(info)
     }
 
     pub fn base_url(&self) -> String {
@@ -97,6 +116,10 @@ struct RuntimeFile(PathBuf);
 impl Drop for RuntimeFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        // The page `meow map` gave the browser holds the same token.
+        if let Some(workspace) = self.0.parent() {
+            let _ = std::fs::remove_file(workspace.join("tmp").join(webui::OPENER_FILE));
+        }
     }
 }
 
@@ -108,11 +131,16 @@ pub fn new_token() -> Result<String> {
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    let a = std::hint::black_box(a.as_bytes());
+    let b = std::hint::black_box(b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff = std::hint::black_box(diff | (x ^ y));
+    }
+    std::hint::black_box(diff) == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +242,9 @@ pub struct State {
     pub session: String,
     pub port: u16,
     pub token: String,
+    /// Served in the map page and sent with every state push to it, never
+    /// taken from a client: how the page knows its own session.
+    page_key: String,
     pub config: Config,
     workspace: Mutex<Workspace>,
     graph: Mutex<Graph>,
@@ -223,6 +254,7 @@ pub struct State {
     revision: watch::Sender<u64>,
     dirty: AtomicBool,
     ground_queue: mpsc::UnboundedSender<String>,
+    ground_pending: Mutex<std::collections::HashSet<String>>,
     recon_queue: mpsc::UnboundedSender<i64>,
     cve: Option<CveClient>,
     vault: Mutex<Vault>,
@@ -231,6 +263,8 @@ pub struct State {
     /// Where this machine is estimated to be; `None` until the map asks.
     location: Mutex<Option<Location>>,
     locating: AtomicBool,
+    /// The "graph is full" notice was shown.
+    full_noticed: AtomicBool,
     /// The location map's pictures, served to the page from memory.
     pictures: Mutex<Vec<Picture>>,
     /// The location database on this disk (`~/.meow/geo`).
@@ -241,8 +275,21 @@ pub struct State {
     target_pictures: Mutex<Vec<Picture>>,
     target_places: Mutex<std::collections::HashMap<String, Option<Place>>>,
     target_generation: std::sync::atomic::AtomicU64,
+    ws_slots: Arc<tokio::sync::Semaphore>,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
+}
+
+/// Removes the evidence record of every node in a port's path tree.
+fn drop_path_evidence(node: &mut Value) {
+    if let Some(object) = node.as_object_mut() {
+        object.remove("record");
+        if let Some(children) = object.get_mut("children").and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                drop_path_evidence(child);
+            }
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -321,23 +368,128 @@ impl State {
             return;
         }
         let path = self.graph_path();
-        let result = self.graph().save(&path);
+        let (result, full) = {
+            let mut graph = self.graph();
+            (graph.save(&path), graph.is_full())
+        };
         if let Err(error) = result {
-            self.dirty.store(true, Ordering::SeqCst);
+            // Tried again on the next change, not in a loop: a graph that
+            // is too large stays too large.
             self.notice(format!("cannot save graph.json: {error:#}"));
+        }
+        if full && !self.full_noticed.swap(true, Ordering::SeqCst) {
+            self.notice(
+                "this workspace's graph is full: new hosts, ports and paths are no longer \
+                 recorded. Open a new workspace for further targets"
+                    .to_owned(),
+            );
         }
     }
 
-    /// Queues CVE lookups for a host (no-op when grounding is disabled).
+    pub fn geo_db(&self) -> &GeoDb {
+        &self.geo
+    }
+
+    pub fn cve_enabled(&self) -> bool {
+        self.cve.is_some()
+    }
+
+    /// Runs CVE grounding for `address` immediately and merges hypotheses into the graph.
+    pub async fn ground_host(&self, address: &str) -> Option<(cve::Merged, usize, Vec<String>)> {
+        let client = self.cve.as_ref()?;
+        let host = self.graph().hosts.get(address).cloned()?;
+        let grounding = client.ground(&host).await;
+        let total_matches = grounding.advisories.len();
+        let (merged, first_fix) = {
+            let mut graph = self.graph();
+            let merged = cve::merge(&mut graph, address, &grounding);
+            let first_fix = graph
+                .hosts
+                .get(address)
+                .and_then(|h| cve::fix_plan(h).into_iter().next());
+            (merged, first_fix)
+        };
+        if !grounding.errors.is_empty() {
+            let shown: Vec<&str> = grounding
+                .errors
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect();
+            self.notice(format!(
+                "CVE lookup for {address} is incomplete: {}",
+                shown.join("; ")
+            ));
+        }
+        if merged.added > 0 || merged.dropped > 0 {
+            self.mark_dirty();
+        }
+        if merged.dropped > 0 {
+            self.notice(format!(
+                "{} earlier matches for {address} no longer apply and were removed",
+                merged.dropped
+            ));
+        }
+        if merged.added > 0 {
+            let fix = first_fix
+                .map(|fix| format!(" Most come from one place: {}", fix.action))
+                .unwrap_or_default();
+            let noun = if merged.added == 1 {
+                "advisory"
+            } else {
+                "advisories"
+            };
+            self.notice(format!(
+                "{} possible {noun} for {address} ({} known exploited), matched by version \
+                 number only and not verified.{fix}",
+                merged.added, merged.kev
+            ));
+        }
+        Some((merged, total_matches, grounding.errors))
+    }
+
+    /// Builds [`crate::report::Inputs`] from the live session state.
+    pub fn report_inputs(&self) -> crate::report::Inputs {
+        let tasks = queue::tasks(&self.db_lock(), 200).unwrap_or_default();
+        let mode = self.mode();
+        let graph = self.graph().clone();
+        let secrets = lock(&self.vault).exposed_secrets();
+        let dir = self.workspace_dir();
+        let (replay, chats) = crate::report::read_chats_and_replay(&dir);
+        crate::report::Inputs {
+            session: self.session.clone(),
+            mode,
+            generated_utc: now_rfc3339(),
+            graph,
+            tasks,
+            secrets,
+            replay,
+            chats,
+        }
+    }
+
+    /// Queues CVE lookups for a host (no-op when grounding is disabled or
+    /// the host is already queued).
     pub fn request_grounding(&self, address: &str) {
-        if self.cve.is_some() {
+        if self.cve.is_some() && lock(&self.ground_pending).insert(address.to_owned()) {
             let _ = self.ground_queue.send(address.to_owned());
         }
     }
 
     /// The snapshot sent to the HUD and the browser map.
+    /// Acquires each mutex individually so graph serialization and topology
+    /// construction never block PTY/IPC writers or invert lock ordering.
     pub fn snapshot(&self) -> Value {
-        let graph = self.graph();
+        let tasks = queue::tasks(&self.db_lock(), 20).unwrap_or_default();
+        let mode = self.mode();
+        let revision = *self.revision.borrow();
+        let graph = self.graph().clone();
+        let notices: Vec<Notice> = lock(&self.notices).iter().cloned().collect();
+        let ai = lock(&self.ai_status).clone();
+        let location = lock(&self.location).clone();
+        let raw_target = lock(&self.target).clone();
+        let budget = self.ai.budget();
+
         let mut checklists = serde_json::Map::new();
         for host in graph.hosts.values() {
             let mut per_host = serde_json::Map::new();
@@ -364,26 +516,41 @@ impl State {
             .filter(|(_, plan)| !plan.is_empty())
             .map(|(address, plan)| (address, json!(plan)))
             .collect();
+        // Neither the map nor the HUD shows the raw evidence of each web
+        // path, and it is most of a large graph: it stays out of the push.
+        let mut shown = json!(&graph);
+        if let Some(hosts) = shown.get_mut("hosts").and_then(Value::as_object_mut) {
+            for host in hosts.values_mut() {
+                if let Some(ports) = host.get_mut("ports").and_then(Value::as_object_mut) {
+                    for port in ports.values_mut() {
+                        if let Some(paths) = port.get_mut("paths") {
+                            drop_path_evidence(paths);
+                        }
+                    }
+                }
+            }
+        }
+        let target = raw_target.map(|target| {
+            let mut value = json!(&target);
+            value["addresses"] = known_addresses(&graph, &target.address);
+            value
+        });
         json!({
             "session": self.session,
-            "mode": self.mode(),
+            "mode": mode,
             "port": self.port,
-            "revision": *self.revision.borrow(),
-            "graph": &*graph,
+            "revision": revision,
+            "graph": shown,
             "checklists": checklists,
             "fixes": fixes,
-            "topology": Topology::build(&graph).cytoscape(&graph),
+            "topology": Topology::build(&graph).cytoscape_with_geo(&graph, Some(&self.geo)),
             "machine": observer::machine_report(&graph.local),
-            "tasks": queue::tasks(&self.db_lock(), 20).unwrap_or_default(),
-            "notices": &*lock(&self.notices),
-            "ai": &*lock(&self.ai_status),
-            "location": &*lock(&self.location),
-            "target": lock(&self.target).as_ref().map(|target| {
-                let mut value = json!(target);
-                value["addresses"] = known_addresses(&graph, &target.address);
-                value
-            }),
-            "budget": self.ai.budget(),
+            "tasks": tasks,
+            "notices": notices,
+            "ai": ai,
+            "location": location,
+            "target": target,
+            "budget": budget,
         })
     }
 
@@ -481,6 +648,7 @@ impl State {
                 let parsed = Target::parse(&target).with_context(|| {
                     format!("'{target}' is not a host name, an IP address or a CIDR range")
                 })?;
+                parsed.check_size().map_err(|reason| anyhow!(reason))?;
                 queue::validate_nmap_flags(&flags)?;
                 let preset = self.config.recon.preset(mode, &self.profile_recon());
                 queue::validate_preset_nmap_flags(&preset.nmap_ports, &preset.nmap_services)?;
@@ -577,6 +745,7 @@ impl State {
     /// Runs one AI request to the end, streaming the reply into the status
     /// that the HUD and the map show, then saves it under `chats/`.
     async fn run_ai(self: Arc<Self>, tier: Tier, graph: Graph, host: Host) {
+        let _running = AiRunning(&self.ai_status);
         let streamer = Arc::clone(&self);
         let mut on_text = move |piece: &str| {
             if !piece.is_empty() {
@@ -627,19 +796,25 @@ impl State {
     }
 }
 
-fn observation_address(observation: &Observation) -> Option<String> {
-    match observation {
-        Observation::Host { address, .. }
-        | Observation::Hostname { address, .. }
-        | Observation::Port { address, .. }
-        | Observation::TlsSan { address, .. }
-        | Observation::Http { address, .. }
-        | Observation::Path { address, .. } => Some(address.clone()),
-        Observation::Note { address, .. } => address.clone(),
-        Observation::Script { address, .. } | Observation::NotOpen { address, .. } => {
-            Some(address.clone())
+/// Clears "an AI request is running" when the request ends, however it
+/// ends: one that stopped on a fault must not leave every later request
+/// refused as "already running" for the rest of the session.
+struct AiRunning<'a>(&'a Mutex<AiStatus>);
+
+impl Drop for AiRunning<'_> {
+    fn drop(&mut self) {
+        let mut status = lock(self.0);
+        if status.running {
+            status.running = false;
+            status
+                .error
+                .get_or_insert_with(|| "the request ended unexpectedly".to_owned());
         }
     }
+}
+
+fn observation_address(observation: &Observation) -> Option<String> {
+    observation.address().map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,48 +827,120 @@ fn deny(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "ok": false, "error": message }))).into_response()
 }
 
-fn allowed_origins(port: u16) -> [String; 2] {
-    [
-        format!("http://127.0.0.1:{port}"),
-        format!("http://localhost:{port}"),
-    ]
+fn cookie_name(port: u16) -> String {
+    format!("meow_token_{port}")
 }
 
-/// `Host` must be the loopback address the coordinator listens on.
+/// `Host` must be a single loopback address matching the coordinator's port.
 fn host_allowed(headers: &HeaderMap, port: u16) -> bool {
-    headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| {
-            host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
-        })
+    let mut values = headers.get_all(header::HOST).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value.to_str().is_ok_and(|host| {
+        let host = host.trim();
+        host == format!("127.0.0.1:{port}")
+            || host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+    })
 }
 
 /// A browser sends `Origin` on WebSocket upgrades and cross-site requests;
-/// when present it must be the coordinator's own origin. Native clients
-/// (the HUD, helper subcommands) send none.
+/// when present it must be a single header matching the coordinator's own
+/// origin. Native clients (the HUD, helper subcommands) send none.
 fn origin_allowed(headers: &HeaderMap, port: u16) -> bool {
-    match headers.get(header::ORIGIN) {
-        None => true,
-        Some(value) => value.to_str().is_ok_and(|origin| {
-            allowed_origins(port)
-                .iter()
-                .any(|allowed| allowed == origin)
-        }),
+    let mut values = headers.get_all(header::ORIGIN).iter();
+    let Some(value) = values.next() else {
+        return true;
+    };
+    if values.next().is_some() {
+        return false;
     }
+    value.to_str().is_ok_and(|origin| {
+        let origin = origin.trim();
+        origin.eq_ignore_ascii_case(&format!("http://127.0.0.1:{port}"))
+            || origin.eq_ignore_ascii_case(&format!("http://localhost:{port}"))
+    })
 }
 
-fn token_from(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
-    if let Some(bearer) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-    {
-        return Some(bearer.trim().to_owned());
+enum PresentedToken {
+    Direct(String),
+    Cookie(String),
+}
+
+fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<PresentedToken> {
+    let mut auth_values = headers.get_all(header::AUTHORIZATION).iter();
+    if let Some(first) = auth_values.next() {
+        if auth_values.next().is_some() {
+            return None;
+        }
+        let raw = first.to_str().ok()?.trim();
+        let bearer = raw
+            .get(..7)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+            .map(|_| raw[7..].trim())?;
+        if bearer.is_empty() {
+            return None;
+        }
+        return Some(PresentedToken::Direct(bearer.to_owned()));
     }
-    url::form_urlencoded::parse(query?.as_bytes())
-        .find(|(key, _)| key == "token")
-        .map(|(_, value)| value.into_owned())
+    if let Some(q) = query {
+        let mut found: Option<String> = None;
+        for (key, value) in url::form_urlencoded::parse(q.as_bytes()) {
+            if key == "token" && !value.is_empty() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(value.into_owned());
+            }
+        }
+        if let Some(token) = found {
+            return Some(PresentedToken::Direct(token));
+        }
+    }
+    let scoped_prefix = format!("{}=", cookie_name(port));
+    let mut legacy = None;
+    for cookie_hdr in headers.get_all(header::COOKIE) {
+        let Ok(cookie_str) = cookie_hdr.to_str() else {
+            continue;
+        };
+        for part in cookie_str.split(';') {
+            let trimmed = part.trim();
+            if let Some(val) = trimmed.strip_prefix(&scoped_prefix) {
+                if !val.is_empty() {
+                    return Some(PresentedToken::Cookie(val.to_owned()));
+                }
+            } else if legacy.is_none() {
+                if let Some(val) = trimmed.strip_prefix("meow_token=") {
+                    if !val.is_empty() {
+                        legacy = Some(val.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    legacy.map(PresentedToken::Cookie)
+}
+
+/// RFC 6265 cookies on `127.0.0.1` are shared across ports (`SameSite=Strict`
+/// treats `127.0.0.1:9999` and `127.0.0.1:8765` as same-site), whereas Fetch
+/// Metadata marks cross-port requests `Sec-Fetch-Site: same-site`. When a
+/// browser sends `Sec-Fetch-Site` on a cookie-authenticated request, only
+/// `same-origin` or user-initiated `none` (reload/address bar) is allowed.
+fn sec_fetch_site_allowed_for_cookie(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all("sec-fetch-site").iter();
+    let Some(value) = values.next() else {
+        return true;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value.to_str().is_ok_and(|site| {
+        let site = site.trim();
+        site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none")
+    })
 }
 
 async fn guard(AxumState(state): AxumState<Shared>, request: Request, next: Next) -> Response {
@@ -702,19 +949,42 @@ async fn guard(AxumState(state): AxumState<Shared>, request: Request, next: Next
     response
 }
 
+/// A refusal by the guard. The connection is closed with it: a client
+/// without the token cannot keep one of the connection slots by asking
+/// again and again.
+fn refuse(status: StatusCode, message: &str) -> Response {
+    let mut response = deny(status, message);
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
 async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response {
     let headers = request.headers();
     if !host_allowed(headers, state.port) {
-        return deny(StatusCode::FORBIDDEN, "unexpected Host header");
+        return refuse(StatusCode::FORBIDDEN, "unexpected Host header");
     }
     if !origin_allowed(headers, state.port) {
-        return deny(StatusCode::FORBIDDEN, "cross-origin request refused");
+        return refuse(StatusCode::FORBIDDEN, "cross-origin request refused");
     }
-    let presented = token_from(headers, request.uri().query());
-    if !presented.is_some_and(|token| constant_time_eq(&token, &state.token)) {
-        return deny(StatusCode::UNAUTHORIZED, "missing or wrong session token");
+    let Some(presented) = token_from(headers, request.uri().query(), state.port) else {
+        return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
+    };
+    let (token, from_cookie) = match presented {
+        PresentedToken::Direct(token) => (token, false),
+        PresentedToken::Cookie(token) => (token, true),
+    };
+    if !constant_time_eq(&token, &state.token) {
+        return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     }
-    next.run(request).await
+    if from_cookie && !sec_fetch_site_allowed_for_cookie(headers) {
+        return refuse(StatusCode::FORBIDDEN, "cross-origin cookie request refused");
+    }
+    match tokio::time::timeout(REQUEST_BODY_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => refuse(StatusCode::REQUEST_TIMEOUT, "request timed out"),
+    }
 }
 
 async fn get_state(AxumState(state): AxumState<Shared>) -> Json<Value> {
@@ -731,17 +1001,69 @@ async fn post_command(
     }
 }
 
+async fn get_report(AxumState(state): AxumState<Shared>) -> Response {
+    let inputs = state.report_inputs();
+    let filename = format!("report-{}.md", crate::ai::chat_file_name(&inputs.session));
+    let markdown = crate::report::render(&inputs);
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        markdown,
+    )
+        .into_response();
+    if let Ok(disp) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, disp);
+    }
+    response
+}
+
+async fn get_host_report(
+    AxumState(state): AxumState<Shared>,
+    AxumPath(address): AxumPath<String>,
+) -> Response {
+    let inputs = state.report_inputs();
+    let Some(markdown) = crate::report::render_host_report(&inputs, &address) else {
+        return refuse(StatusCode::NOT_FOUND, "unknown host");
+    };
+    let filename = format!("report-{}.md", crate::ai::chat_file_name(&address));
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        markdown,
+    )
+        .into_response();
+    if let Ok(disp) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, disp);
+    }
+    response
+}
+
 async fn websocket(AxumState(state): AxumState<Shared>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve_socket(state, socket))
+    let Ok(permit) = Arc::clone(&state.ws_slots).try_acquire_owned() else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many open WebSocket connections",
+        );
+    };
+    upgrade
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| serve_socket(state, socket, permit))
 }
 
 /// Pushes a state snapshot on connect and after every change (rate-limited),
-/// and executes commands the client sends.
-async fn serve_socket(state: Shared, mut socket: WebSocket) {
+/// and executes commands the client sends without blocking incoming frames.
+async fn serve_socket(
+    state: Shared,
+    mut socket: WebSocket,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
     let mut revision = state.revision.subscribe();
     let send_state = |state: &Shared| {
         Message::Text(
-            json!({ "type": "state", "state": state.snapshot() })
+            json!({ "type": "state", "key": state.page_key, "state": state.snapshot() })
                 .to_string()
                 .into(),
         )
@@ -749,15 +1071,23 @@ async fn serve_socket(state: Shared, mut socket: WebSocket) {
     if socket.send(send_state(&state)).await.is_err() {
         return;
     }
+    let mut pending_push = false;
+    let throttle = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(throttle);
     loop {
         tokio::select! {
-            changed = revision.changed() => {
+            changed = revision.changed(), if !pending_push => {
                 if changed.is_err() {
                     break;
                 }
-                // Coalesce bursts of changes into one snapshot.
-                tokio::time::sleep(WS_MIN_INTERVAL).await;
-                revision.borrow_and_update();
+                pending_push = true;
+                throttle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + WS_MIN_INTERVAL);
+            }
+            () = &mut throttle, if pending_push => {
+                pending_push = false;
+                let _ = revision.borrow_and_update();
                 if socket.send(send_state(&state)).await.is_err() {
                     break;
                 }
@@ -781,7 +1111,17 @@ async fn serve_socket(state: Shared, mut socket: WebSocket) {
 }
 
 async fn index(AxumState(state): AxumState<Shared>) -> Response {
-    webui::page(&state.token)
+    let mut response = webui::page(&state.token, &state.page_key);
+    if response.status() == StatusCode::OK {
+        if let Ok(cookie) = HeaderValue::from_str(&format!(
+            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+            cookie_name(state.port),
+            state.token
+        )) {
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+        }
+    }
+    response
 }
 
 async fn asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -794,27 +1134,40 @@ async fn map_tile(
     AxumState(state): AxumState<Shared>,
     AxumPath((z, x, y)): AxumPath<(u8, u32, u32)>,
 ) -> Response {
-    let pictures = lock(&state.pictures);
-    match pictures
-        .iter()
-        .find(|picture| (picture.z, picture.x, picture.y) == (z, x, y))
-    {
-        Some(picture) => (
-            [(header::CONTENT_TYPE, picture.media_type)],
-            picture.bytes.clone(),
-        )
-            .into_response(),
-        None => match lock(&state.target_pictures)
+    if !state.config.location.enabled || !state.config.location.map {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let found = {
+        let pictures = lock(&state.pictures);
+        pictures
             .iter()
             .find(|picture| (picture.z, picture.x, picture.y) == (z, x, y))
-        {
-            Some(picture) => (
-                [(header::CONTENT_TYPE, picture.media_type)],
-                picture.bytes.clone(),
-            )
-                .into_response(),
-            None => StatusCode::NOT_FOUND.into_response(),
-        },
+            .map(|picture| (picture.media_type, picture.bytes.clone()))
+    }
+    .or_else(|| {
+        let target_pictures = lock(&state.target_pictures);
+        target_pictures
+            .iter()
+            .find(|picture| (picture.z, picture.x, picture.y) == (z, x, y))
+            .map(|picture| (picture.media_type, picture.bytes.clone()))
+    });
+    match found {
+        Some((media_type, bytes)) => ([(header::CONTENT_TYPE, media_type)], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn parse_ip_unscoped(value: &str) -> Option<std::net::IpAddr> {
+    match value.split_once('%') {
+        None => value.parse::<std::net::IpAddr>().ok(),
+        Some((bare, zone)) => {
+            if zone.is_empty() || zone.contains('%') {
+                return None;
+            }
+            bare.parse::<std::net::Ipv6Addr>()
+                .ok()
+                .map(std::net::IpAddr::V6)
+        }
     }
 }
 
@@ -860,14 +1213,16 @@ fn known_addresses(graph: &Graph, address: &str) -> Value {
     }
     let (mut ipv4, mut ipv6) = (Vec::new(), Vec::new());
     for entry in all {
-        match entry.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V4(_)) => ipv4.push(entry),
-            Ok(std::net::IpAddr::V6(_)) => ipv6.push(entry),
-            Err(_) => {}
+        match parse_ip_unscoped(&entry) {
+            Some(std::net::IpAddr::V4(_)) => ipv4.push(entry),
+            Some(std::net::IpAddr::V6(_)) => ipv6.push(entry),
+            None => {}
         }
     }
     json!({ "ipv4": ipv4, "ipv6": ipv6 })
 }
+
+const MAX_CACHED_PLACES: usize = 1024;
 
 /// Finds where the device selected on the map is, then fetches its map's
 /// pictures. A newer selection wins: a stale answer is dropped.
@@ -883,20 +1238,32 @@ async fn locate_target(state: Shared, address: String, generation: u64) {
         credit_url: None,
     };
     let mut pictures = Vec::new();
-    match address.parse::<std::net::IpAddr>() {
-        Err(_) => {
+    match parse_ip_unscoped(&address) {
+        None => {
             target.status = "name_only";
             target.note = Some("only a name is known, no address to place".to_owned());
         }
-        Ok(ip) if geoip::is_local(ip) => {
-            // On your network: it is where you are.
+        Some(ip) if geoip::is_local(ip) => {
+            // On your network: it is where you are, unless a full-tunnel VPN
+            // or `[location] enabled = false` hides this machine's location.
             target.status = "local";
-            if let Some(Location::Found { place, map, .. }) = &*lock(&state.location) {
-                target.place = Some(place.clone());
-                target.map = map.clone();
+            let lookup_allowed = {
+                let graph = state.graph();
+                matches!(
+                    location::plan(&settings, &graph.local),
+                    location::Plan::Lookup { .. }
+                )
+            };
+            if lookup_allowed {
+                if let Some(Location::Found { place, map, .. }) = &*lock(&state.location) {
+                    if settings.map {
+                        target.map = map.clone();
+                    }
+                    target.place = Some(place.clone());
+                }
             }
         }
-        Ok(ip) => {
+        Some(ip) => {
             let cached = lock(&state.target_places).get(&address).cloned();
             let place = match cached {
                 Some(place) => Ok(place),
@@ -905,7 +1272,11 @@ async fn locate_target(state: Shared, address: String, generation: u64) {
                     let geo = state.geo.clone();
                     match tokio::task::spawn_blocking(move || geo.lookup(ip)).await {
                         Ok(Ok(place)) => {
-                            lock(&state.target_places).insert(address.clone(), place.clone());
+                            let mut places = lock(&state.target_places);
+                            if places.len() >= MAX_CACHED_PLACES {
+                                places.clear();
+                            }
+                            places.insert(address.clone(), place.clone());
                             Ok(place)
                         }
                         Ok(Err(error)) => Err(Some(format!("{error:#}"))),
@@ -917,7 +1288,7 @@ async fn locate_target(state: Shared, address: String, generation: u64) {
                 Err(None) => {
                     target.status = "no_database";
                     target.note = Some(
-                        "the location database is not installed: run install.sh or meow update"
+                        "the location database is not installed: run meow tools, install.sh, or meow update"
                             .to_owned(),
                     );
                 }
@@ -927,7 +1298,14 @@ async fn locate_target(state: Shared, address: String, generation: u64) {
                     target.status = "found";
                     target.credit = Some(geoip::CREDIT);
                     target.credit_url = Some(geoip::CREDIT_URL);
-                    match location::map_for(&settings, &place).await {
+                    // `[location] enabled = false` asks for no outside
+                    // request about places at all, pictures included.
+                    let map = if settings.enabled {
+                        location::map_for(&settings, &place).await
+                    } else {
+                        None
+                    };
+                    match map {
                         Some(Ok((view, fetched))) => {
                             target.map = Some(Box::new(view));
                             pictures = fetched;
@@ -954,6 +1332,8 @@ fn router(state: Shared) -> Router {
         .route("/assets/{name}", get(asset))
         .route("/map/tile/{z}/{x}/{y}", get(map_tile))
         .route("/api/state", get(get_state))
+        .route("/api/report", get(get_report))
+        .route("/api/report/{address}", get(get_host_report))
         .route("/api/command", post(post_command))
         .route("/ws", get(websocket))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -1020,9 +1400,11 @@ async fn observe_loop(state: Shared) {
 /// change, or a while after a failed lookup.
 async fn location_loop(state: Shared) {
     let settings = state.config.location.clone();
+    let mut revision = state.revision.subscribe();
     let mut last_key: Option<String> = None;
     let mut retry_at: Option<std::time::Instant> = None;
     loop {
+        let _ = revision.borrow_and_update();
         let (key, plan) = {
             let graph = state.graph();
             (
@@ -1069,14 +1451,51 @@ async fn location_loop(state: Shared) {
                     }
                 }
             };
-            // Pictures of a place no longer shown are dropped.
+            // Pictures of a place no longer shown are dropped, and any local
+            // target mirroring our location stops showing stale coordinates.
             if !matches!(found, Location::Found { map: Some(_), .. }) {
                 lock(&state.pictures).clear();
+            }
+            match &found {
+                Location::Found { place, map, .. } => {
+                    if let Some(target) = &mut *lock(&state.target) {
+                        if target.status == "local" {
+                            target.place = Some(place.clone());
+                            target.map = map.clone();
+                        }
+                    }
+                }
+                _ => {
+                    let mut cleared_local = false;
+                    if let Some(target) = &mut *lock(&state.target) {
+                        if target.status == "local" {
+                            target.place = None;
+                            target.map = None;
+                            cleared_local = true;
+                        }
+                    }
+                    if cleared_local {
+                        lock(&state.target_pictures).clear();
+                    }
+                }
             }
             *lock(&state.location) = Some(found);
             state.touch();
         }
-        tokio::time::sleep(LOCATE_EVERY).await;
+        let wait = retry_at
+            .map(|at| {
+                at.saturating_duration_since(std::time::Instant::now())
+                    .min(LOCATE_EVERY)
+            })
+            .unwrap_or(LOCATE_EVERY);
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            changed = revision.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1123,60 +1542,8 @@ async fn tap_loop(state: Shared, mut lines: mpsc::Receiver<String>) {
 /// Runs CVE lookups one host at a time, off the request path.
 async fn grounding_loop(state: Shared, mut queue: mpsc::UnboundedReceiver<String>) {
     while let Some(address) = queue.recv().await {
-        let Some(client) = &state.cve else { continue };
-        let Some(host) = state.graph().hosts.get(&address).cloned() else {
-            continue;
-        };
-        let grounding = client.ground(&host).await;
-        let (merged, first_fix) = {
-            let mut graph = state.graph();
-            let merged = cve::merge(&mut graph, &address, &grounding);
-            let first_fix = graph
-                .hosts
-                .get(&address)
-                .and_then(|host| cve::fix_plan(host).into_iter().next());
-            (merged, first_fix)
-        };
-        // Every source that failed, not only the first: a missing catalog
-        // and an unanswered database are different problems.
-        if !grounding.errors.is_empty() {
-            let shown: Vec<&str> = grounding
-                .errors
-                .iter()
-                .take(3)
-                .map(String::as_str)
-                .collect();
-            state.notice(format!(
-                "CVE lookup for {address} is incomplete: {}",
-                shown.join("; ")
-            ));
-        }
-        if merged.added > 0 || merged.dropped > 0 {
-            state.mark_dirty();
-        }
-        if merged.dropped > 0 {
-            state.notice(format!(
-                "{} earlier matches for {address} no longer apply and were removed",
-                merged.dropped
-            ));
-        }
-        if merged.added > 0 {
-            // Say what these are and what answers most of them, in words
-            // that do not need the evidence model explained first.
-            let fix = first_fix
-                .map(|fix| format!(" Most come from one place: {}", fix.action))
-                .unwrap_or_default();
-            let noun = if merged.added == 1 {
-                "advisory"
-            } else {
-                "advisories"
-            };
-            state.notice(format!(
-                "{} possible {noun} for {address} ({} known exploited), matched by version \
-                 number only and not verified.{fix}",
-                merged.added, merged.kev
-            ));
-        }
+        lock(&state.ground_pending).remove(&address);
+        let _ = state.ground_host(&address).await;
     }
 }
 
@@ -1192,20 +1559,61 @@ pub struct Coordinator {
     _runtime_file: RuntimeFile,
 }
 
-async fn bind_loopback() -> Result<tokio::net::TcpListener> {
-    let mut last_error = None;
-    for offset in 0..PORT_ATTEMPTS {
-        let address = SocketAddr::from(([127, 0, 0, 1], FIRST_PORT + offset));
-        match tokio::net::TcpListener::bind(address).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => last_error = Some(error),
+/// Listens on the first free loopback port from `first`, or, when all
+/// `attempts` of them are taken, on any free one: clients read the port
+/// from `runtime.json`, so another program sitting on the usual ports
+/// cannot keep a session from starting.
+async fn bind_loopback(first: u16, attempts: u16) -> Result<tokio::net::TcpListener> {
+    for offset in 0..attempts {
+        let Some(port) = first.checked_add(offset) else {
+            break;
+        };
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+            return Ok(listener);
         }
     }
-    Err(anyhow!(
-        "no free loopback port in {FIRST_PORT}-{}: {}",
-        FIRST_PORT + PORT_ATTEMPTS - 1,
-        last_error.map(|e| e.to_string()).unwrap_or_default()
-    ))
+    tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .context("no free loopback port for the session")
+}
+
+/// Serves `app` on `listener`, HTTP/1.1 only. `axum::serve` would take every
+/// connection offered and wait on each for ever; any local program could
+/// then use up the session's file descriptors with connections that never
+/// send a request. Here at most `slots` connections are held at once, and
+/// one that has not sent a request head within `head_timeout` is closed.
+/// A WebSocket leaves its slot once the token was accepted and it is open.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    slots: Arc<tokio::sync::Semaphore>,
+    head_timeout: Duration,
+) {
+    loop {
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            return;
+        };
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_RETRY).await;
+                continue;
+            }
+        };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let _slot = slot;
+            let mut http = hyper::server::conn::http1::Builder::new();
+            http.timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(head_timeout)
+                .max_buf_size(64 * 1024);
+            let _ = http
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+    }
 }
 
 impl Coordinator {
@@ -1218,7 +1626,7 @@ impl Coordinator {
             .build()
             .context("cannot start the coordinator runtime")?;
 
-        let listener = runtime.block_on(bind_loopback())?;
+        let listener = runtime.block_on(bind_loopback(FIRST_PORT, PORT_ATTEMPTS))?;
         let port = listener.local_addr()?.port();
         let token = new_token()?;
 
@@ -1248,18 +1656,20 @@ impl Coordinator {
         // Stages left "running" belong to a session that ended mid-run.
         queue::mark_running_interrupted(&lock(&db))?;
         let (tap, tap_rx) = mpsc::channel(TAP_QUEUE);
-        // The location database for scanned servers.
-        let geo = GeoDb::new(&if config.location.database.is_empty() {
+        // The location database for scanned servers (never falls back to CWD).
+        let geo_dir = if config.location.database.is_empty() {
             crate::workspace::MeowHome::from_env()
+                .ok()
                 .map(|home| home.root().join(geoip::DIR))
-                .unwrap_or_default()
         } else {
-            PathBuf::from(&config.location.database)
-        });
+            Some(PathBuf::from(&config.location.database))
+        };
+        let geo = GeoDb::from_optional_dir(geo_dir);
         let state = Arc::new(State {
             session: workspace.name.clone(),
             port,
             token,
+            page_key: new_token()?,
             config,
             workspace: Mutex::new(workspace),
             graph: Mutex::new(graph),
@@ -1268,6 +1678,7 @@ impl Coordinator {
             revision,
             dirty: AtomicBool::new(true),
             ground_queue,
+            ground_pending: Mutex::new(std::collections::HashSet::new()),
             recon_queue,
             cve,
             vault: Mutex::new(vault),
@@ -1275,19 +1686,24 @@ impl Coordinator {
             ai_status: Mutex::new(AiStatus::default()),
             location: Mutex::new(None),
             locating: AtomicBool::new(false),
+            full_noticed: AtomicBool::new(false),
             pictures: Mutex::new(Vec::new()),
             geo,
             target: Mutex::new(None),
             target_pictures: Mutex::new(Vec::new()),
             target_places: Mutex::new(std::collections::HashMap::new()),
             target_generation: std::sync::atomic::AtomicU64::new(0),
+            ws_slots: Arc::new(tokio::sync::Semaphore::new(MAX_WS_CONNECTIONS)),
             handle: runtime.handle().clone(),
         });
 
         let app = router(Arc::clone(&state));
-        runtime.spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        runtime.spawn(serve(
+            listener,
+            app,
+            Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            HEAD_TIMEOUT,
+        ));
         runtime.spawn(saver(Arc::clone(&state)));
         runtime.spawn(observe_loop(Arc::clone(&state)));
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
@@ -1357,6 +1773,10 @@ impl Coordinator {
         self.state.save_if_dirty();
         // A tool that was running has just been killed with the runtime.
         let _ = queue::mark_running_interrupted(&self.state.db_lock());
+        // Clean up any browser bootstrap file containing the session token.
+        let tmp_dir = lock(&self.state.workspace).tmp_dir();
+        let _ = std::fs::remove_file(tmp_dir.join(webui::OPENER_FILE));
+        let _ = std::fs::remove_file(tmp_dir.join("map-open.html"));
     }
 }
 
@@ -1399,6 +1819,93 @@ mod tests {
             workspace,
             coordinator,
         }
+    }
+
+    #[test]
+    fn location_off_means_no_picture_requests_for_a_selected_server_either() {
+        use std::sync::atomic::AtomicUsize;
+        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            block_on(async move {
+                let app = axum::Router::new().route(
+                    "/tiles/{z}/{x}/{y}",
+                    axum::routing::get(|| async {
+                        ASKED.fetch_add(1, Ordering::SeqCst);
+                        JPEG
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let address = rx.recv().unwrap();
+        let place = Place {
+            city: Some("Mountain View".into()),
+            region: Some("California".into()),
+            country: Some("United States".into()),
+            latitude: 37.422,
+            longitude: -122.085,
+            public_address: Some("8.8.8.8".into()),
+            network: None,
+        };
+        let select = |enabled: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+            let (workspace, _) =
+                Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+            let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+            let mut config = Config::default();
+            config.cve.enabled = false;
+            config.location.enabled = enabled;
+            config.location.tiles = format!("http://{address}/tiles/{{z}}/{{x}}/{{y}}");
+            let coordinator = Coordinator::start(workspace, config).unwrap();
+            let state = coordinator.state();
+            // The place is known already, as after a database lookup.
+            lock(&state.target_places).insert("8.8.8.8".to_owned(), Some(place.clone()));
+            state
+                .execute(Command::LocateHost {
+                    address: Some("8.8.8.8".into()),
+                })
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let target = loop {
+                let target = state.snapshot()["target"].clone();
+                if target["status"] != "looking" || std::time::Instant::now() > deadline {
+                    break target;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            coordinator.shutdown();
+            target
+        };
+        let off = select(false);
+        assert_eq!(off["status"], "found", "{off}");
+        assert_eq!(off["place"]["city"], "Mountain View");
+        assert!(off.get("map").is_none(), "{off}");
+        assert_eq!(ASKED.load(Ordering::SeqCst), 0, "no picture was asked for");
+        // On, the same selection fetches the pictures.
+        let on = select(true);
+        assert!(on["map"]["tiles"].as_array().is_some(), "{on}");
+        assert!(ASKED.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn the_live_push_leaves_out_the_evidence_of_web_paths() {
+        let mut tree = json!({ "children": {
+            "admin": { "status": 403, "record": { "evidence": "GET /admin 403" }, "children": {
+                "login": { "status": 200, "record": { "evidence": "GET /admin/login 200" } }
+            } }
+        } });
+        drop_path_evidence(&mut tree);
+        assert_eq!(
+            tree,
+            json!({ "children": { "admin": { "status": 403, "children": {
+                "login": { "status": 200 }
+            } } } })
+        );
     }
 
     #[test]
@@ -1594,13 +2101,145 @@ mod tests {
     }
 
     #[test]
+    fn an_ai_request_that_ends_on_a_fault_is_no_longer_running() {
+        let status = Mutex::new(AiStatus {
+            running: true,
+            ..AiStatus::default()
+        });
+        // The request's task unwinds: nothing set the status.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _running = AiRunning(&status);
+            std::panic::resume_unwind(Box::new("fault in the request"));
+        }));
+        assert!(unwound.is_err());
+        let after = lock(&status);
+        assert!(!after.running);
+        assert_eq!(
+            after.error.as_deref(),
+            Some("the request ended unexpectedly")
+        );
+        drop(after);
+        // A request that ended normally keeps what it reported.
+        *lock(&status) = AiStatus {
+            summary: Some("done".into()),
+            ..AiStatus::default()
+        };
+        drop(AiRunning(&status));
+        assert_eq!(lock(&status).error, None);
+    }
+
+    #[test]
+    fn a_taken_port_range_does_not_keep_a_session_from_starting() {
+        block_on(async {
+            // Someone else holds the whole range (here: one port).
+            let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = taken.local_addr().unwrap().port();
+            let listener = bind_loopback(port, 1).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(address.ip().is_loopback());
+            assert_ne!(address.port(), port);
+            assert_ne!(address.port(), 0);
+            // A free range is used from its first port.
+            drop(taken);
+            let listener = bind_loopback(port, 1).await.unwrap();
+            assert_eq!(listener.local_addr().unwrap().port(), port);
+            // The top of the port numbers does not overflow.
+            assert!(bind_loopback(u16::MAX, 100).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn idle_connections_are_closed_and_never_more_than_the_limit_are_held() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const LIMIT: usize = 4;
+        let head_timeout = Duration::from_millis(300);
+        block_on(async {
+            let app = Router::new().route("/ping", get(|| async { "pong" }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let slots = Arc::new(tokio::sync::Semaphore::new(LIMIT));
+            tokio::spawn(serve(listener, app, Arc::clone(&slots), head_timeout));
+
+            // Twenty clients connect and never send a request.
+            let mut idle = Vec::new();
+            for _ in 0..20 {
+                idle.push(tokio::net::TcpStream::connect(address).await.unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(slots.available_permits(), 0, "only {LIMIT} are held");
+
+            // A real request still gets its answer.
+            let answer = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                stream
+                    .write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply).await.unwrap();
+                reply
+            })
+            .await
+            .expect("answered while idle connections wait");
+            assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+            assert!(answer.ends_with("pong"), "{answer}");
+
+            // Every idle client is hung up on.
+            for mut stream in idle {
+                let mut rest = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+                    .await
+                    .expect("an idle connection is closed")
+                    .ok();
+            }
+            // One that sends half a request head fares no better.
+            let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+            slow.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n")
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), slow.read_to_end(&mut rest))
+                .await
+                .expect("a half-sent request is closed")
+                .ok();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                slots.available_permits() >= LIMIT - 1,
+                "slots are free again"
+            );
+        });
+    }
+
+    #[test]
+    fn a_request_without_the_token_does_not_keep_its_connection() {
+        use std::io::{Read, Write};
+        let fx = fixture();
+        let port = fx.coordinator.info().port;
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        // Reading to the end only returns once the server has hung up.
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).expect("closed, not kept");
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+        assert!(reply.to_ascii_lowercase().contains("connection: close"));
+        fx.coordinator.shutdown();
+    }
+
+    #[test]
     fn runtime_file_is_private_and_removed_at_shutdown() {
         let fx = fixture();
         let path = fx.workspace.runtime_path();
         let info = RuntimeInfo::read(&path).unwrap();
         assert_eq!(info, fx.coordinator.info());
         assert_eq!(info.pid, std::process::id());
-        assert!((FIRST_PORT..FIRST_PORT + PORT_ATTEMPTS).contains(&info.port));
+        assert_ne!(info.port, 0);
         assert_eq!(info.token.len(), 64);
         assert!(info.token.chars().all(|c| c.is_ascii_hexdigit()));
         #[cfg(unix)]
@@ -1828,6 +2467,37 @@ mod tests {
             let first = next().await;
             assert_eq!(first["type"], "state");
             assert_eq!(first["state"]["graph"]["hosts"], json!({}));
+            // Every push carries the key served in the map page, which is
+            // how the page tells its session from whatever else may answer
+            // on this port later. The key is in the page and nowhere else.
+            let page_key = fx.coordinator.state().page_key.clone();
+            assert_eq!(page_key.len(), 64);
+            assert_ne!(page_key, info.token);
+            assert_eq!(first["key"], json!(page_key));
+            assert!(!first["state"].to_string().contains(&page_key));
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let page = client
+                .get(format!("{}/?token={}", info.base_url(), info.token))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(page.contains(&format!("<meta name=\"meow-page\" content=\"{page_key}\">")));
+            let api = client
+                .get(format!(
+                    "{}/api/state?token={}",
+                    info.base_url(),
+                    info.token
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!api.contains(&page_key));
 
             // A change made elsewhere is pushed without being asked for.
             fx.coordinator
@@ -2161,5 +2831,171 @@ mod tests {
         let b = fixture();
         assert_ne!(a.coordinator.info().port, b.coordinator.info().port);
         assert_ne!(a.coordinator.info().token, b.coordinator.info().token);
+    }
+
+    #[test]
+    fn query_token_overrides_stale_cookie_and_empty_query_uses_port_cookie() {
+        let fx = fixture();
+        let info = fx.coordinator.info();
+        let stale = format!("{}=stale; meow_token=stale", cookie_name(info.port));
+        // Opening a fresh session URL with a stale cookie from an earlier run succeeds.
+        let (status, _) = request(
+            &info,
+            "GET",
+            &format!("/?token={}", info.token),
+            &[("Cookie", &stale)],
+            None,
+        );
+        assert_eq!(status, 200);
+
+        // Reloading after history.replaceState (or empty ?token=) authenticates via port-scoped cookie.
+        let valid_cookie = format!(
+            "meow_token_9999=other; {}={}",
+            cookie_name(info.port),
+            info.token
+        );
+        let (status, _) = request(
+            &info,
+            "GET",
+            "/api/state?token=",
+            &[("Cookie", &valid_cookie)],
+            None,
+        );
+        assert_eq!(status, 200);
+
+        // Duplicate Host or Origin headers are refused.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::HOST,
+            format!("127.0.0.1:{}", info.port).parse().unwrap(),
+        );
+        headers.append(header::HOST, "evil.example".parse().unwrap());
+        assert!(!host_allowed(&headers, info.port));
+
+        let mut origins = HeaderMap::new();
+        origins.append(
+            header::ORIGIN,
+            format!("http://127.0.0.1:{}", info.port).parse().unwrap(),
+        );
+        origins.append(header::ORIGIN, "http://evil.example".parse().unwrap());
+        assert!(!origin_allowed(&origins, info.port));
+
+        // Bootstrap HTML is cleaned up on shutdown.
+        let bootstrap = webui::write_bootstrap(
+            &fx.workspace.tmp_dir(),
+            &webui::map_url(info.port, &info.token),
+        )
+        .unwrap();
+        assert!(bootstrap.exists());
+        fx.coordinator.shutdown();
+        assert!(!bootstrap.exists());
+    }
+
+    #[test]
+    fn second_pass_http_ws_and_ip_guards_hold() {
+        // 1. RuntimeInfo::read rejects pid == 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_path = tmp.path().join("runtime.json");
+        write_private_atomic(
+            &rt_path,
+            br#"{"pid":0,"port":8765,"token":"abcdef0123456789"}"#,
+        )
+        .unwrap();
+        assert!(RuntimeInfo::read(&rt_path).is_none());
+
+        // 2. parse_ip_unscoped allows `%zone` only on valid IPv6 addresses.
+        assert!(parse_ip_unscoped("8.8.8.8%eth0").is_none());
+        assert!(parse_ip_unscoped("127.0.0.1%lo").is_none());
+        assert!(parse_ip_unscoped("fe80::1%").is_none());
+        assert!(parse_ip_unscoped("fe80::1%eth0%extra").is_none());
+        assert_eq!(
+            parse_ip_unscoped("fe80::1%eth0"),
+            Some("fe80::1".parse().unwrap())
+        );
+
+        let fx = fixture();
+        let info = fx.coordinator.info();
+        let valid_cookie = format!("{}={}", cookie_name(info.port), info.token);
+
+        // 3. Cross-port (`Sec-Fetch-Site: same-site`) and external (`cross-site`)
+        // cookie-riding requests are refused, while `same-origin` and `none` pass.
+        for blocked in ["same-site", "cross-site"] {
+            let (status, _) = request(
+                &info,
+                "GET",
+                "/api/state",
+                &[("Cookie", &valid_cookie), ("Sec-Fetch-Site", blocked)],
+                None,
+            );
+            assert_eq!(status, 403, "blocked Sec-Fetch-Site={blocked}");
+        }
+        for allowed in ["same-origin", "none"] {
+            let (status, _) = request(
+                &info,
+                "GET",
+                "/api/state",
+                &[("Cookie", &valid_cookie), ("Sec-Fetch-Site", allowed)],
+                None,
+            );
+            assert_eq!(status, 200, "allowed Sec-Fetch-Site={allowed}");
+        }
+
+        // 4. Malformed or duplicate Authorization headers and duplicate `?token=`
+        // query parameters never fall back to a valid cookie.
+        let (status, _) = request(
+            &info,
+            "GET",
+            "/api/state",
+            &[
+                ("Authorization", "Basic dXNlcjpwYXNz"),
+                ("Cookie", &valid_cookie),
+            ],
+            None,
+        );
+        assert_eq!(status, 401);
+
+        let mut dup_auth = HeaderMap::new();
+        dup_auth.append(header::AUTHORIZATION, bearer(&info).parse().unwrap());
+        dup_auth.append(header::AUTHORIZATION, bearer(&info).parse().unwrap());
+        dup_auth.insert(header::COOKIE, valid_cookie.parse().unwrap());
+        assert!(token_from(&dup_auth, None, info.port).is_none());
+
+        let (status, _) = request(
+            &info,
+            "GET",
+            &format!("/api/state?token={}&token={}", info.token, info.token),
+            &[("Cookie", &valid_cookie)],
+            None,
+        );
+        assert_eq!(status, 401);
+
+        // 5. Upgraded WebSockets are bounded by MAX_WS_CONNECTIONS and release
+        // their slot when closed.
+        block_on(async {
+            let url = format!("ws://127.0.0.1:{}/ws?token={}", info.port, info.token);
+            let mut open_sockets = Vec::new();
+            for _ in 0..MAX_WS_CONNECTIONS {
+                let req = url.as_str().into_client_request().unwrap();
+                let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+                let first = ws.next().await.unwrap().unwrap();
+                assert!(matches!(first, WsMessage::Text(_)));
+                open_sockets.push(ws);
+            }
+            let extra = url.as_str().into_client_request().unwrap();
+            let err = tokio_tungstenite::connect_async(extra).await.unwrap_err();
+            let tokio_tungstenite::tungstenite::Error::Http(resp) = err else {
+                panic!("expected HTTP 503 refusal, got {err:?}");
+            };
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let mut released = open_sockets.pop().unwrap();
+            let _ = released.close(None).await;
+            drop(released);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let retry = url.as_str().into_client_request().unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async(retry).await.unwrap();
+            assert!(ws.next().await.is_some());
+        });
     }
 }

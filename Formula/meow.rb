@@ -5,9 +5,9 @@ class Meow < Formula
   #   brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
   #   brew trust Jrdelt/meow   # Homebrew 7+
   #   brew install meow        # or `brew install --HEAD meow`
-  url Pathname.new(__dir__).parent.realpath.to_s, using: :git, tag: "v0.1.1"
+  url "https://github.com/Jrdelt/meow.git", tag: "v0.2.0"
   license "MIT"
-  head Pathname.new(__dir__).parent.realpath.to_s, using: :git, branch: "main"
+  head "https://github.com/Jrdelt/meow.git", branch: "main"
 
   depends_on "rust" => :build
   depends_on "feroxbuster"
@@ -22,7 +22,7 @@ class Meow < Formula
   def install
     system "cargo", "install", *std_cargo_args
     resource("seclists_common").stage do
-      (share/"seclists/Discovery/Web-Content").install "common.txt"
+      (pkgshare/"wordlists").install "common.txt"
     end
   end
 

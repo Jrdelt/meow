@@ -30,10 +30,24 @@ impl HostAddr {
     /// optionally with a `%zone`) or a DNS name. No port.
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
-        let text = text
-            .strip_prefix('[')
-            .and_then(|inner| inner.strip_suffix(']'))
-            .unwrap_or(text);
+        if let Some(inner) = text.strip_prefix('[') {
+            let inner = inner.strip_suffix(']')?;
+            let (addr_text, zone) = match inner.split_once('%') {
+                Some((addr, zone)) => (addr, Some(zone)),
+                None => (inner, None),
+            };
+            let v6 = Ipv6Addr::from_str(addr_text).ok()?;
+            let addr = IpAddr::V6(v6).to_canonical();
+            let zone = match zone {
+                None => None,
+                Some(zone) if addr.is_ipv6() && valid_zone(zone) => Some(zone.to_owned()),
+                Some(_) => return None,
+            };
+            return Some(HostAddr::Ip { addr, zone });
+        }
+        if text.contains(['[', ']']) {
+            return None;
+        }
         let (addr_text, zone) = match text.split_once('%') {
             Some((addr, zone)) => (addr, Some(zone)),
             None => (text, None),
@@ -134,10 +148,7 @@ impl Endpoint {
         let text = text.trim();
         if let Some(rest) = text.strip_prefix('[') {
             let (inside, after) = rest.split_once(']')?;
-            let host = HostAddr::parse(inside)?;
-            if !matches!(host.ip(), Some(IpAddr::V6(_)) | Some(IpAddr::V4(_))) {
-                return None;
-            }
+            let host = HostAddr::parse(&text[..inside.len() + 2])?;
             let port = match after {
                 "" => None,
                 _ => Some(parse_port(after.strip_prefix(':')?)?),
@@ -199,8 +210,9 @@ pub enum Target {
 }
 
 impl Target {
-    /// Only plain hosts and CIDR ranges are accepted, so the result is
-    /// always safe to hand to a scanner as a single argument.
+    /// Only plain hosts and valid CIDR ranges are accepted, so the result is
+    /// always safe to hand to a scanner as a single argument; callers use
+    /// [`Target::check_size`] to cap range width.
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
         if text.contains('/') {
@@ -208,9 +220,7 @@ impl Target {
             let network = IpNetwork::new(network.network(), network.prefix()).ok()?;
             return Some(Target::Network(network));
         }
-        HostAddr::parse(text)
-            .filter(|host| !matches!(host, HostAddr::Ip { zone: Some(_), .. }))
-            .map(Target::Host)
+        HostAddr::parse(text).map(Target::Host)
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
@@ -219,6 +229,52 @@ impl Target {
             Target::Network(network) => network.contains(ip),
         }
     }
+
+    /// Refuses a range of more than [`MAX_RANGE_ADDRESSES`] addresses. A
+    /// slip of the prefix (`/8` for `/24`, or `0.0.0.0/0`) would otherwise
+    /// send a scan across networks nobody asked about.
+    pub fn check_size(&self) -> Result<(), String> {
+        let Target::Network(network) = self else {
+            return Ok(());
+        };
+        let bits = match network {
+            IpNetwork::V4(_) => 32,
+            IpNetwork::V6(_) => 128,
+        };
+        let host_bits = bits - u32::from(network.prefix());
+        if host_bits <= MAX_RANGE_BITS {
+            return Ok(());
+        }
+        let size = if host_bits < 64 {
+            group_thousands(1u64 << host_bits)
+        } else {
+            format!("2^{host_bits}")
+        };
+        Err(format!(
+            "{network} covers {size} addresses; meow scans at most {} at once \
+             (/{} or smaller for IPv4, /{} for IPv6). Queue the parts you mean one by one",
+            group_thousands(MAX_RANGE_ADDRESSES),
+            32 - MAX_RANGE_BITS,
+            128 - MAX_RANGE_BITS
+        ))
+    }
+}
+
+/// The largest range `meow recon` takes: an IPv4 `/16`.
+const MAX_RANGE_BITS: u32 = 16;
+pub const MAX_RANGE_ADDRESSES: u64 = 1 << MAX_RANGE_BITS;
+
+/// `65536` as `65,536`.
+fn group_thousands(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 impl fmt::Display for Target {
@@ -258,7 +314,7 @@ impl WebUrl {
                 zone: None,
             },
         };
-        let port = url.port_or_known_default()?;
+        let port = url.port_or_known_default().filter(|p| *p != 0)?;
         let mut path = String::new();
         for segment in path_segments(url.path()) {
             path.push('/');
@@ -281,11 +337,13 @@ impl WebUrl {
     }
 }
 
-/// Builds `scheme://host[:port]`, bracketing IPv6 addresses.
+/// Builds `scheme://host[:port]`, bracketing IPv6 addresses and stripping any
+/// `%zone` scope suffix so the URL is valid RFC 3986.
 pub fn web_origin(scheme: &str, host: &str, port: u16) -> String {
-    let host = match Ipv6Addr::from_str(host.split('%').next().unwrap_or(host)) {
-        Ok(_) => format!("[{host}]"),
-        Err(_) => host.to_owned(),
+    let bare = host.split('%').next().unwrap_or(host);
+    let host = match Ipv6Addr::from_str(bare) {
+        Ok(_) => format!("[{bare}]"),
+        Err(_) => bare.to_owned(),
     };
     let default = if scheme == "https" { 443 } else { 80 };
     if port == default {
@@ -296,26 +354,62 @@ pub fn web_origin(scheme: &str, host: &str, port: u16) -> String {
 }
 
 /// Splits a URL path into clean segments for the sub-path tree: empty and
-/// `.` segments are dropped, the query and fragment are cut off, and overly
-/// deep or long paths are truncated.
+/// `.` segments are dropped, `..` pops its parent segment, the query and
+/// fragment are cut off, and overly deep or long paths are truncated.
 pub fn path_segments(path: &str) -> Vec<&str> {
     let path = path.split(['?', '#']).next().unwrap_or("");
-    path.split('/')
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .take(MAX_PATH_DEPTH)
-        .map(|segment| {
-            let mut end = segment.len().min(MAX_SEGMENT_LEN);
-            while !segment.is_char_boundary(end) {
-                end -= 1;
-            }
-            &segment[..end]
-        })
-        .collect()
+    let mut out = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            out.pop();
+            continue;
+        }
+        if out.len() >= MAX_PATH_DEPTH {
+            break;
+        }
+        let mut end = segment.len().min(MAX_SEGMENT_LEN);
+        while !segment.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push(&segment[..end]);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_is_at_most_a_sixteen_bit_one() {
+        for fine in [
+            "10.0.0.5",
+            "example.org",
+            "10.0.0.0/24",
+            "10.20.0.0/16",
+            "192.0.2.7/32",
+            "fd00::/112",
+            "fd00::5/128",
+        ] {
+            assert_eq!(Target::parse(fine).unwrap().check_size(), Ok(()), "{fine}");
+        }
+        let refused = |text: &str| Target::parse(text).unwrap().check_size().unwrap_err();
+        assert!(refused("10.0.0.0/15").starts_with("10.0.0.0/15 covers 131,072 addresses"));
+        assert!(refused("10.0.0.0/8").contains("covers 16,777,216 addresses"));
+        assert!(refused("0.0.0.0/0").contains("covers 4,294,967,296 addresses"));
+        assert!(refused("fd00::/111").contains("covers 131,072 addresses"));
+        assert!(refused("fd00::/64").contains("covers 2^64 addresses"));
+        assert!(refused("::/0").contains("covers 2^128 addresses"));
+        assert!(refused("::/0")
+            .contains("at most 65,536 at once (/16 or smaller for IPv4, /112 for IPv6)"));
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(1234567), "1,234,567");
+    }
 
     fn endpoint(text: &str) -> Option<(String, Option<u16>)> {
         Endpoint::parse(text).map(|e| (e.host.canonical(), e.port))
@@ -395,6 +489,8 @@ mod tests {
             "[::1]x",
             "[::1]:",
             "[example.com]:80",
+            "[cargo.toml]",
+            "[10.0.0.5]",
             "10.0.0.5%eth0",
             "fe80::1%",
             "fe80::1%e th0",
@@ -408,6 +504,7 @@ mod tests {
         ] {
             assert_eq!(Endpoint::parse(bad), None, "accepted {bad:?}");
         }
+        assert_eq!(HostAddr::parse("[cargo.toml]"), None);
     }
 
     #[test]
@@ -415,21 +512,28 @@ mod tests {
         let show = |text: &str| Target::parse(text).map(|t| t.to_string());
         assert_eq!(show("10.0.0.5"), Some("10.0.0.5".into()));
         assert_eq!(show("10.0.0.77/24"), Some("10.0.0.0/24".into()));
+        assert_eq!(show("10.10.0.0/16"), Some("10.10.0.0/16".into()));
         assert_eq!(show("2001:db8::1/64"), Some("2001:db8::/64".into()));
+        assert_eq!(show("fe80::1%eth0"), Some("fe80::1%eth0".into()));
         assert_eq!(
             show("Scanme.Example.org"),
             Some("scanme.example.org".into())
         );
         assert_eq!(show("::1"), Some("::1".into()));
+        assert_eq!(show("0.0.0.0/0"), Some("0.0.0.0/0".into()));
+        assert_eq!(show("::/0"), Some("::/0".into()));
         for bad in [
             "-iL/etc/passwd",
             "--script=x",
             "10.0.0.5 10.0.0.6",
             "10.0.0.1-50",
             "10.0.0.0/33",
+            "10.0.0.0/-1",
+            "[2001:db8::1]/64",
+            "fe80::1%eth0/64",
             "example.com/24",
             "10.0.0.5:80",
-            "fe80::1%eth0",
+            "fe80::1%",
             "",
         ] {
             assert_eq!(Target::parse(bad), None, "accepted {bad:?}");
@@ -452,6 +556,10 @@ mod tests {
         let url = WebUrl::parse("http://[2001:db8::1]/a/b.php").unwrap();
         assert_eq!((url.port, url.path.as_str()), (80, "/a/b.php"));
         assert_eq!(url.origin(), "http://[2001:db8::1]");
+        assert_eq!(
+            web_origin("http", "fe80::1%eth0", 8080),
+            "http://[fe80::1]:8080"
+        );
 
         assert_eq!(WebUrl::parse("http://10.0.0.5").unwrap().path, "/");
         assert_eq!(
@@ -463,6 +571,7 @@ mod tests {
             "javascript:alert(1)",
             "/relative",
             "http://",
+            "http://10.0.0.5:0/",
             "mailto:a@b",
         ] {
             assert_eq!(WebUrl::parse(bad), None, "accepted {bad:?}");
@@ -475,6 +584,7 @@ mod tests {
             path_segments("/portal//config/./x?y=/z#f"),
             ["portal", "config", "x"]
         );
+        assert_eq!(path_segments("/portal/old/../admin/../../root"), ["root"]);
         assert_eq!(path_segments("/"), Vec::<&str>::new());
         let deep = "/a".repeat(40);
         assert_eq!(path_segments(&deep).len(), MAX_PATH_DEPTH);

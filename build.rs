@@ -32,18 +32,59 @@ fn main() {
     // The commit this binary is built from, so `meow update` can tell when
     // the checkout has moved on since. Empty outside a git checkout.
     // A path that does not exist would rerun this script on every build.
-    for watched in [".git/HEAD", ".git/refs/heads"] {
+    let has_git = std::path::Path::new(".git").exists();
+    for watched in [".git/HEAD", ".git/packed-refs"] {
         if std::path::Path::new(watched).exists() {
             println!("cargo:rerun-if-changed={watched}");
         }
     }
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_default();
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(rel) = head.trim().strip_prefix("ref:") {
+            let rel = rel.trim();
+            if rel.starts_with("refs/") && !rel.contains("..") && !rel.contains('\\') {
+                let target = std::path::Path::new(".git").join(rel);
+                if target.exists() {
+                    println!("cargo:rerun-if-changed={}", target.display());
+                }
+            }
+        }
+    }
+    let hooks_arg = if cfg!(windows) {
+        "core.hooksPath=NUL"
+    } else {
+        "core.hooksPath=/dev/null"
+    };
+    let commit = if has_git {
+        std::process::Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_EXEC_PATH")
+            .args([
+                "-c",
+                hooks_arg,
+                "-c",
+                "core.fsmonitor=false",
+                "rev-parse",
+                "HEAD",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|hex| {
+                (7..=64).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     println!("cargo:rustc-env=MEOW_BUILD_COMMIT={commit}");
 }

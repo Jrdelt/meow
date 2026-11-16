@@ -13,7 +13,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{path_segments, web_origin, HostAddr};
-use crate::evidence::{sanitize, EvidenceRecord, IllegalTransition, Source, VerificationStatus};
+use crate::evidence::{
+    sanitize, Confidence, EvidenceRecord, IllegalTransition, Source, VerificationStatus,
+};
 use crate::timeutil::now_rfc3339;
 use crate::workspace::write_private_atomic;
 
@@ -26,7 +28,13 @@ const MAX_PATH_NODES: usize = 5000;
 const MAX_FIELD: usize = 200;
 const MAX_REFERENCE_LEN: usize = 512;
 const MAX_REFERENCES: usize = 16;
-const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+/// How much a graph may hold, as an estimate of what its observations add
+/// to `graph.json`. Kept below `MAX_GRAPH_BYTES`: what was recorded can be
+/// saved, and what was saved can be loaded again.
+const MAX_GRAPH_WEIGHT: usize = 48 * 1024 * 1024;
+/// The structure around one recorded item in the file.
+const ITEM_OVERHEAD: usize = 400;
 const MAX_HOSTS: usize = 4096;
 const MAX_PORTS_PER_HOST: usize = 1024;
 const MAX_HOSTNAMES_PER_HOST: usize = 128;
@@ -124,6 +132,169 @@ pub struct HttpInfo {
     pub server: Option<String>,
     #[serde(default)]
     pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powered_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon_hash: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon_framework: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub security_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_not_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_not_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_weak_ciphers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub robots_disallow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_txt: Option<String>,
+}
+
+impl HttpInfo {
+    pub fn sanitize(&mut self) {
+        self.scheme = if self.scheme.eq_ignore_ascii_case("https") {
+            "https".to_owned()
+        } else {
+            "http".to_owned()
+        };
+        self.server = clean_opt(self.server.take());
+        self.location = clean_opt(self.location.take());
+        self.title = clean_opt(self.title.take());
+        self.powered_by = clean_opt(self.powered_by.take());
+        self.waf = clean_opt(self.waf.take());
+        self.favicon_framework = clean_opt(self.favicon_framework.take());
+        self.security_headers = std::mem::take(&mut self.security_headers)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let k = clean(&k);
+                let v = clean(&v);
+                (!k.is_empty() && !v.is_empty()).then_some((k, v))
+            })
+            .take(16)
+            .collect();
+        self.missing_headers = std::mem::take(&mut self.missing_headers)
+            .into_iter()
+            .map(|h| clean(&h))
+            .filter(|h| !h.is_empty())
+            .take(16)
+            .collect();
+        self.tls_subject = clean_opt(self.tls_subject.take());
+        self.tls_issuer = clean_opt(self.tls_issuer.take());
+        self.tls_not_before = clean_opt(self.tls_not_before.take());
+        self.tls_not_after = clean_opt(self.tls_not_after.take());
+        self.tls_versions = std::mem::take(&mut self.tls_versions)
+            .into_iter()
+            .map(|v| clean(&v))
+            .filter(|v| !v.is_empty())
+            .take(8)
+            .collect();
+        self.tls_weak_ciphers = std::mem::take(&mut self.tls_weak_ciphers)
+            .into_iter()
+            .map(|c| clean(&c))
+            .filter(|c| !c.is_empty())
+            .take(32)
+            .collect();
+        self.robots_disallow = std::mem::take(&mut self.robots_disallow)
+            .into_iter()
+            .map(|p| clean(&p))
+            .filter(|p| !p.is_empty())
+            .take(32)
+            .collect();
+        self.security_txt = clean_opt(self.security_txt.take());
+    }
+
+    pub fn absorb(&mut self, mut other: HttpInfo) -> bool {
+        other.sanitize();
+        let before = self.clone();
+        if self.scheme.is_empty() || other.scheme == "https" {
+            self.scheme = other.scheme;
+        }
+        for (mine, theirs) in [
+            (&mut self.server, other.server),
+            (&mut self.location, other.location),
+            (&mut self.title, other.title),
+            (&mut self.powered_by, other.powered_by),
+            (&mut self.waf, other.waf),
+            (&mut self.favicon_framework, other.favicon_framework),
+            (&mut self.tls_subject, other.tls_subject),
+            (&mut self.tls_issuer, other.tls_issuer),
+            (&mut self.tls_not_before, other.tls_not_before),
+            (&mut self.tls_not_after, other.tls_not_after),
+            (&mut self.security_txt, other.security_txt),
+        ] {
+            if theirs.is_some() {
+                *mine = theirs;
+            }
+        }
+        if other.favicon_hash.is_some() {
+            self.favicon_hash = other.favicon_hash;
+        }
+        for (k, v) in other.security_headers {
+            if self.security_headers.len() < 16 || self.security_headers.contains_key(&k) {
+                self.security_headers.insert(k, v);
+            }
+        }
+        if !other.missing_headers.is_empty() {
+            self.missing_headers = other.missing_headers;
+        }
+        for v in other.tls_versions {
+            if !self.tls_versions.contains(&v) && self.tls_versions.len() < 8 {
+                self.tls_versions.push(v);
+            }
+        }
+        for c in other.tls_weak_ciphers {
+            if !self.tls_weak_ciphers.contains(&c) && self.tls_weak_ciphers.len() < 32 {
+                self.tls_weak_ciphers.push(c);
+            }
+        }
+        for r in other.robots_disallow {
+            if !self.robots_disallow.contains(&r) && self.robots_disallow.len() < 32 {
+                self.robots_disallow.push(r);
+            }
+        }
+        *self != before
+    }
+
+    pub fn weight(&self) -> usize {
+        let opt = |v: &Option<String>| v.as_deref().map_or(0, str::len);
+        let list = |v: &[String]| v.iter().map(|s| s.len() + 4).sum::<usize>();
+        let map = self
+            .security_headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 8)
+            .sum::<usize>();
+        2 * (self.scheme.len()
+            + opt(&self.server)
+            + opt(&self.location)
+            + opt(&self.title)
+            + opt(&self.powered_by)
+            + opt(&self.waf)
+            + opt(&self.favicon_framework)
+            + opt(&self.tls_subject)
+            + opt(&self.tls_issuer)
+            + opt(&self.tls_not_before)
+            + opt(&self.tls_not_after)
+            + opt(&self.security_txt)
+            + map
+            + list(&self.missing_headers)
+            + list(&self.tls_versions)
+            + list(&self.tls_weak_ciphers)
+            + list(&self.robots_disallow))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -150,6 +321,10 @@ pub struct Port {
     pub paths: PathNode,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// How sure the source was that said what this port is (service,
+    /// product, version). A less sure one does not replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identified: Option<Confidence>,
 }
 
 impl Port {
@@ -192,41 +367,75 @@ impl Port {
         label
     }
 
-    fn absorb(&mut self, other: Port) {
+    /// Takes over what `other` knows. Returns whether anything changed.
+    ///
+    /// What a port is (service, product, version) is replaced only by a
+    /// source at least as sure as the one that said it: a line of text in
+    /// the terminal does not rewrite what a scanner's probe recorded.
+    fn absorb(&mut self, other: Port) -> bool {
+        let mut changed = false;
         // "open" is never downgraded by a weaker observation.
-        if !other.state.is_empty() && (other.is_open() || !self.is_open()) {
+        if !other.state.is_empty()
+            && (other.is_open() || !self.is_open())
+            && self.state != other.state
+        {
             self.state = other.state;
+            changed = true;
         }
-        for (mine, theirs) in [
-            (&mut self.service, other.service),
-            (&mut self.product, other.product),
-            (&mut self.version, other.version),
-            (&mut self.extra_info, other.extra_info),
-        ] {
-            if theirs.is_some() {
-                *mine = theirs;
+        let names_it = [
+            &other.service,
+            &other.product,
+            &other.version,
+            &other.extra_info,
+        ]
+        .iter()
+        .any(|field| field.is_some());
+        if names_it && other.identified >= self.identified {
+            for (mine, theirs) in [
+                (&mut self.service, other.service),
+                (&mut self.product, other.product),
+                (&mut self.version, other.version),
+                (&mut self.extra_info, other.extra_info),
+            ] {
+                if theirs.is_some() && *mine != theirs {
+                    *mine = theirs;
+                    changed = true;
+                }
             }
+            self.identified = other.identified;
         }
         for cpe in other.cpes {
             if self.cpes.len() >= MAX_CPES_PER_PORT {
                 break;
             }
-            self.cpes.insert(cpe);
+            changed |= self.cpes.insert(cpe);
         }
         for san in other.tls_sans {
             if self.tls_sans.len() >= MAX_TLS_SANS_PER_PORT {
                 break;
             }
-            self.tls_sans.insert(san);
+            changed |= self.tls_sans.insert(san);
         }
-        if other.http.is_some() {
-            self.http = other.http;
+        if let Some(mut other_http) = other.http {
+            match &mut self.http {
+                Some(existing) => {
+                    changed |= existing.absorb(other_http);
+                }
+                None => {
+                    other_http.sanitize();
+                    self.http = Some(other_http);
+                    changed = true;
+                }
+            }
         }
-        let mut budget = MAX_PATH_NODES.saturating_sub(self.paths.count());
+        let before = self.paths.count();
+        let mut budget = MAX_PATH_NODES.saturating_sub(before);
         merge_paths(&mut self.paths, other.paths, &mut budget);
+        changed |= self.paths.count() != before;
         for fact in other.facts {
-            push_fact(&mut self.facts, fact);
+            changed |= push_fact(&mut self.facts, fact);
         }
+        changed
     }
 }
 
@@ -320,6 +529,18 @@ pub struct Host {
     pub os: Option<String>,
     #[serde(default)]
     pub mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bgp_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_dns: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf_cdn: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hops: Vec<String>,
     #[serde(default)]
     pub ports: BTreeMap<String, Port>,
     #[serde(default)]
@@ -343,6 +564,8 @@ pub struct NotOpen {
 
 /// The longest port list kept for one group of ports that were not open.
 const NOT_OPEN_MAX: usize = 600;
+/// How many such groups (`tcp closed`, `tcp filtered`, ...) one host keeps.
+const MAX_NOT_OPEN_GROUPS: usize = 16;
 
 /// A port list with nothing but numbers, commas and dashes, shortened to
 /// `NOT_OPEN_MAX` at a comma and ending in `,…` when anything was cut.
@@ -538,6 +761,38 @@ pub enum Observation {
         output: String,
         record: EvidenceRecord,
     },
+    /// A structured evidence fact about a host or a specific port.
+    Fact {
+        address: String,
+        port: Option<u16>,
+        protocol: String,
+        claim: String,
+        record: EvidenceRecord,
+    },
+    /// Passive OSINT and routing metadata for a host (ASN, BGP prefix, IPv6 DNS, WAF/CDN, hops).
+    HostMeta {
+        address: String,
+        #[serde(default)]
+        asn: Option<String>,
+        #[serde(default)]
+        bgp_prefix: Option<String>,
+        #[serde(default)]
+        country: Option<String>,
+        #[serde(default)]
+        ipv6_dns: Option<String>,
+        #[serde(default)]
+        waf_cdn: Option<String>,
+        #[serde(default)]
+        hops: Vec<String>,
+        record: EvidenceRecord,
+    },
+    /// Extended HTTP/TLS metadata for a web port (security headers, favicon hash, WAF, TLS cert/versions).
+    WebMeta {
+        address: String,
+        port: u16,
+        http: Box<HttpInfo>,
+        record: EvidenceRecord,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -554,6 +809,24 @@ pub struct Graph {
     /// Hosts removed while loading an older graph; nothing is saved.
     #[serde(skip)]
     pub cleaned: Vec<String>,
+    #[serde(skip)]
+    tally: Tally,
+}
+
+/// The running size of a graph and whether it has filled up. Bookkeeping,
+/// not content: two graphs holding the same things are equal.
+#[derive(Debug, Clone, Default)]
+struct Tally {
+    weight: usize,
+    full: bool,
+    /// Set when the observation being applied made a new host or port.
+    created: bool,
+}
+
+impl PartialEq for Tally {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 impl Default for Graph {
@@ -565,6 +838,7 @@ impl Default for Graph {
             hosts: BTreeMap::new(),
             notes: Vec::new(),
             cleaned: Vec::new(),
+            tally: Tally::default(),
         }
     }
 }
@@ -752,7 +1026,150 @@ fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
     true
 }
 
+/// What an advisory adds to `graph.json`, counted like an observation.
+fn advisory_weight(advisory: &Advisory) -> usize {
+    let opt = |v: &Option<String>| v.as_deref().map_or(0, str::len);
+    let references: usize = advisory.references.iter().map(String::len).sum();
+    2 * (advisory.id.len()
+        + advisory.title.len()
+        + opt(&advisory.severity)
+        + advisory.matched.len()
+        + opt(&advisory.port)
+        + opt(&advisory.fixed_in)
+        + opt(&advisory.last_affected)
+        + advisory.record.evidence.len()
+        + references)
+        + 2 * ITEM_OVERHEAD
+}
+
 impl Observation {
+    /// An upper estimate of what recording this adds to `graph.json`: its
+    /// text (escaped it is at most twice as long) and the structure around
+    /// it.
+    fn weight(&self) -> usize {
+        let opt = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+        let text = match self {
+            Observation::Host {
+                address,
+                os,
+                mac,
+                record,
+            } => address.len() + opt(os) + opt(mac) + record.evidence.len(),
+            Observation::Hostname {
+                address,
+                hostname,
+                record,
+            } => address.len() + hostname.len() + record.evidence.len(),
+            Observation::Port {
+                address,
+                protocol,
+                state,
+                service,
+                product,
+                version,
+                extra_info,
+                cpes,
+                record,
+                ..
+            } => {
+                // The port's name is also the claim of the fact it leaves.
+                2 * (address.len()
+                    + protocol.len()
+                    + state.len()
+                    + opt(service)
+                    + opt(product)
+                    + opt(version)
+                    + opt(extra_info))
+                    + cpes.iter().map(|cpe| cpe.len() + 4).sum::<usize>()
+                    + record.evidence.len()
+            }
+            Observation::TlsSan {
+                address,
+                san,
+                record,
+                ..
+            } => address.len() + 2 * san.len() + record.evidence.len(),
+            Observation::Http {
+                address,
+                scheme,
+                server,
+                location,
+                record,
+                ..
+            } => {
+                address.len()
+                    + scheme.len()
+                    + 2 * (opt(server) + opt(location))
+                    + record.evidence.len()
+            }
+            Observation::Path {
+                address,
+                scheme,
+                path,
+                record,
+                ..
+            } => {
+                // Every segment is a node of its own in the tree.
+                let segments = path.bytes().filter(|byte| *byte == b'/').count();
+                address.len() + scheme.len() + path.len() + 16 * segments + record.evidence.len()
+            }
+            Observation::Note {
+                address,
+                text,
+                record,
+            } => opt(address) + text.len() + record.evidence.len(),
+            Observation::NotOpen {
+                address,
+                protocol,
+                state,
+                ports,
+                record,
+                ..
+            } => address.len() + protocol.len() + state.len() + ports.len() + record.evidence.len(),
+            Observation::Script {
+                address,
+                protocol,
+                id,
+                output,
+                record,
+                ..
+            } => address.len() + protocol.len() + id.len() + output.len() + record.evidence.len(),
+            Observation::Fact {
+                address,
+                protocol,
+                claim,
+                record,
+                ..
+            } => address.len() + protocol.len() + claim.len() + record.evidence.len(),
+            Observation::HostMeta {
+                address,
+                asn,
+                bgp_prefix,
+                country,
+                ipv6_dns,
+                waf_cdn,
+                hops,
+                record,
+            } => {
+                address.len()
+                    + opt(asn)
+                    + opt(bgp_prefix)
+                    + opt(country)
+                    + opt(ipv6_dns)
+                    + opt(waf_cdn)
+                    + hops.iter().map(|h| h.len() + 4).sum::<usize>()
+                    + record.evidence.len()
+            }
+            Observation::WebMeta {
+                address,
+                http,
+                record,
+                ..
+            } => address.len() + http.weight() / 2 + record.evidence.len(),
+        };
+        2 * text + ITEM_OVERHEAD
+    }
+
     /// The host this observation is about; `None` for a workspace note.
     pub fn address(&self) -> Option<&str> {
         match self {
@@ -763,7 +1180,10 @@ impl Observation {
             | Observation::Http { address, .. }
             | Observation::Path { address, .. }
             | Observation::NotOpen { address, .. }
-            | Observation::Script { address, .. } => Some(address),
+            | Observation::Script { address, .. }
+            | Observation::Fact { address, .. }
+            | Observation::HostMeta { address, .. }
+            | Observation::WebMeta { address, .. } => Some(address),
             Observation::Note { address, .. } => address.as_deref(),
         }
     }
@@ -772,11 +1192,24 @@ impl Observation {
 impl Graph {
     /// Loads `graph.json`; a missing file is an empty graph.
     pub fn load(path: &Path) -> Result<Self> {
-        let meta = match std::fs::metadata(path) {
+        use std::io::Read;
+        crate::workspace::refuse_file_symlink(path)?;
+        let pre = match std::fs::metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
+        if !pre.is_file() {
+            bail!("{} is not a regular file", path.display());
+        }
+        let file =
+            std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a regular file", path.display());
+        }
         if meta.len() > MAX_GRAPH_BYTES {
             bail!(
                 "{} is {} bytes, exceeding the {} byte limit",
@@ -785,8 +1218,20 @@ impl Graph {
                 MAX_GRAPH_BYTES
             );
         }
-        let text = std::fs::read_to_string(path)
+        let mut bytes = Vec::with_capacity((meta.len() as usize).min(MAX_GRAPH_BYTES as usize));
+        file.take(MAX_GRAPH_BYTES + 1)
+            .read_to_end(&mut bytes)
             .with_context(|| format!("cannot read {}", path.display()))?;
+        if bytes.len() as u64 > MAX_GRAPH_BYTES {
+            bail!(
+                "{} is {} bytes, exceeding the {} byte limit",
+                path.display(),
+                bytes.len(),
+                MAX_GRAPH_BYTES
+            );
+        }
+        let text =
+            String::from_utf8(bytes).with_context(|| format!("invalid {}", path.display()))?;
         let mut graph: Graph =
             serde_json::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
         if graph.version > GRAPH_VERSION {
@@ -812,7 +1257,82 @@ impl Graph {
             graph.cleaned = gone;
         }
         graph.version = GRAPH_VERSION;
+        // At least what the file itself weighed: that is known exactly.
+        graph.tally.weight = graph.measure().max(text.len());
         Ok(graph)
+    }
+
+    /// The weight of what this graph already holds, counted the way
+    /// [`Observation::weight`] counts what is added.
+    fn measure(&self) -> usize {
+        fn facts(list: &[Fact]) -> usize {
+            list.iter()
+                .map(|fact| 2 * (fact.claim.len() + fact.record.evidence.len()) + ITEM_OVERHEAD)
+                .sum()
+        }
+        fn paths(node: &PathNode) -> usize {
+            node.children
+                .iter()
+                .map(|(name, child)| {
+                    let evidence = child.record.as_ref().map_or(0, |r| r.evidence.len());
+                    2 * (name.len() + evidence) + ITEM_OVERHEAD + paths(child)
+                })
+                .sum()
+        }
+        fn names<'a>(list: impl Iterator<Item = &'a String>) -> usize {
+            list.map(|name| 2 * name.len() + 8).sum()
+        }
+        let opt = |v: &Option<String>| v.as_deref().map_or(0, |s| 2 * s.len());
+        let local = self.local.interfaces.len() * ITEM_OVERHEAD
+            + self.local.routes.len() * ITEM_OVERHEAD
+            + self.local.neighbors.len() * ITEM_OVERHEAD
+            + self.local.listeners.len() * ITEM_OVERHEAD
+            + names(self.local.warnings.iter())
+            + names(self.local.notes.iter());
+        let hosts: usize = self
+            .hosts
+            .values()
+            .map(|host| {
+                let ports: usize = host
+                    .ports
+                    .values()
+                    .map(|port| {
+                        ITEM_OVERHEAD
+                            + facts(&port.facts)
+                            + paths(&port.paths)
+                            + names(port.tls_sans.iter())
+                            + names(port.cpes.iter())
+                            + port.http.as_ref().map_or(0, HttpInfo::weight)
+                    })
+                    .sum();
+                let advisories: usize = host.advisories.iter().map(advisory_weight).sum();
+                let not_open: usize = host
+                    .not_open
+                    .values()
+                    .map(|group| ITEM_OVERHEAD + 2 * group.ports.len())
+                    .sum();
+                ITEM_OVERHEAD
+                    + 2 * host.address.len()
+                    + opt(&host.asn)
+                    + opt(&host.bgp_prefix)
+                    + opt(&host.country)
+                    + opt(&host.ipv6_dns)
+                    + opt(&host.waf_cdn)
+                    + names(host.hops.iter())
+                    + names(host.hostnames.iter())
+                    + facts(&host.facts)
+                    + ports
+                    + advisories
+                    + not_open
+            })
+            .sum();
+        local + hosts + facts(&self.notes)
+    }
+
+    /// True once the graph holds as much as it can keep: new observations
+    /// are no longer recorded (verdicts and notes already there stay).
+    pub fn is_full(&self) -> bool {
+        self.tally.full
     }
 
     /// Sanitizes all text fields and protocol keys on a deserialized graph so
@@ -878,13 +1398,7 @@ impl Graph {
                     .take(MAX_TLS_SANS_PER_PORT)
                     .collect();
                 port.http = port.http.map(|mut http| {
-                    http.scheme = if http.scheme.eq_ignore_ascii_case("https") {
-                        "https".to_owned()
-                    } else {
-                        "http".to_owned()
-                    };
-                    http.server = clean_opt(http.server);
-                    http.location = clean_opt(http.location);
+                    http.sanitize();
                     http
                 });
                 let mut path_budget = MAX_PATH_NODES;
@@ -896,7 +1410,9 @@ impl Graph {
                 port.facts = port_facts;
                 let pkey = port.key();
                 match ports.get_mut(&pkey) {
-                    Some(existing) => existing.absorb(port),
+                    Some(existing) => {
+                        existing.absorb(port);
+                    }
                     None => {
                         ports.insert(pkey, port);
                     }
@@ -917,6 +1433,12 @@ impl Graph {
                     }
                 }
             }
+            let hops: Vec<String> = std::mem::take(&mut host.hops)
+                .into_iter()
+                .map(|h| clean(&h))
+                .filter(|h| !h.is_empty())
+                .take(32)
+                .collect();
             hosts.insert(
                 key.clone(),
                 Host {
@@ -924,6 +1446,12 @@ impl Graph {
                     hostnames,
                     os: clean_opt(host.os),
                     mac: clean_opt(host.mac),
+                    asn: clean_opt(host.asn),
+                    bgp_prefix: clean_opt(host.bgp_prefix),
+                    country: clean_opt(host.country),
+                    ipv6_dns: clean_opt(host.ipv6_dns),
+                    waf_cdn: clean_opt(host.waf_cdn),
+                    hops,
                     ports,
                     facts,
                     advisories,
@@ -953,9 +1481,25 @@ impl Graph {
     }
 
     /// Atomically replaces `graph.json`.
+    ///
+    /// Never writes a file `load` would refuse: one that is too large even
+    /// without indentation is not written, and the last good file stays.
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.updated_utc = now_rfc3339();
-        let json = serde_json::to_vec_pretty(self).context("cannot serialise the graph")?;
+        let mut json = serde_json::to_vec_pretty(self).context("cannot serialise the graph")?;
+        if json.len() as u64 > MAX_GRAPH_BYTES {
+            json = serde_json::to_vec(self).context("cannot serialise the graph")?;
+        }
+        if json.len() as u64 > MAX_GRAPH_BYTES {
+            self.tally.full = true;
+            bail!(
+                "the graph has grown to {} MB, more than the {} MB a workspace can hold; \
+                 {} keeps what was saved before",
+                json.len() / (1024 * 1024),
+                MAX_GRAPH_BYTES / (1024 * 1024),
+                path.display()
+            );
+        }
         write_private_atomic(path, &json)
     }
 
@@ -973,11 +1517,25 @@ impl Graph {
             .unwrap_or(key)
     }
 
+    fn host_mut(&mut self, address: &str) -> Option<&mut Host> {
+        let addr = HostAddr::parse(address)?;
+        let key = self.resolve(&addr);
+        self.hosts.get_mut(&key)
+    }
+
+    /// The host at `address`, made if it is not there yet. A new host has
+    /// a weight like everything else the graph holds, and a graph that has
+    /// all the hosts it can keep says so.
     fn host_entry(&mut self, address: &str) -> Option<&mut Host> {
         let addr = HostAddr::parse(address)?;
         let key = self.resolve(&addr);
-        if !self.hosts.contains_key(&key) && self.hosts.len() >= MAX_HOSTS {
-            return None;
+        if !self.hosts.contains_key(&key) {
+            if self.hosts.len() >= MAX_HOSTS {
+                self.tally.full = true;
+                return None;
+            }
+            self.tally.weight += ITEM_OVERHEAD + 2 * key.len();
+            self.tally.created = true;
         }
         Some(self.hosts.entry(key.clone()).or_insert_with(|| Host {
             address: key,
@@ -989,9 +1547,16 @@ impl Graph {
         let protocol = normalize_protocol(protocol)?;
         let pkey = port_key(number, &protocol);
         let host = self.host_entry(address)?;
-        if !host.ports.contains_key(&pkey) && host.ports.len() >= MAX_PORTS_PER_HOST {
+        let known = host.ports.contains_key(&pkey);
+        if !known && host.ports.len() >= MAX_PORTS_PER_HOST {
             return None;
         }
+        let key = host.address.clone();
+        if !known {
+            self.tally.weight += ITEM_OVERHEAD;
+            self.tally.created = true;
+        }
+        let host = self.hosts.get_mut(&key)?;
         Some(host.ports.entry(pkey).or_insert_with(|| Port {
             number,
             protocol,
@@ -1007,10 +1572,25 @@ impl Graph {
 
     /// Records `name` for the host at `address`. If the name was known as a
     /// separate, name-keyed host, that host is folded into this one.
-    fn add_hostname(&mut self, address: &str, name: &str) -> bool {
+    ///
+    /// A name has one owner. `trusted` says who makes the claim: the scanner
+    /// about the name the user asked it to scan, or anything else (a line of
+    /// text, a certificate, a reverse DNS record), which whoever runs the
+    /// machine at `address` can make say what they like. An untrusted claim
+    /// never takes a name another host has, and never takes over a host the
+    /// operator has worked on: its advisories, with their verdicts, and its
+    /// notes stay where they are. A trusted one moves the name to this host.
+    fn add_hostname(&mut self, address: &str, name: &str, trusted: bool) -> bool {
         let Some(HostAddr::Name(name)) = HostAddr::parse(name) else {
             return false;
         };
+        let Some(addr) = HostAddr::parse(address) else {
+            return false;
+        };
+        let resolved = self.resolve(&addr);
+        if resolved == name {
+            return false;
+        }
         let Some(host) = self.host_entry(address) else {
             return false;
         };
@@ -1021,42 +1601,144 @@ impl Graph {
         if !host.hostnames.contains(&name) && host.hostnames.len() >= MAX_HOSTNAMES_PER_HOST {
             return false;
         }
-        let added = host.hostnames.insert(name.clone());
-        if let Some(named) = self.hosts.remove(&name) {
-            let host = self.hosts.get_mut(&key).expect("host was just created");
-            for extra in named.hostnames {
-                if host.hostnames.len() >= MAX_HOSTNAMES_PER_HOST {
-                    break;
-                }
-                host.hostnames.insert(extra);
+        if !trusted {
+            let taken = self
+                .hosts
+                .values()
+                .any(|other| other.address != key && other.hostnames.contains(&name));
+            let worked_on = self.hosts.get(&name).is_some_and(|named| {
+                !named.advisories.is_empty()
+                    || named
+                        .facts
+                        .iter()
+                        .any(|fact| fact.record.source == Source::ManualNote)
+            });
+            if taken || worked_on {
+                return false;
             }
-            for (port_key, port) in named.ports {
-                match host.ports.get_mut(&port_key) {
-                    Some(existing) => existing.absorb(port),
-                    None => {
-                        if host.ports.len() < MAX_PORTS_PER_HOST {
-                            host.ports.insert(port_key, port);
+        } else {
+            for other in self.hosts.values_mut() {
+                if other.address != key {
+                    other.hostnames.remove(&name);
+                }
+            }
+        }
+        let host = self.hosts.get_mut(&key).expect("host was just created");
+        let added = host.hostnames.insert(name.clone());
+        let key_is_ip = HostAddr::parse(&key).is_some_and(|a| !a.is_name());
+        if key_is_ip {
+            if let Some(named) = self.hosts.remove(&name) {
+                self.tally.weight = self
+                    .tally
+                    .weight
+                    .saturating_sub(ITEM_OVERHEAD + 2 * name.len());
+                let host = self.hosts.get_mut(&key).expect("host was just created");
+                if host.os.is_none() {
+                    host.os = named.os;
+                }
+                if host.mac.is_none() {
+                    host.mac = named.mac;
+                }
+                if host.asn.is_none() {
+                    host.asn = named.asn;
+                }
+                if host.bgp_prefix.is_none() {
+                    host.bgp_prefix = named.bgp_prefix;
+                }
+                if host.country.is_none() {
+                    host.country = named.country;
+                }
+                if host.ipv6_dns.is_none() {
+                    host.ipv6_dns = named.ipv6_dns;
+                }
+                if host.waf_cdn.is_none() {
+                    host.waf_cdn = named.waf_cdn;
+                }
+                if host.hops.is_empty() {
+                    host.hops = named.hops;
+                }
+                for (group_key, group) in named.not_open {
+                    if host.not_open.contains_key(&group_key)
+                        || host.not_open.len() < MAX_NOT_OPEN_GROUPS
+                    {
+                        host.not_open.entry(group_key).or_insert(group);
+                    }
+                }
+                for extra in named.hostnames {
+                    if host.hostnames.len() >= MAX_HOSTNAMES_PER_HOST {
+                        break;
+                    }
+                    host.hostnames.insert(extra);
+                }
+                for (port_key, port) in named.ports {
+                    match host.ports.get_mut(&port_key) {
+                        Some(existing) => {
+                            existing.absorb(port);
+                        }
+                        None => {
+                            if host.ports.len() < MAX_PORTS_PER_HOST {
+                                host.ports.insert(port_key, port);
+                            }
                         }
                     }
                 }
-            }
-            for fact in named.facts {
-                push_fact(&mut host.facts, fact);
-            }
-            for advisory in named.advisories {
-                if host.advisories.len() >= MAX_ADVISORIES_PER_HOST {
-                    break;
+                for fact in named.facts {
+                    push_fact(&mut host.facts, fact);
                 }
-                if !host.advisories.iter().any(|a| a.id == advisory.id) {
-                    host.advisories.push(advisory);
+                for advisory in named.advisories {
+                    if host.advisories.len() >= MAX_ADVISORIES_PER_HOST {
+                        break;
+                    }
+                    if !host.advisories.iter().any(|a| a.id == advisory.id) {
+                        host.advisories.push(advisory);
+                    }
                 }
             }
         }
         added
     }
 
+    /// Checks whether `weight` more bytes fit inside [`MAX_GRAPH_WEIGHT`].
+    /// Once `tally.full` is latched, nothing further is accepted; if repeated
+    /// in-place updates caused `tally.weight` to drift above what is actually
+    /// stored, re-measuring snaps it back before latching `full`.
+    fn has_room_for(&mut self, weight: usize) -> bool {
+        if self.tally.full {
+            return false;
+        }
+        if self.tally.weight.saturating_add(weight) > MAX_GRAPH_WEIGHT {
+            let measured = self.measure();
+            if measured.saturating_add(weight) <= MAX_GRAPH_WEIGHT {
+                self.tally.weight = measured;
+                return true;
+            }
+            self.tally.full = true;
+            return false;
+        }
+        true
+    }
+
     /// Merges one observation. Returns `true` if the graph changed.
+    ///
+    /// A graph that is full records nothing more: every observation has a
+    /// weight, and their sum stays below what `graph.json` may hold, however
+    /// much a scanned server, a crawl or an imported file sends.
     pub fn apply(&mut self, observation: Observation) -> bool {
+        let weight = observation.weight();
+        if !self.has_room_for(weight) {
+            return false;
+        }
+        self.tally.created = false;
+        // A new host or port is a change too, whatever became of the rest:
+        // the session then saves it, and it has been weighed.
+        let changed = self.record(observation) | self.tally.created;
+        if changed {
+            self.tally.weight += weight;
+        }
+        changed
+    }
+
+    fn record(&mut self, observation: Observation) -> bool {
         match observation {
             Observation::Host {
                 address,
@@ -1098,7 +1780,11 @@ impl Graph {
                 hostname,
                 record,
             } => {
-                if !self.add_hostname(&address, &hostname) {
+                // The scanner's word about the name it was told to scan:
+                // nmap marks that one `user`, and the parser rates it High.
+                let trusted = matches!(record.source, Source::NmapXml | Source::Dns)
+                    && record.confidence == Confidence::High;
+                if !self.add_hostname(&address, &hostname, trusted) {
                     return false;
                 }
                 let claim = format!("hostname {}", clean(&hostname.to_ascii_lowercase()));
@@ -1122,7 +1808,6 @@ impl Graph {
                 let Some(entry) = self.port_entry(&address, port, &protocol) else {
                     return false;
                 };
-                let before = entry.clone();
                 let incoming = Port {
                     number: port,
                     protocol: entry.protocol.clone(),
@@ -1136,12 +1821,15 @@ impl Graph {
                         .map(|c| clean(c))
                         .filter(|c| !c.is_empty())
                         .collect(),
+                    identified: Some(record.confidence),
                     ..Port::default()
                 };
-                entry.absorb(incoming);
+                // What changed is asked of the update itself. Comparing the
+                // port before and after meant copying it, its whole path
+                // tree included, for every mention of it.
+                let changed = entry.absorb(incoming);
                 let claim = format!("{} {}", entry.label(), entry.state);
-                push_fact(&mut entry.facts, Fact { claim, record });
-                *entry != before
+                changed | push_fact(&mut entry.facts, Fact { claim, record })
             }
             Observation::TlsSan {
                 address,
@@ -1165,7 +1853,7 @@ impl Graph {
                 push_fact(&mut entry.facts, Fact { claim, record });
                 // Wildcards are certificate patterns, not hostnames.
                 if !san.starts_with('*') {
-                    self.add_hostname(&address, &san);
+                    self.add_hostname(&address, &san, false);
                 }
                 true
             }
@@ -1181,7 +1869,10 @@ impl Graph {
                     return false;
                 };
                 let before = entry.http.clone();
-                entry.state = "open".to_owned();
+                let before_state = entry.state.clone();
+                if entry.identified.is_none_or(|had| record.confidence >= had) {
+                    entry.state = "open".to_owned();
+                }
                 let mut http = entry.http.clone().unwrap_or_default();
                 http.scheme = if scheme.eq_ignore_ascii_case("https") {
                     "https"
@@ -1200,21 +1891,15 @@ impl Graph {
                     );
                     http.server = Some(server);
                 }
-                let mut redirect_host = None;
+                // Where a server sends its visitors is not what it is called:
+                // the target of a redirect stays a fact about this port.
                 if let Some(location) = clean_opt(location) {
                     let claim = format!("HTTP Location header: {location}");
                     push_fact(&mut entry.facts, Fact { claim, record });
-                    redirect_host = crate::endpoint::WebUrl::parse(&location)
-                        .map(|url| url.host)
-                        .filter(HostAddr::is_name);
                     http.location = Some(location);
                 }
                 entry.http = Some(http);
-                let changed = entry.http != before;
-                if let Some(name) = redirect_host {
-                    self.add_hostname(&address, &name.canonical());
-                }
-                changed
+                entry.http != before || entry.state != before_state
             }
             Observation::Path {
                 address,
@@ -1280,8 +1965,12 @@ impl Graph {
                     count,
                     ports,
                 };
-                // The latest scan says which ports are not open now.
+                // The latest scan says which ports are not open now. The
+                // states are words from the file: only so many are kept.
                 let key = format!("{protocol} {state}");
+                if !host.not_open.contains_key(&key) && host.not_open.len() >= MAX_NOT_OPEN_GROUPS {
+                    return false;
+                }
                 host.not_open.insert(key, group.clone()) != Some(group)
             }
             Observation::Script {
@@ -1308,6 +1997,97 @@ impl Graph {
                         None => false,
                     },
                 }
+            }
+            Observation::Fact {
+                address,
+                port,
+                protocol,
+                claim,
+                record,
+            } => {
+                let claim = claim.trim();
+                if claim.is_empty() {
+                    return false;
+                }
+                let fact = Fact {
+                    claim: sanitize(claim, crate::evidence::EVIDENCE_MAX),
+                    record,
+                };
+                match port {
+                    Some(number) => match self.port_entry(&address, number, &protocol) {
+                        Some(entry) => push_fact(&mut entry.facts, fact),
+                        None => false,
+                    },
+                    None => match self.host_entry(&address) {
+                        Some(host) => push_fact(&mut host.facts, fact),
+                        None => false,
+                    },
+                }
+            }
+            Observation::HostMeta {
+                address,
+                asn,
+                bgp_prefix,
+                country,
+                ipv6_dns,
+                waf_cdn,
+                hops,
+                record: _,
+            } => {
+                let Some(host) = self.host_entry(&address) else {
+                    return false;
+                };
+                let mut changed = false;
+                for (mine, theirs) in [
+                    (&mut host.asn, clean_opt(asn)),
+                    (&mut host.bgp_prefix, clean_opt(bgp_prefix)),
+                    (&mut host.country, clean_opt(country)),
+                    (&mut host.ipv6_dns, clean_opt(ipv6_dns)),
+                    (&mut host.waf_cdn, clean_opt(waf_cdn)),
+                ] {
+                    if theirs.is_some() && *mine != theirs {
+                        *mine = theirs;
+                        changed = true;
+                    }
+                }
+                let clean_hops: Vec<String> = hops
+                    .into_iter()
+                    .map(|h| clean(&h))
+                    .filter(|h| !h.is_empty())
+                    .take(32)
+                    .collect();
+                if !clean_hops.is_empty() && host.hops != clean_hops {
+                    host.hops = clean_hops;
+                    changed = true;
+                }
+                changed
+            }
+            Observation::WebMeta {
+                address,
+                port,
+                http,
+                record: _,
+            } => {
+                let Some(entry) = self.port_entry(&address, port, "tcp") else {
+                    return false;
+                };
+                let mut changed = false;
+                if entry.state != "open" {
+                    entry.state = "open".to_owned();
+                    changed = true;
+                }
+                match &mut entry.http {
+                    Some(existing) => {
+                        changed |= existing.absorb(*http);
+                    }
+                    None => {
+                        let mut h = *http;
+                        h.sanitize();
+                        entry.http = Some(h);
+                        changed = true;
+                    }
+                }
+                changed
             }
             Observation::Note {
                 address,
@@ -1343,12 +2123,19 @@ impl Graph {
         let Some(advisory) = sanitize_advisory(advisory, true) else {
             return false;
         };
+        let weight = advisory_weight(&advisory);
+        // Advisories count towards what the graph can hold like anything
+        // else: thousands of matches for one product do not go unweighed.
+        if !self.has_room_for(weight) {
+            return false;
+        }
         let Some(host) = self.host_entry(address) else {
             return false;
         };
         match host.advisories.iter_mut().find(|a| a.id == advisory.id) {
             Some(existing) => {
                 let before = existing.clone();
+                let before_weight = advisory_weight(&before);
                 existing.kev |= advisory.kev;
                 if existing.title.is_empty() {
                     existing.title = advisory.title;
@@ -1365,13 +2152,19 @@ impl Graph {
                         existing.references.push(reference);
                     }
                 }
-                *existing != before
+                let changed = *existing != before;
+                if changed {
+                    let after_weight = advisory_weight(existing);
+                    self.tally.weight += after_weight.saturating_sub(before_weight);
+                }
+                changed
             }
             None => {
                 if host.advisories.len() >= MAX_ADVISORIES_PER_HOST {
                     return false;
                 }
                 host.advisories.push(advisory);
+                self.tally.weight += weight;
                 true
             }
         }
@@ -1381,25 +2174,42 @@ impl Graph {
     /// returns: the software was updated, or the match was a wrong one.
     /// Anything the operator has ruled on stays.
     pub fn drop_stale_advisories(&mut self, address: &str, current: &BTreeSet<String>) -> usize {
-        let Some(host) = self.host_entry(address) else {
+        let Some(host) = self.host_mut(address) else {
             return 0;
         };
         let before = host.advisories.len();
+        let mut freed = 0usize;
         host.advisories.retain(|advisory| {
-            current.contains(&advisory.id)
+            let keep = current.contains(&advisory.id)
                 || advisory.record.verification_status != VerificationStatus::UnverifiedHypothesis
-                || !matches!(advisory.record.source, Source::NvdApi | Source::OsvApi)
+                || !matches!(advisory.record.source, Source::NvdApi | Source::OsvApi);
+            if !keep {
+                freed += advisory_weight(advisory);
+            }
+            keep
         });
-        before - host.advisories.len()
+        let dropped = before - host.advisories.len();
+        if dropped > 0 {
+            self.tally.weight = self.tally.weight.saturating_sub(freed);
+        }
+        dropped
     }
 
     /// Adds a host-level fact that did not come from a parser (for example
     /// a CISA KEV listing found during CVE grounding).
     pub fn add_host_fact(&mut self, address: &str, fact: Fact) -> bool {
-        match self.host_entry(address) {
+        let weight = 2 * (fact.claim.len() + fact.record.evidence.len()) + ITEM_OVERHEAD;
+        if !self.has_room_for(weight) {
+            return false;
+        }
+        let added = match self.host_entry(address) {
             Some(host) => push_fact(&mut host.facts, fact),
             None => false,
+        };
+        if added {
+            self.tally.weight += weight;
         }
+        added
     }
 
     /// Operator verdict on an advisory (`Confirmed`, `FalsePositive`, or
@@ -1411,8 +2221,8 @@ impl Graph {
         status: VerificationStatus,
     ) -> Result<()> {
         let host = self
-            .host_entry(address)
-            .with_context(|| format!("unknown host '{address}'"))?;
+            .host_mut(address)
+            .with_context(|| format!("no advisory {advisory_id} on {address}"))?;
         let advisory = host
             .advisories
             .iter_mut()
@@ -1603,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn sans_and_redirects_name_the_host_and_fold_in_name_keyed_hosts() {
+    fn a_certificate_names_the_host_and_folds_in_a_name_keyed_host_a_redirect_does_not() {
         let mut graph = Graph::default();
         // A crawl saw the site by name before any scan tied it to an IP.
         graph.apply(path("app.lab.local", 443, "/login", 200));
@@ -1633,11 +2443,13 @@ mod tests {
 
         assert_eq!(graph.hosts.len(), 1, "{:?}", graph.hosts.keys());
         let host = &graph.hosts["10.0.0.5"];
-        assert_eq!(
-            host.hostnames.iter().collect::<Vec<_>>(),
-            ["app.lab.local", "portal.lab.local"]
-        );
+        // Where the server sends its visitors is not what it is called.
+        assert_eq!(host.hostnames.iter().collect::<Vec<_>>(), ["app.lab.local"]);
         let p = &host.ports["443/tcp"];
+        assert_eq!(
+            p.http.as_ref().unwrap().location.as_deref(),
+            Some("https://portal.lab.local/sso")
+        );
         assert!(p.tls_sans.contains("*.lab.local"));
         assert_eq!(
             p.http.as_ref().unwrap().server.as_deref(),
@@ -1645,10 +2457,163 @@ mod tests {
         );
         // The crawl result recorded under the name now lives on the IP host.
         assert_eq!(p.paths.walk()[0].0, "/login");
-        // Later observations by name land on the same host.
-        graph.apply(path("portal.lab.local", 443, "/sso", 302));
+        // Later observations by the certificate's name land on the same
+        // host; the redirect's target is a host of its own.
+        graph.apply(path("app.lab.local", 443, "/account", 200));
         assert_eq!(graph.hosts.len(), 1);
         assert_eq!(graph.host("APP.lab.local.").unwrap().address, "10.0.0.5");
+        graph.apply(path("portal.lab.local", 443, "/sso", 302));
+        assert_eq!(graph.hosts.len(), 2);
+        assert!(graph.hosts.contains_key("portal.lab.local"));
+    }
+
+    fn hostname(address: &str, name: &str, source: Source, confidence: Confidence) -> Observation {
+        Observation::Hostname {
+            address: address.into(),
+            hostname: name.into(),
+            record: EvidenceRecord::observed(source, confidence, "x"),
+        }
+    }
+
+    #[test]
+    fn a_claimed_name_takes_nothing_from_the_host_that_has_it() {
+        // The operator has worked on portal.example: a confirmed finding
+        // and a note of their own.
+        let mut graph = Graph::default();
+        graph.apply(port("portal.example", 443, "https", Some("nginx")));
+        graph.add_advisory("portal.example", advisory("CVE-2021-23017"));
+        graph
+            .set_advisory_status(
+                "portal.example",
+                "CVE-2021-23017",
+                VerificationStatus::Confirmed,
+            )
+            .unwrap();
+        graph.apply(Observation::Note {
+            address: Some("portal.example".into()),
+            text: "admin panel, in scope".into(),
+            record: rec(Source::ManualNote),
+        });
+        let before = graph.hosts["portal.example"].clone();
+
+        // Another machine claims the name every way it can: a redirect, a
+        // certificate, a line of text, its reverse DNS record.
+        graph.apply(Observation::Http {
+            address: "10.0.0.66".into(),
+            port: 80,
+            scheme: "http".into(),
+            server: None,
+            location: Some("https://portal.example/login".into()),
+            record: rec(Source::FeroxJson),
+        });
+        graph.apply(Observation::TlsSan {
+            address: "10.0.0.66".into(),
+            port: 443,
+            san: "portal.example".into(),
+            record: rec(Source::TlsSan),
+        });
+        graph.apply(hostname(
+            "10.0.0.66",
+            "portal.example",
+            Source::PtyRegex,
+            Confidence::Medium,
+        ));
+        graph.apply(hostname(
+            "10.0.0.66",
+            "portal.example",
+            Source::NmapXml,
+            Confidence::Medium,
+        ));
+
+        assert_eq!(graph.hosts["portal.example"], before, "nothing moved");
+        assert!(graph.hosts["10.0.0.66"].hostnames.is_empty());
+        assert!(graph.hosts["10.0.0.66"].advisories.is_empty());
+        assert_eq!(
+            graph.host("portal.example").unwrap().address,
+            "portal.example"
+        );
+        // The certificate's name is still recorded as what the port presents.
+        assert!(graph.hosts["10.0.0.66"].ports["443/tcp"]
+            .tls_sans
+            .contains("portal.example"));
+
+        // The scanner resolving the name the user asked for does merge the
+        // hosts, verdict and note included.
+        graph.apply(hostname(
+            "203.0.113.50",
+            "portal.example",
+            Source::NmapXml,
+            Confidence::High,
+        ));
+        assert!(!graph.hosts.contains_key("portal.example"));
+        let real = graph.host("portal.example").unwrap();
+        assert_eq!(real.address, "203.0.113.50");
+        assert_eq!(
+            real.advisories[0].record.verification_status,
+            VerificationStatus::Confirmed
+        );
+        assert!(real
+            .facts
+            .iter()
+            .any(|fact| fact.claim == "admin panel, in scope"));
+    }
+
+    #[test]
+    fn a_name_has_one_owner_and_only_the_scanner_can_move_it() {
+        let mut graph = Graph::default();
+        // First come, first named, as long as nobody is sure.
+        assert!(graph.apply(hostname(
+            "10.0.0.5",
+            "app.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        // The second claimant becomes a host (that is a change), without
+        // the name.
+        assert!(graph.apply(hostname(
+            "10.0.0.66",
+            "app.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        assert!(!graph.apply(hostname(
+            "10.0.0.66",
+            "app.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        graph.apply(Observation::TlsSan {
+            address: "10.0.0.66".into(),
+            port: 443,
+            san: "app.lab.local".into(),
+            record: rec(Source::TlsSan),
+        });
+        assert_eq!(graph.host("app.lab.local").unwrap().address, "10.0.0.5");
+        assert!(graph.hosts["10.0.0.66"].hostnames.is_empty());
+
+        // An address that sorts first does not win by sorting first.
+        assert!(graph.apply(hostname(
+            "10.0.0.1",
+            "db.lab.local",
+            Source::LogRegex,
+            Confidence::Low
+        )));
+        assert!(graph.apply(hostname(
+            "10.0.0.9",
+            "db.lab.local",
+            Source::NmapXml,
+            Confidence::High
+        )));
+        assert_eq!(graph.host("db.lab.local").unwrap().address, "10.0.0.9");
+        assert!(graph.hosts["10.0.0.1"].hostnames.is_empty());
+        // And a later claim does not take it back.
+        assert!(!graph.apply(hostname(
+            "10.0.0.1",
+            "db.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        assert_eq!(graph.host("db.lab.local").unwrap().address, "10.0.0.9");
     }
 
     #[test]
@@ -1720,6 +2685,274 @@ mod tests {
         assert!(graph
             .set_advisory_status("10.0.0.5", "CVE-0000-0000", VerificationStatus::Confirmed)
             .is_err());
+    }
+
+    #[test]
+    fn hosts_and_ports_made_by_a_mention_are_weighed_and_saved() {
+        // A bare address of a site: `http://h1.x:8001/`. It records no
+        // path, and used to count as "nothing changed" and weigh nothing.
+        let root = |host: usize, port: u16| Observation::Path {
+            address: format!("h{host}.x"),
+            port,
+            scheme: "http".into(),
+            path: "/".into(),
+            status: None,
+            record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Low, &"x".repeat(60)),
+        };
+        let mut graph = Graph::default();
+        let before = graph.tally.weight;
+        assert!(
+            graph.apply(root(1, 8001)),
+            "a new host and port is a change"
+        );
+        let first = graph.tally.weight - before;
+        assert!(first >= 2 * ITEM_OVERHEAD, "both were weighed: {first}");
+        assert!(!graph.apply(root(1, 8001)), "said again, nothing changes");
+        assert_eq!(graph.tally.weight - before, first);
+        assert!(graph.apply(root(1, 8002)), "a new port");
+
+        // 400 names times 1,000 ports of such mentions: the graph says it
+        // is full before it holds more than a file can, and still saves.
+        let mut graph = Graph::default();
+        'flood: for host in 0..400 {
+            for port in 1..=1000u16 {
+                graph.apply(root(host, port));
+                if graph.is_full() {
+                    break 'flood;
+                }
+            }
+        }
+        assert!(graph.is_full(), "the budget saw the flood coming");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.save(&file).expect("what was recorded can be written");
+        let loaded = Graph::load(&file).unwrap();
+        assert_eq!(loaded.hosts.len(), graph.hosts.len());
+        // Loaded, it weighs at least what the file does.
+        assert!(loaded.tally.weight >= std::fs::metadata(&file).unwrap().len() as usize);
+    }
+
+    #[test]
+    fn a_full_host_list_says_so_and_advisories_have_a_weight() {
+        let mut graph = Graph::default();
+        for host in 0..MAX_HOSTS {
+            graph.apply(Observation::Host {
+                address: format!("h{host}.x"),
+                os: None,
+                mac: None,
+                record: rec(Source::LogRegex),
+            });
+        }
+        assert_eq!(graph.hosts.len(), MAX_HOSTS);
+        assert!(!graph.is_full());
+        // One more is refused, and no longer in silence.
+        assert!(!graph.apply(port("10.0.0.5", 22, "ssh", None)));
+        assert!(graph.is_full());
+        assert!(!graph.hosts.contains_key("10.0.0.5"));
+
+        let mut graph = Graph::default();
+        graph.apply(port("10.0.0.5", 443, "https", None));
+        let before = graph.tally.weight;
+        assert!(graph.add_advisory("10.0.0.5", advisory("CVE-2021-23017")));
+        assert!(graph.tally.weight > before + ITEM_OVERHEAD);
+        // What is measured after loading counts them too.
+        assert!(graph.measure() >= graph.tally.weight - before);
+    }
+
+    #[test]
+    fn text_does_not_rewrite_what_a_probe_recorded() {
+        let observed = |source: Source, confidence: Confidence, product: &str, version: &str| {
+            Observation::Port {
+                address: "10.0.0.9".into(),
+                port: 22,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("ssh".into()),
+                product: Some(product.into()),
+                version: Some(version.into()),
+                extra_info: None,
+                cpes: vec![],
+                record: EvidenceRecord::observed(
+                    source,
+                    confidence,
+                    &format!("{product} {version}"),
+                ),
+            }
+        };
+        let mut graph = Graph::default();
+        graph.apply(observed(
+            Source::NmapXml,
+            Confidence::High,
+            "OpenSSH",
+            "8.2p1",
+        ));
+        // A banner shown in the terminal says otherwise.
+        assert!(graph.apply(observed(
+            Source::PtyRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "9.9p2"
+        )));
+        let port = &graph.hosts["10.0.0.9"].ports["22/tcp"];
+        assert_eq!(port.version.as_deref(), Some("8.2p1"), "the probe stands");
+        assert_eq!(port.identified, Some(Confidence::High));
+        // What the text said is still kept, as what it is.
+        assert_eq!(port.facts.len(), 2);
+        assert!(
+            port.facts[1].claim.contains("8.2p1")
+                || port.facts[1].record.evidence.contains("9.9p2")
+        );
+        // A new probe does update it.
+        graph.apply(observed(
+            Source::NmapXml,
+            Confidence::High,
+            "OpenSSH",
+            "9.6p1",
+        ));
+        assert_eq!(
+            graph.hosts["10.0.0.9"].ports["22/tcp"].version.as_deref(),
+            Some("9.6p1")
+        );
+        // Text about a port nothing has probed still names it.
+        let mut graph = Graph::default();
+        graph.apply(observed(
+            Source::PtyRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "9.9p2",
+        ));
+        graph.apply(observed(
+            Source::LogRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "9.9p3",
+        ));
+        assert_eq!(
+            graph.hosts["10.0.0.9"].ports["22/tcp"].version.as_deref(),
+            Some("9.9p3")
+        );
+        // And it survives saving and loading.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.apply(observed(
+            Source::NmapXml,
+            Confidence::High,
+            "OpenSSH",
+            "8.2p1",
+        ));
+        graph.save(&file).unwrap();
+        let mut loaded = Graph::load(&file).unwrap();
+        loaded.apply(observed(
+            Source::PtyRegex,
+            Confidence::Medium,
+            "OpenSSH",
+            "1.0",
+        ));
+        assert_eq!(
+            loaded.hosts["10.0.0.9"].ports["22/tcp"].version.as_deref(),
+            Some("8.2p1")
+        );
+    }
+
+    #[test]
+    fn many_mentions_of_a_port_with_many_paths_stay_quick() {
+        let mut graph = Graph::default();
+        for index in 0..4000 {
+            graph.apply(path(
+                "10.0.0.5",
+                81,
+                &format!("/a/{index}/{}", "p".repeat(40)),
+                200,
+            ));
+        }
+        let mention = || Observation::Port {
+            address: "10.0.0.5".into(),
+            port: 81,
+            protocol: "tcp".into(),
+            state: "unverified".into(),
+            service: None,
+            product: None,
+            version: None,
+            extra_info: None,
+            cpes: vec![],
+            record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Low, "10.0.0.5:81"),
+        };
+        let started = std::time::Instant::now();
+        let mut changed = 0;
+        for _ in 0..20_000 {
+            changed += usize::from(graph.apply(mention()));
+        }
+        // Copying and comparing the port each time took 6 ms a mention.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert!(changed <= 1, "a repeat changes nothing: {changed}");
+    }
+
+    #[test]
+    fn a_flood_of_urls_fills_the_graph_which_still_saves_and_loads() {
+        // 225,000 distinct URLs on 45 ports of one server: what a hostile
+        // site's output or a crafted import file can hold.
+        let mut graph = Graph::default();
+        let mut kept = 0usize;
+        for port in 8001..=8045u16 {
+            for n in 0..5000 {
+                if graph.apply(path("10.9.8.7", port, &format!("/p{n:05}"), 200)) {
+                    kept += 1;
+                }
+            }
+        }
+        assert!(graph.is_full());
+        assert!(kept > 50_000 && kept < 225_000, "{kept}");
+        // Nothing more is recorded, whatever it is.
+        assert!(!graph.apply(port("10.9.8.9", 22, "ssh", None)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph.save(&file).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().len() <= MAX_GRAPH_BYTES);
+        // The file opens again. What it holds is counted on loading, so a
+        // second flood fills it up again without outgrowing the file.
+        let mut loaded = Graph::load(&file).unwrap();
+        assert_eq!(
+            loaded.hosts["10.9.8.7"].ports.len(),
+            graph.hosts["10.9.8.7"].ports.len()
+        );
+        for port in 9001..=9045u16 {
+            for n in 0..5000 {
+                loaded.apply(path("10.9.8.7", port, &format!("/q{n:05}"), 200));
+            }
+        }
+        assert!(loaded.is_full());
+        loaded.save(&file).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().len() <= MAX_GRAPH_BYTES);
+        assert!(Graph::load(&file).is_ok());
+    }
+
+    #[test]
+    fn a_graph_too_large_to_load_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        let mut graph = Graph::default();
+        graph.apply(port("10.0.0.5", 22, "ssh", None));
+        graph.save(&file).unwrap();
+        let good = std::fs::read(&file).unwrap();
+
+        // Grown past the limit behind `apply`'s back.
+        graph.notes.push(Fact {
+            claim: "x".repeat(MAX_GRAPH_BYTES as usize + 1),
+            record: rec(Source::NmapXml),
+        });
+        let error = graph.save(&file).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("more than the 64 MB"),
+            "{error:#}"
+        );
+        assert!(graph.is_full());
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            good,
+            "the last good file stays"
+        );
+        assert!(Graph::load(&file).is_ok());
     }
 
     #[test]
@@ -2122,5 +3355,78 @@ mod tests {
         let loaded = Graph::load(&file).unwrap();
         assert_eq!(loaded.hosts["192.0.2.40"].ports["443/tcp"].paths.count(), 4);
         assert_eq!(loaded, graph);
+    }
+
+    #[test]
+    fn full_latch_weight_resync_and_fold_metadata_stay_consistent() {
+        let mut graph = Graph::default();
+        // Unknown-host operations never materialize phantom empty hosts.
+        assert_eq!(
+            graph.drop_stale_advisories("198.51.100.99", &BTreeSet::new()),
+            0
+        );
+        let err = graph
+            .set_advisory_status(
+                "198.51.100.99",
+                "CVE-2024-0001",
+                VerificationStatus::Confirmed,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no advisory"), "{err}");
+        assert!(graph.hosts.is_empty());
+
+        // Folding a name-keyed host into an IP host preserves os, mac, and not_open.
+        assert!(graph.apply(Observation::Host {
+            address: "svc.lab.local".into(),
+            os: Some("Linux 6.6".into()),
+            mac: Some("00:11:22:33:44:55".into()),
+            record: rec(Source::NmapXml),
+        }));
+        assert!(graph.apply(Observation::NotOpen {
+            address: "svc.lab.local".into(),
+            protocol: "tcp".into(),
+            state: "closed".into(),
+            count: 999,
+            ports: "1-79,81-1000".into(),
+            record: rec(Source::NmapXml),
+        }));
+        assert!(graph.apply(hostname(
+            "198.51.100.10",
+            "svc.lab.local",
+            Source::NmapXml,
+            Confidence::High,
+        )));
+        let merged = graph.host("svc.lab.local").unwrap();
+        assert_eq!(merged.address, "198.51.100.10");
+        assert_eq!(merged.os.as_deref(), Some("Linux 6.6"));
+        assert_eq!(merged.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(merged.not_open["tcp closed"].count, 999);
+
+        // Inflate tally.weight via simulated repeated in-place overwrites;
+        // has_room_for re-measures instead of wedging is_full() prematurely.
+        graph.tally.weight = MAX_GRAPH_WEIGHT - 8;
+        assert!(graph.apply(Observation::NotOpen {
+            address: "198.51.100.10".into(),
+            protocol: "tcp".into(),
+            state: "closed".into(),
+            count: 998,
+            ports: "1-79,82-1000".into(),
+            record: rec(Source::NmapXml),
+        }));
+        assert!(!graph.is_full());
+        assert!(graph.tally.weight < MAX_GRAPH_WEIGHT / 2);
+
+        // Once full is latched, even tiny updates to an existing host are refused.
+        graph.tally.full = true;
+        assert!(!graph.apply(port("198.51.100.10", 8080, "http", None)));
+        assert!(!graph.add_advisory("198.51.100.10", advisory("CVE-2024-9999")));
+        assert!(!graph.add_host_fact(
+            "198.51.100.10",
+            Fact {
+                claim: "kev".into(),
+                record: rec(Source::ManualNote),
+            },
+        ));
     }
 }

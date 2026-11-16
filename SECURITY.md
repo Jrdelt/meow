@@ -15,18 +15,33 @@ made on `main` first; the report stays private until the fix is published.
 meow itself, for example:
 
 - the installers (`install.sh`, `install.ps1`, `Formula/meow.rb`) and
-  `meow update`, `meow tools`;
+  `meow update` (SHA-256 verified GitHub release upgrades and hardened git
+  source updates), `meow tools`;
 - the local map server and the HUD connection (they listen on `127.0.0.1`
-  only and require the session token);
-- the secret vault and anything that could send unvaulted addresses, host
+  only, enforce strict `Host`/`Origin` checks, and require the session token);
+- the secret vault, local-only AI lock (`disable_cloud = true` in
+  `~/.meow/ai.toml`), and anything that could send unvaulted addresses, host
   names, paths or keys to a cloud AI;
-- the handling of untrusted input: scan files, terminal output, web pages
+- location and map tile privacy (`[location] enabled` and `map` in
+  `~/.meow/config.toml`, full-tunnel VPN auto-suppression, HTTPS/redirect
+  enforcement, and offline DB-IP lookups);
+- the handling of untrusted input: scan files, terminal output, web pages,
+  SQLite workspace state (`SQLITE_DBCONFIG_DEFENSIVE`, `trusted_schema = OFF`),
   and API answers that reach the graph, the terminal or a report;
-- file permissions of the workspace and of `~/.meow/ai.toml`.
+- ownership, symlink refusal, and `0700`/`0600` (or Windows current-user SID
+  ACL) permissions of workspaces and `~/.meow/ai.toml`.
 
 Out of scope: vulnerabilities in the systems you scan (that is what meow
 reports on), and problems in nmap, katana or feroxbuster themselves, which
 belong to those projects.
+
+## Local workspaces (`--local`)
+
+Prefer named workspaces (`meow <name>`, stored under `~/.meow/workspaces/`)
+when inspecting untrusted directories. Only pass `--local` (`./.meow/`) inside
+directories you own and trust: meow verifies directory ownership, refuses
+symlinks, and disables SQLite schema execution (`trusted_schema = OFF`), but
+shared or world-writable parent directories remain untrusted.
 
 ## Supported versions
 
@@ -38,3 +53,4 @@ Update with `meow update`.
 meow drives network scanners. Use `meow recon` only against systems you own
 or are explicitly authorised to test. The default `light` mode sends nothing
 to any target.
+

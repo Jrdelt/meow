@@ -11,6 +11,7 @@
     .\install.ps1 -DryRun       # only show what would be done
     .\install.ps1 -NoTools      # leave out the scanners and the wordlist
     .\install.ps1 -NoGeo        # leave out the location database
+    .\install.ps1 -ToolsOnly    # only install scanners, wordlist, and location database
 #>
 
 [CmdletBinding()]
@@ -21,22 +22,25 @@ param(
     [switch]$DryRun,
     [switch]$NoTools,
     [switch]$WithTools,
+    [switch]$ToolsOnly,
     [switch]$NoGeo,
     [Alias('h')]
     [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 $MIN_RUST_MINOR = 89
-$RUSTUP_URL = "https://win.rustup.rs/x86_64"
+$IsArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') -or ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')
+$RUSTUP_URL = if ($IsArm64) { "https://win.rustup.rs/aarch64" } else { "https://win.rustup.rs/x86_64" }
 $WORDLIST_URL = "https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
-$WORDLIST_SHA256 = if ($env:MEOW_WORDLIST_SHA256) {
-    $env:MEOW_WORDLIST_SHA256.ToLowerInvariant()
-} else {
-    "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
-}
+$WORDLIST_SHA256 = "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
 $KATANA_GO = "github.com/projectdiscovery/katana/cmd/katana@v1.1.2"
+$FEROXBUSTER_VERSION = "2.11.0"
+# The most a location database file may weigh, packed (200 MB) and unpacked (512 MB).
+$GEO_MAX_PACKED = 209715200
+$GEO_MAX_BYTES = 536870912
 
 function Say([string]$Message) {
     Write-Host "[+] $Message"
@@ -55,6 +59,28 @@ function Have([string]$Name) {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Test-IsReparsePoint([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    $Item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $Item) {
+        return $false
+    }
+    return [bool]($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+}
+
+# Strip empty and relative PATH segments so command lookups never run binaries from CWD.
+if ($env:PATH) {
+    $CleanPathEntries = @()
+    foreach ($Entry in ($env:PATH -split ';')) {
+        if ($Entry -and [System.IO.Path]::IsPathRooted($Entry) -and ($Entry -match '^[A-Za-z]:\\')) {
+            $CleanPathEntries += $Entry
+        }
+    }
+    $env:PATH = $CleanPathEntries -join ';'
+}
+
 if ($Help) {
     Write-Host @"
 Builds and installs meow with everything it uses on Windows: a C compiler,
@@ -66,18 +92,25 @@ and a wordlist for the directory stage.
   .\install.ps1 -DryRun       only show what would be done
   .\install.ps1 -NoTools      leave out the scanners and the wordlist
   .\install.ps1 -NoGeo        leave out the location database
+  .\install.ps1 -ToolsOnly    only the scanners, wordlist, and location database
 "@
     exit 0
 }
 
 $InstallTools = -not $NoTools
-if ($WithTools) {
+if ($WithTools -or $ToolsOnly) {
     $InstallTools = $true
 }
 
-Set-Location -LiteralPath $PSScriptRoot
-if (-not (Test-Path -LiteralPath "Cargo.toml") -or -not (Select-String -Path "Cargo.toml" -Pattern '^name = "meow"' -Quiet)) {
-    Die "Run this script from the meow repository (Cargo.toml not found next to it)."
+if (-not $ToolsOnly) {
+    Set-Location -LiteralPath $PSScriptRoot
+    if (-not (Test-Path -LiteralPath "Cargo.toml") -or -not (Select-String -Path "Cargo.toml" -Pattern '^name = "meow"' -Quiet)) {
+        Die "Run this script from the meow repository (Cargo.toml not found next to it)."
+    }
+} else {
+    # Nothing below needs the folder the user is in, and rustup's cargo and
+    # rustc would obey a rust-toolchain.toml found there.
+    Set-Location -LiteralPath ([System.IO.Path]::GetTempPath())
 }
 
 $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
@@ -94,6 +127,23 @@ $Pm = if (Have "winget") {
     ""
 }
 
+function Test-MsvcInstalled {
+    if ((Have "cl") -or (Have "gcc") -or (Have "clang")) {
+        return $true
+    }
+    $Pf86 = ${env:ProgramFiles(x86)}
+    if ($Pf86) {
+        $VsWhere = Join-Path $Pf86 "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path -LiteralPath $VsWhere) {
+            try {
+                $Found = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath 2>$null
+                if ($Found) { return $true }
+            } catch {}
+        }
+    }
+    return $false
+}
+
 function Get-RustMinor {
     if (-not (Have "rustc")) {
         return $null
@@ -107,17 +157,22 @@ function Get-RustMinor {
     return $null
 }
 
-$NeedCompiler = -not ((Have "cl") -or (Have "gcc") -or (Have "clang"))
+$NeedCompiler = $false
 $NeedRust = $false
 $UpdateRust = $false
-$FoundRust = Get-RustMinor
-if (-not (Have "cargo") -or $null -eq $FoundRust) {
-    $NeedRust = $true
-} elseif ($FoundRust -lt $MIN_RUST_MINOR) {
-    if (Have "rustup") {
-        $UpdateRust = $true
-    } else {
+$FoundRust = $null
+
+if (-not $ToolsOnly) {
+    $NeedCompiler = -not (Test-MsvcInstalled)
+    $FoundRust = Get-RustMinor
+    if (-not (Have "cargo") -or $null -eq $FoundRust) {
         $NeedRust = $true
+    } elseif ($FoundRust -lt $MIN_RUST_MINOR) {
+        if (Have "rustup") {
+            $UpdateRust = $true
+        } else {
+            $NeedRust = $true
+        }
     }
 }
 
@@ -141,9 +196,11 @@ $NeedWordlist = $InstallTools -and ($ExistingWordlists.Count -eq 0)
 # is kept.
 $GeoDir = Join-Path $MeowHome "geo"
 $GeoCity = Join-Path $GeoDir "dbip-city-lite.mmdb"
+$GeoAsn = Join-Path $GeoDir "dbip-asn-lite.mmdb"
 $NeedGeo = -not $NoGeo
-if ((Test-Path -LiteralPath $GeoCity) -and
-    ((Get-Item -LiteralPath $GeoCity).LastWriteTime -gt (Get-Date).AddDays(-30))) {
+if ((Test-Path -LiteralPath $GeoCity) -and (Test-Path -LiteralPath $GeoAsn) -and
+    ((Get-Item -LiteralPath $GeoCity).LastWriteTime -gt (Get-Date).AddDays(-30)) -and
+    ((Get-Item -LiteralPath $GeoAsn).LastWriteTime -gt (Get-Date).AddDays(-30))) {
     $NeedGeo = $false
 }
 
@@ -166,7 +223,9 @@ if ($UpdateRust) {
     Write-Host "  - update Rust to the latest stable (meow needs 1.$MIN_RUST_MINOR or newer; found 1.$FoundRust)"
 }
 $InstalledExe = Join-Path $CargoBin "meow.exe"
-Write-Host "  - build meow in release mode and install it to $InstalledExe"
+if (-not $ToolsOnly) {
+    Write-Host "  - build meow in release mode and install it to $InstalledExe"
+}
 if ($InstallTools -and $MissingTools.Count -gt 0) {
     Write-Host "  - install the scanners meow recon drives: $($MissingTools -join ' ')"
 }
@@ -176,8 +235,12 @@ if ($NeedWordlist) {
 if ($NeedGeo) {
     Write-Host "  - download the DB-IP Lite location database (about 65 MB, 135 MB unpacked) to $GeoDir"
 }
-if (-not $NeedCompiler -and -not $NeedRust -and -not $UpdateRust) {
+if (-not $ToolsOnly -and -not $NeedCompiler -and -not $NeedRust -and -not $UpdateRust) {
     Write-Host "The C compiler and Rust are already installed."
+}
+if ($ToolsOnly -and $MissingTools.Count -eq 0 -and -not $NeedWordlist -and -not $NeedGeo) {
+    Say "Every tool meow recon uses is already installed."
+    exit 0
 }
 
 if ($DryRun) {
@@ -186,17 +249,92 @@ if ($DryRun) {
 }
 
 if (-not $Yes) {
-    $answer = Read-Host "Proceed? [Y/n]"
-    if ($answer -match '^(n|no)$') {
+    if ([Console]::IsInputRedirected) {
+        Die "Not running in a terminal, so I cannot ask. Rerun with -Yes to proceed."
+    }
+    Write-Host -NoNewline "Proceed? [Y/n] "
+    $answer = [Console]::ReadLine()
+    if ($null -eq $answer -or $answer.Trim() -match '^(n|no)$') {
         Die "Cancelled; nothing was changed."
+    }
+}
+
+# Downloads an HTTPS resource to a brand-new file (`FileMode::CreateNew`),
+# enforcing HTTPS on every redirect hop and aborting immediately if the body
+# exceeds `$MaxBytes`.
+function Invoke-SafeDownload([string]$Url, [string]$OutFile, [long]$MaxBytes) {
+    $Current = New-Object System.Uri($Url)
+    if ($Current.Scheme -ne 'https') {
+        throw "Refusing non-HTTPS URL: $Url"
+    }
+    for ($Hop = 0; $Hop -le 5; $Hop++) {
+        $Req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Current)
+        $Req.AllowAutoRedirect = $false
+        $Req.Timeout = 300000
+        $Req.ReadWriteTimeout = 60000
+        $Req.UserAgent = "meow-installer"
+        $Resp = [System.Net.HttpWebResponse]$Req.GetResponse()
+        try {
+            $Code = [int]$Resp.StatusCode
+            if ($Code -in @(301, 302, 303, 307, 308)) {
+                if ($Hop -eq 5) {
+                    throw "Too many HTTP redirects for $Url"
+                }
+                $Loc = $Resp.Headers["Location"]
+                if (-not $Loc) {
+                    throw "Redirect without Location header for $Url"
+                }
+                $Next = New-Object System.Uri($Current, $Loc)
+                if ($Next.Scheme -ne 'https') {
+                    throw "Refusing HTTPS downgrade redirect for $Url"
+                }
+                $Current = $Next
+                continue
+            }
+            if ($Code -ne 200) {
+                throw "Unexpected HTTP status $Code for $Url"
+            }
+            if ($Resp.ContentLength -gt $MaxBytes) {
+                throw "Download from $Url exceeds size limit ($($Resp.ContentLength) > $MaxBytes)"
+            }
+            $Stream = $Resp.GetResponseStream()
+            $Out = New-Object System.IO.FileStream(
+                $OutFile,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $Buf = New-Object byte[] 65536
+                $Total = 0L
+                while (($Read = $Stream.Read($Buf, 0, $Buf.Length)) -gt 0) {
+                    $Total += $Read
+                    if ($Total -gt $MaxBytes) {
+                        throw "Download from $Url exceeds size limit ($MaxBytes bytes)"
+                    }
+                    $Out.Write($Buf, 0, $Read)
+                }
+                return
+            } finally {
+                $Out.Dispose()
+            }
+        } finally {
+            $Resp.Dispose()
+        }
     }
 }
 
 $RustupInit = $null
 $WordlistPart = $null
+$GeoPart = $null
 
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+    $TlsProto = [Net.SecurityProtocolType]::Tls12
+    $Tls13 = [Net.SecurityProtocolType]::Tls12
+    if ([Enum]::TryParse([Net.SecurityProtocolType], 'Tls13', [ref]$Tls13)) {
+        $TlsProto = $TlsProto -bor $Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $TlsProto
 
     if ($NeedCompiler) {
         if ($Pm -eq "winget") {
@@ -210,7 +348,7 @@ try {
     if ($NeedRust) {
         Say "Installing Rust with rustup"
         $RustupInit = Join-Path ([System.IO.Path]::GetTempPath()) ("rustup-init-" + [System.Guid]::NewGuid().ToString("N") + ".exe")
-        Invoke-WebRequest -Uri $RUSTUP_URL -OutFile $RustupInit -UseBasicParsing
+        Invoke-SafeDownload -Url $RUSTUP_URL -OutFile $RustupInit -MaxBytes 67108864
         & $RustupInit -y --profile minimal --no-modify-path
         if ($LASTEXITCODE -ne 0) {
             Die "The Rust installer failed."
@@ -226,24 +364,26 @@ try {
         }
     }
 
-    if (-not (Have "cargo")) {
-        Die "Rust is installed but cargo is not on PATH. Open a new terminal and rerun this script."
-    }
-    $NowRust = Get-RustMinor
-    if ($null -eq $NowRust -or $NowRust -lt $MIN_RUST_MINOR) {
-        Die "meow needs Rust 1.$MIN_RUST_MINOR or newer. Run: rustup update stable"
-    }
+    if (-not $ToolsOnly) {
+        if (-not (Have "cargo")) {
+            Die "Rust is installed but cargo is not on PATH. Open a new terminal and rerun this script."
+        }
+        $NowRust = Get-RustMinor
+        if ($null -eq $NowRust -or $NowRust -lt $MIN_RUST_MINOR) {
+            Die "meow needs Rust 1.$MIN_RUST_MINOR or newer. Run: rustup update stable"
+        }
 
-    Say "Building meow (release). The first build takes a few minutes."
-    & cargo install --path . --locked
-    if ($LASTEXITCODE -ne 0) {
-        Die "The build failed. The messages above say why."
+        Say "Building meow (release). The first build takes a few minutes."
+        & cargo install --path . --locked
+        if ($LASTEXITCODE -ne 0) {
+            Die "The build failed. The messages above say why."
+        }
+        if (-not (Test-Path -LiteralPath $InstalledExe)) {
+            Die "The build finished but $InstalledExe is missing."
+        }
+        $VerOut = (& $InstalledExe --version) -join ""
+        Say "Installed $VerOut at $InstalledExe"
     }
-    if (-not (Test-Path -LiteralPath $InstalledExe)) {
-        Die "The build finished but $InstalledExe is missing."
-    }
-    $VerOut = (& $InstalledExe --version) -join ""
-    Say "Installed $VerOut at $InstalledExe"
 
     function Install-Tool([string]$Tool) {
         if ($Pm -eq "scoop") {
@@ -262,9 +402,12 @@ try {
         }
         switch ($Tool) {
             "feroxbuster" {
-                Say "Building feroxbuster with cargo (a few minutes)"
-                & cargo install feroxbuster --locked
-                return ($LASTEXITCODE -eq 0)
+                if (Have "cargo") {
+                    Say "Building feroxbuster with cargo (a few minutes)"
+                    & cargo install feroxbuster --locked --version $FEROXBUSTER_VERSION
+                    return ($LASTEXITCODE -eq 0)
+                }
+                return $false
             }
             "katana" {
                 if (Have "go") {
@@ -289,70 +432,155 @@ try {
 
     if ($NeedWordlist) {
         Say "Downloading the wordlist"
-        New-Item -ItemType Directory -Force -Path $WordlistDir | Out-Null
-        $WordlistPart = Join-Path $WordlistDir (".common.txt." + [System.Guid]::NewGuid().ToString("N"))
-        try {
-            Invoke-WebRequest -Uri $WORDLIST_URL -OutFile $WordlistPart -UseBasicParsing
-            $ActualHash = (Get-FileHash -LiteralPath $WordlistPart -Algorithm SHA256).Hash.ToLowerInvariant()
-            $ContentHead = Get-Content -LiteralPath $WordlistPart -TotalCount 5 -ErrorAction SilentlyContinue
-            if ((Get-Item -LiteralPath $WordlistPart).Length -gt 0 -and
-                -not ($ContentHead -match '<html') -and
-                ($ActualHash -eq $WORDLIST_SHA256)) {
-                $Dest = Join-Path $WordlistDir "common.txt"
-                Move-Item -LiteralPath $WordlistPart -Destination $Dest -Force
-                $WordlistPart = $null
-                Say "Wordlist saved to $Dest"
-            } else {
-                Warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $WordlistDir and meow will use it."
+        $Dest = Join-Path $WordlistDir "common.txt"
+        if ((Test-IsReparsePoint $MeowHome) -or (Test-IsReparsePoint $WordlistDir) -or (Test-IsReparsePoint $Dest)) {
+            Warn "Refusing to write wordlist through a symbolic link or junction under $MeowHome."
+        } else {
+            New-Item -ItemType Directory -Force -Path $WordlistDir | Out-Null
+            $WordlistPart = Join-Path $WordlistDir (".common.txt." + [System.Guid]::NewGuid().ToString("N"))
+            try {
+                Invoke-SafeDownload -Url $WORDLIST_URL -OutFile $WordlistPart -MaxBytes 16777216
+                $Sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                    $Stream = [System.IO.File]::OpenRead($WordlistPart)
+                    try {
+                        $ActualHash = ([System.BitConverter]::ToString($Sha.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+                    } finally {
+                        $Stream.Dispose()
+                    }
+                } finally {
+                    $Sha.Dispose()
+                }
+                $ContentHead = Get-Content -LiteralPath $WordlistPart -TotalCount 5 -ErrorAction SilentlyContinue
+                if ((Get-Item -LiteralPath $WordlistPart).Length -gt 0 -and
+                    -not ($ContentHead -match '<html') -and
+                    ($ActualHash -eq $WORDLIST_SHA256) -and
+                    -not (Test-IsReparsePoint $Dest)) {
+                    Move-Item -LiteralPath $WordlistPart -Destination $Dest -Force
+                    $WordlistPart = $null
+                    Say "Wordlist saved to $Dest"
+                } else {
+                    Warn "Could not download the wordlist from $WORDLIST_URL (or its SHA-256 digest did not match). Put any .txt wordlist in $WordlistDir and meow will use it."
+                }
+            } catch {
+                Warn "Could not download the wordlist from $WORDLIST_URL. Put any .txt wordlist in $WordlistDir and meow will use it."
             }
-        } catch {
-            Warn "Could not download the wordlist from $WORDLIST_URL. Put any .txt wordlist in $WordlistDir and meow will use it."
         }
     }
 
     # This month's file, or last month's early in a month before it is out.
     function Get-GeoFile([string]$Name) {
-        $Part = Join-Path $GeoDir (".$Name." + [System.Guid]::NewGuid().ToString("N"))
-        foreach ($Month in @((Get-Date).ToString("yyyy-MM"), (Get-Date).AddMonths(-1).ToString("yyyy-MM"))) {
+        $TargetMmdb = Join-Path $GeoDir "$Name.mmdb"
+        if (Test-IsReparsePoint $TargetMmdb) {
+            return $false
+        }
+        $NowUtc = [DateTime]::UtcNow
+        $Months = @(
+            $NowUtc.ToString("yyyy-MM"),
+            (New-Object DateTime($NowUtc.Year, $NowUtc.Month, 1)).AddMonths(-1).ToString("yyyy-MM")
+        )
+        $script:GeoPart = Join-Path $GeoDir (".$Name." + [System.Guid]::NewGuid().ToString("N"))
+        foreach ($Month in $Months) {
+            $GzPath = "$($script:GeoPart).gz"
             try {
-                Invoke-WebRequest -Uri "https://download.db-ip.com/free/$Name-$Month.mmdb.gz" -OutFile "$Part.gz" -UseBasicParsing
-                $In = [System.IO.File]::OpenRead("$Part.gz")
+                Invoke-SafeDownload -Url "https://download.db-ip.com/free/$Name-$Month.mmdb.gz" -OutFile $GzPath -MaxBytes $GEO_MAX_PACKED
+                if ((Get-Item -LiteralPath $GzPath).Length -gt $GEO_MAX_PACKED) {
+                    Remove-Item -LiteralPath $GzPath -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+                $In = [System.IO.File]::OpenRead($GzPath)
+                $ValidSize = $true
                 try {
                     $Unzip = New-Object System.IO.Compression.GZipStream($In, [System.IO.Compression.CompressionMode]::Decompress)
-                    $Out = [System.IO.File]::Create($Part)
-                    try { $Unzip.CopyTo($Out) } finally { $Out.Dispose(); $Unzip.Dispose() }
-                } finally { $In.Dispose() }
-                $Bytes = [System.IO.File]::ReadAllBytes($Part)
-                $Tail = [System.Text.Encoding]::ASCII.GetString($Bytes, [Math]::Max(0, $Bytes.Length - 100000), [Math]::Min(100000, $Bytes.Length))
-                if ($Tail.Contains("MaxMind.com")) {
-                    Move-Item -LiteralPath $Part -Destination (Join-Path $GeoDir "$Name.mmdb") -Force
-                    Remove-Item -LiteralPath "$Part.gz" -Force -ErrorAction SilentlyContinue
+                    $Out = New-Object System.IO.FileStream(
+                        $script:GeoPart,
+                        [System.IO.FileMode]::CreateNew,
+                        [System.IO.FileAccess]::Write,
+                        [System.IO.FileShare]::None
+                    )
+                    try {
+                        $Buf = New-Object byte[] 65536
+                        $Total = 0L
+                        while (($Read = $Unzip.Read($Buf, 0, $Buf.Length)) -gt 0) {
+                            $Total += $Read
+                            if ($Total -gt $GEO_MAX_BYTES) {
+                                $ValidSize = $false
+                                break
+                            }
+                            $Out.Write($Buf, 0, $Read)
+                        }
+                    } finally {
+                        $Out.Dispose()
+                        $Unzip.Dispose()
+                    }
+                } finally {
+                    $In.Dispose()
+                }
+                if (-not $ValidSize) {
+                    Remove-Item -LiteralPath $script:GeoPart, $GzPath -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+                $Check = [System.IO.File]::OpenRead($script:GeoPart)
+                $HasMarker = $false
+                try {
+                    $TailLen = [int][Math]::Min(100000L, $Check.Length)
+                    if ($TailLen -gt 0) {
+                        [void]$Check.Seek(-$TailLen, [System.IO.SeekOrigin]::End)
+                        $TailBuf = New-Object byte[] $TailLen
+                        $Got = 0
+                        while ($Got -lt $TailLen) {
+                            $Step = $Check.Read($TailBuf, $Got, $TailLen - $Got)
+                            if ($Step -le 0) { break }
+                            $Got += $Step
+                        }
+                        $Tail = [System.Text.Encoding]::ASCII.GetString($TailBuf, 0, $Got)
+                        $HasMarker = $Tail.Contains("MaxMind.com")
+                    }
+                } finally {
+                    $Check.Dispose()
+                }
+                if ($HasMarker -and -not (Test-IsReparsePoint $TargetMmdb)) {
+                    Move-Item -LiteralPath $script:GeoPart -Destination $TargetMmdb -Force
+                    Remove-Item -LiteralPath $GzPath -Force -ErrorAction SilentlyContinue
+                    $script:GeoPart = $null
                     return $true
                 }
             } catch {
                 # Try last month's file, then give up.
             }
+            Remove-Item -LiteralPath $script:GeoPart, $GzPath -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item -LiteralPath $Part, "$Part.gz" -Force -ErrorAction SilentlyContinue
+        $script:GeoPart = $null
         return $false
     }
 
     if ($NeedGeo) {
         Say "Downloading the location database (IP Geolocation by DB-IP, https://db-ip.com)"
-        New-Item -ItemType Directory -Force -Path $GeoDir | Out-Null
-        if ((Get-GeoFile "dbip-city-lite") -and (Get-GeoFile "dbip-asn-lite")) {
-            Say "Location database saved to $GeoDir"
+        if ((Test-IsReparsePoint $MeowHome) -or (Test-IsReparsePoint $GeoDir)) {
+            Warn "Refusing to write location database through a symbolic link or junction under $MeowHome."
         } else {
-            Warn "Could not download the location database from download.db-ip.com. The map still shows your own place; run this again later."
+            New-Item -ItemType Directory -Force -Path $GeoDir | Out-Null
+            if ((Get-GeoFile "dbip-city-lite") -and (Get-GeoFile "dbip-asn-lite")) {
+                Say "Location database saved to $GeoDir"
+            } else {
+                Warn "Could not download the location database from download.db-ip.com. The map still shows your own place; run this again later."
+            }
         }
     }
 
-    Say "Ready. Run 'meow' for the interactive setup GUI, or 'meow <name>' to open a session"
+    if ($ToolsOnly) {
+        Say "Done."
+    } else {
+        Say "Ready. Run 'meow' for the interactive setup GUI, or 'meow <name>' to open a session"
+    }
 } finally {
     if ($RustupInit -and (Test-Path -LiteralPath $RustupInit)) {
         Remove-Item -LiteralPath $RustupInit -Force -ErrorAction SilentlyContinue
     }
     if ($WordlistPart -and (Test-Path -LiteralPath $WordlistPart)) {
         Remove-Item -LiteralPath $WordlistPart -Force -ErrorAction SilentlyContinue
+    }
+    if ($GeoPart) {
+        Remove-Item -LiteralPath $GeoPart, "$GeoPart.gz" -Force -ErrorAction SilentlyContinue
     }
 }

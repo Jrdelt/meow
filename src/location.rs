@@ -105,6 +105,22 @@ pub enum Plan {
     Lookup { partial_vpns: Vec<String> },
 }
 
+fn vpn_carries_all(local: &LocalNet, name: &str, reported_all: bool) -> bool {
+    if reported_all {
+        return true;
+    }
+    let has = |dest: &str| {
+        local
+            .routes
+            .iter()
+            .any(|r| r.interface == name && r.destination == dest)
+    };
+    has("0.0.0.0/0")
+        || has("::/0")
+        || (has("0.0.0.0/1") && has("128.0.0.0/1"))
+        || (has("::/1") && has("8000::/1"))
+}
+
 pub fn plan(settings: &LocationSettings, local: &LocalNet) -> Plan {
     if !settings.enabled {
         return Plan::Off;
@@ -112,7 +128,7 @@ pub fn plan(settings: &LocationSettings, local: &LocalNet) -> Plan {
     let vpns = observer::active_vpns(local);
     let all: Vec<String> = vpns
         .iter()
-        .filter(|(_, all)| *all)
+        .filter(|(name, all)| vpn_carries_all(local, name, *all))
         .map(|(name, _)| name.clone())
         .collect();
     if !all.is_empty() {
@@ -127,15 +143,25 @@ pub fn plan(settings: &LocationSettings, local: &LocalNet) -> Plan {
 pub fn network_key(local: &LocalNet) -> String {
     let vpns: Vec<String> = observer::active_vpns(local)
         .into_iter()
-        .map(|(name, all)| format!("{name}:{all}"))
+        .map(|(name, all)| {
+            let full = vpn_carries_all(local, &name, all);
+            format!("{name}:{full}")
+        })
         .collect();
     let mut gateways: Vec<String> = local
         .routes
         .iter()
-        .filter(|route| observer::is_default_route(route))
+        .filter(|route| {
+            observer::is_default_route(route)
+                || matches!(
+                    route.destination.as_str(),
+                    "0.0.0.0/1" | "128.0.0.0/1" | "::/1" | "8000::/1"
+                )
+        })
         .map(|route| {
             format!(
-                "{}@{}",
+                "{}:{}@{}",
+                route.destination,
                 route.gateway.as_deref().unwrap_or("-"),
                 route.interface
             )
@@ -192,26 +218,67 @@ pub fn parse(value: &Value) -> Option<Place> {
     if !sane {
         return None;
     }
+    let public_address = match text(value, &["ip", "query"]) {
+        Some(raw) => {
+            let ip: std::net::IpAddr = raw.parse().ok()?;
+            if crate::geoip::is_local(ip) {
+                return None;
+            }
+            Some(ip.to_string())
+        }
+        None => None,
+    };
     Some(Place {
         city: text(value, &["city"]),
         region: text(value, &["region", "region_name", "regionName"]),
         country: text(value, &["country_name", "country"]),
         latitude,
         longitude,
-        public_address: text(value, &["ip", "query"]),
+        public_address,
         network: text(value, &["org", "asn_org", "isp"]),
     })
 }
 
-/// Asks the service at `url` where this machine's public address is.
-pub async fn lookup(url: &str) -> Result<Place> {
-    let http = reqwest::Client::builder()
+const LOOKUP_MAX_BYTES: usize = 64 * 1024;
+
+pub fn validate_lookup_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url)
+        .with_context(|| format!("the location service address '{url}' is not a web address"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("the location service address '{url}' must not embed credentials");
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        bail!("the location service address '{url}' must start with https://");
+    }
+    Ok(())
+}
+
+fn lookup_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(http) = CLIENT.get() {
+        return Ok(http);
+    }
+    let built = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent("meow")
         .build()
         .context("cannot create the HTTP client")?;
-    let response = http
+    let _ = CLIENT.set(built);
+    CLIENT.get().context("cannot create the HTTP client")
+}
+
+/// Asks the service at `url` where this machine's public address is.
+pub async fn lookup(url: &str) -> Result<Place> {
+    validate_lookup_url(url)?;
+    let mut response = lookup_client()?
         .get(url)
         .header("Accept", "application/json")
         .send()
@@ -220,20 +287,35 @@ pub async fn lookup(url: &str) -> Result<Place> {
     if !response.status().is_success() {
         bail!("the location service answered HTTP {}", response.status());
     }
-    let body: Value = response
-        .json()
+    if response
+        .content_length()
+        .is_some_and(|len| len > LOOKUP_MAX_BYTES as u64)
+    {
+        bail!("the location service sent a response larger than 64 KB");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .context("the location service response was cut off")?
+    {
+        if bytes.len().saturating_add(chunk.len()) > LOOKUP_MAX_BYTES {
+            bail!("the location service sent a response larger than 64 KB");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: Value = serde_json::from_slice(&bytes)
         .context("the location service sent something other than JSON")?;
     parse(&body).context("the location service's answer held no place")
 }
 
 /// The small map around `place` and its pictures, or `None` when
-/// `[location] map` is off.
+/// `[location] enabled` or `[location] map` is off.
 pub async fn map_for(
     settings: &LocationSettings,
     place: &Place,
 ) -> Option<Result<(MapView, Vec<Picture>)>> {
-    if !settings.map {
+    if !settings.enabled || !settings.map {
         return None;
     }
     let mut view = tiles::view(place.latitude, place.longitude, &settings.tiles);
@@ -255,8 +337,9 @@ pub async fn map_for(
 pub fn source(url: &str) -> String {
     url::Url::parse(url)
         .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .unwrap_or_else(|| url.to_owned())
+        .and_then(|parsed| parsed.host_str().map(|h| sanitize(h, FIELD_MAX)))
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| sanitize(url, FIELD_MAX))
 }
 
 #[cfg(test)]
@@ -309,13 +392,21 @@ mod tests {
                 partial_vpns: vec!["utun4".into()]
             }
         );
-        // Full tunnel, as VPN clients usually do it: both halves.
+        // Full tunnel, as VPN clients usually do it: both IPv4 or IPv6 halves, or /0.
         assert_eq!(
             plan(&settings, &local(&["0.0.0.0/1", "128.0.0.0/1"])),
             Plan::Hidden(vec!["utun4".into()])
         );
         assert_eq!(
+            plan(&settings, &local(&["::/1", "8000::/1"])),
+            Plan::Hidden(vec!["utun4".into()])
+        );
+        assert_eq!(
             plan(&settings, &local(&["0.0.0.0/0"])),
+            Plan::Hidden(vec!["utun4".into()])
+        );
+        assert_eq!(
+            plan(&settings, &local(&["::/0"])),
             Plan::Hidden(vec!["utun4".into()])
         );
         let off = LocationSettings {
@@ -327,6 +418,10 @@ mod tests {
         assert_ne!(
             network_key(&local(&["10.0.22.0/24"])),
             network_key(&local(&["0.0.0.0/1", "128.0.0.0/1"]))
+        );
+        assert_ne!(
+            network_key(&local(&["10.0.22.0/24"])),
+            network_key(&local(&["::/1", "8000::/1"]))
         );
     }
 
@@ -356,8 +451,12 @@ mod tests {
             "regionName": "Osaka", "country": "Japan", "lat": 34.69, "lon": 135.5 });
         assert_eq!(parse(&ip_api).unwrap().region.as_deref(), Some("Osaka"));
 
-        // No place: private address, failure, missing or impossible coordinates.
+        // No place: private address (even without bogon=true), failure, missing or impossible coordinates.
         assert_eq!(parse(&json!({ "ip": "192.168.0.81", "bogon": true })), None);
+        assert_eq!(
+            parse(&json!({ "ip": "192.168.0.81", "loc": "47.6,-117.4" })),
+            None
+        );
         assert_eq!(
             parse(&json!({ "status": "fail", "message": "private range" })),
             None
@@ -374,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_asks_the_service_and_reads_its_answer() {
-        use axum::{routing::get, Json, Router};
+        use axum::{response::Redirect, routing::get, Json, Router};
         let app = Router::new()
             .route(
                 "/json",
@@ -382,7 +481,12 @@ mod tests {
                     Json(json!({ "ip": "203.0.113.7", "city": "Spokane", "loc": "47.6,-117.4" }))
                 }),
             )
-            .route("/broken", get(|| async { "not json" }));
+            .route("/broken", get(|| async { "not json" }))
+            .route("/moved", get(|| async { Redirect::to("/json") }))
+            .route(
+                "/huge",
+                get(|| async { " ".repeat(LOOKUP_MAX_BYTES + 1024) }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -394,6 +498,15 @@ mod tests {
             format!("{error:#}").contains("other than JSON"),
             "{error:#}"
         );
+        let moved = lookup(&format!("{base}/moved")).await.unwrap_err();
+        assert!(format!("{moved:#}").contains("HTTP 303"), "{moved:#}");
+        let huge = lookup(&format!("{base}/huge")).await.unwrap_err();
+        assert!(
+            format!("{huge:#}").contains("larger than 64 KB"),
+            "{huge:#}"
+        );
+        assert!(validate_lookup_url("http://ipinfo.io/json").is_err());
+        assert!(validate_lookup_url("https://user:pass@ipinfo.io/json").is_err());
         assert_eq!(source("https://ipinfo.io/json"), "ipinfo.io");
 
         // The map: off means no pictures are fetched; a broken address is
@@ -404,6 +517,11 @@ mod tests {
             ..LocationSettings::default()
         };
         assert!(map_for(&off, &place).await.is_none());
+        let disabled = LocationSettings {
+            enabled: false,
+            ..LocationSettings::default()
+        };
+        assert!(map_for(&disabled, &place).await.is_none());
         let broken = LocationSettings {
             tiles: format!("{base}/tiles/{{z}}/{{x}}.jpg"),
             ..LocationSettings::default()

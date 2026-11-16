@@ -1,6 +1,6 @@
 [package]
 name = "meow"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Local security triage shell, topology mapper & grounded audit workspace"
@@ -18,11 +18,14 @@ path = "src/main.rs"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-dirs = "7"
+dirs = "6"
 fd-lock = "4.0"
 futures-util = "0.3"
 getrandom = "0.3"
-ipnetwork = "0.21"
+# The session's loopback server sets its own connection limits.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+ipnetwork = "0.20"
 maxminddb = "0.33"
 petgraph = "0.7"
 portable-pty = "0.9"
@@ -37,13 +40,13 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.30"
+tokio-tungstenite = "0.29"
 toml = "0.8"
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.4"
+signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Console-mode access for VT input/output; same crate crossterm uses.

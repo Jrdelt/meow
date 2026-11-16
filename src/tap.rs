@@ -90,8 +90,24 @@ impl TapFilter {
 
     /// Feeds one chunk and returns the clean lines it completed.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        // Worst case: the buffered line plus every input byte is emitted.
-        self.out.resize(chunk.len() + self.line_max + 1, 0);
+        // Every emitted line ends at an input '\n' (at most `line_max + 1`
+        // bytes each), and each ConPTY `CSI <n> C` (`'C'` final byte) can
+        // expand into up to 256 spaces. Bound by the tighter of the two so
+        // `dropped_nospace` remains impossible without over-allocating.
+        let newlines = chunk.iter().filter(|&&b| b == b'\n').count();
+        let cuf_extra = chunk
+            .iter()
+            .filter(|&&b| b == b'C')
+            .count()
+            .saturating_mul(256);
+        let line_cap = self.line_max.saturating_add(1);
+        let by_expansion = chunk
+            .len()
+            .saturating_add(cuf_extra)
+            .saturating_add(line_cap);
+        let by_newlines = newlines.saturating_mul(line_cap);
+        let needed = by_expansion.min(by_newlines).max(1);
+        self.out.resize(needed, 0);
         let state = self.state_mut();
         // SAFETY: `state` was initialised by `tap_init`; `chunk` and `out`
         // are valid for the lengths passed and do not overlap.
@@ -228,7 +244,10 @@ mod tests {
 
     #[test]
     fn cr_then_erase_sequence_then_text_rewinds() {
-        let lines = feed_all(&[b"Compiling a\r\x1b[KCompiling b\r\x1b[KFinished\r\n"]);
+        let lines = feed_all(&[
+            b"Compiling a\r\x1b[KCompiling b\r\x1b[KFinished\r\n",
+            b"Cleared\r\x1b[K\r\n",
+        ]);
         assert_eq!(lines, ["Finished"]);
     }
 
@@ -302,14 +321,26 @@ mod tests {
         let mut filter = TapFilter::new();
         let lines = filter.feed(
             b"[sudo] password for bob: \r\n\
+              [sudo] password for bob: secret123\r\n\
+              Password for 'https://git.corp.local': token123\r\n\
               bob@10.0.0.5's Password:\r\n\
+              Password: hunter2\r\n\
+              Enter API key: sk-secret\r\n\
+              Bearer token:\r\n\
+              Token: ghp_secret\r\n\
               Enter passphrase for key '/home/bob/.ssh/id_ed25519': \r\n\
               Enter PEM pass phrase:\r\n\
               password policy: enabled\r\n\
               ok\r\n",
         );
         assert_eq!(lines, ["password policy: enabled", "ok"]);
-        assert_eq!(filter.stats().dropped_secret, 4);
+        assert_eq!(filter.stats().dropped_secret, 10);
+    }
+
+    #[test]
+    fn conpty_cursor_forward_preserves_word_spacing() {
+        let lines = feed_all(&[b"80/tcp\x1b[3Copen\x1b[Cnginx\x1b[1C1.24.0\r\n"]);
+        assert_eq!(lines, ["80/tcp   open nginx 1.24.0"]);
     }
 
     #[test]
@@ -318,8 +349,11 @@ mod tests {
         let mut input = b"text\n".to_vec();
         input.extend_from_slice(&[0x7f, b'E', b'L', b'F', 0x00, 0x01, 0xff, 0xfe, 0x80, 0x02]);
         input.extend_from_slice(b"\nclean\n");
+        let mut wrap = vec![0x00; 256];
+        wrap.extend_from_slice(b"after256nuls\n");
+        input.extend_from_slice(&wrap);
         assert_eq!(filter.feed(&input), ["text", "clean"]);
-        assert_eq!(filter.stats().dropped_binary, 1);
+        assert_eq!(filter.stats().dropped_binary, 2);
     }
 
     #[test]
@@ -358,5 +392,46 @@ mod tests {
         // Past TAP_STRING_MAX the string is abandoned and text flows again.
         let lines = filter.feed(b"\nvisible\n");
         assert_eq!(lines.last().map(String::as_str), Some("visible"));
+    }
+
+    #[test]
+    fn multi_colon_and_indented_secret_prompts_redact_echoed_secrets() {
+        let mut filter = TapFilter::new();
+        let lines = filter.feed(
+            b"bob@fe80::1's password: hunter2\r\n\
+              https://bob@git.corp.local:8443's password: s3cr3t\r\n\
+              [12:34:56] Enter API key: sk-live-secret\r\n\
+              mysql [127.0.0.1:3306] Enter password: dbsecret\r\n\
+                Password: indented-secret\r\n\
+              \tToken: ghp_indented\r\n\
+              Client secret: oauth-secret\r\n\
+              token count: 42\r\n\
+              80/tcp open http\r\n",
+        );
+        assert_eq!(lines, ["token count: 42", "80/tcp open http"]);
+        assert_eq!(filter.stats().dropped_secret, 7);
+    }
+
+    #[test]
+    fn incomplete_csi_across_newline_and_truncated_backspaces_stay_contained() {
+        let mut filter = TapFilter::new();
+        let lines = filter.feed(b"first\x1b[?1049\nhost\n\x1b[31\n80/tcp open http\n");
+        assert!(!filter.in_alt_screen());
+        assert_eq!(lines, ["first", "host", "80/tcp open http"]);
+
+        let mut overlong = vec![b'x'; 4096];
+        overlong.extend_from_slice(b"overflow\x08\x08\x08\n");
+        let truncated = filter.feed(&overlong);
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0].len(), 4096);
+    }
+
+    #[test]
+    fn dense_conpty_cuf_burst_never_drops_for_nospace() {
+        let mut filter = TapFilter::new();
+        let burst = b"\x1b[256Cx\n".repeat(25);
+        let lines = filter.feed(&burst);
+        assert_eq!(lines.len(), 25);
+        assert_eq!(filter.stats().dropped_nospace, 0);
     }
 }

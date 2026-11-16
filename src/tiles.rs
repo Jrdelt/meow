@@ -37,13 +37,15 @@ const TILE_PIXELS: f64 = 256.0;
 /// drawn smaller. They come from the next whole level up, so they are drawn
 /// at half to full size and stay sharp on dense screens.
 const MIN_ZOOM: f64 = 2.0;
-const MAX_ZOOM: f64 = 12.0;
+const MAX_ZOOM: f64 = 11.0;
 /// The circle is this share of the round map across: it nearly fills it.
 const CIRCLE_SHARE: f64 = 0.8;
 /// A click on the map zooms this many levels closer (4 times), never past
-/// `CLOSEST_ZOOM`, where the satellite pictures run out of detail.
+/// `CLOSEST_ZOOM`, where the satellite pictures run out of detail (EOX WMTS
+/// `GoogleMapsCompatible` serves up to tile zoom 13).
 pub const CLOSER_ZOOM: f64 = 2.0;
-const CLOSEST_ZOOM: f64 = 14.0;
+const CLOSEST_ZOOM: f64 = 12.99;
+const MAX_TILE_ZOOM: u8 = 13;
 /// Web Mercator stops here; the poles are infinitely far away.
 const MAX_LATITUDE: f64 = 85.051_128_78;
 const EQUATOR_M: f64 = 40_075_016.686;
@@ -127,7 +129,7 @@ pub fn shown_zoom(latitude: f64) -> f64 {
 
 /// The whole zoom level the tiles for a shown zoom come from.
 fn tile_zoom(shown: f64) -> u8 {
-    shown.floor() as u8 + 1
+    ((shown.floor() as u8).saturating_add(1)).min(MAX_TILE_ZOOM)
 }
 
 fn round_to(value: f64, step: f64) -> f64 {
@@ -210,7 +212,7 @@ pub fn tile_url(template: &str, z: u8, x: u32, y: u32) -> String {
 fn host(template: &str) -> String {
     url::Url::parse(&tile_url(template, 0, 0, 0))
         .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
+        .and_then(|url| url.host_str().map(|h| crate::evidence::sanitize(h, 80)))
         .unwrap_or_default()
 }
 
@@ -238,16 +240,38 @@ fn credit(template: &str) -> (String, Option<String>) {
     (format!("Map pictures from {host}"), None)
 }
 
-/// A tile address must be http(s) and name the zoom, column and row.
+fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback(),
+        None => false,
+    }
+}
+
+/// A tile address must be https (or loopback http for tests) and name the
+/// zoom, column and row in its path/query only.
 pub fn check_template(template: &str) -> Result<()> {
     for part in ["{z}", "{x}", "{y}"] {
         if !template.contains(part) {
             bail!("the map picture address '{template}' lacks {part}");
         }
     }
-    let url = url::Url::parse(&tile_url(template, 0, 0, 0))
+    let url0 = url::Url::parse(&tile_url(template, 0, 0, 0))
         .with_context(|| format!("the map picture address '{template}' is not a web address"))?;
-    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
+    let url1 = url::Url::parse(&tile_url(template, 1, 1, 1))
+        .with_context(|| format!("the map picture address '{template}' is not a web address"))?;
+    if !url0.username().is_empty() || url0.password().is_some() {
+        bail!("the map picture address '{template}' must not embed credentials");
+    }
+    if (url0.scheme(), url0.host_str(), url0.port())
+        != (url1.scheme(), url1.host_str(), url1.port())
+    {
+        bail!("the map picture address '{template}' must keep {{z}}, {{x}}, {{y}} in the path");
+    }
+    let ok_scheme =
+        url0.scheme() == "https" || (url0.scheme() == "http" && is_loopback_host(url0.host()));
+    if !ok_scheme || url0.host_str().is_none() {
         bail!("the map picture address '{template}' must start with https://");
     }
     Ok(())
@@ -265,7 +289,50 @@ pub fn picture_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+const TILE_CACHE_CAP: usize = 128;
+type TileCacheKey = (String, u8, u32, u32);
+type TileCacheList = std::collections::VecDeque<(TileCacheKey, Picture)>;
+
+fn tile_cache() -> &'static std::sync::Mutex<TileCacheList> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<TileCacheList>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn cached_tile(template: &str, spot: &TileSpot) -> Option<Picture> {
+    let mut cache = tile_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pos = cache.iter().position(|((tpl, z, x, y), _)| {
+        tpl == template && (*z, *x, *y) == (spot.z, spot.x, spot.y)
+    })?;
+    let entry = cache.remove(pos)?;
+    let hit = entry.1.clone();
+    cache.push_back(entry);
+    Some(hit)
+}
+
+fn store_tile(template: &str, picture: &Picture) {
+    let mut cache = tile_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pos) = cache.iter().position(|((tpl, z, x, y), _)| {
+        tpl == template && (*z, *x, *y) == (picture.z, picture.x, picture.y)
+    }) {
+        cache.remove(pos);
+    }
+    while cache.len() >= TILE_CACHE_CAP {
+        cache.pop_front();
+    }
+    cache.push_back((
+        (template.to_owned(), picture.z, picture.x, picture.y),
+        picture.clone(),
+    ));
+}
+
 async fn fetch_one(http: &reqwest::Client, template: &str, spot: &TileSpot) -> Result<Picture> {
+    if let Some(hit) = cached_tile(template, spot) {
+        return Ok(hit);
+    }
     let mut response = http
         .get(tile_url(template, spot.z, spot.x, spot.y))
         .send()
@@ -295,35 +362,50 @@ async fn fetch_one(http: &reqwest::Client, template: &str, spot: &TileSpot) -> R
         .await
         .context("a map picture was cut off")?
     {
-        if bytes.len() + chunk.len() > PICTURE_MAX_BYTES {
+        if bytes.len().saturating_add(chunk.len()) > PICTURE_MAX_BYTES {
             return Err(too_big());
         }
         bytes.extend_from_slice(&chunk);
     }
     let media_type = picture_type(&bytes)
         .context("the map picture service sent something other than a JPEG or PNG picture")?;
-    Ok(Picture {
+    let picture = Picture {
         z: spot.z,
         x: spot.x,
         y: spot.y,
         media_type,
         bytes: Bytes::from(bytes),
-    })
+    };
+    store_tile(template, &picture);
+    Ok(picture)
 }
 
-/// Fetches every tile of `view` at once; all of them, or an error.
-pub async fn fetch(template: &str, view: &MapView) -> Result<Vec<Picture>> {
-    check_template(template)?;
-    let http = reqwest::Client::builder()
+fn tile_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(http) = CLIENT.get() {
+        return Ok(http);
+    }
+    let built = reqwest::Client::builder()
+        // The picture service names the pictures; it does not get to send
+        // this machine's requests on to another address.
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent("meow")
         .build()
         .context("cannot create the HTTP client")?;
+    let _ = CLIENT.set(built);
+    CLIENT.get().context("cannot create the HTTP client")
+}
+
+/// Fetches every tile of `view` at once; all of them, or an error.
+pub async fn fetch(template: &str, view: &MapView) -> Result<Vec<Picture>> {
+    check_template(template)?;
+    let http = tile_client()?;
     futures_util::future::try_join_all(
         view.tiles
             .iter()
-            .map(|spot| fetch_one(&http, template, spot)),
+            .map(|spot| fetch_one(http, template, spot)),
     )
     .await
 }
@@ -381,6 +463,9 @@ mod tests {
             assert_eq!(view.radius_m, ROUGH_RADIUS_M);
         }
         assert_eq!(tile_zoom(shown_zoom(0.0)), 9);
+        // EOX WMTS GoogleMapsCompatible stops at zoom 13 even near the poles.
+        let polar = view(80.0, 10.0, TILES_URL);
+        assert!(polar.closer.unwrap().tiles.iter().all(|t| t.z <= 13));
         // A click goes four times closer, with tiles of its own.
         let near = view(47.6588, -117.426, TILES_URL);
         let closer = near.closer.as_deref().unwrap();
@@ -435,6 +520,9 @@ mod tests {
         assert!(check_template("http://127.0.0.1:9/{z}/{x}/{y}").is_ok());
         for bad in [
             "https://tile.example.org/{z}/{x}.png",
+            "http://tile.example.org/{z}/{x}/{y}.png",
+            "https://user:pass@tile.example.org/{z}/{x}/{y}.png",
+            "https://{x}.tile.example.org/{z}/{y}.png",
             "file:///tiles/{z}/{x}/{y}.png",
             "ftp://tile.example.org/{z}/{x}/{y}.png",
             "{z}/{x}/{y}",
@@ -470,7 +558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_tiles_are_fetched_and_checked() {
+    async fn the_tiles_are_fetched_cached_and_checked() {
         use axum::extract::{Path, State};
         use axum::routing::get;
         use std::sync::{Arc, Mutex};
@@ -491,6 +579,12 @@ mod tests {
                 ),
             )
             .route("/page/{z}/{x}/{y}", get(|| async { "<!doctype html>" }))
+            .route(
+                "/moved/{z}/{x}/{y}",
+                get(|Path((z, x, y)): Path<(u8, u32, u32)>| async move {
+                    axum::response::Redirect::to(&format!("/ok/{z}/{x}/{y}"))
+                }),
+            )
             .route(
                 "/huge/{z}/{x}/{y}",
                 get(|| async {
@@ -513,7 +607,16 @@ mod tests {
             assert_eq!(picture.media_type, "image/jpeg");
             assert_eq!(&picture.bytes[..], JPEG);
         }
-        // Each request names one tile and nothing else.
+        // Each request names one tile and nothing else; a second fetch hits the LRU cache.
+        let count_after_first = asked.lock().unwrap().len();
+        let cached_again = fetch(&template, &view).await.unwrap();
+        assert_eq!(cached_again.len(), pictures.len());
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            count_after_first,
+            "repeated fetch must be served from the bounded LRU cache"
+        );
+
         let mut asked = asked.lock().unwrap().clone();
         asked.sort();
         let mut expected: Vec<String> = view
@@ -524,10 +627,27 @@ mod tests {
         expected.sort();
         assert_eq!(asked, expected);
 
+        // Cache never grows past TILE_CACHE_CAP.
+        for i in 0..(TILE_CACHE_CAP as u32 + 16) {
+            store_tile(
+                "https://tiles.example.test/{z}/{x}/{y}.jpg",
+                &Picture {
+                    z: 9,
+                    x: i,
+                    y: 0,
+                    media_type: "image/jpeg",
+                    bytes: Bytes::from_static(JPEG),
+                },
+            );
+        }
+        assert!(tile_cache().lock().unwrap().len() <= TILE_CACHE_CAP);
+
         for (path, why) in [
             ("page", "other than a JPEG or PNG"),
             ("huge", "larger than 1024 KB"),
             ("missing", "HTTP 404"),
+            // A redirect is an answer, not somewhere to go.
+            ("moved", "HTTP 303"),
         ] {
             let template = format!("{base}/{path}/{{z}}/{{x}}/{{y}}");
             let error = fetch(&template, &view).await.unwrap_err();

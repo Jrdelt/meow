@@ -36,7 +36,7 @@ fn percent_decode(text: &str) -> String {
 
 /// Encodes one decoded attribute value for a CPE 2.3 formatted string.
 fn encode_23(value: &str) -> String {
-    if value.is_empty() {
+    if value.is_empty() || value == "*" {
         return "*".to_owned();
     }
     if value == "-" {
@@ -58,6 +58,30 @@ fn encode_23(value: &str) -> String {
     }
 }
 
+/// Checks that one attribute of a CPE 2.3 formatted string holds only
+/// valid unescaped characters or backslash-escaped printable ASCII.
+fn valid_cpe23_field(field: &str) -> bool {
+    if field.is_empty() {
+        return false;
+    }
+    if field == "*" || field == "-" {
+        return true;
+    }
+    let mut chars = field.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some(escaped)
+                    if escaped.is_ascii() && !escaped.is_ascii_control() && escaped != ' ' => {}
+                _ => return false,
+            },
+            c if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '*' | '?') => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Converts a CPE 2.2 URI to a CPE 2.3 formatted string. A value that is
 /// already 2.3 is returned normalised to lower case. Returns `None` for
 /// anything that is not a CPE name.
@@ -65,7 +89,15 @@ pub fn to_cpe23(cpe: &str) -> Option<String> {
     let cpe = cpe.trim();
     if let Some(rest) = strip_prefix_ci(cpe, "cpe:2.3:") {
         let fields = split_23(rest);
-        if fields.len() != 11 || !matches!(fields[0].as_str(), "a" | "o" | "h" | "*") {
+        if fields.len() != 11
+            || !matches!(
+                fields[0].to_ascii_lowercase().as_str(),
+                "a" | "o" | "h" | "*"
+            )
+            || matches!(fields[1].as_str(), "" | "*" | "-")
+            || matches!(fields[2].as_str(), "" | "*" | "-")
+            || !fields[1..].iter().all(|field| valid_cpe23_field(field))
+        {
             return None;
         }
         return Some(format!("cpe:2.3:{}", rest.to_ascii_lowercase()));
@@ -80,7 +112,7 @@ pub fn to_cpe23(cpe: &str) -> Option<String> {
         return None;
     }
     fields.resize(7, "");
-    if fields[1].is_empty() || fields[2].is_empty() {
+    if matches!(fields[1], "" | "*" | "-") || matches!(fields[2], "" | "*" | "-") {
         return None;
     }
 
@@ -245,9 +277,21 @@ mod tests {
             "cpe:/a:a:b:c:d:e:f:g:h",
             "cpe:2.3:a:too:short",
             "cpe:2.3:z:v:p:1:*:*:*:*:*:*:*",
+            "cpe:2.3:a:*:*:*:*:*:*:*:*:*:*",
+            "cpe:2.3:a:-:product:1.0:*:*:*:*:*:*:*",
+            "cpe:2.3:a:nginx:nginx:1.18.0&apikey=x#:*:*:*:*:*:*:*",
+            "cpe:2.3:a:nginx:nginx:1.18.0 extra:*:*:*:*:*:*:*",
+            "cpe:2.3:a:nginx:nginx:1.18.0\x1b[2J:*:*:*:*:*:*:*",
+            "cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*:\\",
+            "cpe:/a:*:product:1.0",
+            "cpe:/a:vendor:-:1.0",
         ] {
             assert_eq!(to_cpe23(bad), None, "accepted {bad:?}");
         }
+        assert_eq!(
+            to_cpe23("CPE:2.3:A:Nginx:Nginx:1.18.0:*:*:*:*:*:*:*").as_deref(),
+            Some("cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*")
+        );
     }
 
     #[test]

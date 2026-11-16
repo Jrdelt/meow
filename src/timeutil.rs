@@ -56,6 +56,20 @@ pub fn today_utc() -> String {
     now_rfc3339()[..10].to_owned()
 }
 
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// Parses the subset of RFC 3339 this crate writes plus the common variants
 /// returned by NVD and OSV: optional fractional seconds, `Z` or a numeric
 /// offset, or no zone at all (treated as UTC).
@@ -67,15 +81,29 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     if !matches!(bytes[10], b'T' | b't' | b' ') || bytes[16] != b':' {
         return None;
     }
-    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let slice = text.get(range)?;
+        if !slice.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        slice.parse::<i64>().ok()
+    };
     let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+    if !(1..=12).contains(&month)
+        || !(1..=i64::from(days_in_month(year, month as u32))).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     let mut rest = &text[19..];
     if let Some(fraction) = rest.strip_prefix('.') {
         let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
         rest = &fraction[digits..];
     }
     let offset = match rest {
@@ -87,14 +115,30 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
                 _ => return None,
             };
             let (h, m) = rest[1..].split_once(':')?;
-            sign * (h.parse::<i64>().ok()? * 3600 + m.parse::<i64>().ok()? * 60)
+            if h.len() != 2
+                || m.len() != 2
+                || !h.bytes().all(|b| b.is_ascii_digit())
+                || !m.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let (oh, om) = (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?);
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
+            sign * (oh * 3600 + om * 60)
         }
     };
     let days = days_from_civil(year, month as u32, day as u32);
-    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
-    u64::try_from(secs)
-        .ok()
-        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3600 + minute * 60 + second)?
+        .checked_sub(offset)?;
+    if secs >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+    }
 }
 
 #[cfg(test)]
@@ -135,10 +179,21 @@ mod tests {
         ] {
             assert_eq!(parse_rfc3339(text), expected, "{text}");
         }
+        assert_eq!(
+            parse_rfc3339("1970-01-01T00:30:00+01:00"),
+            UNIX_EPOCH.checked_sub(Duration::from_secs(1800))
+        );
         for bad in [
             "",
             "2026-11-12",
             "2026-13-01T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-11-12T09:41:61Z",
+            "2026-11-12T09:41:99Z",
+            "2026-11-12T-9:41:00Z",
+            "2026-11-12T09:41:00.Z",
+            "2026-11-12T09:41:00+-1:00",
             "not a date at all!",
             "2026-11-12T09:41:00X",
         ] {
