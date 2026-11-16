@@ -264,6 +264,23 @@ impl AiSettings {
         }
     }
 
+    /// Whether the key in the environment is meant for the service these
+    /// settings name. `OPENROUTER_API_KEY` is OpenRouter's and
+    /// `ANTHROPIC_API_KEY` the Claude API's: neither goes to another address
+    /// because that address speaks the same protocol. A stand-in on this
+    /// machine is the user's own.
+    fn env_key_applies(&self) -> bool {
+        let host = url::Url::parse(self.cloud_url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        is_loopback_url(&self.cloud_url)
+            || match self.provider() {
+                CloudProvider::Anthropic => host == "api.anthropic.com",
+                CloudProvider::OpenAi => host == "openrouter.ai",
+            }
+    }
+
     /// Where the API key comes from, for `meow setup`: the environment wins
     /// over the user's file, which wins over `config.toml`.
     pub fn key_source(&self) -> Option<String> {
@@ -273,8 +290,11 @@ impl AiSettings {
             .as_deref()
             .and_then(|path| AiOverrides::load(path).ok())
             .is_some_and(|overrides| filled(&overrides.api_key));
-        let variable = self.effective().key_variable();
-        if std::env::var(variable).is_ok_and(|key| !key.trim().is_empty()) {
+        let effective = self.effective();
+        let variable = effective.key_variable();
+        if effective.env_key_applies()
+            && std::env::var(variable).is_ok_and(|key| !key.trim().is_empty())
+        {
             Some(format!("the {variable} environment variable"))
         } else if in_file {
             Some("your setup file".to_owned())
@@ -288,6 +308,7 @@ impl AiSettings {
     pub fn api_key(&self) -> Option<String> {
         std::env::var(self.key_variable())
             .ok()
+            .filter(|key| !key.trim().is_empty() && self.env_key_applies())
             .or_else(|| self.openrouter_api_key.clone())
             .map(|key| key.trim().to_owned())
             .filter(|key| !key.is_empty())
@@ -610,6 +631,8 @@ pub struct Outcome {
 
 pub struct AiEngine {
     http: reqwest::Client,
+    /// For a server on this machine: no proxy, `localhost` pinned.
+    local_http: reqwest::Client,
     settings: AiSettings,
     db: Arc<Mutex<Db>>,
     /// One request at a time, so two requests cannot both pass the budget
@@ -619,6 +642,118 @@ pub struct AiEngine {
 
 fn lock_db(db: &Arc<Mutex<Db>>) -> std::sync::MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The most of one answer that is read from a model server. Only the first
+/// [`MAX_REPLY`] bytes of text are kept; this bounds what is read to find
+/// them, whatever the server sends and for however long.
+pub const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
+/// The longest line of a streamed answer.
+const MAX_STREAM_LINE: usize = 1024 * 1024;
+/// How much of an error page is read for its message.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+
+/// An HTTP client for the model server at `url`. One on this machine is
+/// reached directly: never through a proxy taken from the environment or
+/// the system settings, which would be handed the unmasked request to pass
+/// on, and `localhost` is this machine whatever a resolver says.
+pub fn http_client(url: &str, timeout: Duration) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("security-audit-client");
+    if is_loopback_url(url) {
+        builder = builder
+            .no_proxy()
+            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+    builder.build().context("cannot create the HTTP client")
+}
+
+/// Cuts `text` to at most `max` bytes, between two characters.
+/// (`String::truncate` panics when `max` falls inside one.)
+pub fn cut(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
+
+/// Reads a whole answer of at most `max` bytes; a longer one is an error.
+pub async fn read_bounded(response: &mut reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("the reply was cut off")? {
+        if body.len() + chunk.len() > max {
+            bail!(
+                "the reply is larger than the {} MB meow reads",
+                max / (1024 * 1024)
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// The start of an error page, as text.
+pub async fn read_error(response: &mut reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = MAX_ERROR_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if body.len() >= MAX_ERROR_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// The lines of a streamed answer. A line that never ends, or a stream
+/// that never stops, is an error instead of memory.
+#[derive(Default)]
+pub struct StreamLines {
+    buffer: Vec<u8>,
+    /// How much of `buffer` is known to hold no line end.
+    searched: usize,
+    total: usize,
+}
+
+impl StreamLines {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        self.total += chunk.len();
+        if self.total > MAX_ANSWER_BYTES {
+            bail!(
+                "the reply is larger than the {} MB meow reads",
+                MAX_ANSWER_BYTES / (1024 * 1024)
+            );
+        }
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// The next whole line, without its line end.
+    pub fn next_line(&mut self) -> Result<Option<String>> {
+        match self.buffer[self.searched..]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            Some(at) => {
+                let line: Vec<u8> = self.buffer.drain(..=self.searched + at).collect();
+                self.searched = 0;
+                Ok(Some(String::from_utf8_lossy(&line).trim().to_owned()))
+            }
+            None => {
+                self.searched = self.buffer.len();
+                if self.buffer.len() > MAX_STREAM_LINE {
+                    bail!("the reply has a line longer than meow reads");
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Whether `raw` names this machine itself: `localhost` or a loopback
@@ -744,19 +879,21 @@ pub fn validate_cloud_url(raw: &str) -> Result<String> {
 
 impl AiEngine {
     pub fn new(settings: AiSettings, db: Arc<Mutex<Db>>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("security-audit-client")
-            .build()
-            .context("cannot create the HTTP client")?;
         Ok(Self {
-            http,
+            http: http_client("https://elsewhere.invalid", REQUEST_TIMEOUT)?,
+            local_http: http_client("http://localhost", REQUEST_TIMEOUT)?,
             settings,
             db,
             gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    fn client(&self, url: &str) -> &reqwest::Client {
+        if is_loopback_url(url) {
+            &self.local_http
+        } else {
+            &self.http
+        }
     }
 
     pub fn budget(&self) -> Budget {
@@ -777,7 +914,7 @@ impl AiEngine {
         }
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
         let mut request = self
-            .http
+            .client(base)
             .post(&url)
             .header("Accept", "text/event-stream")
             .json(body);
@@ -802,7 +939,7 @@ impl AiEngine {
         };
         let status = response.status();
         if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
+            let detail = read_error(&mut response).await;
             let message = serde_json::from_str::<Value>(&detail)
                 .ok()
                 .and_then(|v| {
@@ -825,10 +962,9 @@ impl AiEngine {
         let mut text = String::new();
         let mut usage = Usage::default();
         if !streamed {
-            let reply: Value = response
-                .json()
-                .await
-                .context("the model server sent invalid JSON")?;
+            let reply: Value =
+                serde_json::from_slice(&read_bounded(&mut response, MAX_ANSWER_BYTES).await?)
+                    .context("the model server sent invalid JSON")?;
             if let Some(message) = reply.pointer("/error/message").and_then(Value::as_str) {
                 bail!("the model server reported: {}", sanitize(message, 300));
             }
@@ -837,6 +973,7 @@ impl AiEngine {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            cut(&mut text, MAX_REPLY);
             on_delta(&text);
             if let Some(found) = reply.get("usage") {
                 usage = parse_usage(found);
@@ -844,13 +981,11 @@ impl AiEngine {
             return Ok((text, usage));
         }
 
-        let mut buffer: Vec<u8> = Vec::new();
+        let mut lines = StreamLines::default();
         'stream: while let Some(chunk) = response.chunk().await.context("the reply was cut off")? {
-            buffer.extend_from_slice(&chunk);
-            while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = buffer.drain(..=end).collect();
-                let line = String::from_utf8_lossy(&line);
-                let Some(data) = line.trim().strip_prefix("data:") else {
+            lines.push(&chunk)?;
+            while let Some(line) = lines.next_line()? {
+                let Some(data) = line.strip_prefix("data:") else {
                     continue; // comments and keep-alives
                 };
                 let data = data.trim();
@@ -1080,7 +1215,7 @@ impl AiEngine {
             // A Claude API key: the Claude API's own protocol, the user's
             // fallback chain, and Claude's own web search for research.
             CloudProvider::Anthropic => anthropic::ask(
-                &self.http,
+                self.client(&settings.cloud_url),
                 &settings.cloud_url,
                 &api_key,
                 &model,
@@ -1193,15 +1328,9 @@ pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<P
     }
     // Model output is untrusted too: it is kept as Markdown that formats
     // and does nothing else (no image, link or HTML of its making).
-    let mut reply = outcome.text.as_str();
-    if reply.len() > MAX_REPLY {
-        let mut end = MAX_REPLY;
-        while !reply.is_char_boundary(end) {
-            end -= 1;
-        }
-        reply = &reply[..end];
-    }
-    entry.push_str(crate::evidence::inert_markdown(reply).trim());
+    let mut reply = outcome.text.clone();
+    cut(&mut reply, MAX_REPLY);
+    entry.push_str(crate::evidence::inert_markdown(&reply).trim());
     entry.push_str("\n\n");
     let searches = match outcome.web_search_requests {
         0 => String::new(),
@@ -1871,6 +2000,194 @@ mod tests {
             .unwrap();
         assert!((cost - 0.0042).abs() < 1e-12);
         assert_eq!(searches, 2);
+    }
+
+    /// Runs in a child process that has a proxy in its environment; see
+    /// the test below. Alone it does nothing.
+    #[tokio::test]
+    async fn proxy_probe_child() {
+        let Ok(name) = std::env::var("MEOW_PROXY_PROBE") else {
+            return;
+        };
+        let (base, mock) = mock_models().await;
+        // Once by address, once as "localhost".
+        let base = base.replace("127.0.0.1", &name);
+        let (engine, _db) = engine(&base, None);
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&engine, Tier::Local, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.text, "local answer");
+        assert_eq!(mock.local.lock().unwrap().len(), 1);
+        // Unmasked, as it may be on this machine.
+        assert!(mock.local.lock().unwrap()[0]
+            .to_string()
+            .contains("10.10.10.5"));
+    }
+
+    #[test]
+    fn the_local_tier_never_goes_through_a_proxy() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A stand-in for a company or system proxy: it counts what it is
+        // handed and keeps what it read.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let handed = Arc::new(AtomicUsize::new(0));
+        let read = Arc::new(Mutex::new(String::new()));
+        {
+            let (handed, read) = (Arc::clone(&handed), Arc::clone(&read));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    handed.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let mut buffer = [0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buffer) {
+                        read.lock()
+                            .unwrap()
+                            .push_str(&String::from_utf8_lossy(&buffer[..n]));
+                    }
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
+                }
+            });
+        }
+        for name in ["127.0.0.1", "localhost"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ai::tests::proxy_probe_child", "--nocapture"])
+                .env("MEOW_PROXY_PROBE", name)
+                .env("http_proxy", &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("all_proxy", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .env_remove(API_KEY_ENV)
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && said.contains("1 passed"),
+                "{name}: {said}\n{}\nthe proxy read: {}",
+                String::from_utf8_lossy(&output.stderr),
+                read.lock().unwrap()
+            );
+        }
+        assert_eq!(
+            handed.load(Ordering::SeqCst),
+            0,
+            "the proxy was handed: {}",
+            read.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endless_or_enormous_reply_is_an_error_not_memory() {
+        use axum::body::Body;
+        // 20 MB of JSON, 20 MB of an error page, a streamed line that never
+        // ends, and a stream of small lines that never stops.
+        let big = || "x".repeat(20 * 1024 * 1024);
+        let app = Router::new()
+            .route(
+                "/json/chat/completions",
+                post(move || async move {
+                    (
+                        [("content-type", "application/json")],
+                        format!("{{\"pad\":\"{}\"}}", big()),
+                    )
+                }),
+            )
+            .route(
+                "/error/chat/completions",
+                post(move || async move { (axum::http::StatusCode::BAD_GATEWAY, big()) }),
+            )
+            .route(
+                "/line/chat/completions",
+                post(move || async move {
+                    (
+                        [("content-type", "text/event-stream")],
+                        format!("data: {}", "y".repeat(3 * 1024 * 1024)),
+                    )
+                }),
+            )
+            .route(
+                "/stream/chat/completions",
+                post(|| async {
+                    let chunk = ": keep-alive\n".repeat(4096);
+                    let stream = futures_util::stream::repeat_with(move || {
+                        Ok::<_, std::io::Error>(chunk.clone())
+                    });
+                    (
+                        [("content-type", "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (engine, _db) = engine(&base, None);
+        let body = json!({ "messages": [] });
+        for (path, expected) in [
+            ("json", "the reply is larger than the 16 MB meow reads"),
+            ("error", "the model server answered HTTP 502"),
+            ("line", "the reply has a line longer than meow reads"),
+            ("stream", "the reply is larger than the 16 MB meow reads"),
+        ] {
+            let started = std::time::Instant::now();
+            let error = engine
+                .chat(&format!("{base}/{path}"), None, &body, |_| {})
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(expected), "{path}: {error}");
+            assert!(error.len() < 1000, "{path}: the error is short");
+            assert!(started.elapsed() < Duration::from_secs(60), "{path}");
+        }
+        // Cutting a long text never lands inside a character.
+        let mut text = "é".repeat(100_001);
+        cut(&mut text, MAX_REPLY);
+        assert_eq!(text.len(), MAX_REPLY);
+        let mut text = "aé".repeat(70_000);
+        cut(&mut text, MAX_REPLY);
+        assert_eq!(text.len(), MAX_REPLY - 1);
+        let mut lines = StreamLines::default();
+        lines.push(b"one\ntw").unwrap();
+        assert_eq!(lines.next_line().unwrap().as_deref(), Some("one"));
+        assert_eq!(lines.next_line().unwrap(), None);
+        lines.push(b"o\r\n\n").unwrap();
+        assert_eq!(lines.next_line().unwrap().as_deref(), Some("two"));
+        assert_eq!(lines.next_line().unwrap().as_deref(), Some(""));
+        assert_eq!(lines.next_line().unwrap(), None);
+    }
+
+    #[test]
+    fn a_key_in_the_environment_goes_only_to_its_own_service() {
+        let openai_style = |url: &str| AiSettings {
+            cloud_url: url.into(),
+            ..AiSettings::default()
+        };
+        assert!(openai_style("https://openrouter.ai/api/v1").env_key_applies());
+        assert!(openai_style("http://127.0.0.1:4000/v1").env_key_applies());
+        assert!(!openai_style("https://llm.other-service.example/v1").env_key_applies());
+        assert!(!openai_style("https://openrouter.ai.example/v1").env_key_applies());
+        let claude = |url: &str| AiSettings {
+            cloud_url: url.into(),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            ..AiSettings::default()
+        };
+        assert!(claude("https://api.anthropic.com/v1").env_key_applies());
+        assert!(!claude("https://claude.gateway.example/v1").env_key_applies());
+        // A key from the setup file or config.toml is the user's choice
+        // for whatever service they set up.
+        let own = AiSettings {
+            openrouter_api_key: Some("their-own".into()),
+            ..openai_style("https://llm.other-service.example/v1")
+        };
+        if no_env_key() {
+            assert_eq!(own.api_key().as_deref(), Some("their-own"));
+        }
     }
 
     #[test]

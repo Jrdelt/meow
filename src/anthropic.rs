@@ -160,7 +160,7 @@ fn request(http: &reqwest::Client, base: &str, key: &str, body: &Value) -> reqwe
 /// person can act on.
 async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::Response> {
     crate::ai::validate_cloud_url(base)?;
-    let response = match request.send().await {
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("cannot connect to the Claude API at {base}"),
         Err(error) if error.is_timeout() => bail!("the Claude API did not answer in time"),
@@ -170,7 +170,7 @@ async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::R
     if status.is_success() {
         return Ok(response);
     }
-    let detail = response.text().await.unwrap_or_default();
+    let detail = crate::ai::read_error(&mut response).await;
     let error = serde_json::from_str::<Value>(&detail).unwrap_or_default();
     let kind = error.pointer("/error/type").and_then(Value::as_str);
     let message = error
@@ -297,13 +297,11 @@ async fn triage(
     let mut counts = Counts::default();
     let mut stop = String::new();
     let mut stop_details = None;
-    let mut buffer: Vec<u8> = Vec::new();
+    let mut lines = crate::ai::StreamLines::default();
     while let Some(chunk) = response.chunk().await.context("the reply was cut off")? {
-        buffer.extend_from_slice(&chunk);
-        while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=end).collect();
-            let line = String::from_utf8_lossy(&line);
-            let Some(data) = line.trim().strip_prefix("data:") else {
+        lines.push(&chunk)?;
+        while let Some(line) = lines.next_line()? {
+            let Some(data) = line.strip_prefix("data:") else {
                 continue; // `event:` lines and keep-alives
             };
             let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
@@ -390,11 +388,10 @@ async fn research(
     for _ in 0..=MAX_RESUMES {
         let body = body(model, true, own_chain, system, &json!(messages));
         let request = request(http, base, key, &body).timeout(RESEARCH_TIMEOUT);
-        let reply: Value = send(request, base)
-            .await?
-            .json()
-            .await
-            .context("the Claude API sent invalid JSON")?;
+        let mut response = send(request, base).await?;
+        let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
+        let reply: Value =
+            serde_json::from_slice(&body).context("the Claude API sent invalid JSON")?;
         counts.model = reply
             .get("model")
             .and_then(Value::as_str)
@@ -458,14 +455,7 @@ async fn research(
         text.push_str("\n\nSources consulted:\n");
         text.push_str(&sources[..sources.len().min(12)].join("\n"));
     }
-    // On a character boundary: `String::truncate` panics inside one.
-    if text.len() > MAX_REPLY {
-        let mut end = MAX_REPLY;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
+    crate::ai::cut(&mut text, MAX_REPLY);
     Ok(Attempt {
         text,
         counts,
@@ -578,11 +568,9 @@ pub async fn list_models(http: &reqwest::Client, base: &str, key: &str) -> Resul
         .get(format!("{}/models", base.trim_end_matches('/')))
         .header("x-api-key", key)
         .header("anthropic-version", API_VERSION);
-    let reply: Value = send(request, base)
-        .await?
-        .json()
-        .await
-        .context("the Claude API sent invalid JSON")?;
+    let mut response = send(request, base).await?;
+    let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
+    let reply: Value = serde_json::from_slice(&body).context("the Claude API sent invalid JSON")?;
     let models = reply.get("data").and_then(Value::as_array);
     Ok(models
         .into_iter()

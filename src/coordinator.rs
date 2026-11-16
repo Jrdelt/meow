@@ -639,6 +639,7 @@ impl State {
     /// Runs one AI request to the end, streaming the reply into the status
     /// that the HUD and the map show, then saves it under `chats/`.
     async fn run_ai(self: Arc<Self>, tier: Tier, graph: Graph, host: Host) {
+        let _running = AiRunning(&self.ai_status);
         let streamer = Arc::clone(&self);
         let mut on_text = move |piece: &str| {
             if !piece.is_empty() {
@@ -686,6 +687,23 @@ impl State {
             }
         };
         self.notice(line);
+    }
+}
+
+/// Clears "an AI request is running" when the request ends, however it
+/// ends: one that stopped on a fault must not leave every later request
+/// refused as "already running" for the rest of the session.
+struct AiRunning<'a>(&'a Mutex<AiStatus>);
+
+impl Drop for AiRunning<'_> {
+    fn drop(&mut self) {
+        let mut status = lock(self.0);
+        if status.running {
+            status.running = false;
+            status
+                .error
+                .get_or_insert_with(|| "the request ended unexpectedly".to_owned());
+        }
     }
 }
 
@@ -1803,6 +1821,34 @@ mod tests {
 
     fn bearer(info: &RuntimeInfo) -> String {
         format!("Bearer {}", info.token)
+    }
+
+    #[test]
+    fn an_ai_request_that_ends_on_a_fault_is_no_longer_running() {
+        let status = Mutex::new(AiStatus {
+            running: true,
+            ..AiStatus::default()
+        });
+        // The request's task unwinds: nothing set the status.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _running = AiRunning(&status);
+            std::panic::resume_unwind(Box::new("fault in the request"));
+        }));
+        assert!(unwound.is_err());
+        let after = lock(&status);
+        assert!(!after.running);
+        assert_eq!(
+            after.error.as_deref(),
+            Some("the request ended unexpectedly")
+        );
+        drop(after);
+        // A request that ended normally keeps what it reported.
+        *lock(&status) = AiStatus {
+            summary: Some("done".into()),
+            ..AiStatus::default()
+        };
+        drop(AiRunning(&status));
+        assert_eq!(lock(&status).error, None);
     }
 
     #[test]

@@ -324,7 +324,9 @@ matches the databases no longer return are removed, while anything you marked
 From the HUD: `L`, `C` and `R`. From the map: the buttons on a host.
 
 - **L, local**: an OpenAI-compatible server on your machine
-  (`http://localhost:1234/v1`). Free; nothing leaves.
+  (`http://localhost:1234/v1`). Free; nothing leaves: a server on this
+  machine is reached directly, never through a proxy from the environment or
+  the system settings.
 - **C, cloud triage**: three short sections: risk and a verification question,
   hardening, and a detection rule.
 - **R, grounded research** (with web search): available once a hypothesis has
@@ -419,9 +421,15 @@ meow setup --forget-key
 ```
 
 A key in the environment also works and wins over the file: `ANTHROPIC_API_KEY`
-when the Claude API is in use, `OPENROUTER_API_KEY` otherwise. It is read when
+for the Claude API (`api.anthropic.com`), `OPENROUTER_API_KEY` for OpenRouter
+(`openrouter.ai`). Neither is sent to any other address; for another service,
+store its key with `--api-key-stdin`. It is read when
 the session starts. Without any key, `C` answers with the local model and `R`
 is unavailable; the map and the HUD say so.
+
+A key stays with the service it was entered for: `--provider` or `--cloud-url`
+naming another service, without `--api-key-stdin` in the same command, removes
+the stored key and says so.
 
 ## Configuration
 

@@ -364,11 +364,21 @@ fn setup_keeps_each_users_own_ai_in_their_private_file() {
         text.contains("[!] [L] nothing is listening at http://127.0.0.1:9/v1"),
         "{text}"
     );
+    // The key was entered for OpenRouter: it is not tried on, or sent to,
+    // the address named now.
     assert!(
-        text.contains("[!] [C] nothing is listening at http://127.0.0.1:9/v1"),
+        text.contains(
+            "[+] API key removed from your setup file: it was entered for openrouter.ai. \
+             Give the key for 127.0.0.1 with --api-key-stdin"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("[!] [C] no API key set, so it was not tried"),
         "{text}"
     );
     assert!(!text.contains(KEY), "{text}");
+    assert!(!std::fs::read_to_string(&file).unwrap().contains(KEY));
 
     // A mistyped address is refused and nothing is saved.
     let before = std::fs::read_to_string(&file).unwrap();

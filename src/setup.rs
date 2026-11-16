@@ -27,6 +27,8 @@ pub(crate) const LOCAL_SERVERS: &[(&str, &str)] = &[
     ("http://localhost:8080/v1", "llama.cpp"),
 ];
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// More models than any server offers; the rest of a list is not read.
+const MAX_MODELS: usize = 500;
 
 /// Said when Ctrl+V is pressed at a key prompt: terminals paste with other
 /// keys, and Ctrl+V itself would only add a "v".
@@ -104,7 +106,22 @@ pub(crate) fn masked(key: &str) -> String {
 
 /// The current setup in a few lines. Never prints a key.
 pub fn describe(settings: &AiSettings, file: &Path) -> String {
-    let effective = settings.effective();
+    // Names and addresses come from files and, once, from a server's
+    // answer: none of it reaches the terminal as anything but text.
+    let clean = |text: &str| crate::evidence::sanitize(text, 200);
+    let mut effective = settings.effective();
+    for field in [
+        &mut effective.local_url,
+        &mut effective.local_model,
+        &mut effective.cloud_url,
+        &mut effective.cloud_model,
+        &mut effective.research_model,
+    ] {
+        *field = clean(field);
+    }
+    if let Some(chain) = &mut effective.cloud_fallbacks {
+        chain.iter_mut().for_each(|model| *model = clean(model));
+    }
     let model = match effective.local_model.as_str() {
         "" => "chosen by the server".to_owned(),
         model => model.to_owned(),
@@ -190,14 +207,17 @@ pub(crate) fn parse_chain(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn http() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(PROBE_TIMEOUT)
-        .timeout(PROBE_TIMEOUT * 3)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("security-audit-client")
-        .build()
-        .context("cannot create the HTTP client")
+/// A client for the service at `url`: one on this machine is reached
+/// directly, never through a proxy (see [`crate::ai::http_client`]).
+fn http(url: &str) -> Result<reqwest::Client> {
+    crate::ai::http_client(url, PROBE_TIMEOUT * 3)
+}
+
+/// A model name as a server gave it, safe to print and to store: whatever
+/// answers on the local model port chooses these words.
+fn model_name(id: &str) -> Option<String> {
+    let name = crate::evidence::sanitize(id, 120);
+    (!name.is_empty()).then_some(name)
 }
 
 /// The models an OpenAI-compatible server offers (`GET <url>/models`).
@@ -206,11 +226,11 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     if key.is_some() {
         crate::ai::validate_cloud_url(url)?;
     }
-    let mut request = http()?.get(format!("{}/models", url.trim_end_matches('/')));
+    let mut request = http(url)?.get(format!("{}/models", url.trim_end_matches('/')));
     if let Some(key) = key {
         request = request.bearer_auth(key);
     }
-    let response = match request.send().await {
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("nothing is listening at {url}"),
         Err(error) if error.is_timeout() => bail!("{url} did not answer in time"),
@@ -223,9 +243,8 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     if !status.is_success() {
         bail!("{url} answered HTTP {}", status.as_u16());
     }
-    let body: Value = response
-        .json()
-        .await
+    let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
+    let body: Value = serde_json::from_slice(&body)
         .with_context(|| format!("{url} did not answer like an OpenAI-compatible API"))?;
     let models = body
         .get("data")
@@ -234,7 +253,8 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     Ok(models
         .iter()
         .filter_map(|model| model.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
+        .filter_map(model_name)
+        .take(MAX_MODELS)
         .collect())
 }
 
@@ -243,7 +263,7 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
 /// model list, which needs a valid key.
 pub async fn check_key(url: &str, key: &str) -> Result<()> {
     let base = crate::ai::validate_cloud_url(url)?;
-    let response = http()?
+    let response = http(&base)?
         .get(format!("{base}/key"))
         .bearer_auth(key)
         .send()
@@ -297,8 +317,8 @@ pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> 
         Some(key) if claude => {
             // The key first, then every model the setup names: a key is not
             // necessarily offered all of them.
-            let client = http()?;
             let url = &effective.cloud_url;
+            let client = http(url)?;
             match block_on(anthropic::list_models(&client, url, &key))? {
                 Ok(_) => writeln!(out, "[+] [C] the Claude API accepts your API key")?,
                 Err(error) => {
@@ -400,6 +420,24 @@ fn apply(
             changed.push(format!("{what}: {model}"));
             *slot = Some(model.to_owned());
         }
+    }
+    // A key stays with the service it was entered for. Naming another
+    // service without giving its key does not send the old one there.
+    let host = |url: &str| {
+        url::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default()
+    };
+    let (before, after) = (
+        host(&current.cloud_url),
+        host(own.cloud_url.as_deref().unwrap_or(&current.cloud_url)),
+    );
+    if before != after && key_from_stdin.is_none() && own.api_key.take().is_some() {
+        changed.push(format!(
+            "API key removed from your setup file: it was entered for {before}. \
+             Give the key for {after} with --api-key-stdin"
+        ));
     }
     if args.forget_key {
         own.api_key = None;
@@ -887,6 +925,114 @@ mod tests {
         assert!(!refused.contains("wrong"));
     }
 
+    #[tokio::test]
+    async fn model_names_from_a_server_reach_the_terminal_as_text_only() {
+        // Whatever answers on the local model port: here with a title
+        // change, a clipboard write and a forged status line in one name.
+        const HOSTILE: &str =
+            "llama3\u{1b}]0;owned\u{7}\u{1b}]52;c;aGk=\u{7}\r\u{1b}[2K[+] [C] accepts your API key";
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                Json(json!({ "data": [ { "id": HOSTILE }, { "id": "\u{1b}\u{7}" }, { "id": "plain" } ] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let models = list_models(&url, None).await.unwrap();
+        assert_eq!(
+            models.len(),
+            2,
+            "a name of nothing but control codes is dropped"
+        );
+        assert_eq!(models[1], "plain");
+        assert!(models[0].starts_with("llama3]0;owned"), "{:?}", models[0]);
+        for model in &models {
+            assert!(!model.chars().any(char::is_control), "{model:?}");
+        }
+        // And a name already saved in the setup file, by an earlier version
+        // or by hand, is printed clean too.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        AiOverrides {
+            local_model: Some(HOSTILE.into()),
+            cloud_model: Some(format!("m{HOSTILE}")),
+            cloud_fallbacks: Some(vec![HOSTILE.into()]),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        let settings = AiSettings {
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let shown = describe(&settings, &file);
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
+        assert!(shown.contains("llama3]0;owned"));
+    }
+
+    #[test]
+    fn a_key_stays_with_the_service_it_was_entered_for() {
+        let claude = AiSettings {
+            cloud_url: anthropic::API_URL.into(),
+            ..AiSettings::default()
+        };
+        let stored = || AiOverrides {
+            cloud_url: Some(anthropic::API_URL.into()),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            api_key: Some("sk-ant-their-claude-key-ZZ99".into()),
+            ..AiOverrides::default()
+        };
+        // Another service by address, or by name: the Claude key is not
+        // taken along, and the answer says so without printing it.
+        for args in [
+            SetupArgs {
+                cloud_url: Some("https://llm.other-service.example/v1".into()),
+                ..SetupArgs::default()
+            },
+            SetupArgs {
+                provider: Some("openrouter".into()),
+                ..SetupArgs::default()
+            },
+        ] {
+            let mut own = stored();
+            let changed = apply(&args, &claude, &mut own, None).unwrap();
+            assert_eq!(own.api_key, None, "{changed:?}");
+            let said = changed.join("\n");
+            assert!(
+                said.contains(
+                    "API key removed from your setup file: it was entered for api.anthropic.com"
+                ),
+                "{said}"
+            );
+            assert!(!said.contains("ZZ99") && !said.contains("sk-ant"), "{said}");
+        }
+        // With the new service's key in the same call, that key is stored.
+        let mut own = stored();
+        let args = SetupArgs {
+            cloud_url: Some("https://llm.other-service.example/v1".into()),
+            api_key_stdin: true,
+            ..SetupArgs::default()
+        };
+        apply(&args, &claude, &mut own, Some(GOOD_KEY.into())).unwrap();
+        assert_eq!(own.api_key.as_deref(), Some(GOOD_KEY));
+        // A change that keeps the service keeps the key.
+        let mut own = stored();
+        let args = SetupArgs {
+            cloud_model: Some("claude-opus-5-5".into()),
+            cloud_url: Some(format!("{}/", anthropic::API_URL)),
+            ..SetupArgs::default()
+        };
+        apply(&args, &claude, &mut own, None).unwrap();
+        assert!(own.api_key.is_some());
+    }
+
     #[test]
     fn flags_change_only_what_they_name() {
         let mut own = AiOverrides {
@@ -1112,7 +1258,16 @@ mod tests {
             ..SetupArgs::default()
         };
         let changed = apply(&back, &settings.effective(), &mut own, None).unwrap();
-        assert_eq!(changed, ["cloud service: https://openrouter.ai/api/v1"]);
+        // The Claude key does not go along to the other service.
+        assert_eq!(
+            changed,
+            [
+                "cloud service: https://openrouter.ai/api/v1",
+                "API key removed from your setup file: it was entered for api.anthropic.com. \
+                 Give the key for openrouter.ai with --api-key-stdin"
+            ]
+        );
+        assert_eq!(own.api_key, None);
         own.save(&file).unwrap();
         let effective = settings.effective();
         assert_eq!(effective.provider(), CloudProvider::OpenAi);
