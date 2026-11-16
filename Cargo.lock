@@ -1196,15 +1196,6 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "ipnetwork"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "ipnetwork"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
@@ -1434,7 +1425,7 @@ version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "317d6b918ba3893345af072f52cb56bcfcb532a9d0ebcf861ab3c25b37a316ac"
 dependencies = [
- "ipnetwork 0.21.1",
+ "ipnetwork",
  "memchr",
  "serde",
  "thiserror 2.0.21",
@@ -1476,7 +1467,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hyper",
  "hyper-util",
- "ipnetwork 0.20.0",
+ "ipnetwork",
  "libc",
  "maxminddb",
  "petgraph",
