@@ -43,7 +43,11 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("[!] {error:#}");
+            // Whatever a file, a repository or a server put into the text
+            // of an error is printed as text: no control characters, no
+            // characters that hide or reorder what follows.
+            let said = meow::evidence::sanitize_block(&format!("{error:#}"), 4000);
+            eprintln!("[!] {said}");
             ExitCode::from(1)
         }
     }

@@ -135,6 +135,35 @@ fn update_pulls_what_was_pushed_and_runs_the_installer() {
 }
 
 #[test]
+fn a_commit_subject_is_shown_as_text() {
+    let repos = Repos::new();
+    // An upstream commit whose subject would retitle the terminal, write
+    // the clipboard and replace the line with a forged one.
+    let work = repos.path("work");
+    std::fs::write(work.join("typo.txt"), "x").unwrap();
+    git(&work, &["add", "."]);
+    git(
+        &work,
+        &[
+            "commit",
+            "-qm",
+            "docs: fix typo\u{1b}]0;owned\u{7}\u{1b}]52;c;aGk=\u{7}\r\u{1b}[2K[+] Already up to date",
+        ],
+    );
+    git(&work, &["push", "-q", "origin", "HEAD:main"]);
+
+    let output = repos.update(&["--check"]);
+    let shown = text(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(shown.contains("1 new on origin/main:"), "{shown}");
+    assert!(shown.contains("docs: fix typo]0;owned"), "{shown}");
+    assert!(
+        !shown.bytes().any(|b| b < 0x20 && b != b'\n'),
+        "control bytes reached the terminal: {shown:?}"
+    );
+}
+
+#[test]
 fn local_changes_are_never_pulled_over() {
     let repos = Repos::new();
     repos.push_change("upstream.txt");

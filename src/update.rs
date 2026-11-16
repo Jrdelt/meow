@@ -147,7 +147,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         bail!(
             "git {} failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            crate::evidence::sanitize_block(&String::from_utf8_lossy(&output.stderr), 2000)
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
@@ -277,8 +277,9 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     } else {
         let lines: Vec<&str> = incoming.lines().collect();
         println!("[+] {} new on {upstream}:", lines.len());
+        // A commit's subject is whatever its author typed: shown as text.
         for line in lines.iter().take(20) {
-            println!("    {line}");
+            println!("    {}", crate::evidence::sanitize(line, 200));
         }
         if lines.len() > 20 {
             println!("    ... and {} more", lines.len() - 20);

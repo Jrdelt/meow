@@ -1164,6 +1164,85 @@ exit
     assert!(!page.exists());
 }
 
+/// Bytes that take over a terminal: a title, the clipboard, a forged line.
+#[cfg(unix)]
+const TAKEOVER: &str =
+    "\u{1b}]0;owned\u{7}\u{1b}]52;c;aGk=\u{7}\r\u{1b}[2K[+] Report written to REPORT.md";
+
+#[cfg(unix)]
+fn no_control_bytes(what: &str, text: &str) {
+    assert!(
+        !text.bytes().any(|b| b < 0x20 && b != b'\n') && !text.contains('\u{7f}'),
+        "{what} carries control bytes: {text:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn text_from_files_reaches_the_terminal_as_text_only() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home()).unwrap();
+    std::fs::write(
+        sandbox.home().join("config.toml"),
+        "default_mode = \"light\"\n[cve]\nenabled = false\n",
+    )
+    .unwrap();
+
+    // A folder that came with a .meow holding a link whose name is the
+    // attack: the refusal names it before any question is asked.
+    let planted = sandbox.project().join(".meow");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join("profile.toml"),
+        "name = \"demo\"\nmode = \"light\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", planted.join(format!("x{TAKEOVER}"))).unwrap();
+    for command in [
+        vec!["review", "--local"],
+        vec!["report", "--local"],
+        vec!["mode", "mild", "--local"],
+    ] {
+        let output = sandbox.run(&command, &[]);
+        let said = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{command:?}: {said}");
+        no_control_bytes(&format!("{command:?}"), &said);
+        no_control_bytes(&format!("{command:?}"), &stdout(&output));
+    }
+    let said = stderr(&sandbox.run(&["report", "--local"], &[]));
+    assert!(
+        said.contains("is a symbolic link inside a workspace"),
+        "{said}"
+    );
+    assert!(said.contains("]0;owned"), "the link is still named: {said}");
+    std::fs::remove_dir_all(&planted).unwrap();
+
+    // A workspace of the user's own whose graph.json holds the bytes where
+    // a fixed word belongs: the parser's message repeats the value.
+    let output = sandbox.run(&["mode", "light", "--session", "own"], &[]);
+    let _ = output;
+    let own = sandbox.workspace("own");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(
+        own.join("profile.toml"),
+        "name = \"own\"\nmode = \"light\"\n",
+    )
+    .unwrap();
+    let hostile = serde_json::json!({
+        "version": 2,
+        "hosts": { "10.0.0.5": { "address": "10.0.0.5", "facts": [ { "claim": "x", "record": {
+            "timestamp_utc": "2026-11-12T09:00:00Z", "source": "nmap_xml",
+            "confidence": format!("High{TAKEOVER}"),
+            "verification_status": "Observed", "evidence": "x" } } ] } }
+    });
+    std::fs::write(own.join("graph.json"), hostile.to_string()).unwrap();
+    let output = sandbox.run(&["report", "--session", "own"], &[]);
+    let said = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(said.contains("graph.json"), "{said}");
+    no_control_bytes("report", &said);
+}
+
 #[test]
 fn a_workspace_that_came_with_the_folder_is_not_opened_unasked() {
     let sandbox = Sandbox::new();
