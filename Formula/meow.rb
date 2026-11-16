@@ -15,8 +15,8 @@ class Meow < Formula
   depends_on "nmap"
 
   resource "seclists_common" do
-    url "https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
-    sha256 "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
+    url "https://raw.githubusercontent.com/danielmiessler/SecLists/0c618cfc28d1e68811b95c61cc9ab05bc10b0a02/Discovery/Web-Content/common.txt"
+    sha256 "47fb86ca6fb3f97e5491161581900d6d99851fb16764eacddf16aa85617c956a"
   end
 
   def install

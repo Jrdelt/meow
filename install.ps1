@@ -34,8 +34,8 @@ $ProgressPreference = 'SilentlyContinue'
 $MIN_RUST_MINOR = 89
 $IsArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') -or ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')
 $RUSTUP_URL = if ($IsArm64) { "https://win.rustup.rs/aarch64" } else { "https://win.rustup.rs/x86_64" }
-$WORDLIST_URL = "https://raw.githubusercontent.com/danielmiessler/SecLists/f68bef9c49622d9f76c7cae7a8c2dae24da2d236/Discovery/Web-Content/common.txt"
-$WORDLIST_SHA256 = "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52"
+$WORDLIST_URL = "https://raw.githubusercontent.com/danielmiessler/SecLists/0c618cfc28d1e68811b95c61cc9ab05bc10b0a02/Discovery/Web-Content/common.txt"
+$WORDLIST_SHA256 = "47fb86ca6fb3f97e5491161581900d6d99851fb16764eacddf16aa85617c956a"
 $KATANA_GO = "github.com/projectdiscovery/katana/cmd/katana@v1.1.2"
 $FEROXBUSTER_VERSION = "2.11.0"
 # The most a location database file may weigh, packed (200 MB) and unpacked (512 MB).

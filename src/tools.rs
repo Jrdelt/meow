@@ -446,7 +446,7 @@ mod tests {
         };
         let wordlist_url = extract("WORDLIST_URL=");
         let katana_go = extract("KATANA_GO=");
-        let sha256 = "78e7be2efbbbfef8ef1eb02116189087fd9205ef2bf997e68b29b45bfeb8ab52";
+        let sha256 = "47fb86ca6fb3f97e5491161581900d6d99851fb16764eacddf16aa85617c956a";
 
         for needle in [
             wordlist_url.as_str(),
