@@ -190,7 +190,10 @@ fn check_sha256_for(bytes: &[u8], sum_file: &str, expected_file: Option<&str>) -
         .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
         .context("the checksum file holds no SHA-256 digest")?
         .to_ascii_lowercase();
-    if let (Some(wanted), Some(recorded)) = (expected_file, parts.next()) {
+    if let Some(wanted) = expected_file {
+        let recorded = parts
+            .next()
+            .context("the checksum file does not name the release archive")?;
         let recorded = recorded.trim_start_matches('*');
         let recorded = recorded.strip_prefix("./").unwrap_or(recorded);
         if recorded != wanted {
@@ -230,11 +233,13 @@ fn is_trusted_github_url(url: &url::Url, allow_api: bool) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    let host = host.to_ascii_lowercase();
-    (allow_api && host == "api.github.com")
-        || host == "github.com"
-        || host == "objects.githubusercontent.com"
-        || host.ends_with(".githubusercontent.com")
+    let path = url.path().to_ascii_lowercase();
+    match host.to_ascii_lowercase().as_str() {
+        "api.github.com" => allow_api && path.starts_with("/repos/jrdelt/meow/"),
+        "github.com" => path.starts_with("/jrdelt/meow/releases/download/"),
+        "objects.githubusercontent.com" | "release-assets.githubusercontent.com" => true,
+        _ => false,
+    }
 }
 
 /// A release file is fetched only from GitHub over https (or, for a
@@ -365,8 +370,43 @@ fn tar() -> PathBuf {
     }
 }
 
+fn is_safe_archive_entry_path(raw: &str) -> bool {
+    use std::path::Component;
+    let trimmed = raw.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.contains(':')
+    {
+        return false;
+    }
+    let normalized = trimmed.replace('\\', "/");
+    Path::new(&normalized)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// Unpacks the archive at `archive` into `into` and returns the new meow.
 fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
+    let listing = Command::new(tar())
+        .env_remove("TAPE")
+        .env_remove("RSH")
+        .arg("-tf")
+        .arg(archive)
+        .stdin(Stdio::null())
+        .output()
+        .context("cannot inspect the download archive")?;
+    if !listing.status.success() {
+        bail!("the download archive could not be inspected");
+    }
+    let entries = String::from_utf8(listing.stdout)
+        .map_err(|_| anyhow::anyhow!("the download archive contains non-UTF-8 entry names"))?;
+    for entry in entries.lines() {
+        if !is_safe_archive_entry_path(entry) {
+            bail!("refusing archive with unsafe entry path");
+        }
+    }
+
     let mut cmd = Command::new(tar());
     cmd.env_remove("TAPE")
         .env_remove("RSH")
@@ -701,6 +741,14 @@ mod tests {
                 false,
             ),
             ("https://downloads.example.com/meow.tar.gz", false),
+            (
+                "https://github.com/other/repo/releases/download/v0.1.2/meow.tar.gz",
+                false,
+            ),
+            (
+                "https://raw.githubusercontent.com/Jrdelt/meow/main/meow.tar.gz",
+                false,
+            ),
             ("https://github.com.example.com/meow.tar.gz", false),
             ("https://notgithubusercontent.com/meow.tar.gz", false),
             ("http://127.0.0.1:8000/meow.tar.gz", false),
@@ -725,6 +773,23 @@ mod tests {
     fn checksums_and_release_urls_are_validated() {
         let sum = "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52  meow.tar.gz\n";
         assert!(check_sha256(b"meow", sum).is_ok());
+        assert!(check_sha256(
+            b"meow",
+            "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52\n"
+        )
+        .is_ok());
+        // When an archive filename is expected, a bare hash without a filename is refused.
+        assert!(check_sha256_for(
+            b"meow",
+            "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52\n",
+            Some("meow.tar.gz")
+        )
+        .is_err());
+        assert!(is_safe_archive_entry_path("meow"));
+        assert!(is_safe_archive_entry_path("./meow.exe"));
+        assert!(!is_safe_archive_entry_path("../meow"));
+        assert!(!is_safe_archive_entry_path("/usr/local/bin/meow"));
+        assert!(!is_safe_archive_entry_path("C:\\meow.exe"));
         assert!(check_sha256_for(b"meow", &format!("\u{feff}{sum}"), Some("meow.tar.gz")).is_ok());
         assert!(check_sha256_for(
             b"meow",

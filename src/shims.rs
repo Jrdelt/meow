@@ -316,6 +316,7 @@ function global:prompt {
     $global:LASTEXITCODE = $code
     & $global:__meow.Prompt
 }
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Undefined -Force -ErrorAction SilentlyContinue
 "##;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,9 +365,22 @@ fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// Quotes `text` as a single-quoted PowerShell string literal.
+/// Quotes `text` as a single-quoted PowerShell string literal, doubling both
+/// ASCII `'` and the Unicode single-quote characters PowerShell's lexer treats
+/// as string delimiters.
 fn ps_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for ch in text.chars() {
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            out.push(ch);
+            out.push(ch);
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn utf8(path: &Path) -> Result<&str> {
@@ -572,6 +586,10 @@ mod tests {
     fn quoting_survives_awkward_paths() {
         assert_eq!(sh_quote("/a b/it's"), r"'/a b/it'\''s'");
         assert_eq!(ps_quote("C:\\it's\\$x"), "'C:\\it''s\\$x'");
+        assert_eq!(
+            ps_quote("C:\\bob\u{2019}s\\$(calc)"),
+            "'C:\\bob\u{2019}\u{2019}s\\$(calc)'"
+        );
     }
 
     #[test]

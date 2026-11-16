@@ -38,10 +38,6 @@ pub fn runtime_info_in(dir: &Path) -> Option<RuntimeInfo> {
     let info = RuntimeInfo::read(&dir.join(RUNTIME_FILE))?;
     match SessionLock::check_free(&dir.join(LOCK_FILE)) {
         Err(LockError::Held { pid: Some(holder) }) => (holder == info.pid).then_some(info),
-        // On Windows an older lock layout starting at byte 0 cannot be read
-        // while locked; elsewhere an unreadable process id means the lock is
-        // changing hands.
-        Err(LockError::Held { pid: None }) => (cfg!(windows) && info.pid != 0).then_some(info),
         _ => None,
     }
 }

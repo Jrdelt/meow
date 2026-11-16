@@ -1482,8 +1482,15 @@
         web.appendChild(row('Favicon hash', fav));
       }
       if (http && http.location) { web.appendChild(row('Redirects to', http.location)); }
-      if (http && http.security_headers && http.security_headers.length) {
-        web.appendChild(row('Security headers', marked(http.security_headers.join(', '), 'ok')));
+      if (http && http.security_headers) {
+        var secHdrs = Array.isArray(http.security_headers)
+          ? http.security_headers
+          : Object.keys(http.security_headers).filter(function (k) {
+              return own(http.security_headers, k) !== undefined;
+            });
+        if (secHdrs.length) {
+          web.appendChild(row('Security headers', marked(secHdrs.join(', '), 'ok')));
+        }
       }
       if (http && http.missing_headers && http.missing_headers.length) {
         web.appendChild(row('Missing headers', marked(http.missing_headers.join(', '), 'warn')));

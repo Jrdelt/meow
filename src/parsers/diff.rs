@@ -38,14 +38,22 @@ fn strip_side(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+const MAX_DIFF_FILES: usize = 512;
+
 pub fn parse(text: &str) -> Vec<Observation> {
     let mut out = Vec::new();
     let mut current = FileDiff::default();
     let mut in_hunk = false;
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
+        if out.len() >= MAX_DIFF_FILES {
+            return out;
+        }
         if let Some(rest) = line.strip_prefix("diff --git ") {
             std::mem::take(&mut current).finish(&mut out);
+            if out.len() >= MAX_DIFF_FILES {
+                return out;
+            }
             in_hunk = false;
             // "a/old b/new": the new path is after the last " b/".
             current.path = rest
@@ -67,6 +75,9 @@ pub fn parse(text: &str) -> Vec<Observation> {
                 // A plain unified diff has no "diff --git" header between files.
                 if !current.block.is_empty() {
                     std::mem::take(&mut current).finish(&mut out);
+                    if out.len() >= MAX_DIFF_FILES {
+                        return out;
+                    }
                 }
                 in_hunk = false;
                 if current.path.is_empty() && rest.trim() != "/dev/null" {
@@ -89,7 +100,9 @@ pub fn parse(text: &str) -> Vec<Observation> {
             in_hunk = false; // next file header ("index ...", "new file mode ...")
         }
     }
-    current.finish(&mut out);
+    if out.len() < MAX_DIFF_FILES {
+        current.finish(&mut out);
+    }
     out
 }
 

@@ -1194,16 +1194,31 @@ impl Graph {
     pub fn load(path: &Path) -> Result<Self> {
         use std::io::Read;
         crate::workspace::refuse_file_symlink(path)?;
-        let pre = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+            }
         };
-        if !pre.is_file() {
-            bail!("{} is not a regular file", path.display());
-        }
-        let file =
-            std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+        #[cfg(not(unix))]
+        let file = {
+            let pre = match std::fs::metadata(path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+            };
+            if !pre.is_file() {
+                bail!("{} is not a regular file", path.display());
+            }
+            std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?
+        };
         let meta = file
             .metadata()
             .with_context(|| format!("cannot inspect {}", path.display()))?;

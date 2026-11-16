@@ -867,7 +867,7 @@ fn origin_allowed(headers: &HeaderMap, port: u16) -> bool {
 
 enum PresentedToken {
     Direct(String),
-    Cookie(String),
+    Cookies(Vec<String>),
 }
 
 fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<PresentedToken> {
@@ -901,7 +901,7 @@ fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<Pre
         }
     }
     let scoped_prefix = format!("{}=", cookie_name(port));
-    let mut legacy = None;
+    let mut cookies = Vec::new();
     for cookie_hdr in headers.get_all(header::COOKIE) {
         let Ok(cookie_str) = cookie_hdr.to_str() else {
             continue;
@@ -909,19 +909,13 @@ fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<Pre
         for part in cookie_str.split(';') {
             let trimmed = part.trim();
             if let Some(val) = trimmed.strip_prefix(&scoped_prefix) {
-                if !val.is_empty() {
-                    return Some(PresentedToken::Cookie(val.to_owned()));
-                }
-            } else if legacy.is_none() {
-                if let Some(val) = trimmed.strip_prefix("meow_token=") {
-                    if !val.is_empty() {
-                        legacy = Some(val.to_owned());
-                    }
+                if !val.is_empty() && cookies.len() < 16 {
+                    cookies.push(val.to_owned());
                 }
             }
         }
     }
-    legacy.map(PresentedToken::Cookie)
+    (!cookies.is_empty()).then_some(PresentedToken::Cookies(cookies))
 }
 
 /// RFC 6265 cookies on `127.0.0.1` are shared across ports (`SameSite=Strict`
@@ -971,15 +965,40 @@ async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response
     let Some(presented) = token_from(headers, request.uri().query(), state.port) else {
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     };
-    let (token, from_cookie) = match presented {
-        PresentedToken::Direct(token) => (token, false),
-        PresentedToken::Cookie(token) => (token, true),
+    let from_cookie = match presented {
+        PresentedToken::Direct(token) => {
+            if !constant_time_eq(&token, &state.token) {
+                return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
+            }
+            false
+        }
+        PresentedToken::Cookies(tokens) => {
+            let mut matched = false;
+            for candidate in &tokens {
+                if constant_time_eq(candidate, &state.token) {
+                    matched = true;
+                }
+            }
+            if !matched {
+                return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
+            }
+            true
+        }
     };
-    if !constant_time_eq(&token, &state.token) {
-        return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
-    }
-    if from_cookie && !sec_fetch_site_allowed_for_cookie(headers) {
-        return refuse(StatusCode::FORBIDDEN, "cross-origin cookie request refused");
+    if from_cookie {
+        let safe_read_route = matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) && request.uri().path() != "/ws";
+        if !safe_read_route {
+            return refuse(
+                StatusCode::FORBIDDEN,
+                "cookie authentication is restricted to read-only page and asset requests",
+            );
+        }
+        if !sec_fetch_site_allowed_for_cookie(headers) {
+            return refuse(StatusCode::FORBIDDEN, "cross-origin cookie request refused");
+        }
     }
     match tokio::time::timeout(REQUEST_BODY_TIMEOUT, next.run(request)).await {
         Ok(response) => response,
@@ -1003,7 +1022,7 @@ async fn post_command(
 
 async fn get_report(AxumState(state): AxumState<Shared>) -> Response {
     let inputs = state.report_inputs();
-    let filename = format!("report-{}.md", crate::ai::chat_file_name(&inputs.session));
+    let filename = format!("report-{}", crate::ai::chat_file_name(&inputs.session));
     let markdown = crate::report::render(&inputs);
     let mut response = (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
@@ -1026,7 +1045,7 @@ async fn get_host_report(
     let Some(markdown) = crate::report::render_host_report(&inputs, &address) else {
         return refuse(StatusCode::NOT_FOUND, "unknown host");
     };
-    let filename = format!("report-{}.md", crate::ai::chat_file_name(&address));
+    let filename = format!("report-{}", crate::ai::chat_file_name(&address));
     let mut response = (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
         markdown,
@@ -1641,6 +1660,8 @@ impl Coordinator {
             None
         };
 
+        let _ = std::fs::remove_file(workspace.tmp_dir().join(webui::OPENER_FILE));
+        let _ = std::fs::remove_file(workspace.tmp_dir().join("map-open.html"));
         let runtime_path = workspace.runtime_path();
         let info = RuntimeInfo {
             pid: std::process::id(),
@@ -2980,6 +3001,55 @@ mod tests {
             None,
         );
         assert_eq!(status, 401);
+
+        // 4b. Cookie authentication is rejected on state-changing POST routes
+        // and WebSocket upgrades (blocking cookie-based CSRF and CSWSH), legacy
+        // unscoped `meow_token=` cookies are rejected, and a stale duplicate
+        // port cookie does not shadow a valid port cookie on read-only GETs.
+        let (status, _) = request(
+            &info,
+            "POST",
+            "/api/command",
+            &[("Cookie", &valid_cookie)],
+            Some(json!({"cmd": "mode", "mode": "mild"})),
+        );
+        assert_eq!(status, 403);
+
+        let legacy_cookie = format!("meow_token={}", info.token);
+        let (status, _) = request(
+            &info,
+            "GET",
+            "/api/state",
+            &[("Cookie", &legacy_cookie)],
+            None,
+        );
+        assert_eq!(status, 401);
+
+        let shadowed_cookie = format!(
+            "{}=stale_wrong_value; {}",
+            cookie_name(info.port),
+            valid_cookie
+        );
+        let (status, _) = request(
+            &info,
+            "GET",
+            "/api/state",
+            &[("Cookie", &shadowed_cookie)],
+            None,
+        );
+        assert_eq!(status, 200);
+
+        block_on(async {
+            let ws_cookie_url = format!("ws://127.0.0.1:{}/ws", info.port);
+            let mut req = ws_cookie_url.as_str().into_client_request().unwrap();
+            req.headers_mut()
+                .insert(header::COOKIE, valid_cookie.parse().unwrap());
+            let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+            let tokio_tungstenite::tungstenite::Error::Http(resp) = err else {
+                panic!("expected HTTP 403 refusal for cookie-only /ws, got {err:?}");
+            };
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        });
 
         // 5. Upgraded WebSockets are bounded by MAX_WS_CONNECTIONS and release
         // their slot when closed.

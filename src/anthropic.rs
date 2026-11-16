@@ -174,6 +174,13 @@ fn request(
 /// person can act on.
 async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::Response> {
     crate::ai::validate_cloud_url(base)?;
+    if crate::ai::is_loopback_url(base) {
+        if let Some(uid) = crate::ai::another_users_server(base) {
+            bail!(
+                "refusing to send the Claude API key to {base}: port belongs to another user (uid {uid})"
+            );
+        }
+    }
     let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("cannot connect to the Claude API at {base}"),
@@ -399,11 +406,12 @@ async fn triage(
                         .filter(|_| event.pointer("/delta/type") == Some(&json!("text_delta")));
                     if let Some(piece) = piece {
                         if !truncated {
-                            let added = append_bounded_utf8(&mut text, piece, MAX_REPLY);
+                            let clean_piece = crate::ai::sanitize_model_chunk(piece);
+                            let added = append_bounded_utf8(&mut text, &clean_piece, MAX_REPLY);
                             if !added.is_empty() {
                                 on_text(added);
                             }
-                            if added.len() < piece.len() {
+                            if added.len() < clean_piece.len() {
                                 truncated = true;
                             }
                         }
@@ -499,8 +507,9 @@ async fn research(
                 Some("text") => {
                     if !truncated {
                         let piece = block.get("text").and_then(Value::as_str).unwrap_or("");
-                        let added = append_bounded_utf8(&mut text, piece, MAX_REPLY);
-                        if added.len() < piece.len() {
+                        let clean_piece = crate::ai::sanitize_model_chunk(piece);
+                        let added = append_bounded_utf8(&mut text, &clean_piece, MAX_REPLY);
+                        if added.len() < clean_piece.len() {
                             truncated = true;
                         }
                     }
@@ -641,6 +650,39 @@ pub async fn ask_with_spend(
     on_text: &mut (dyn FnMut(&str) + Send),
     spent: &mut Usage,
 ) -> Result<Answer> {
+    ask_with_spend_and_reset(
+        http,
+        base,
+        key,
+        model,
+        fallbacks,
+        research_tier,
+        system,
+        user,
+        on_text,
+        &mut || {},
+        spent,
+    )
+    .await
+}
+
+/// Like [`ask_with_spend`], invoking `on_reset` between declined attempts so
+/// stateful stream unmaskers never carry unclosed Markdown/HTML state from a
+/// declined model into the next fallback model.
+#[allow(clippy::too_many_arguments)]
+pub async fn ask_with_spend_and_reset(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+    fallbacks: &[String],
+    research_tier: bool,
+    system: &str,
+    user: &str,
+    on_text: &mut (dyn FnMut(&str) + Send),
+    on_reset: &mut (dyn FnMut() + Send),
+    spent: &mut Usage,
+) -> Result<Answer> {
     let mut chain: Vec<&str> = vec![model];
     for next in fallbacks {
         if !chain.contains(&next.as_str()) && !next.trim().is_empty() {
@@ -698,6 +740,7 @@ pub async fn ask_with_spend(
             });
         };
         last_category = category;
+        on_reset();
         // What a model wrote before it stopped is not the answer.
         if let Some(next) = chain.get(index + 1) {
             if !attempt.text.is_empty() {

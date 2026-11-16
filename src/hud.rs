@@ -189,6 +189,13 @@ impl Model {
                     Ok(mut snapshot) => {
                         snapshot.session = sanitize(&snapshot.session, 80);
                         snapshot.graph.sanitize_loaded();
+                        for notice in &mut snapshot.notices {
+                            notice.at = sanitize(&notice.at, 40);
+                            notice.text = sanitize(&notice.text, 400);
+                        }
+                        if let Some(address) = &mut snapshot.ai.address {
+                            *address = sanitize(address, 120);
+                        }
                         self.snapshot = Some(snapshot);
                     }
                     Err(error) => {
@@ -946,9 +953,10 @@ fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
     let ai = &snapshot.ai;
     let title = match (ai.tier, &ai.address) {
         (Some(tier), Some(address)) => format!(
-            "AI: [{}] {} for {address}{}",
+            "AI: [{}] {} for {}{}",
             tier.key(),
             tier.label(),
+            sanitize(address, 120),
             if ai.running { " (running)" } else { "" }
         ),
         _ => "AI: press L (local), C (cloud) or R (research) on a host".to_owned(),
@@ -1865,7 +1873,13 @@ mod tests {
                     "created_utc": "",
                     "stages": [{ "stage": "ports", "status": "done\u{001b}", "detail": "ok\u{001b}" }]
                 }],
-                "notices": [{ "at": "2026-11-12T09:00:00Z", "text": "alert\u{001b}]52;c;x\u{0007}" }]
+                "notices": [{ "at": "2026-11-12T09:00:00Z\u{001b}[2J", "text": "alert\u{001b}]52;c;x\u{0007}" }],
+                "ai": {
+                    "tier": "local",
+                    "address": "192.0.2.50\u{001b}]52;c;x\u{0007}",
+                    "running": false,
+                    "text": "ok"
+                }
             }
         });
         hud_model.apply_message(&hostile.to_string());
@@ -1873,6 +1887,9 @@ mod tests {
         assert!(!rendered.contains('\x1b') && !rendered.contains('\x07'));
         assert!(rendered.contains("192.0.2.50"));
         assert!(rendered.contains("CVE-2024-7777]0;pwn"));
+        hud_model.show_ai = true;
+        let ai_rendered = screen(&hud_model, 160, 50);
+        assert!(!ai_rendered.contains('\x1b') && !ai_rendered.contains('\x07'));
     }
 
     #[test]

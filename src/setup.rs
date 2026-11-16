@@ -488,6 +488,21 @@ fn apply(
         if key.len() > 512 || key.chars().any(char::is_control) {
             bail!("the API key on standard input contains control characters or is too long");
         }
+        if key.starts_with("sk-ant-")
+            && args.provider.is_none()
+            && args.cloud_url.is_none()
+            && own.cloud_url.is_none()
+            && current.provider() == CloudProvider::OpenAi
+        {
+            use_claude(own, current);
+            if let Some(model) = args.cloud_model.as_deref().and_then(model_name) {
+                own.cloud_model = Some(model);
+            }
+            if let Some(model) = args.research_model.as_deref().and_then(model_name) {
+                own.research_model = Some(model);
+            }
+            changed.push("cloud service: the Claude API, with your Claude API key".to_owned());
+        }
         own.disable_cloud = false;
         changed.push(format!("API key {}", masked(&key)));
         own.api_key = Some(key);
@@ -656,7 +671,10 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         None => match block_on(list_models(&url, None))? {
             Ok(models) => models,
             Err(error) => {
-                println!("[!] {error:#}. Saved all the same; start the server before using [L].");
+                println!(
+                    "[!] {}. Saved all the same; start the server before using [L].",
+                    crate::evidence::sanitize(&format!("{error:#}"), 300)
+                );
                 Vec::new()
             }
         },
@@ -824,7 +842,10 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
             }
             Ok(false) => {}
             // A mistyped address must not end the whole setup.
-            Err(error) => println!("[!] {error:#}"),
+            Err(error) => println!(
+                "[!] {}",
+                crate::evidence::sanitize(&format!("{error:#}"), 300)
+            ),
         }
         println!();
     }

@@ -416,13 +416,32 @@ impl Drop for Watcher {
 // Session
 // ---------------------------------------------------------------------------
 
+/// Resolves `program` to an absolute executable path without consulting empty
+/// or relative `PATH` entries or the current working directory.
+fn resolve_shell_executable(program: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    if program.eq_ignore_ascii_case("powershell.exe") || program.eq_ignore_ascii_case("powershell")
+    {
+        if let Some(ps) = crate::tools::windows_powershell_exe() {
+            return Ok(ps);
+        }
+    }
+    crate::tools::find_program(program).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot find executable shell '{}'",
+            crate::evidence::sanitize(program, 200)
+        )
+    })
+}
+
 /// Runs the shell described by `spec` until it exits. Blocks the caller.
 pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome> {
+    let executable = resolve_shell_executable(&spec.program)?;
     let pair = native_pty_system()
         .openpty(terminal_size())
         .context("cannot open a pseudo-terminal")?;
 
-    let mut command = CommandBuilder::new(&spec.program);
+    let mut command = CommandBuilder::new(&executable);
     command.args(&spec.args);
     command.cwd(&spec.cwd);
     // $TERM and $COLORTERM are inherited; only fill in a missing $TERM.
@@ -565,6 +584,18 @@ mod tests {
         assert_eq!(resolve_shell(None, None), "/bin/zsh");
         #[cfg(windows)]
         assert_eq!(resolve_shell(None, Some("/bin/zsh")), "powershell.exe");
+    }
+
+    #[test]
+    fn shell_executable_resolution_rejects_relative_and_missing_programs() {
+        assert!(resolve_shell_executable("./bash").is_err());
+        assert!(resolve_shell_executable("../bash").is_err());
+        assert!(resolve_shell_executable("definitely-not-a-real-shell-binary-xyz").is_err());
+        #[cfg(unix)]
+        assert_eq!(
+            resolve_shell_executable("/bin/sh").unwrap(),
+            PathBuf::from("/bin/sh")
+        );
     }
 
     #[test]

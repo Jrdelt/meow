@@ -54,7 +54,28 @@ fn sanitize_path_display(path: &Path) -> String {
     sanitize_terminal_line(&path.display().to_string(), 1024)
 }
 
+#[cfg(windows)]
+fn harden_windows_dll_search_path() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDllDirectoryW(lp_path_name: *const u16) -> i32;
+        fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
+    }
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    let empty: [u16; 1] = [0];
+    // SAFETY: `empty` is a valid NUL-terminated UTF-16 empty string, which
+    // removes the current working directory from legacy `LoadLibrary` searches;
+    // `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` restricts default searches to the
+    // application directory and `%SystemRoot%\System32` (never CWD or `PATH`).
+    unsafe {
+        let _ = SetDllDirectoryW(empty.as_ptr());
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    harden_windows_dll_search_path();
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,

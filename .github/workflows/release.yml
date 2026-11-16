@@ -67,7 +67,8 @@ jobs:
           # A draft release made already (on github.com, or by an earlier run
           # that stopped half-way) is kept; the builds are added to it.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "The draft release exists already; adding the builds to it."
+            echo "The draft release exists already; updating target and adding the builds to it."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
               --title "meow $TAG" --notes-file .github/release-notes.md
@@ -186,5 +187,5 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag --latest
           else
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft=false --latest
           fi

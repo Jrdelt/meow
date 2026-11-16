@@ -752,13 +752,29 @@ fn first_token(text: &str) -> Option<String> {
         .then(|| token.to_owned())
 }
 
+const MAX_LOOKUPS_PER_HOST: usize = 64;
+
+fn is_safe_keyword_token(s: &str, allow_spaces: bool) -> bool {
+    let trimmed = s.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 80
+        && !trimmed.starts_with('-')
+        && !trimmed.contains("://")
+        && trimmed.chars().any(|c| c.is_ascii_alphanumeric())
+        && trimmed.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '+' | '-' | '~')
+                || (allow_spaces && c == ' ')
+        })
+}
+
 /// Decides which lookups a host's evidence justifies. Only open ports and
 /// software with a known version are looked up: a product without a
 /// version would match thousands of unrelated CVEs.
 pub fn plan(host: &Host) -> Vec<Lookup> {
     let mut out: Vec<Lookup> = Vec::new();
     let mut push = |lookup: Lookup| {
-        if !out.contains(&lookup) {
+        if out.len() < MAX_LOOKUPS_PER_HOST && !out.contains(&lookup) {
             out.push(lookup);
         }
     };
@@ -783,24 +799,29 @@ pub fn plan(host: &Host) -> Vec<Lookup> {
                 cpe,
                 port: key.clone(),
             });
-            push(Lookup::Keyword {
-                product: parts.product.replace('_', " "),
-                version,
-                port: key.clone(),
-            });
-            if parts.part == 'a' {
-                keyworded = true;
+            let product = parts.product.replace('_', " ");
+            if is_safe_keyword_token(&product, true) && is_safe_keyword_token(&version, false) {
+                push(Lookup::Keyword {
+                    product,
+                    version,
+                    port: key.clone(),
+                });
+                if parts.part == 'a' {
+                    keyworded = true;
+                }
             }
         }
         if !keyworded {
             if let (Some(product), Some(version)) =
                 (&port.product, port.version.as_deref().and_then(first_token))
             {
-                push(Lookup::Keyword {
-                    product: product.clone(),
-                    version,
-                    port: key.clone(),
-                });
+                if is_safe_keyword_token(product, true) && is_safe_keyword_token(&version, false) {
+                    push(Lookup::Keyword {
+                        product: product.clone(),
+                        version,
+                        port: key.clone(),
+                    });
+                }
             }
         }
         for (path, _) in port.paths.walk() {
@@ -863,6 +884,7 @@ pub struct Grounding {
 
 pub struct CveClient {
     http: reqwest::Client,
+    local_http: reqwest::Client,
     settings: CveSettings,
     db: Arc<Mutex<Db>>,
     nvd_pace: Duration,
@@ -1023,22 +1045,37 @@ impl CveClient {
         crate::ai::validate_cloud_url(&settings.nvd_url).context("invalid cve.nvd_url")?;
         crate::ai::validate_cloud_url(&settings.osv_url).context("invalid cve.osv_url")?;
         crate::ai::validate_cloud_url(&settings.kev_url).context("invalid cve.kev_url")?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(STALL_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("security-audit-client")
-            .build()
-            .context("cannot create the HTTP client")?;
+        let build = |local: bool| {
+            let mut builder = reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(STALL_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent("security-audit-client");
+            if local {
+                builder = builder
+                    .no_proxy()
+                    .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+            }
+            builder.build().context("cannot create the HTTP client")
+        };
         let nvd_pace = settings.nvd_pace();
         Ok(Self {
-            http,
+            http: build(false)?,
+            local_http: build(true)?,
             settings,
             db,
             nvd_pace,
             nvd_gate: tokio::sync::Mutex::new(None),
         })
+    }
+
+    fn client(&self, url: &str) -> &reqwest::Client {
+        if crate::ai::is_loopback_url(url) {
+            &self.local_http
+        } else {
+            &self.http
+        }
     }
 
     /// Overrides the NVD pacing interval (tests).
@@ -1098,7 +1135,7 @@ impl CveClient {
                     tokio::time::sleep(self.nvd_pace.saturating_sub(sent.elapsed())).await;
                 }
                 let mut request = self
-                    .http
+                    .client(&self.settings.nvd_url)
                     .get(&self.settings.nvd_url)
                     .query(&[(param, value), ("resultsPerPage", "200")]);
                 if start_index > 0 {
@@ -1111,6 +1148,13 @@ impl CveClient {
                     request = request.query(&[("isVulnerable", "")]);
                 }
                 if let Some(api_key) = self.settings.api_key() {
+                    if crate::ai::is_loopback_url(&self.settings.nvd_url) {
+                        if let Some(uid) = crate::ai::another_users_server(&self.settings.nvd_url) {
+                            bail!(
+                                "refusing to send NVD API key to loopback listener owned by another user (uid {uid})"
+                            );
+                        }
+                    }
                     let mut val = reqwest::header::HeaderValue::from_str(api_key)
                         .context("invalid characters in NVD API key")?;
                     val.set_sensitive(true);
@@ -1167,7 +1211,11 @@ impl CveClient {
         }
         let fetched: Result<Value> = async {
             crate::ai::validate_cloud_url(&self.settings.kev_url)?;
-            let response = self.http.get(&self.settings.kev_url).send().await?;
+            let response = self
+                .client(&self.settings.kev_url)
+                .get(&self.settings.kev_url)
+                .send()
+                .await?;
             if !response.status().is_success() {
                 bail!("HTTP {}", response.status());
             }
@@ -1226,7 +1274,7 @@ impl CveClient {
                 .map(|(i, t)| query(&packages[*i], t.as_deref()))
                 .collect();
             let response = self
-                .http
+                .client(&url)
                 .post(&url)
                 .json(&json!({ "queries": queries }))
                 .send()
@@ -1284,7 +1332,7 @@ impl CveClient {
             self.settings.osv_url.trim_end_matches('/')
         );
         let response = self
-            .http
+            .client(&url)
             .get(&url)
             .send()
             .await
@@ -2653,5 +2701,47 @@ mod tests {
             .advisories
             .iter()
             .any(|a| a.id == "CVE-2026-8888"));
+    }
+
+    #[test]
+    fn plan_caps_lookups_and_rejects_unsafe_keyword_tokens() {
+        let mut graph = Graph::default();
+        for port in 1..=90u16 {
+            graph.apply(Observation::Port {
+                address: "10.0.0.9".into(),
+                port,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("http".into()),
+                product: Some(format!("svc{port}")),
+                version: Some(format!("1.0.{port}")),
+                extra_info: None,
+                cpes: Vec::new(),
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        graph.apply(Observation::Port {
+            address: "10.0.0.9".into(),
+            port: 9000,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: Some("https://evil.example/exfil".into()),
+            version: Some("1.0.0".into()),
+            extra_info: None,
+            cpes: Vec::new(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        let host = graph.hosts.remove("10.0.0.9").unwrap();
+        let lookups = plan(&host);
+        assert_eq!(lookups.len(), MAX_LOOKUPS_PER_HOST);
+        assert!(!lookups.iter().any(|l| matches!(
+            l,
+            Lookup::Keyword { product, .. } if product.contains("://")
+        )));
+        assert!(!is_safe_keyword_token("https://evil.example", true));
+        assert!(!is_safe_keyword_token("-flag", true));
+        assert!(is_safe_keyword_token("Apache httpd", true));
+        assert!(is_safe_keyword_token("9.4.31.v20200723", false));
     }
 }

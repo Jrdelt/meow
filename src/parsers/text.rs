@@ -302,8 +302,12 @@ impl TextParser {
 
     /// Parses a whole document line by line.
     pub fn parse(source: Source, text: &str) -> Vec<Observation> {
+        const MAX_OBSERVATIONS: usize = 100_000;
         let mut parser = Self::new(source);
-        text.lines().flat_map(|line| parser.feed(line)).collect()
+        text.lines()
+            .flat_map(|line| parser.feed(line))
+            .take(MAX_OBSERVATIONS)
+            .collect()
     }
 }
 

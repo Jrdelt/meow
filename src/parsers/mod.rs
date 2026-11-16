@@ -98,12 +98,25 @@ fn bytes_to_string_lossy(bytes: Vec<u8>) -> String {
 }
 
 fn open_regular_file(path: &Path) -> Result<(std::fs::File, u64)> {
-    let pre = std::fs::metadata(path).with_context(|| format!("cannot open {}", path.display()))?;
-    if !pre.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
-    let file =
-        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    crate::workspace::refuse_file_symlink(path)?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .with_context(|| format!("cannot open {}", path.display()))?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let pre =
+            std::fs::metadata(path).with_context(|| format!("cannot open {}", path.display()))?;
+        if !pre.is_file() {
+            bail!("{} is not a regular file", path.display());
+        }
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?
+    };
     let meta = file
         .metadata()
         .with_context(|| format!("cannot inspect {}", path.display()))?;
@@ -227,5 +240,20 @@ mod tests {
         assert!(parse_file(&dir.path().join("missing")).is_err());
         assert!(read_capped(dir.path()).is_err());
         assert!(read_prefix_capped(dir.path()).is_err());
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.txt");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(parse_file(&link).is_err());
+            assert!(crate::graph::Graph::load(&link).is_err());
+
+            let fifo = dir.path().join("pipe.fifo");
+            let c_fifo = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            if unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) } == 0 {
+                assert!(parse_file(&fifo).is_err());
+                assert!(crate::graph::Graph::load(&fifo).is_err());
+            }
+        }
     }
 }

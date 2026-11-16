@@ -1757,14 +1757,21 @@ fn run_from_with_timeout(
     )
     .unwrap_or_default();
     let mut cmd = Command::new(&resolved);
-    cmd.args(args)
+    cmd.env_clear()
+        .args(args)
         .env("PATH", safe_path)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let sys_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("SYSTEMROOT"))
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        cmd.env("SystemRoot", sys_root);
         cmd.creation_flags(0x0800_0000);
     }
     let command = format!("{program} {}", args.join(" "));

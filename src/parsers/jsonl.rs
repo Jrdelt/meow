@@ -116,14 +116,23 @@ pub fn parse_line(line: &str) -> Option<Vec<Observation>> {
     Some(out)
 }
 
+const MAX_OBSERVATIONS: usize = 100_000;
+
 /// Parses a whole JSONL document. Returns the observations and the number
 /// of non-empty lines that were skipped.
 pub fn parse(text: &str) -> (Vec<Observation>, usize) {
     let mut out = Vec::new();
     let mut skipped = 0;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if out.len() >= MAX_OBSERVATIONS {
+            skipped += 1;
+            continue;
+        }
         match parse_line(line) {
-            Some(observations) => out.extend(observations),
+            Some(observations) => {
+                let remaining = MAX_OBSERVATIONS.saturating_sub(out.len());
+                out.extend(observations.into_iter().take(remaining));
+            }
             None => skipped += 1,
         }
     }

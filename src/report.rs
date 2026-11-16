@@ -158,7 +158,77 @@ fn neutralize_unmatched_inline_backticks(line: &str) -> String {
     out
 }
 
-fn fence_opening(line: &str) -> Option<(u8, usize)> {
+fn split_blockquote_prefix(line: &str) -> (usize, &str, &str) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut depth = 0;
+    loop {
+        let spaces = bytes[i..]
+            .iter()
+            .take(4)
+            .take_while(|&&b| b == b' ')
+            .count();
+        if spaces <= 3 && bytes.get(i + spaces) == Some(&b'>') {
+            depth += 1;
+            i += spaces + 1;
+            if bytes.get(i) == Some(&b' ') {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    (depth, &line[..i], &line[i..])
+}
+
+fn is_passive_code_lang(info: &str) -> bool {
+    const PASSIVE_LANGS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "powershell",
+        "ps1",
+        "cmd",
+        "bat",
+        "json",
+        "jsonl",
+        "yaml",
+        "yml",
+        "toml",
+        "ini",
+        "xml",
+        "html",
+        "css",
+        "js",
+        "javascript",
+        "ts",
+        "typescript",
+        "py",
+        "python",
+        "rs",
+        "rust",
+        "go",
+        "c",
+        "cpp",
+        "java",
+        "rb",
+        "php",
+        "sql",
+        "http",
+        "diff",
+        "nginx",
+        "apache",
+        "conf",
+        "txt",
+        "text",
+    ];
+    PASSIVE_LANGS
+        .iter()
+        .any(|allowed| info.eq_ignore_ascii_case(allowed))
+}
+
+fn fence_opening(line: &str) -> Option<(u8, usize, String)> {
     let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
     if indent > 3 {
         return None;
@@ -175,7 +245,12 @@ fn fence_opening(line: &str) -> Option<(u8, usize)> {
     if marker == b'`' && rest[len..].contains(&b'`') {
         return None;
     }
-    Some((marker, len))
+    let info = line[indent + len..].trim();
+    let mut normalized = String::from(&line[..indent + len]);
+    if is_passive_code_lang(info) {
+        normalized.push_str(&info.to_ascii_lowercase());
+    }
+    Some((marker, len, normalized))
 }
 
 fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
@@ -192,36 +267,54 @@ fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
 /// nothing in it live (see [`inert_markdown`]). A code block the text left
 /// open is closed, so that it cannot take the rest of the report with it.
 fn render_chat_markdown(out: &mut String, text: &str) {
-    let mut open_fence: Option<(u8, usize)> = None;
+    let mut open_fence: Option<(u8, usize, usize)> = None;
     for line in inert_markdown(text).lines() {
-        if let Some((open, length)) = open_fence {
-            if is_fence_closing(line, open, length) {
+        let (qdepth, qprefix, rest) = split_blockquote_prefix(line);
+        if let Some((open, length, fence_qdepth)) = open_fence {
+            if qdepth < fence_qdepth {
+                // Leaving the blockquote closes the fenced block in CommonMark;
+                // emit an explicit closing fence so dialects stay aligned.
+                for _ in 0..fence_qdepth {
+                    out.push_str("> ");
+                }
+                out.extend(std::iter::repeat_n(open as char, length));
+                out.push('\n');
                 open_fence = None;
+            } else {
+                if qdepth == fence_qdepth && is_fence_closing(rest, open, length) {
+                    open_fence = None;
+                }
+                out.push_str(line);
+                out.push('\n');
+                continue;
             }
-            out.push_str(line);
-            out.push('\n');
-            continue;
         }
-        if let Some(fence) = fence_opening(line) {
-            open_fence = Some(fence);
-            out.push_str(line);
+        if let Some((marker, len, normalized_fence)) = fence_opening(rest) {
+            open_fence = Some((marker, len, qdepth));
+            out.push_str(qprefix);
+            out.push_str(&normalized_fence);
             out.push('\n');
             continue;
         }
         let sanitized = neutralize_unmatched_inline_backticks(line);
-        let indent = sanitized.bytes().take(4).take_while(|&b| b == b' ').count();
+        let (_, san_qprefix, san_rest) = split_blockquote_prefix(&sanitized);
+        let indent = san_rest.bytes().take(4).take_while(|&b| b == b' ').count();
         // Nest the file's own headings below this section, also one that
-        // is moved in by up to three spaces.
-        if indent <= 3 && sanitized.as_bytes().get(indent) == Some(&b'#') {
-            out.push_str(&sanitized[..indent]);
+        // is moved in by up to three spaces (or inside a blockquote).
+        if indent <= 3 && san_rest.as_bytes().get(indent) == Some(&b'#') {
+            out.push_str(san_qprefix);
+            out.push_str(&san_rest[..indent]);
             out.push_str("###");
-            out.push_str(&sanitized[indent..]);
+            out.push_str(&san_rest[indent..]);
         } else {
             out.push_str(&sanitized);
         }
         out.push('\n');
     }
-    if let Some((marker, length)) = open_fence {
+    if let Some((marker, length, fence_qdepth)) = open_fence {
+        for _ in 0..fence_qdepth {
+            out.push_str("> ");
+        }
         out.extend(std::iter::repeat_n(marker as char, length));
         out.push('\n');
     }
@@ -1097,7 +1190,17 @@ mod tests {
                  <div>unclosed fence"
                     .into(),
             ),
-            ("192.0.2.2.md".into(), "## Next chat\nClean text.\n".into()),
+            (
+                "192.0.2.2.md".into(),
+                "## Next chat\n\
+                 ```mermaid\n\
+                 graph TD\n\
+                 ```\n\
+                 > ```dataviewjs\n\
+                 > dv.view('x')\n\
+                 Clean text.\n"
+                    .into(),
+            ),
         ];
         let rendered = render(&custom);
         assert!(rendered.contains("| 443/tcp \\| &lt;img src=x&gt; |"));
@@ -1108,8 +1211,18 @@ mod tests {
         assert!(rendered.contains("```sh\n# shell comment stays a comment\n"));
         assert!(rendered.contains("grep '&lt;title>'"));
         assert!(rendered.contains("&lt;div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
-        assert!(rendered.contains("##### Next chat"));
-        for tag in ["<script", "<img", "<b>", "<div", "<raw"] {
+        assert!(rendered.contains(
+            "##### Next chat\n```\ngraph TD\n```\n> ```\n> dv.view('x')\n> ```\nClean text."
+        ));
+        for tag in [
+            "<script",
+            "<img",
+            "<b>",
+            "<div",
+            "<raw",
+            "```mermaid\ngraph TD",
+            "dataviewjs",
+        ] {
             assert!(!rendered.contains(tag), "{tag}");
         }
     }

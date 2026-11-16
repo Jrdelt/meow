@@ -267,8 +267,20 @@ fetch() {
         curl --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 5 --max-filesize "$max_dl" -fsSL -o "$2" "$1"
     else
         # wget follows a redirect to http:// even with --https-only, so it
-        # follows none.
-        wget --https-only --max-redirect=0 -q -O "$2" "$1"
+        # follows none; bound the stream to max_dl bytes while checking status.
+        wget_err=$(
+            { wget --https-only --max-redirect=0 -q -O - "$1" || echo $? >&3; } \
+                | head -c "$((max_dl + 1))" >"$2"
+        ) 3>&1
+        if [ -n "$wget_err" ]; then
+            rm -f "$2"
+            return 1
+        fi
+        actual_dl=$(wc -c <"$2" | tr -d ' ')
+        if [ "${actual_dl:-0}" -gt "$max_dl" ]; then
+            rm -f "$2"
+            return 1
+        fi
     fi
 }
 

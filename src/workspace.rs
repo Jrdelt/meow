@@ -238,6 +238,26 @@ impl MeowHome {
         self.workspaces_dir().join(name)
     }
 
+    /// True when `dir` is a valid named workspace directly inside
+    /// `self.workspaces_dir()`, even if reached through a symlinked parent.
+    pub fn is_saved_workspace_dir(&self, dir: &Path) -> bool {
+        let Some(parent) = dir.parent() else {
+            return false;
+        };
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if validate_name(name).is_err() {
+            return false;
+        }
+        let expected = self.workspaces_dir();
+        if parent == expected {
+            return true;
+        }
+        let real = |p: &Path| fs::canonicalize(p).ok();
+        matches!((real(parent), real(&expected)), (Some(a), Some(b)) if a == b)
+    }
+
     /// Absolute `./.meow` of `cwd`, refused when it is the base directory
     /// itself (running `--local` from the home directory) or lies inside it.
     /// The two are compared as the folders they really are: either path may
@@ -790,7 +810,7 @@ fn run_windows_acl_script(path: &Path, script: &str) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn verify_windows_owner(path: &Path) -> io::Result<()> {
+pub(crate) fn verify_windows_owner(path: &Path) -> io::Result<()> {
     const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -1405,12 +1425,7 @@ impl Workspace {
         refuse_links_inside(&dir)?;
 
         let profile_path = dir.join(PROFILE_FILE);
-        let existed = profile_path.is_file();
-        create_private_dir(&dir)?;
-        create_private_subdir(&dir.join("tmp"))?;
-        create_private_subdir(&dir.join("chats"))?;
-        enforce_private_tree(&dir)
-            .with_context(|| format!("cannot restrict permissions under {}", dir.display()))?;
+        let existed = fs::symlink_metadata(&profile_path).is_ok_and(|meta| meta.is_file());
 
         let mut profile = if existed {
             Profile::read(&profile_path)?
@@ -1423,7 +1438,15 @@ impl Workspace {
                 id: if local { Some(new_mark()?) } else { None },
             }
         };
-        profile.name = name.clone();
+        let unaccepted_foreign = existed && local && !is_own_local(home, &profile);
+        if !unaccepted_foreign {
+            create_private_dir(&dir)?;
+            create_private_subdir(&dir.join("tmp"))?;
+            create_private_subdir(&dir.join("chats"))?;
+            enforce_private_tree(&dir)
+                .with_context(|| format!("cannot restrict permissions under {}", dir.display()))?;
+            profile.name = name.clone();
+        }
         if let (false, Some(mark)) = (existed, &profile.id) {
             remember_mark(home, mark)?;
         }
@@ -1440,14 +1463,14 @@ impl Workspace {
         Ok((workspace, !existed))
     }
 
-    /// True for a `./.meow` this user neither made nor accepted: it came
-    /// with the folder. What it carries (its mode, queued scans, verdicts,
-    /// the directory its shell starts in) was chosen by someone else.
+    /// True for any workspace outside `home.workspaces_dir()` that this user
+    /// neither made nor accepted (a `./.meow` that came with a folder, or an
+    /// arbitrary directory passed via `$MEOW_WORKSPACE`).
     pub fn is_foreign(&self, home: &MeowHome) -> bool {
-        self.local && !is_own_local(home, &self.profile)
+        !home.is_saved_workspace_dir(&self.dir) && !is_own_local(home, &self.profile)
     }
 
-    /// Fails for a `./.meow` that is not this user's, saying how to review
+    /// Fails for a workspace that is not this user's, saying how to review
     /// or remove it. Helper commands call this before touching it.
     pub fn ensure_own(&self, home: &MeowHome) -> Result<()> {
         if self.is_foreign(home) {
@@ -1458,13 +1481,23 @@ impl Workspace {
                 self.dir.display()
             );
         }
+        enforce_private_tree(&self.dir)
+            .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
         Ok(())
     }
 
     /// Accepts a `./.meow` that came with a folder as this user's own. Its
-    /// stored mode is replaced by `mode` (the user's default), so nothing it
-    /// has queued runs until the user chooses a mode that sends packets.
+    /// stored mode is replaced by `mode` (the user's default), its recorded
+    /// `last_cwd` is discarded, and private permissions are enforced.
     pub fn adopt(&mut self, home: &MeowHome, mode: Mode) -> Result<()> {
+        refuse_symlink(&self.dir)?;
+        refuse_links_inside(&self.dir)?;
+        create_private_dir(&self.dir)?;
+        create_private_subdir(&self.tmp_dir())?;
+        create_private_subdir(&self.chats_dir())?;
+        enforce_private_tree(&self.dir)
+            .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
+        let _ = fs::remove_file(self.last_cwd_path());
         let mark = new_mark()?;
         self.profile.id = Some(mark.clone());
         self.profile.mode = mode;
@@ -1485,24 +1518,31 @@ impl Workspace {
     }
 
     /// Loads an existing workspace for a helper subcommand and re-applies
-    /// its permissions.
+    /// permissions on saved global workspaces (local workspaces are
+    /// re-permissioned in `ensure_own` after ownership is verified).
     pub fn load(dir: &Path) -> Result<Self> {
         let dir = std::path::absolute(dir)
             .with_context(|| format!("cannot resolve {}", dir.display()))?;
         refuse_symlink(&dir)?;
         refuse_links_inside(&dir)?;
         let profile_path = dir.join(PROFILE_FILE);
-        if !profile_path.is_file() {
+        if !fs::symlink_metadata(&profile_path).is_ok_and(|meta| meta.is_file()) {
             bail!("no meow workspace at {}", dir.display());
         }
-        enforce_private_tree(&dir)
-            .with_context(|| format!("cannot restrict permissions under {}", dir.display()))?;
+        let local = dir.file_name() == Some(LOCAL_DIR.as_ref());
+        let in_workspaces_dir = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "workspaces");
+        if !local && in_workspaces_dir {
+            enforce_private_tree(&dir)
+                .with_context(|| format!("cannot restrict permissions under {}", dir.display()))?;
+        }
         let profile = Profile::read(&profile_path)?;
         let name = match validate_name(&profile.name) {
             Ok(name) => name,
             Err(_) => dir_name(&dir),
         };
-        let local = dir.file_name() == Some(LOCAL_DIR.as_ref());
         Ok(Self {
             name,
             dir,
@@ -1566,14 +1606,22 @@ impl Workspace {
         self.dir.join("last_cwd")
     }
 
-    /// The directory the previous session ended in, if it was recorded and
-    /// still exists.
+    /// The directory the previous session ended in, if it was recorded as a
+    /// local absolute directory path and still exists.
     pub fn restored_cwd(&self) -> Option<PathBuf> {
         let text = read_bounded(&self.last_cwd_path(), LAST_CWD_MAX).ok()?;
         // Windows PowerShell may prepend a byte-order mark.
-        let text = text.trim_start_matches('\u{feff}');
-        let dir = PathBuf::from(text.trim_end_matches(['\r', '\n']));
-        (dir.is_absolute() && dir.is_dir()).then_some(dir)
+        let text = text
+            .trim_start_matches('\u{feff}')
+            .trim_end_matches(['\r', '\n']);
+        if text.starts_with(r"\\") && !text.starts_with(r"\\?\") {
+            return None;
+        }
+        let dir = PathBuf::from(text);
+        if !is_local_absolute_dir_path(&dir) {
+            return None;
+        }
+        dir.is_dir().then_some(dir)
     }
 
     /// Variables exported into the session shell so helper subcommands can
@@ -1585,6 +1633,25 @@ impl Workspace {
             (MODE_ENV.to_owned(), self.profile.mode.as_str().into()),
         ]
     }
+}
+
+fn is_local_absolute_dir_path(dir: &Path) -> bool {
+    if !dir.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut comps = dir.components();
+        if !matches!(
+            (comps.next(), comps.next()),
+            (Some(Component::Prefix(p)), Some(Component::RootDir))
+                if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 fn dir_name(dir: &Path) -> String {
@@ -1617,8 +1684,22 @@ pub fn resolve_helper_dir(
         return Ok(home.workspace_dir(&checked_name(name)?));
     }
     if let Some(dir) = &env.workspace {
-        return std::path::absolute(dir)
-            .with_context(|| format!("cannot resolve ${WORKSPACE_ENV} ({})", dir.display()));
+        let resolved = std::path::absolute(dir)
+            .with_context(|| format!("cannot resolve ${WORKSPACE_ENV} ({})", dir.display()))?;
+        let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let base = real(home.root());
+        let target = real(&resolved);
+        let inside_home = resolved == home.root()
+            || resolved.starts_with(home.root())
+            || target == base
+            || target.starts_with(&base);
+        if inside_home && !home.is_saved_workspace_dir(&resolved) {
+            bail!(
+                "${WORKSPACE_ENV} ({}) points into meow's own data directory rather than a workspace",
+                resolved.display()
+            );
+        }
+        return Ok(resolved);
     }
     if let Some(name) = &env.session {
         return Ok(home.workspace_dir(&checked_name(name)?));
@@ -2761,5 +2842,67 @@ mod tests {
             assert!(own_marks(&fx.home).is_empty());
             assert!(remember_mark(&fx.home, mark).is_err());
         }
+    }
+
+    #[test]
+    fn foreign_workspace_env_and_adopt_guards_prevent_untrusted_use() {
+        let fx = fixture();
+        // Arbitrary directory NOT named `.meow` passed via MEOW_WORKSPACE must
+        // still be rejected by ensure_own unless adopted.
+        let rogue = fx.cwd.join("rogue-ws");
+        fs::create_dir_all(&rogue).unwrap();
+        fs::write(
+            rogue.join(PROFILE_FILE),
+            "name = \"rogue\"\nmode = \"aggressive\"\n",
+        )
+        .unwrap();
+        let loaded = Workspace::load(&rogue).unwrap();
+        assert!(loaded.is_foreign(&fx.home));
+        assert!(loaded.ensure_own(&fx.home).is_err());
+
+        // MEOW_WORKSPACE pointing at MEOW_HOME or a non-workspace child inside
+        // MEOW_HOME is rejected.
+        for bad in [
+            fx.home.root().to_path_buf(),
+            fx.home.workspaces_dir(),
+            fx.home.root().join("geo"),
+        ] {
+            let env = SessionEnv {
+                session: None,
+                workspace: Some(bad.clone()),
+            };
+            assert!(
+                resolve_helper_dir(&fx.home, &fx.cwd, false, None, &env).is_err(),
+                "accepted {:?}",
+                bad
+            );
+        }
+
+        // Unaccepted foreign `./.meow` is not mutated before adopt(), and
+        // adopt() discards its recorded `last_cwd`.
+        let cloned = fx.cwd.join("cloned-repo");
+        let dot_meow = cloned.join(".meow");
+        fs::create_dir_all(&dot_meow).unwrap();
+        fs::write(
+            dot_meow.join(PROFILE_FILE),
+            "name = \"repo\"\nmode = \"aggressive\"\n",
+        )
+        .unwrap();
+        fs::write(dot_meow.join("last_cwd"), format!("{}\n", fx.cwd.display())).unwrap();
+        let (mut ws, _) =
+            Workspace::open_or_create(&fx.home, &cloned, "review", true, Mode::Light).unwrap();
+        assert!(ws.is_foreign(&fx.home));
+        assert!(!dot_meow.join("tmp").exists());
+        assert!(!dot_meow.join("chats").exists());
+
+        ws.adopt(&fx.home, Mode::Light).unwrap();
+        assert!(!ws.is_foreign(&fx.home));
+        assert!(dot_meow.join("tmp").is_dir());
+        assert!(dot_meow.join("chats").is_dir());
+        assert!(!ws.last_cwd_path().exists());
+
+        // UNC paths in last_cwd are rejected before touching the filesystem.
+        fs::write(ws.last_cwd_path(), "\\\\198.51.100.99\\share\\dir\n").unwrap();
+        assert_eq!(ws.restored_cwd(), None);
     }
 }

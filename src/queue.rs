@@ -1012,6 +1012,7 @@ pub fn crawl_command(
             // sites (and to `localhost`) would be followed.
             "-fs",
             "fqdn",
+            "-dr",
             "-ct",
             "5m",
             "-d",
@@ -1165,13 +1166,32 @@ impl Drop for GroupGuard {
     }
 }
 
-/// Environment variables that hold credentials by their names: API keys
-/// and tokens are no business of a scanner.
+/// Environment variables that hold credentials or dangerous dynamic-linker /
+/// TLS / shell injection hooks: API keys, tokens, and loader overrides are no
+/// business of an external scanner.
 fn is_secret_variable(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"]
+    if ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"]
         .iter()
         .any(|word| upper.contains(word))
+    {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "LD_AUDIT"
+            | "OPENSSL_CONF"
+            | "OPENSSL_ENGINES"
+            | "OPENSSL_MODULES"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "NODE_OPTIONS"
+            | "GIT_SSH_COMMAND"
+            | "BASH_ENV"
+            | "ENV"
+    ) || upper.starts_with("DYLD_")
 }
 
 /// Runs one tool to completion, or stops it at the time or size limit.
@@ -1632,7 +1652,9 @@ impl Found {
     /// name: the scanner resolved it, so any IP address it reported.
     fn belongs(address: &str, target: &Target) -> bool {
         match (HostAddr::parse(address), target) {
-            (Some(HostAddr::Ip { .. }), Target::Host(HostAddr::Name(_))) => true,
+            (Some(HostAddr::Ip { addr, zone }), Target::Host(HostAddr::Name(name))) => {
+                zone.is_none() && crate::osint::is_allowed_resolved_ip_for_name(name, addr)
+            }
             (
                 Some(HostAddr::Ip { addr, zone }),
                 Target::Host(HostAddr::Ip {
@@ -1916,7 +1938,10 @@ async fn resolve_target_ips(state: &State, task_id: i64, target: &Target) -> Vec
             )
             .await
             {
-                for sa in addrs.take(4) {
+                for sa in addrs
+                    .filter(|sa| crate::osint::is_allowed_resolved_ip_for_name(name, sa.ip()))
+                    .take(4)
+                {
                     if !ips.contains(&sa.ip()) {
                         ips.push(sa.ip());
                     }
@@ -3172,7 +3197,7 @@ mod tests {
 
         assert_eq!(
             args(&crawl_command(&settings, &mild, url, out)),
-            "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -fs fqdn -ct 5m -d 2 -o /t/out.jsonl"
+            "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -fs fqdn -dr -ct 5m -d 2 -o /t/out.jsonl"
         );
         assert!(args(&crawl_command(&settings, &aggressive, url, out)).contains(" -d 4 "));
 
@@ -3741,5 +3766,15 @@ mod tests {
         );
         assert!(args(&cmd).contains("ssl-cert or banner"));
         assert!(args(&cmd).contains(" -6 "));
+
+        let ext = target("evil.example");
+        assert!(!Found::belongs("127.0.0.1", &ext));
+        assert!(!Found::belongs("169.254.169.254", &ext));
+        assert!(Found::belongs("10.0.0.5", &ext));
+        assert!(Found::belongs("127.0.0.1", &target("localhost")));
+        assert!(is_secret_variable("LD_PRELOAD"));
+        assert!(is_secret_variable("DYLD_INSERT_LIBRARIES"));
+        assert!(is_secret_variable("OPENSSL_CONF"));
+        assert!(!is_secret_variable("MEOW_TEST_SCANNER_PLAIN"));
     }
 }

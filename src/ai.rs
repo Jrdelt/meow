@@ -350,7 +350,7 @@ impl AiSettings {
             .ok()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
             .unwrap_or_default();
-        is_loopback_url(&self.cloud_url)
+        (is_loopback_url(&self.cloud_url) && another_users_server(&self.cloud_url).is_none())
             || match self.provider() {
                 CloudProvider::Anthropic => host == "api.anthropic.com",
                 CloudProvider::OpenAi => host == "openrouter.ai",
@@ -597,18 +597,30 @@ pub fn triage_prompt(graph: &Graph, host: &Host) -> Prompt {
 /// Research prompt for `[R]`: public identifiers only. No address, host
 /// name, path, note or raw evidence is included.
 pub fn research_prompt(host: &Host) -> Prompt {
+    let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<Value> = Vec::new();
     for port in host.open_ports() {
+        if stack.len() >= MAX_PORTS {
+            break;
+        }
         if port.product.is_none() && port.cpes.is_empty() {
             continue;
         }
-        let entry = json!({
-            "product": port.product,
-            "version": port.version,
-            "cpes": port.cpes,
-        });
-        if !stack.contains(&entry) {
-            stack.push(entry);
+        let product = port.product.as_deref().map(clean);
+        let version = port.version.as_deref().map(clean);
+        let cpes: Vec<String> = port
+            .cpes
+            .iter()
+            .take(MAX_CPES_PER_PORT)
+            .map(|cpe| clean(cpe))
+            .collect();
+        let key = (product.clone(), version.clone(), cpes.clone());
+        if seen.insert(key) {
+            stack.push(json!({
+                "product": product,
+                "version": version,
+                "cpes": cpes,
+            }));
         }
     }
     let advisories: Vec<Value> = host
@@ -616,7 +628,13 @@ pub fn research_prompt(host: &Host) -> Prompt {
         .iter()
         .filter(|a| a.record.verification_status == VerificationStatus::UnverifiedHypothesis)
         .take(MAX_HYPOTHESES)
-        .map(|a| json!({ "id": a.id, "matched_on": a.matched, "known_exploited": a.kev }))
+        .map(|a| {
+            json!({
+                "id": clean(&a.id),
+                "matched_on": clean(&a.matched),
+                "known_exploited": a.kev,
+            })
+        })
         .collect();
     Prompt {
         system: format!("{RESEARCH_SYSTEM}\n\n{SANDBOX_RULES}"),
@@ -819,7 +837,7 @@ fn is_unspecified_host(host: &url::Host<&str>) -> bool {
 /// Validates a local AI endpoint URL: must use `http://` or `https://` with a
 /// concrete host (never `0.0.0.0`/`::`), and without embedded credentials,
 /// query parameters, or fragments. Non-loopback hosts are allowed here because
-/// `run_local` automatically masks prompts sent off-machine (`ISS-025`).
+/// `run_local` automatically masks prompts sent off-machine.
 pub fn validate_local_url(raw: &str) -> Result<String> {
     let url = raw.trim().trim_end_matches('/');
     let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
@@ -840,6 +858,17 @@ pub fn validate_local_url(raw: &str) -> Result<String> {
         bail!("'{raw}' must not include credentials, query parameters, or fragments");
     }
     Ok(url.to_owned())
+}
+
+/// Strips terminal escape/control characters (preserving `\n` and `\t`) and
+/// invisible/bidirectional Unicode characters from untrusted model output chunks.
+pub(crate) fn sanitize_model_chunk(piece: &str) -> String {
+    piece
+        .chars()
+        .filter(|&c| {
+            (!c.is_control() || matches!(c, '\n' | '\t')) && !crate::evidence::is_hidden(c)
+        })
+        .collect()
 }
 
 /// An HTTP client for the model server at `url`. One on this machine is
@@ -1008,10 +1037,10 @@ fn lsof_listener_uids(output: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Another login user who listens on the port of the "local" model server.
+/// Another login user who listens on the port of a loopback server.
 /// On a shared machine anyone can answer on an unused loopback port, and
 /// the local tier sends evidence unmasked.
-fn another_users_server(url: &str) -> Option<u32> {
+pub(crate) fn another_users_server(url: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         use std::io::{BufRead, BufReader, Read};
@@ -1021,10 +1050,12 @@ fn another_users_server(url: &str) -> Option<u32> {
         let port = url::Url::parse(url.trim()).ok()?.port_or_known_default()?;
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
+        let mut opened_any = false;
         for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
             let Ok(file) = std::fs::File::open(table) else {
                 continue;
             };
+            opened_any = true;
             let reader = BufReader::new(file.take(MAX_PROC_NET_BYTES));
             for line in reader.lines().skip(1).map_while(Result::ok) {
                 if let Some(uid) = parse_proc_tcp_listener(&line, port) {
@@ -1033,6 +1064,9 @@ fn another_users_server(url: &str) -> Option<u32> {
                     }
                 }
             }
+        }
+        if !opened_any {
+            return Some(u32::MAX);
         }
         None
     }
@@ -1045,6 +1079,7 @@ fn another_users_server(url: &str) -> Option<u32> {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
         let mut child = Command::new("/usr/sbin/lsof")
+            .env_clear()
             .args([
                 "-nP",
                 "-b",
@@ -1058,7 +1093,7 @@ fn another_users_server(url: &str) -> Option<u32> {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let deadline = std::time::Instant::now() + Duration::from_millis(1000);
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -1199,6 +1234,13 @@ impl AiEngine {
     ) -> Result<(String, Usage)> {
         if api_key.is_some() {
             validate_cloud_url(base)?;
+            if is_loopback_url(base) {
+                if let Some(uid) = another_users_server(base) {
+                    bail!(
+                        "refusing to send the API key to {base}: port belongs to another user (uid {uid})"
+                    );
+                }
+            }
         } else {
             validate_local_url(base)?;
         }
@@ -1269,11 +1311,11 @@ impl AiEngine {
             if let Some(message) = reply.pointer("/error/message").and_then(Value::as_str) {
                 bail!("the model server reported: {}", sanitize(message, 300));
             }
-            text = reply
+            let raw_text = reply
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+                .unwrap_or_default();
+            text = sanitize_model_chunk(raw_text);
             cut(&mut text, MAX_REPLY);
             on_delta(&text);
             if let Some(found) = reply.get("usage") {
@@ -1305,11 +1347,12 @@ impl AiEngine {
                     .and_then(Value::as_str)
                 {
                     if !truncated {
-                        let added = append_bounded_utf8(&mut text, piece, MAX_REPLY);
+                        let clean_piece = sanitize_model_chunk(piece);
+                        let added = append_bounded_utf8(&mut text, &clean_piece, MAX_REPLY);
                         if !added.is_empty() {
                             on_delta(added);
                         }
-                        if added.len() < piece.len() {
+                        if added.len() < clean_piece.len() {
                             truncated = true;
                         }
                     }
@@ -1339,8 +1382,13 @@ impl AiEngine {
         let masked_because = if !is_loopback_url(&settings.local_url) {
             Some("the server is not on this machine".to_owned())
         } else {
-            another_users_server(&settings.local_url)
-                .map(|uid| format!("the server belongs to another user, uid {uid}"))
+            another_users_server(&settings.local_url).map(|uid| {
+                if uid == u32::MAX {
+                    "cannot verify local server owner".to_owned()
+                } else {
+                    format!("the server belongs to another user, uid {uid}")
+                }
+            })
         };
         let (user, mut unmasker) = match &masked_because {
             Some(_) => {
@@ -1468,7 +1516,7 @@ impl AiEngine {
         };
 
         // Mask, then prove nothing private is left before going on.
-        let (masked_user, mut unmasker) = mask_prompt(vault, graph, &prompt, settings.cloud_notes)?;
+        let (masked_user, unmasker) = mask_prompt(vault, graph, &prompt, settings.cloud_notes)?;
 
         let model = match tier {
             Tier::Research => sanitize(&settings.research_model, 120),
@@ -1484,6 +1532,7 @@ impl AiEngine {
             )
             .optional()?;
         if let Some(masked_reply) = cached {
+            let mut unmasker = unmasker;
             let mut text = unmasker.push(&masked_reply);
             text.push_str(&unmasker.finish());
             on_text(&text);
@@ -1510,20 +1559,46 @@ impl AiEngine {
                 .await;
         }
 
-        let mut shown = String::new();
+        let shared_unmasker = Mutex::new(unmasker);
+        let shared_shown = Mutex::new(String::new());
+        let shared_out = Mutex::new(on_text);
         let mut deliver = |piece: &str| {
-            let ready = unmasker.push(piece);
+            let ready = shared_unmasker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(piece);
             if !ready.is_empty() {
-                on_text(&ready);
-                shown.push_str(&ready);
+                if let Ok(mut cb) = shared_out.lock() {
+                    (*cb)(&ready);
+                }
+                shared_shown
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push_str(&ready);
             }
+        };
+        let mut reset_attempt = || {
+            let rest = shared_unmasker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .flush_and_reset();
+            if !rest.is_empty() {
+                if let Ok(mut cb) = shared_out.lock() {
+                    (*cb)(&rest);
+                }
+            }
+            // Only the final accepted model's text is kept in Outcome.text.
+            shared_shown
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
         };
         let mut failed_spend = Usage::default();
         // (masked reply, what it cost, the model that answered)
         let result: Result<(String, Usage, String)> = match settings.provider() {
             // A Claude API key: the Claude API's own protocol, the user's
             // fallback chain, and Claude's own web search for research.
-            CloudProvider::Anthropic => anthropic::ask_with_spend(
+            CloudProvider::Anthropic => anthropic::ask_with_spend_and_reset(
                 self.client(&settings.cloud_url),
                 &settings.cloud_url,
                 &api_key,
@@ -1533,6 +1608,7 @@ impl AiEngine {
                 &prompt.system,
                 &masked_user,
                 &mut deliver,
+                &mut reset_attempt,
                 &mut failed_spend,
             )
             .await
@@ -1567,8 +1643,13 @@ impl AiEngine {
                 return Err(error.context(format!("[{}] request failed", tier.key())));
             }
         };
-        let rest = unmasker.finish();
-        on_text(&rest);
+        let rest = shared_unmasker
+            .into_inner()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish();
+        let mut shown = shared_shown.into_inner().unwrap_or_else(|p| p.into_inner());
+        let out_cb = shared_out.into_inner().unwrap_or_else(|p| p.into_inner());
+        out_cb(&rest);
         shown.push_str(&rest);
 
         {
@@ -3169,7 +3250,7 @@ mod tests {
         // macOS lsof `-F u` parser extracts listener UIDs accurately.
         assert_eq!(lsof_listener_uids("p1234\nu501\np5678\nu502\n"), [501, 502]);
 
-        // Broken ai.toml with an API key must never echo the key in the error message (ISS-029).
+        // Broken ai.toml with an API key must never echo the key in the error message.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ai.toml");
         crate::workspace::write_private_atomic(

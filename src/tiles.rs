@@ -244,7 +244,7 @@ fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
     match host {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
-        Some(url::Host::Ipv6(v6)) => v6.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback() || v6.to_canonical().is_loopback(),
         None => false,
     }
 }
@@ -398,10 +398,37 @@ fn tile_client() -> Result<&'static reqwest::Client> {
     CLIENT.get().context("cannot create the HTTP client")
 }
 
+fn local_tile_client() -> Result<&'static reqwest::Client> {
+    static LOCAL_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(http) = LOCAL_CLIENT.get() {
+        return Ok(http);
+    }
+    let built = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent("meow")
+        .build()
+        .context("cannot create the local HTTP client")?;
+    let _ = LOCAL_CLIENT.set(built);
+    LOCAL_CLIENT
+        .get()
+        .context("cannot create the local HTTP client")
+}
+
 /// Fetches every tile of `view` at once; all of them, or an error.
 pub async fn fetch(template: &str, view: &MapView) -> Result<Vec<Picture>> {
     check_template(template)?;
-    let http = tile_client()?;
+    let loopback = url::Url::parse(&tile_url(template, 0, 0, 0))
+        .ok()
+        .is_some_and(|u| is_loopback_host(u.host()));
+    let http = if loopback {
+        local_tile_client()?
+    } else {
+        tile_client()?
+    };
     futures_util::future::try_join_all(
         view.tiles
             .iter()

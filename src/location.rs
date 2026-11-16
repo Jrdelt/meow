@@ -241,18 +241,22 @@ pub fn parse(value: &Value) -> Option<Place> {
 
 const LOOKUP_MAX_BYTES: usize = 64 * 1024;
 
+fn is_loopback_url(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback() || v6.to_canonical().is_loopback(),
+        None => false,
+    }
+}
+
 pub fn validate_lookup_url(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url)
         .with_context(|| format!("the location service address '{url}' is not a web address"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         bail!("the location service address '{url}' must not embed credentials");
     }
-    let loopback = match parsed.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
-        Some(url::Host::Ipv6(v6)) => v6.is_loopback(),
-        None => false,
-    };
+    let loopback = is_loopback_url(&parsed);
     if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
         bail!("the location service address '{url}' must start with https://");
     }
@@ -275,10 +279,37 @@ fn lookup_client() -> Result<&'static reqwest::Client> {
     CLIENT.get().context("cannot create the HTTP client")
 }
 
+fn local_lookup_client() -> Result<&'static reqwest::Client> {
+    static LOCAL_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(http) = LOCAL_CLIENT.get() {
+        return Ok(http);
+    }
+    let built = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent("meow")
+        .build()
+        .context("cannot create the local HTTP client")?;
+    let _ = LOCAL_CLIENT.set(built);
+    LOCAL_CLIENT
+        .get()
+        .context("cannot create the local HTTP client")
+}
+
 /// Asks the service at `url` where this machine's public address is.
 pub async fn lookup(url: &str) -> Result<Place> {
     validate_lookup_url(url)?;
-    let mut response = lookup_client()?
+    let parsed = url::Url::parse(url)
+        .with_context(|| format!("the location service address '{url}' is not a web address"))?;
+    let client = if is_loopback_url(&parsed) {
+        local_lookup_client()?
+    } else {
+        lookup_client()?
+    };
+    let mut response = client
         .get(url)
         .header("Accept", "application/json")
         .send()

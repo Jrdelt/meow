@@ -245,6 +245,7 @@ static void set_alt_screen(tap_state_t *st, uint8_t on)
 {
     if (st->alt_screen != on) {
         line_reset(st);
+        st->last_cup_row = 0;
         st->alt_screen = on;
     }
 }
@@ -260,6 +261,7 @@ static void c0_execute(tap_state_t *st, uint8_t b, tap_out_t *out)
         st->mode = TAP_ESCAPE;
         break;
     case 0x0A: /* LF */
+        st->last_cup_row = 0;
         line_emit(st, out);
         break;
     case 0x0D: /* CR: decided by the next byte (LF = newline, text = rewind) */
@@ -378,6 +380,7 @@ static void escape(tap_state_t *st, uint8_t b, tap_out_t *out)
         st->mode = TAP_CSI;
         st->csi_param = 0;
         st->csi_first = 0;
+        st->csi_second = 0;
         st->csi_private = 0;
         st->csi_seen = 0;
         st->csi_inter = 0;
@@ -393,6 +396,7 @@ static void escape(tap_state_t *st, uint8_t b, tap_out_t *out)
     } else if (b == 'c') {
         /* RIS: full reset returns to the main screen. */
         st->mode = TAP_GROUND;
+        st->last_cup_row = 0;
         set_alt_screen(st, 0);
     } else if (b <= 0x7E) {
         st->mode = TAP_GROUND; /* two-byte escape, e.g. ESC 7 / ESC = */
@@ -424,6 +428,8 @@ static void csi_param_end(tap_state_t *st)
 
     if (st->csi_nparams == 0) {
         st->csi_first = v;
+    } else if (st->csi_nparams == 1) {
+        st->csi_second = v;
     }
     if (v == 47 || v == 1047 || v == 1049) {
         st->csi_alt_hit = 1;
@@ -434,7 +440,7 @@ static void csi_param_end(tap_state_t *st)
     st->csi_param = 0;
 }
 
-static void csi_dispatch(tap_state_t *st, uint8_t final)
+static void csi_dispatch(tap_state_t *st, uint8_t final, tap_out_t *out)
 {
     if (st->csi_inter || st->csi_invalid) {
         return;
@@ -453,6 +459,21 @@ static void csi_dispatch(tap_state_t *st, uint8_t final)
         line_reset(st); /* EL 2 or CR + EL 0: erase whole line (spinner redraw) */
     } else if (final == 'G' && st->csi_first <= 1) {
         st->pending_cr = 1; /* CHA 1: cursor to column 1, same as bare CR */
+    } else if ((final == 'E' || final == 'F') && !st->alt_screen) {
+        /* CNL / CPL: Windows ConPTY and TUIs jump to the next/previous row. */
+        st->last_cup_row = 0;
+        line_emit(st, out);
+    } else if ((final == 'H' || final == 'f') && !st->alt_screen) {
+        /* CUP / HVP: Windows ConPTY often repositions between rows via CSI r;c H. */
+        uint32_t row = (st->csi_first == 0) ? 1u : st->csi_first;
+        uint32_t col = (st->csi_nparams < 2 || st->csi_second == 0) ? 1u : st->csi_second;
+        if ((st->last_cup_row != 0 && row != st->last_cup_row) ||
+            (st->last_cup_row == 0 && st->line_len > 0)) {
+            line_emit(st, out);
+        } else if (col <= 1u) {
+            st->pending_cr = 1;
+        }
+        st->last_cup_row = row;
     } else if (final == 'C' && !st->alt_screen) {
         /* CUF (CSI <n> C): Windows ConPTY translates runs of spaces into cursor-forward. */
         uint32_t n = (st->csi_first == 0) ? 1u : st->csi_first;
@@ -489,7 +510,7 @@ static void csi(tap_state_t *st, uint8_t b, tap_out_t *out)
     } else if (b <= 0x7E) {
         csi_param_end(st);
         st->mode = TAP_GROUND;
-        csi_dispatch(st, b);
+        csi_dispatch(st, b, out);
         return;
     } else if (b == 0x7F) {
         /* ignored */

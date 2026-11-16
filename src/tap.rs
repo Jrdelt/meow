@@ -90,11 +90,14 @@ impl TapFilter {
 
     /// Feeds one chunk and returns the clean lines it completed.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        // Every emitted line ends at an input '\n' (at most `line_max + 1`
-        // bytes each), and each ConPTY `CSI <n> C` (`'C'` final byte) can
-        // expand into up to 256 spaces. Bound by the tighter of the two so
-        // `dropped_nospace` remains impossible without over-allocating.
-        let newlines = chunk.iter().filter(|&&b| b == b'\n').count();
+        // Every emitted line ends at an input '\n' or a CNL/CPL/CUP/HVP CSI
+        // row break (at most `line_max + 1` bytes each), and each ConPTY
+        // `CSI <n> C` (`'C'` final byte) can expand into up to 256 spaces.
+        // Bound by the tighter of the two so `dropped_nospace` remains 0.
+        let line_breaks = chunk
+            .iter()
+            .filter(|&&b| matches!(b, b'\n' | b'E' | b'F' | b'H' | b'f'))
+            .count();
         let cuf_extra = chunk
             .iter()
             .filter(|&&b| b == b'C')
@@ -105,7 +108,7 @@ impl TapFilter {
             .len()
             .saturating_add(cuf_extra)
             .saturating_add(line_cap);
-        let by_newlines = newlines.saturating_mul(line_cap);
+        let by_newlines = line_breaks.saturating_mul(line_cap);
         let needed = by_expansion.min(by_newlines).max(1);
         self.out.resize(needed, 0);
         let state = self.state_mut();
@@ -432,6 +435,17 @@ mod tests {
         let burst = b"\x1b[256Cx\n".repeat(25);
         let lines = filter.feed(&burst);
         assert_eq!(lines.len(), 25);
+        assert_eq!(filter.stats().dropped_nospace, 0);
+    }
+
+    #[test]
+    fn conpty_row_jumps_split_lines_and_suppress_secret_prompts() {
+        let mut filter = TapFilter::new();
+        let lines = filter.feed(
+            b"\x1b[5;1HPS C:\\> ssh bob@10.0.0.5\x1b[6;1HPassword: supersecret\x1b[1E80/tcp open http\x1b[8;1H",
+        );
+        assert_eq!(lines, ["PS C:\\> ssh bob@10.0.0.5", "80/tcp open http"]);
+        assert_eq!(filter.stats().dropped_secret, 1);
         assert_eq!(filter.stats().dropped_nospace, 0);
     }
 }

@@ -188,7 +188,7 @@ fn show(gaps: &[Gap]) {
 }
 
 #[cfg(windows)]
-fn windows_powershell_exe() -> Option<PathBuf> {
+pub(crate) fn windows_powershell_exe() -> Option<PathBuf> {
     use std::path::Prefix;
     let root = PathBuf::from(std::env::var_os("SystemRoot")?);
     let mut comps = root.components();

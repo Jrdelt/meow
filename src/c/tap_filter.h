@@ -53,11 +53,13 @@ typedef struct tap_stats {
 typedef struct tap_state {
     tap_stats_t stats;
 
-    uint32_t line_len;   /* bytes buffered in line[] */
-    uint32_t line_bad;   /* invalid/binary bytes seen on this line */
-    uint32_t csi_param;  /* parameter currently being accumulated */
-    uint32_t csi_first;  /* value of the first parameter */
-    uint32_t str_len;    /* bytes consumed by the current OSC/STRING */
+    uint32_t line_len;     /* bytes buffered in line[] */
+    uint32_t line_bad;     /* invalid/binary bytes seen on this line */
+    uint32_t csi_param;    /* parameter currently being accumulated */
+    uint32_t csi_first;    /* value of the first parameter */
+    uint32_t csi_second;   /* value of the second parameter */
+    uint32_t last_cup_row; /* 1-based row of last CUP/HVP on main screen */
+    uint32_t str_len;      /* bytes consumed by the current OSC/STRING */
 
     uint8_t mode;           /* tap_mode_t */
     uint8_t alt_screen;     /* 1 between ?1049h and ?1049l */

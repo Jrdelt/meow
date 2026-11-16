@@ -59,26 +59,44 @@ fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
         .context("cannot create OSINT HTTP client")
 }
 
-const SUBPROCESS_ENV_SCRUB: &[&str] = &[
-    "OPENROUTER_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "NVD_API_KEY",
-    "MEOW_API_KEY",
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-];
-
 fn configure_osint_command(cmd: &mut tokio::process::Command) {
-    for var in SUBPROCESS_ENV_SCRUB {
-        cmd.env_remove(var);
+    cmd.env_clear();
+    if let Some(raw_path) = std::env::var_os("PATH") {
+        let safe_dirs = std::env::split_paths(&raw_path)
+            .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute());
+        if let Ok(joined) = std::env::join_paths(safe_dirs) {
+            cmd.env("PATH", joined);
+        }
     }
+    cmd.env("LC_ALL", "C").env("LANG", "C");
+    #[cfg(windows)]
+    {
+        let sys_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("SYSTEMROOT"))
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        cmd.env("SystemRoot", sys_root);
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+}
+
+#[cfg(unix)]
+struct OsintGroupGuard(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for OsintGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.filter(|&p| p > 1 && p <= i32::MAX as u32) {
+            // SAFETY: negative pid signals the dedicated process group started with process_group(0).
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
 }
 
 async fn wait_bounded_stdout(
@@ -86,6 +104,8 @@ async fn wait_bounded_stdout(
     max_bytes: usize,
     timeout: Duration,
 ) -> Option<String> {
+    #[cfg(unix)]
+    let _group = OsintGroupGuard(child.id());
     let mut stdout = child.stdout.take()?;
     let fut = async move {
         let mut buf = Vec::with_capacity(max_bytes.min(8192));
@@ -124,6 +144,43 @@ async fn read_bytes_prefix(mut resp: reqwest::Response, max_bytes: usize) -> Res
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// True when `ip` is safe to accept as a DNS resolution result for `domain`.
+/// Blocks unspecified, broadcast, multicast, link-local / cloud metadata IMDS
+/// (`169.254.0.0/16`, `fe80::/10`), and loopback addresses unless `domain` is
+/// explicitly `localhost`, while still permitting RFC 1918 / RFC 4193 lab hosts.
+pub fn is_allowed_resolved_ip_for_name(domain: &str, ip: IpAddr) -> bool {
+    let is_localhost = domain
+        .trim()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("localhost");
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified()
+                || v4.octets()[0] == 0
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_link_local()
+            {
+                return false;
+            }
+            if v4.is_loopback() && !is_localhost {
+                return false;
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            if v6.is_unspecified() || v6.is_multicast() || (segs[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            if v6.is_loopback() && !is_localhost {
+                return false;
+            }
+            true
+        }
+    }
 }
 
 /// True when `ip` is loopback, private (RFC 1918 / RFC 4193), link-local,
@@ -597,12 +654,18 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
             }
 
             for ip in &a_recs {
-                if IpAddr::from_str(ip).is_ok() && !resolved_ips.contains(ip) {
+                if IpAddr::from_str(ip)
+                    .is_ok_and(|addr| is_allowed_resolved_ip_for_name(domain, addr))
+                    && !resolved_ips.contains(ip)
+                {
                     resolved_ips.push(ip.clone());
                 }
             }
             for ip in &aaaa_recs {
-                if IpAddr::from_str(ip).is_ok() && !resolved_ips.contains(ip) {
+                if IpAddr::from_str(ip)
+                    .is_ok_and(|addr| is_allowed_resolved_ip_for_name(domain, addr))
+                    && !resolved_ips.contains(ip)
+                {
                     resolved_ips.push(ip.clone());
                 }
             }
@@ -1885,8 +1948,17 @@ pub async fn inspect_web_endpoint(
     port: u16,
     tls: bool,
 ) -> Result<(Vec<Observation>, Option<String>, String)> {
+    let parsed_addr = HostAddr::parse(address)
+        .with_context(|| format!("invalid web endpoint address '{address}'"))?;
+    let resolved_hostname = match hostname {
+        Some(h) => match HostAddr::parse(h) {
+            Some(HostAddr::Name(domain)) => Some(domain),
+            _ => bail!("invalid hostname '{h}' for web inspection"),
+        },
+        None => None,
+    };
     let scheme = if tls { "https" } else { "http" };
-    let host_for_url = hostname.unwrap_or(address);
+    let host_for_url = resolved_hostname.as_deref().unwrap_or(address);
     let authority = match HostAddr::parse(host_for_url) {
         Some(HostAddr::Ip {
             addr: IpAddr::V6(v6),
@@ -1901,13 +1973,45 @@ pub async fn inspect_web_endpoint(
         format!("{scheme}://{authority}:{port}")
     };
 
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(REQUEST_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
-        .user_agent("meow-osint/0.1")
+        .no_proxy()
+        .user_agent("meow-osint/0.1");
+
+    match (&parsed_addr, &resolved_hostname) {
+        (HostAddr::Ip { addr, zone }, Some(domain)) => {
+            if zone.is_some() {
+                bail!("zoned IPv6 address '{address}' cannot be pinned to '{domain}'");
+            }
+            if !is_allowed_resolved_ip_for_name(domain, *addr) {
+                bail!("refusing web inspection of '{domain}' at disallowed IP {addr}");
+            }
+            builder = builder.resolve(domain, SocketAddr::new(*addr, port));
+        }
+        (HostAddr::Name(domain), _) => {
+            let lookup = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio::net::lookup_host((domain.as_str(), port)),
+            )
+            .await
+            .with_context(|| format!("DNS lookup timed out for '{domain}'"))?
+            .with_context(|| format!("DNS lookup failed for '{domain}'"))?;
+            let pinned = lookup
+                .map(|sa| sa.ip().to_canonical())
+                .find(|ip| is_allowed_resolved_ip_for_name(domain, *ip))
+                .with_context(|| {
+                    format!("'{domain}' resolved only to disallowed special-use addresses")
+                })?;
+            builder = builder.resolve(domain, SocketAddr::new(pinned, port));
+        }
+        (HostAddr::Ip { .. }, None) => {}
+    }
+
+    let client = builder
         .build()
         .context("cannot build web inspector client")?;
 
@@ -3100,5 +3204,47 @@ traceroute to 45.33.32.156 (45.33.32.156), 15 hops max, 60 byte packets
             Some("scanme.nmap.org"),
         );
         assert_eq!(reparsed, hops);
+    }
+
+    #[tokio::test]
+    async fn resolved_ip_policy_blocks_loopback_and_imds_for_external_domains() {
+        assert!(is_allowed_resolved_ip_for_name(
+            "app.lab.local",
+            "10.0.0.5".parse().unwrap()
+        ));
+        assert!(is_allowed_resolved_ip_for_name(
+            "localhost",
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(is_allowed_resolved_ip_for_name(
+            "localhost.",
+            "::1".parse().unwrap()
+        ));
+        for blocked in [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "0.0.0.0",
+            "::",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(
+                !is_allowed_resolved_ip_for_name("evil.example", blocked.parse().unwrap()),
+                "{blocked} should be rejected for evil.example"
+            );
+        }
+        assert!(
+            inspect_web_endpoint("169.254.169.254", Some("evil.example"), 80, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            inspect_web_endpoint("127.0.0.1", Some("evil.example"), 80, false)
+                .await
+                .is_err()
+        );
     }
 }

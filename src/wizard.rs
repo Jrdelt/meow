@@ -503,6 +503,10 @@ impl Wizard {
                         if self.cloud_choice != CloudChoice::Claude {
                             self.select_cloud_choice(CloudChoice::Claude);
                         }
+                    } else if key.starts_with("sk-or-") {
+                        if self.cloud_choice != CloudChoice::OpenRouter {
+                            self.select_cloud_choice(CloudChoice::OpenRouter);
+                        }
                     } else if self.cloud_choice == CloudChoice::LocalOnly {
                         self.select_cloud_choice(CloudChoice::OpenRouter);
                     }

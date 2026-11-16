@@ -102,6 +102,7 @@ fn verify_checkout_security(dir: &Path, explicit_source: bool) -> Result<()> {
         dir.to_path_buf(),
         dir.join("Cargo.toml"),
         dir.join("build.rs"),
+        dir.join("src"),
         dir.join(".git"),
         dir.join(".git").join("config"),
         dir.join("install.sh"),
@@ -135,6 +136,7 @@ fn ensure_own_checkout(dir: &Path) -> Result<()> {
         (dir.join(".git").join("config"), false),
         (dir.join("Cargo.toml"), true),
         (dir.join("build.rs"), false),
+        (dir.join("src"), false),
         (dir.join("install.sh"), false),
         (dir.join("install.ps1"), false),
         (dir.join(".cargo"), false),
@@ -169,19 +171,43 @@ fn ensure_own_checkout(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn ensure_own_checkout(dir: &Path) -> Result<()> {
+    for (path, must_exist) in [
+        (dir.to_path_buf(), true),
+        (dir.join(".git"), true),
+        (dir.join("Cargo.toml"), true),
+        (dir.join("src"), false),
+        (dir.join("install.ps1"), false),
+        (dir.join(".cargo"), false),
+    ] {
+        if !must_exist && std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        crate::workspace::verify_windows_owner(&path).with_context(|| {
+            format!(
+                "refusing untrusted checkout path {}",
+                sanitize(&path.display().to_string(), 400)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_own_checkout(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
 fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
-    let safe_dir = sanitize(&dir.display().to_string(), 400);
-    for rel in [
+    const OVERRIDES: [&str; 4] = [
         ".cargo/config",
         ".cargo/config.toml",
         "rust-toolchain",
         "rust-toolchain.toml",
-    ] {
+    ];
+    let safe_dir = sanitize(&dir.display().to_string(), 400);
+    for rel in OVERRIDES {
         let candidate = dir.join(rel);
         let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
             continue;
@@ -194,6 +220,32 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
         }
         if git(dir, &["ls-files", "--error-unmatch", "--", rel]).is_err() {
             bail!("refusing to build {safe_dir}: untracked '{rel}' could override Cargo or rustc settings");
+        }
+    }
+    // Cargo and rustup also walk parent directories above the checkout; allow
+    // the user's own private `~/.cargo/config.toml`, but refuse any parent
+    // override file owned or writable by another account.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (me, my_group) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for ancestor in dir.ancestors().skip(1) {
+            for rel in OVERRIDES {
+                let candidate = ancestor.join(rel);
+                let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+                    continue;
+                };
+                let untrusted = meta.file_type().is_symlink()
+                    || (meta.uid() != me && meta.uid() != 0)
+                    || meta.mode() & 0o002 != 0
+                    || (meta.mode() & 0o020 != 0 && meta.gid() != my_group);
+                if untrusted {
+                    bail!(
+                        "refusing to build {safe_dir}: untrusted parent override {}",
+                        sanitize(&candidate.display().to_string(), 400)
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -383,6 +435,7 @@ fn is_unsafe_local_git_config_key(key: &str) -> bool {
             | "interactive.difffilter"
             | "ssh.variant"
             | "include.path"
+            | "fetch.recursesubmodules"
     ) || http_tail.is_some_and(|leaf| {
         leaf == "proxy"
             || leaf == "extraheader"
@@ -396,6 +449,7 @@ fn is_unsafe_local_git_config_key(key: &str) -> bool {
                 || k.ends_with(".receivepack")
                 || k.ends_with(".proxy")
                 || k.ends_with(".vcs"))
+        || k.starts_with("submodule.")
         || k.starts_with("uploadpack.")
         || k.starts_with("receivepack.")
         || k.starts_with("filter.")
@@ -436,6 +490,8 @@ const GIT_ENV_SCRUB: &[&str] = &[
     "GIT_COMMON_DIR",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_ASKPASS",
@@ -460,6 +516,10 @@ fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
         .arg(format!("core.hooksPath={}", hooks_dir.display()))
         .arg("-c")
         .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("submodule.recurse=false")
+        .arg("-c")
+        .arg("fetch.recurseSubmodules=false")
         .arg("-c")
         .arg("protocol.ext.allow=never")
         .arg("-c")
@@ -719,6 +779,9 @@ mod tests {
             "url.https://evil.example/.insteadof",
             "include.path",
             "includeif.gitdir:~/x.path",
+            "fetch.recursesubmodules",
+            "submodule.evil.url",
+            "submodule.evil.update",
         ] {
             assert!(
                 is_unsafe_local_git_config_key(unsafe_key),

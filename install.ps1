@@ -109,8 +109,10 @@ if (-not $ToolsOnly) {
     }
 } else {
     # Nothing below needs the folder the user is in, and rustup's cargo and
-    # rustc would obey a rust-toolchain.toml found there.
-    Set-Location -LiteralPath ([System.IO.Path]::GetTempPath())
+    # rustc would obey a rust-toolchain.toml found there; use SystemRoot
+    # rather than a potentially shared temp folder.
+    $SafeWorkDir = if ($env:SystemRoot -and (Test-Path -LiteralPath $env:SystemRoot)) { $env:SystemRoot } else { $HOME }
+    Set-Location -LiteralPath $SafeWorkDir
 }
 
 $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }

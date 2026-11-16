@@ -86,7 +86,7 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Upgrade meow (via signed GitHub Release or source checkout) and its companion tools
+    /// Upgrade meow (via SHA-256 verified GitHub Release or source checkout) and its companion tools
     Update {
         /// Only show what is new; change nothing
         #[arg(long)]
