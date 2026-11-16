@@ -170,7 +170,7 @@ static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
         r#"|(?:access|refresh|auth|id|bearer|session|csrf|xsrf)[_-]?token|token|credentials?"#,
         r#"|[a-z]*sess(?:ion)?[_-]?id)"#,
         r#"(?:[_.-][A-Za-z0-9]+)*["']?\s*[:=]\s*"#,
-        r#"(?:"([^"\r\n]{3,4096})"|'([^'\r\n]{3,4096})'|([^\s"',;&<>]{3,}))"#,
+        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
     ))
     .expect("valid regex")
 });
@@ -180,7 +180,7 @@ static KEY_VALUE_CAMEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"[a-z0-9]+(?:Password|Passwd|Passphrase|Pwd|Secret|Token|ApiKey|Credentials?)"#,
         r#"[A-Za-z0-9]*["']?\s*[:=]\s*"#,
-        r#"(?:"([^"\r\n]{3,4096})"|'([^'\r\n]{3,4096})'|([^\s"',;&<>]{3,}))"#,
+        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
     ))
     .expect("valid regex")
 });
