@@ -187,7 +187,10 @@ $MeowHome = if ($env:MEOW_HOME) { $env:MEOW_HOME } else { Join-Path $HOME ".meow
 $WordlistDir = Join-Path $MeowHome "wordlists"
 $ExistingWordlists = @()
 if (Test-Path -LiteralPath $WordlistDir) {
-    $ExistingWordlists = @(Get-ChildItem -LiteralPath $WordlistDir -Filter "*.txt" -File -ErrorAction SilentlyContinue)
+    $ExistingWordlists = @(
+        Get-ChildItem -LiteralPath $WordlistDir -Filter "*.txt" -File -ErrorAction SilentlyContinue |
+            Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $_.Length -gt 0 }
+    )
 }
 $NeedWordlist = $InstallTools -and ($ExistingWordlists.Count -eq 0)
 

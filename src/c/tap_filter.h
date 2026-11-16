@@ -93,8 +93,9 @@ void tap_init(tap_state_t *st);
  * Feed in_len raw bytes. Completed clean lines are written to out, each
  * terminated by '\n'. Returns the number of bytes written.
  *
- * An out_cap of at least in_len + TAP_LINE_MAX can never overflow. A line
- * that does not fit is dropped whole and counted in dropped_nospace.
+ * Callers should size out_cap generously (e.g. 2 * in_len + TAP_LINE_MAX + 2,
+ * since CSI n C cursor-forward sequences expand to spaces). Any line that
+ * does not fit in out_cap is dropped whole and counted in dropped_nospace.
  */
 size_t tap_feed(tap_state_t *st, const uint8_t *in, size_t in_len,
                 uint8_t *out, size_t out_cap);

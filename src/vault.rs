@@ -153,7 +153,7 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 static AUTH_HEADER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(?:proxy-)?authorization\s*[:=]\s*(?:aws4-hmac-sha256\s+([^\r\n"']{8,})|(?:basic|bearer|digest|negotiate|ntlm|token|apikey|api-key|ssws|splunk|hmac)\s+([A-Za-z0-9+/=._~:-]{4,}))"#)
+    Regex::new(r#"(?i)\b(?:proxy-)?authorization\s*[:=]\s*(?:aws4-hmac-sha256\s+([^\r\n"']{8,})|(?:basic|bearer|digest|negotiate|ntlm|token|apikey|api-key|ssws|splunk|hmac|hawk|sharedkey|oauth|dpop|gnap|mac)\s+([A-Za-z0-9+/=._~:-]{4,}))"#)
         .expect("valid regex")
 });
 static COOKIE: LazyLock<Regex> = LazyLock::new(|| {
@@ -170,7 +170,7 @@ static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
         r#"|(?:access|refresh|auth|id|bearer|session|csrf|xsrf)[_-]?token|token|credentials?"#,
         r#"|[a-z]*sess(?:ion)?[_-]?id)"#,
         r#"(?:[_.-][A-Za-z0-9]+)*["']?\s*[:=]\s*"#,
-        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
+        r#"(?:"([^"\r\n]{3,4096})"|'([^'\r\n]{3,4096})'|([^\s"',;&<>]{3,}))"#,
     ))
     .expect("valid regex")
 });
@@ -180,7 +180,7 @@ static KEY_VALUE_CAMEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"[a-z0-9]+(?:Password|Passwd|Passphrase|Pwd|Secret|Token|ApiKey|Credentials?)"#,
         r#"[A-Za-z0-9]*["']?\s*[:=]\s*"#,
-        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
+        r#"(?:"([^"\r\n]{3,4096})"|'([^'\r\n]{3,4096})'|([^\s"',;&<>]{3,}))"#,
     ))
     .expect("valid regex")
 });
@@ -978,10 +978,13 @@ impl Vault {
     pub fn register(&mut self, kind: Kind, value: &str) -> String {
         let value = match kind {
             Kind::Dom => value.trim_end_matches('.').to_ascii_lowercase(),
-            Kind::Host => match value.parse::<IpAddr>() {
-                Ok(ip) => ip.to_canonical().to_string(),
-                Err(_) => value.to_ascii_lowercase(),
-            },
+            Kind::Host => {
+                let bare = value.split('%').next().unwrap_or(value);
+                match bare.parse::<IpAddr>() {
+                    Ok(ip) => ip.to_canonical().to_string(),
+                    Err(_) => value.to_ascii_lowercase(),
+                }
+            }
             _ => value.to_owned(),
         };
         if let Some(token) = self.tokens.get(&(kind, value.clone())) {

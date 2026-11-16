@@ -31,6 +31,7 @@ class Meow < Formula
        /\\_/\\   meow is installed!
       ( ^w^ )  Run `meow` (or `meow setup`) in a terminal for the interactive
        > ^ <   first-time Cat Setup GUI, or `meow <name>` to open a session.
+               Run `meow tools` any time to install the offline location database.
     EOS
   end
 

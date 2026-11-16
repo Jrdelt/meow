@@ -57,8 +57,7 @@ pub enum Command {
         /// Model the local server should use ("" lets the server choose)
         #[arg(long, value_name = "NAME")]
         local_model: Option<String>,
-        /// Cloud service: `claude` (the Claude API, with a Claude API key)
-        /// or `openrouter`
+        /// Cloud service: `claude` (`anthropic`) or `openrouter` (`openai`)
         #[arg(long, value_parser = ["claude", "anthropic", "openrouter", "openai"])]
         provider: Option<String>,
         /// Claude API only: models to ask next when one declines a request,
@@ -87,7 +86,7 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Pull the latest meow from GitHub and rebuild it, with every tool it uses
+    /// Upgrade meow (via signed GitHub Release or source checkout) and its companion tools
     Update {
         /// Only show what is new; change nothing
         #[arg(long)]
@@ -195,7 +194,7 @@ impl Command {
     }
 
     /// The workspace a helper targets. `None` for `list`, `delete`,
-    /// `setup` and `update`, which are not helpers of a session.
+    /// `setup`, `tools` and `update`, which are not helpers of a session.
     pub fn session_arg(&self) -> Option<&SessionArg> {
         match self {
             Command::List

@@ -132,7 +132,20 @@ pub fn gaps_with_db(settings: &ReconSettings, location_db: Option<&str>) -> Vec<
 /// Whether the location database is installed at `location_db` (when set) or `~/.meow/geo`.
 fn location_database_installed(location_db: Option<&str>) -> bool {
     if let Some(configured) = location_db.map(str::trim).filter(|s| !s.is_empty()) {
-        return crate::geoip::GeoDb::new(Path::new(configured)).available();
+        let p = Path::new(configured);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            crate::workspace::MeowHome::from_env()
+                .map(|home| home.root().join(p))
+                .unwrap_or_else(|_| p.to_path_buf())
+        };
+        let dir = if resolved.extension().and_then(|e| e.to_str()) == Some("mmdb") {
+            resolved.parent().map(Path::to_path_buf).unwrap_or(resolved)
+        } else {
+            resolved
+        };
+        return crate::geoip::GeoDb::new(&dir).available();
     }
     crate::workspace::MeowHome::from_env()
         .map(|home| crate::geoip::GeoDb::new(&home.root().join(crate::geoip::DIR)).available())

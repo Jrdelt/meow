@@ -59,12 +59,62 @@ fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
         .context("cannot create OSINT HTTP client")
 }
 
+const SUBPROCESS_ENV_SCRUB: &[&str] = &[
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "NVD_API_KEY",
+    "MEOW_API_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+
+fn configure_osint_command(cmd: &mut tokio::process::Command) {
+    for var in SUBPROCESS_ENV_SCRUB {
+        cmd.env_remove(var);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+}
+
+async fn wait_bounded_stdout(
+    mut child: tokio::process::Child,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Option<String> {
+    let mut stdout = child.stdout.take()?;
+    let fut = async move {
+        let mut buf = Vec::with_capacity(max_bytes.min(8192));
+        let mut limited = (&mut stdout).take(max_bytes as u64);
+        let _ = limited.read_to_end(&mut buf).await;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    tokio::time::timeout(timeout, fut).await.ok()
+}
+
 async fn read_bytes_bounded(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
     if let Some(len) = resp.content_length() {
         if len > max_bytes as u64 {
             bail!("response content-length ({len}) exceeds {max_bytes} byte cap");
         }
     }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("failed reading HTTP body")? {
+        if out.len() + chunk.len() > max_bytes {
+            bail!("response body exceeds {max_bytes} byte cap");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+async fn read_bytes_prefix(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     while let Some(chunk) = resp.chunk().await.context("failed reading HTTP body")? {
         if out.len() + chunk.len() > max_bytes {
@@ -206,6 +256,10 @@ pub fn parse_doh_records(json: &Value, rrtype: u16) -> Vec<String> {
 
 /// Builds a minimal RFC 1035 DNS query packet for `qname` and `qtype`.
 pub fn build_dns_query(txid: u16, qname: &str, qtype: u16) -> Result<Vec<u8>> {
+    let trimmed = qname.trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.len() > 253 {
+        bail!("invalid DNS name '{qname}'");
+    }
     let mut packet = Vec::with_capacity(64);
     packet.extend_from_slice(&txid.to_be_bytes());
     packet.extend_from_slice(&0x0100u16.to_be_bytes()); // RD = 1
@@ -213,7 +267,7 @@ pub fn build_dns_query(txid: u16, qname: &str, qtype: u16) -> Result<Vec<u8>> {
     packet.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
     packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
     packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
-    for label in qname.trim_end_matches('.').split('.') {
+    for label in trimmed.split('.') {
         if label.is_empty() || label.len() > 63 {
             bail!("invalid DNS label in '{qname}'");
         }
@@ -381,7 +435,12 @@ fn system_nameservers() -> Vec<SocketAddr> {
 
 async fn query_dns_udp(qname: &str, qtype: u16) -> Result<Vec<String>> {
     let servers = system_nameservers();
-    let txid = ((qtype.wrapping_mul(31337)) ^ (qname.len() as u16)).max(1);
+    let mut txid_bytes = [0u8; 2];
+    let txid = if getrandom::fill(&mut txid_bytes).is_ok() {
+        u16::from_be_bytes(txid_bytes).max(1)
+    } else {
+        ((qtype.wrapping_mul(31337)) ^ (qname.len() as u16)).max(1)
+    };
     let query = build_dns_query(txid, qname, qtype)?;
     for server in servers.into_iter().take(2) {
         let bind_addr = if server.is_ipv6() {
@@ -392,16 +451,17 @@ async fn query_dns_udp(qname: &str, qtype: u16) -> Result<Vec<String>> {
         let Ok(sock) = UdpSocket::bind(bind_addr).await else {
             continue;
         };
-        if tokio::time::timeout(Duration::from_secs(3), sock.send_to(&query, server))
+        if sock.connect(server).await.is_err() {
+            continue;
+        }
+        if tokio::time::timeout(Duration::from_secs(3), sock.send(&query))
             .await
             .is_err()
         {
             continue;
         }
         let mut buf = [0u8; 2048];
-        if let Ok(Ok((n, _))) =
-            tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await
-        {
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await {
             let records = parse_dns_wire_response(&buf[..n], txid, qtype);
             if !records.is_empty() {
                 return Ok(records);
@@ -1394,20 +1454,19 @@ pub async fn run_trace(
     let mut tool_ran = false;
 
     for (prog, args) in candidates {
-        let mut cmd = tokio::process::Command::new(prog);
-        cmd.args(*args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+        let Some(bin) = crate::tools::find_program(prog) else {
+            continue;
+        };
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.args(*args);
+        configure_osint_command(&mut cmd);
         let Ok(child) = cmd.spawn() else {
             continue;
         };
         tool_ran = true;
-        if let Ok(Ok(output)) =
-            tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await
+        if let Some(stdout) = wait_bounded_stdout(child, 128 * 1024, Duration::from_secs(10)).await
         {
-            raw_out = String::from_utf8_lossy(&output.stdout).into_owned();
+            raw_out = stdout;
             hops = parse_traceroute_output(&raw_out, &ip_str);
             if !hops.is_empty() {
                 break;
@@ -1863,7 +1922,7 @@ pub async fn inspect_web_endpoint(
         .iter()
         .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
         .collect();
-    let body_bytes = read_bytes_bounded(root_resp, MAX_HTTP_BYTES)
+    let body_bytes = read_bytes_prefix(root_resp, MAX_HTTP_BYTES)
         .await
         .unwrap_or_default();
     let body_text = String::from_utf8_lossy(&body_bytes);
@@ -1890,7 +1949,7 @@ pub async fn inspect_web_endpoint(
             if !ct.starts_with("text/plain") {
                 return None;
             }
-            let bytes = read_bytes_bounded(resp, 64 * 1024).await.ok()?;
+            let bytes = read_bytes_prefix(resp, 64 * 1024).await.ok()?;
             Some(String::from_utf8_lossy(&bytes).into_owned())
         }
     };
@@ -2194,76 +2253,91 @@ pub async fn run_tls_audit(
     hostname: Option<&str>,
     port: u16,
 ) -> Result<(Vec<Observation>, String)> {
+    let sni = hostname.unwrap_or(address);
+    if address.is_empty()
+        || address.starts_with('-')
+        || address.chars().any(|c| c.is_control() || c.is_whitespace())
+        || sni.is_empty()
+        || sni.starts_with('-')
+        || sni.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        bail!("invalid address or SNI for TLS audit");
+    }
     let connect_target = match HostAddr::parse(address) {
         Some(HostAddr::Ip {
             addr: IpAddr::V6(v6),
-            ..
+            zone: Some(z),
+        }) => format!("[{v6}%{z}]:{port}"),
+        Some(HostAddr::Ip {
+            addr: IpAddr::V6(v6),
+            zone: None,
         }) => format!("[{v6}]:{port}"),
         _ => format!("{address}:{port}"),
     };
-    let sni = hostname.unwrap_or(address);
 
     let mut result = TlsAuditResult::default();
     let mut openssl_available = false;
+    let openssl_bin = crate::tools::find_program("openssl");
 
     // 1. Inspect certificate + default negotiated TLS protocol via `openssl s_client`.
-    let mut s_client = tokio::process::Command::new("openssl");
-    s_client
-        .args(["s_client", "-connect", &connect_target, "-servername", sni])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+    if let Some(ref openssl_path) = openssl_bin {
+        let mut s_client = tokio::process::Command::new(openssl_path);
+        s_client.args(["s_client", "-connect", &connect_target, "-servername", sni]);
+        configure_osint_command(&mut s_client);
 
-    if let Ok(child) = s_client.spawn() {
-        openssl_available = true;
-        if let Ok(Ok(output)) =
-            tokio::time::timeout(Duration::from_secs(6), child.wait_with_output()).await
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            result = parse_openssl_cert_output(&stdout);
+        if let Ok(child) = s_client.spawn() {
+            openssl_available = true;
+            if let Some(stdout) =
+                wait_bounded_stdout(child, 128 * 1024, Duration::from_secs(6)).await
+            {
+                result = parse_openssl_cert_output(&stdout);
 
-            // If a PEM certificate block was returned, parse Subject/Issuer/Dates/SANs with `openssl x509`.
-            if stdout.contains("-----BEGIN CERTIFICATE-----") {
-                let mut x509 = tokio::process::Command::new("openssl");
-                x509.args([
-                    "x509",
-                    "-noout",
-                    "-subject",
-                    "-issuer",
-                    "-dates",
-                    "-ext",
-                    "subjectAltName",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-                if let Ok(mut xchild) = x509.spawn() {
-                    if let Some(mut stdin) = xchild.stdin.take() {
-                        let _ = stdin.write_all(stdout.as_bytes()).await;
-                    }
-                    if let Ok(Ok(xout)) =
-                        tokio::time::timeout(Duration::from_secs(3), xchild.wait_with_output())
-                            .await
-                    {
-                        let xtext = String::from_utf8_lossy(&xout.stdout);
-                        let parsed_x509 = parse_openssl_cert_output(&xtext);
-                        if parsed_x509.subject.is_some() {
-                            result.subject = parsed_x509.subject;
-                        }
-                        if parsed_x509.issuer.is_some() {
-                            result.issuer = parsed_x509.issuer;
-                        }
-                        if parsed_x509.not_before.is_some() {
-                            result.not_before = parsed_x509.not_before;
-                        }
-                        if parsed_x509.not_after.is_some() {
-                            result.not_after = parsed_x509.not_after;
-                        }
-                        for san in parsed_x509.sans {
-                            if !result.sans.contains(&san) {
-                                result.sans.push(san);
+                // If a PEM certificate block was returned, parse Subject/Issuer/Dates/SANs with `openssl x509`.
+                if let Some(begin_idx) = stdout.find("-----BEGIN CERTIFICATE-----") {
+                    let rest = &stdout[begin_idx..];
+                    let end_marker = "-----END CERTIFICATE-----";
+                    if let Some(end_rel) = rest.find(end_marker) {
+                        let pem_block = &rest[..end_rel + end_marker.len()];
+                        if pem_block.len() <= 32 * 1024 {
+                            let mut x509 = tokio::process::Command::new(openssl_path);
+                            x509.args([
+                                "x509",
+                                "-noout",
+                                "-subject",
+                                "-issuer",
+                                "-dates",
+                                "-ext",
+                                "subjectAltName",
+                            ]);
+                            configure_osint_command(&mut x509);
+                            x509.stdin(Stdio::piped());
+                            if let Ok(mut xchild) = x509.spawn() {
+                                if let Some(mut stdin) = xchild.stdin.take() {
+                                    let _ = stdin.write_all(pem_block.as_bytes()).await;
+                                }
+                                if let Some(xtext) =
+                                    wait_bounded_stdout(xchild, 32 * 1024, Duration::from_secs(3))
+                                        .await
+                                {
+                                    let parsed_x509 = parse_openssl_cert_output(&xtext);
+                                    if parsed_x509.subject.is_some() {
+                                        result.subject = parsed_x509.subject;
+                                    }
+                                    if parsed_x509.issuer.is_some() {
+                                        result.issuer = parsed_x509.issuer;
+                                    }
+                                    if parsed_x509.not_before.is_some() {
+                                        result.not_before = parsed_x509.not_before;
+                                    }
+                                    if parsed_x509.not_after.is_some() {
+                                        result.not_after = parsed_x509.not_after;
+                                    }
+                                    for san in parsed_x509.sans {
+                                        if !result.sans.contains(&san) {
+                                            result.sans.push(san);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2274,36 +2348,33 @@ pub async fn run_tls_audit(
 
     // 2. Check TLS 1.0, 1.1, 1.2, 1.3 support if openssl is available.
     if openssl_available {
-        for (flag, label) in [
-            ("-tls1", "TLSv1.0"),
-            ("-tls1_1", "TLSv1.1"),
-            ("-tls1_2", "TLSv1.2"),
-            ("-tls1_3", "TLSv1.3"),
-        ] {
-            let mut probe = tokio::process::Command::new("openssl");
-            probe
-                .args([
+        if let Some(ref openssl_path) = openssl_bin {
+            for (flag, label) in [
+                ("-tls1", "TLSv1.0"),
+                ("-tls1_1", "TLSv1.1"),
+                ("-tls1_2", "TLSv1.2"),
+                ("-tls1_3", "TLSv1.3"),
+            ] {
+                let mut probe = tokio::process::Command::new(openssl_path);
+                probe.args([
                     "s_client",
                     "-connect",
                     &connect_target,
                     "-servername",
                     sni,
                     flag,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-            if let Ok(child) = probe.spawn() {
-                if let Ok(Ok(output)) =
-                    tokio::time::timeout(Duration::from_secs(4), child.wait_with_output()).await
-                {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    if (text.contains("BEGIN CERTIFICATE")
-                        || (text.contains("Cipher is ") && !text.contains("Cipher is (NONE)")))
-                        && !result.supported_versions.iter().any(|v| v == label)
+                ]);
+                configure_osint_command(&mut probe);
+                if let Ok(child) = probe.spawn() {
+                    if let Some(text) =
+                        wait_bounded_stdout(child, 64 * 1024, Duration::from_secs(4)).await
                     {
-                        result.supported_versions.push(label.to_owned());
+                        if (text.contains("BEGIN CERTIFICATE")
+                            || (text.contains("Cipher is ") && !text.contains("Cipher is (NONE)")))
+                            && !result.supported_versions.iter().any(|v| v == label)
+                        {
+                            result.supported_versions.push(label.to_owned());
+                        }
                     }
                 }
             }
@@ -2571,7 +2642,11 @@ pub async fn audit_ssh_port(address: &str, port: u16) -> Result<(Vec<Observation
     let connect_addr = match HostAddr::parse(address) {
         Some(HostAddr::Ip {
             addr: IpAddr::V6(v6),
-            ..
+            zone: Some(z),
+        }) => format!("[{v6}%{z}]:{port}"),
+        Some(HostAddr::Ip {
+            addr: IpAddr::V6(v6),
+            zone: None,
         }) => format!("[{v6}]:{port}"),
         _ => format!("{address}:{port}"),
     };
@@ -2581,23 +2656,29 @@ pub async fn audit_ssh_port(address: &str, port: u16) -> Result<(Vec<Observation
         .with_context(|| format!("cannot connect to {connect_addr}"))?;
 
     // 1. Read server identification string (RFC 4253 §4.2 allows preamble lines before `SSH-`).
-    let mut buf = Vec::with_capacity(1024);
+    let mut buf = Vec::with_capacity(256);
+    let mut total_bytes = 0usize;
+    let mut lines_read = 0usize;
     let mut server_banner = String::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-    while buf.len() < 4096 {
+    while total_bytes < 4096 {
         let mut byte = [0u8; 1];
         let read_res = tokio::time::timeout_at(deadline, stream.read(&mut byte)).await;
         match read_res {
             Ok(Ok(1)) => {
+                total_bytes += 1;
                 buf.push(byte[0]);
                 if byte[0] == b'\n' {
+                    lines_read += 1;
                     let line = String::from_utf8_lossy(&buf);
-                    if let Some(idx) = line.rfind("SSH-") {
-                        server_banner = sanitize(line[idx..].trim(), 200);
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("SSH-") {
+                        server_banner = sanitize(trimmed.trim_end(), 200);
                         buf.clear();
                         break;
                     }
-                    if line.lines().count() > 16 {
+                    buf.clear();
+                    if lines_read > 16 {
                         bail!("SSH server sent too many preamble lines without SSH- banner");
                     }
                 }
@@ -2609,34 +2690,45 @@ pub async fn audit_ssh_port(address: &str, port: u16) -> Result<(Vec<Observation
         bail!("no SSH- banner received from {connect_addr}");
     }
 
-    // 2. Send client identification string and read first binary packet (`SSH_MSG_KEXINIT`).
+    // 2. Send client identification string and read binary packets until `SSH_MSG_KEXINIT` (20),
+    // skipping optional pre-KEXINIT `SSH_MSG_IGNORE` (2) / `SSH_MSG_DEBUG` (4) packets.
     tokio::time::timeout(
         Duration::from_secs(3),
-        stream.write_all(b"SSH-2.0-meow_0.1.1\r\n"),
+        stream.write_all(b"SSH-2.0-meow_0.2.0\r\n"),
     )
     .await
     .context("SSH banner write timed out")?
     .context("cannot write SSH client banner")?;
 
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len_buf))
-        .await
-        .context("timed out waiting for SSH_MSG_KEXINIT")?
-        .context("EOF waiting for SSH_MSG_KEXINIT")?;
-    let pkt_len = u32::from_be_bytes(len_buf) as usize;
-    if !(18..=MAX_SSH_PACKET_BYTES).contains(&pkt_len) {
-        bail!("invalid SSH packet length {pkt_len}");
+    let mut kex_pkt = None;
+    for _ in 0..4 {
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len_buf))
+            .await
+            .context("timed out waiting for SSH_MSG_KEXINIT")?
+            .context("EOF waiting for SSH_MSG_KEXINIT")?;
+        let pkt_len = u32::from_be_bytes(len_buf) as usize;
+        if !(2..=MAX_SSH_PACKET_BYTES).contains(&pkt_len) {
+            bail!("invalid SSH packet length {pkt_len}");
+        }
+        let mut pkt = vec![0u8; 4 + pkt_len];
+        pkt[..4].copy_from_slice(&len_buf);
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut pkt[4..]))
+            .await
+            .context("timed out reading SSH packet body")?
+            .context("EOF reading SSH packet body")?;
+        let msg_type = pkt.get(5).copied().unwrap_or(0);
+        if msg_type == 2 || msg_type == 4 {
+            continue;
+        }
+        kex_pkt = Some(pkt);
+        break;
     }
-    let mut pkt = vec![0u8; 4 + pkt_len];
-    pkt[..4].copy_from_slice(&len_buf);
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut pkt[4..]))
-        .await
-        .context("timed out reading SSH_MSG_KEXINIT body")?
-        .context("EOF reading SSH_MSG_KEXINIT body")?;
 
     // Drop stream immediately — zero authentication or key exchange reply sent.
     drop(stream);
 
+    let pkt = kex_pkt.context("SSH server did not send SSH_MSG_KEXINIT")?;
     let kex = parse_ssh_kexinit(&pkt)?;
     let weak = kex.weak_algorithms();
     let ev = serde_json::json!({

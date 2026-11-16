@@ -231,7 +231,7 @@ for list in \
     /usr/local/share/seclists/Discovery/Web-Content/common.txt \
     /home/linuxbrew/.linuxbrew/share/seclists/Discovery/Web-Content/common.txt \
     "$wordlist_dir"/*.txt; do
-    if [ -f "$list" ]; then
+    if [ -f "$list" ] && [ ! -L "$list" ] && [ -s "$list" ]; then
         need_wordlist=no
         break
     fi

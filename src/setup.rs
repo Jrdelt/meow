@@ -399,8 +399,10 @@ fn apply(
         }
         Some("openrouter" | "openai") => {
             use_openai_style(own, current, None);
-            let url = own.cloud_url.clone().unwrap_or_default();
-            changed.push(format!("cloud service: {url}"));
+            if args.cloud_url.is_none() {
+                let url = own.cloud_url.clone().unwrap_or_default();
+                changed.push(format!("cloud service: {url}"));
+            }
         }
         Some(other) => bail!(
             "unknown provider '{}': use claude or openrouter",
@@ -435,10 +437,11 @@ fn apply(
         own.disable_cloud = false;
         // The address decides the protocol unless a provider was named.
         if args.provider.is_none() {
-            own.cloud_provider = Some(match anthropic::is_claude_api(&url) {
-                true => CloudProvider::Anthropic,
-                false => CloudProvider::OpenAi,
-            });
+            if anthropic::is_claude_api(&url) {
+                use_claude(own, current);
+            } else {
+                use_openai_style(own, current, Some(url.clone()));
+            }
         }
         own.cloud_url = Some(url);
     }

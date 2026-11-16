@@ -1,491 +1,343 @@
 # meow
 
 ```text
-   /\_/\    _ __ ___   ___  _____      __
-  ( o.o )  | '_ ` _ \ / _ \/ _ \ \ /\ / /
-   > ^ <   | | | | | |  __/ (_) \ V  V /
-  /|   |\  |_| |_| |_|\___|\___/ \_/\_/
- (_|   |_)  local security triage, topology & audit shell
+  /\_/\
+ ( ^w^ )  meow — local security triage shell, topology mapper & grounded audit workspace
+  > ^ <
 ```
 
-A local security triage shell, live topology mapper and grounded audit
-workspace for authorized defensive work. Rust with a small C11 stream filter.
+`meow` wraps your normal interactive shell (`zsh`, `bash`, `fish`, or `pwsh`), passively observes authorized reconnaissance and command output, grounds discovered services against public vulnerability feeds, maps your OPSEC transit path and target topology on a live local canvas, and compiles a verified Markdown or printable PDF audit report.
 
-`meow <name>` wraps your normal shell. While you work, it quietly builds a
-graph of the hosts, ports, paths and software it sees, matches that software
-against public vulnerability databases, and keeps every raw observation apart
-from every conclusion. Nothing about your targets leaves your machine unless
-you ask for it; the lookups meow makes by itself (vulnerability databases, the
-map's location estimate and its satellite picture) are described below and can
-be turned off.
+Everything stays on your machine in a private workspace (`~/.meow/workspaces/<name>/` or `./.meow/`). When you ask a cloud AI model for triage notes, `meow` masks IP addresses, hostnames, domains, emails, MAC addresses, and credentials into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine, and restores the real values locally when the reply returns.
 
-Report security problems privately, as [`SECURITY.md`](SECURITY.md) describes.
-MIT licensed ([`LICENSE`](LICENSE)).
+> **Authorized use only.** Use `meow` only on systems and networks you own or have explicit written permission to test. `meow` inventories services, configurations, and public advisories to help operators patch and verify systems; it never generates exploits or attacks.
+
+---
 
 ## Install
 
-### Download (nothing to build)
-
-Get the file for your computer from the
-[latest release](https://github.com/Jrdelt/meow/releases/latest):
-
-| Computer | File | Then |
-|---|---|---|
-| Mac with Apple silicon (M1 and newer) | `meow-<version>-macos-arm64.pkg` | Double-click it. Because it is not signed with a paid Apple account, macOS blocks it the first time: on macOS 15 (Sequoia) and newer open **System Settings → Privacy & Security → Open Anyway** (on macOS 14 and earlier, Control-click → **Open → Open**). `meow` goes to `/usr/local/bin/meow`. |
-| Intel Mac | `meow-<version>-macos-x86_64.pkg` | The same. |
-| Linux / Kali | `meow-<version>-linux-x86_64.tar.gz` (or `-linux-arm64`) | `sha256sum -c meow-*.tar.gz.sha256 && tar -xzf meow-*.tar.gz && sudo install -m 0755 meow /usr/local/bin/meow` |
-| Windows | `meow-<version>-windows-x86_64.zip` | Verify with `Get-FileHash`, unzip it, and put `meow.exe` in a folder on your `PATH`. |
-
-Then run `meow`. The first session opens the Cat Setup wizard and offers to
-install what `meow recon` and the map use (`nmap`, `katana`, `feroxbuster`, the
-wordlist, and the offline DB-IP Lite location database); `meow tools` does the
-same any time. `meow update` later downloads and installs newer releases by
-itself, after checking each download against its `.sha256`. Releases are built
-by GitHub (`.github/workflows/release.yml`) when a version tag is pushed, or
-when the workflow is run by hand from the Actions tab (it then makes the tag
-itself).
-
-### From source
-
-On Linux (Kali, Debian, Ubuntu, Fedora, Arch, ...) and macOS, from a clone of
-this repository. No Homebrew is needed on Linux: the script uses the system's
-package manager.
-
-```sh
-git clone https://github.com/Jrdelt/meow.git
-cd meow
-./install.sh
-```
-
-Or with Homebrew, on macOS (or Linux where Homebrew is already installed;
-Kali and most distributions do not have it):
+### Option 1 — Homebrew (macOS & Linux)
 
 ```sh
 brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
-brew trust Jrdelt/meow        # required once on Homebrew 7+
-brew install meow             # tagged release (or `brew install --HEAD meow`)
+brew trust Jrdelt/meow   # Homebrew 7+
+brew install meow
 ```
 
-Or on Windows (PowerShell):
+Homebrew installs `meow` along with `nmap`, `katana`, `feroxbuster`, and the SecLists `common.txt` wordlist. To install the optional offline IP location database afterwards, run:
+
+```sh
+meow tools
+```
+
+To upgrade a Homebrew installation later:
+
+```sh
+brew update && brew upgrade meow
+```
+
+### Option 2 — macOS `.pkg` installer
+
+Download the universal `.pkg` installer (`meow-<version>-macos-universal.pkg`) from the [latest GitHub Release](https://github.com/Jrdelt/meow/releases/latest) and open it, or install from the terminal:
+
+```sh
+sudo installer -pkg meow-0.2.0-macos-universal.pkg -target /
+```
+
+Then run `meow tools` once in your terminal to install any missing companion scanners (`nmap`, `katana`, `feroxbuster`), the web wordlist, and the offline location database.
+
+### Option 3 — One-line installer (macOS & Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Jrdelt/meow/main/install.sh | sh
+```
+
+The installer downloads the prebuilt release binary for your platform (verifying its SHA-256 digest against `SHA256SUMS`) or builds from source if no prebuilt archive matches, and sets up `nmap`, `katana`, `feroxbuster`, the SecLists `common.txt` wordlist (`~/.meow/wordlists/common.txt`), and the DB-IP Lite offline location database (`~/.meow/geo/`).
+
+Installer flags (when running `./install.sh` from a git clone):
+
+- `./install.sh --no-tools` — install `meow` without installing `nmap`, `katana`, `feroxbuster`, or the wordlist
+- `./install.sh --no-geo` — skip downloading the offline location database
+- `./install.sh --yes` — non-interactive mode (do not prompt)
+
+### Option 4 — Windows (PowerShell)
+
+Download `meow-<version>-x86_64-pc-windows-msvc.zip` from the [latest GitHub Release](https://github.com/Jrdelt/meow/releases/latest), or run `install.ps1` from a PowerShell window:
 
 ```powershell
-.\install.ps1
+git clone https://github.com/Jrdelt/meow.git
+cd meow
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The script checks what is missing, shows what it will do, asks once, and then
-does it, all in one go:
+---
 
-- a C compiler if there is none (the Xcode Command Line Tools on macOS, the
-  distribution's compiler package on Linux);
-- the Rust toolchain through `rustup` if there is none or it is older than 1.89;
-- meow itself, built and installed as `~/.cargo/bin/meow`;
-- the scanners `meow recon` drives: `nmap`, `katana` and `feroxbuster`, with
-  Homebrew on macOS or the system package manager on Linux (`feroxbuster` is
-  built with cargo, and `katana` with Go, where no package has them);
-- a wordlist for the directory stage: the SecLists web-content list, downloaded
-  from GitHub to `~/.meow/wordlists/common.txt` (SHA-256 verified);
-- the offline DB-IP Lite IP-to-City and IP-to-ASN databases
-  (`~/.meow/geo/dbip-city-lite.mmdb` and `dbip-asn-lite.mmdb`).
+## First-Time Setup
 
-Anything already present is left alone, so it is safe to run again. A tool
-that cannot be installed is reported and skipped; meow works without it.
-
-| Option (`install.sh` / `install.ps1`) | Effect |
-|---|---|
-| `--dry-run` / `-DryRun` | Only show the plan. |
-| `--yes` / `-Yes` | Do not ask before starting. |
-| `--no-tools` / `-NoTools` | Leave out the scanners and the wordlist. |
-| `--no-geo` / `-NoGeo` | Leave out the DB-IP Lite location database. |
-| `--tools-only` / `-ToolsOnly` | Only the scanners, wordlist and location database; meow is not rebuilt. |
-
-### Updating
+Run `meow` with no arguments (or `meow setup`) in an interactive terminal to open the **Cat Setup GUI**:
 
 ```sh
-meow update            # install the newest version
-meow update --check    # only show what is new
+meow
 ```
 
-A meow installed from a release download asks GitHub for the newest
-release, downloads the file for this computer, checks its SHA-256 and puts it
-in place of the running one (with `sudo` when it lives in `/usr/local/bin`).
+The 5-step setup wizard walks you through:
 
-A meow built from source works in the folder it was installed from (or `--source
-<folder>`). It pulls only when that folder has no local changes and the pull is
-a fast-forward, then runs `./install.sh --yes` there (on Windows, where a
-running executable cannot overwrite itself, it prints the `.\install.ps1 -Yes`
-command to finish rebuilding after closing `meow`). Sessions that are open keep
-the old version until they are closed and reopened. `git pull && ./install.sh`
-in the folder does the same by hand.
+1. **Welcome & Overview** — how sessions, masking, and local workspaces work.
+2. **Cloud AI Provider** — choose **OpenRouter**, **Anthropic (Claude API)**, or **Local-Only (Offline)**, paste your API key (kept hidden), and pick triage/research models.
+3. **Local AI Server** — configure an optional local server (`Ollama` on `http://127.0.0.1:11434` or `LM Studio` on `http://127.0.0.1:1234`) for completely offline `[L]` local triage.
+4. **CVE Feeds & Offline GeoIP** — toggle public vulnerability lookups (NVD, OSV.dev, CISA KEV), optionally add an NVD API key for higher rate limits, and enable offline IP geolocation.
+5. **Companion Tools Check** — verify `nmap`, `katana`, `feroxbuster`, the SecLists wordlist, and the DB-IP City Lite database, and optionally launch your first workspace immediately.
 
-Works on macOS (Apple silicon and Intel, with Homebrew for the scanners), on
-Linux with `apt`, `dnf`, `yum`, `pacman`, `zypper` or `apk`, and on Windows
-via `.\install.ps1` (`winget` or `scoop` for Visual Studio Build Tools and
-scanners, or manual Rust from <https://rustup.rs> + `cargo install --path . --locked`).
+You can re-open this wizard any time with `meow setup` (or `meow setup --gui`).
 
-To build by hand instead (Rust 1.89 or newer and a C compiler):
+---
+
+## Quick Start
+
+### 1. Open a session
 
 ```sh
-cargo build --release        # binary: target/release/meow
-cargo test                   # the full test suite
+meow acme
 ```
 
-## Commands
+This opens your normal shell inside the `acme` workspace (`~/.meow/workspaces/acme/`). Your prompt is prefixed with `(meow:acme:mild)` so you always know a session is active, and `meow` prints the localhost URL for the live topology map.
 
-| Command | What it does |
-|---|---|
-| `meow list` | Lists every saved workspace (and `./.meow/` of the current directory): whether its session is running, mode, host count, unfinished tasks, last activity. `meow ls` and a bare `meow` do the same (on a brand-new install, bare `meow` opens the interactive Cat Setup GUI first); inside a session use `meow list`. |
-| `meow delete <name>` | Deletes a saved workspace and everything in it (command log, graph, notes, AI chats, report), after asking. `--yes` skips the question; `--local` deletes `./.meow/` of the current directory. Refused while a session is open on it. `meow rm` does the same. |
-| `meow <name>` | Creates or resumes `~/.meow/workspaces/<name>/` and starts the session shell. `--local` uses `./.meow/` instead. A `./.meow/` that was already in the folder when you got it (a cloned repository, an unpacked archive) is not yours: meow says what it carries and opens it only after you answer yes, then in your default mode; helper commands refuse it until then, and `meow delete --local` removes it. Links inside a workspace folder are refused, never followed. |
-| `meow mode <light\|mild\|aggressive>` | Switches the discovery profile. |
-| `meow recon <target> [-- <nmap flags>]` | Queues a four-stage inventory of a host or CIDR range. Runs in the background of the session, one tool at a time. |
-| `meow map` | Opens the live topology map in your browser. `--no-open` prints the URL. |
-| `meow hud` | Opens the terminal panel: this machine's connection and VPN, hosts, inspector, checklist, CVE feed, queue, notes, AI. |
-| `meow add <file>` | Imports an Nmap XML, JSON Lines, log or `git diff` file. `--no-cve` skips the vulnerability lookups. |
-| `meow report` | Writes `REPORT.md` into the workspace. No AI, no network. |
-| `meow setup` | Opens the interactive Cat Setup GUI (`--plain` for the line-by-line terminal menu): default discovery mode, local model server, cloud AI key, live CVE grounding / optional NVD key, scanner readiness and live endpoint check. See [Your own AI](#your-own-ai-meow-setup). |
-| `meow tools` | Shows which of the tools `meow recon` uses are installed, and offers to install the missing ones (`--yes` installs without asking). |
-| `meow update` | Installs the newest GitHub Release (for release installs), or pulls the latest meow from GitHub and rebuilds it with its tools (for source checkouts). `--check` only shows what is new. See [Updating](#updating). |
-
-Inside a session the helper commands find it by themselves. From another
-terminal, add `--session <name>` or `--local`.
-
-## The map
-
-`meow map` draws your network top-down, like a home-network diagram: the
-Internet cloud at the top, your router (or access point) under it, and every
-device on your network in one row below the router, you last.
-
-| On the map | What it means |
-|---|---|
-| Lines from the router | One line down to a bar, then one down to each device. Solid: wired. Dotted: Wi-Fi. meow can only see how your own machine connects, so the other devices are drawn connected the same way (the legend says so). |
-| Picture | Router, server (a service seen), computer (none seen), printer (ports 9100, 631 or 515), firewall, the Internet; a laptop for you. |
-| Amber or red glow | Advisories to verify, or confirmed findings (a wider glow when one is known exploited). |
-| Dashed cyan line | A VPN. It hangs below you, not off the router: only your machine uses it. Its gateway, then what is behind it. |
-| Dashed purple line | Another network only your machine is on (e.g. a virtual one): its switch and devices below you. |
-| A long row | Every device is drawn. A row wider than the card scrolls left and right (trackpad, Shift + mouse wheel, the scrollbar, or drag the background); it opens on the router. A tall drawing makes the card taller rather than too small to read. |
-| Blue VPN pill (top right) | A VPN is up; "location hidden" when it carries all traffic. Hover it for which networks it carries. |
-| Round map follows the selection | Select a device and the round map moves to it, with its IPv4 and IPv6 addresses under it. A public address is looked up in the location database on your disk (nothing is sent anywhere with it); a device on your own network is shown where you are, marked "On your network". Deselect to come back to yourself. |
-| Round map (top right) | Where this machine roughly is, estimated from its public address (see below): a round satellite picture with a pin and a circle for the rough area (about 25 km), the city and state with the coordinates under them (hover for the details). Click the map to zoom in four times closer around the pin, and again to zoom out. A compass when there is no picture. |
-| Route not known | Hosts this machine has no route to, in a group at the bottom. |
-
-A private address such as 192.168.0.81 has no location, so the estimate needs
-the address the rest of the world sees. When the map opens, meow asks
-`ipinfo.io` once (and again only when the network changes): a plain request
-that carries nothing about you or your targets; the service sees only the
-address it comes from. While a VPN carries all traffic nothing is asked,
-since the answer would be the VPN's exit. `[location] enabled = false` in
-`config.toml` turns it off; `url` picks another service.
-
-Scanned servers are placed with the DB-IP Lite location database (IP
-Geolocation by [DB-IP](https://db-ip.com), CC BY 4.0), which `install.sh`
-and `install.ps1` download to `~/.meow/geo` (about 65 MB) and `meow update`
-refreshes monthly; `--no-geo` / `-NoGeo` leaves it out. The address is looked
-up in the files on your disk. Fetching the satellite picture for a server
-tells EOX that server's rough area, as it does for yours.
-
-The picture is Sentinel-2 cloudless 2016 by EOX: free satellite imagery
-(CC BY 4.0), shown with the credit EOX asks for. meow fetches the few tiles
-around the estimate itself (at most six), keeps them in memory and hands them
-to the page, which loads nothing from anywhere else. The tile requests carry
-only the tiles' numbers, which tell EOX the rough area. EOX offers its
-picture service free for non-commercial use (commercial use: see
-[cloudless.eox.at](https://cloudless.eox.at)). `[location] map = false` shows
-only the compass; `tiles` picks another picture source (`{z}`, `{x}` and `{y}`
-are filled in).
-
-The picture is drawn from this machine's own tables (interfaces, routes,
-neighbours) and from scans; reading the tables sends nothing. Click any device
-for its cards.
-
-A name that only appeared in text (a URL printed in the session shell, such
-as `curl https://example.com/install.sh`) is not drawn: nothing was seen on
-it and it has no address to place it by. Such names are listed under
-**Names only mentioned** in the Hosts card, and after the machines in the HUD.
-
-The page around the drawing is a dashboard of cards, each with a heading and
-rows of label and value:
-
-- **Topology**, **This Machine** and the selected node side by side at the top.
-- **Advisory**, across the page: what needs a decision, most urgent first.
-  Confirmed findings, known-exploited matches to verify, other matches to
-  verify, informational notes and false positives each fold open. An entry
-  unfolds into its verification checklist and the buttons to confirm it, mark
-  it a false positive or reopen it. Without a selection it covers every host.
-- For a selected host: **Open Ports** (each port and its service, a
-  **Versions** section with the software that answered, and the ports the
-  last scan tried that were closed or filtered), **Web** (server headers, certificate
-  names and paths, when there are any), **Ask AI**, **Evidence**, **Add a note**.
-- **Hosts** (click one to select it), **Routes**, **Neighbours**,
-  **All interfaces**, **Background Tasks** and **Notices**.
-
-Only cards that have something to say are shown.
-
-The picture is a drawing hint, not a finding. Click any device to read what it
-was derived from.
-
-## This machine
-
-The top right of both `meow map` and `meow hud` sums up the machine meow runs
-on in a few lines:
-
-```
-192.168.50.5 -> MacBook Pro -> macOS -> 15.1
-Open ports  none listening
-Interfaces  en0  192.168.50.5/28  gateway 192.168.50.1
-            utun5  10.99.2.24/32  VPN, carries 10.0.0.0/8, 172.16.0.0/12 and 5 single hosts
-```
-
-That is its address, what kind of machine it is, its operating system and
-version, the ports open on it (those only this machine can reach are listed
-apart) and one line per interface in use, saying what each is for. An interface
-is shown by its IPv4 address. A VPN also gets a badge in the map header, and
-the local link stays listed while one is up.
-
-The tables behind this are folded away: on the map they unfold on a click, in
-the HUD press `m`. Routes are cut down to the ones that say where traffic goes;
-single hosts, multicast, link-local and idle interfaces are left out and
-counted. Everything is read from the operating system every 30 seconds, and
-nothing is sent to find it out.
-
-A selected host gets the same one-line answer, for example
-`10.20.30.41 -> Server -> Ubuntu -> 24.04 (OS read off a service banner)`,
-followed by its open ports. Without an OS scan the system is read off service
-banners where they give it away, and marked as such.
-
-If one of the system tools behind these tables cannot be run, the session says
-so when it starts (`[!] Local network not fully read: ...`) and the summary
-lists it under "Could not be read". An empty table then means it was not read,
-not that there is nothing there.
-
-## Modes
-
-- **light** (default): sends no packets to targets. Reads the local interface,
-  route, neighbour and listener tables, and warns about route problems. Refuses
-  `meow recon` and warns when you type a high-rate scan by hand.
-- **mild**: rate-limited inventory (`nmap -T3`, top 1000 ports, katana depth 2,
-  feroxbuster at 20 requests per second).
-- **aggressive**: full port range, `-T4`, OS detection, katana depth 4,
-  feroxbuster auto-tune.
-
-Recon stages: port inventory, service inventory on the open ports only, web
-crawl (`katana`, kept on the host being crawled: links to other sites are
-neither followed nor stored), directory inventory (`feroxbuster`). Before a
-recon is queued, meow checks that `nmap`, `katana`, `feroxbuster` and a
-wordlist are there. If any is missing it lists them with the stage each one
-is needed for, and asks whether to install them now (`--install-tools`
-installs without asking). Whatever is still missing skips its stage, and the
-map and HUD say so. `meow tools` does the same check at any time. A wordlist
-is looked for in `recon.wordlist_path`, then in the usual system places, then
-in `~/.meow/wordlists/` (the first `.txt` file there). Without root, `-sS` becomes `-sT` and `-O` is dropped.
-
-OS detection, versions and scripts: `meow recon <host> -- -A` (or `-O`, `-sC`,
-`--script default,vuln`). Version detection always runs on the open ports;
-scripts run there too, by category: `default`, `safe`, `vuln`, `discovery`,
-`version`. Scripts that are also intrusive, brute-force, denial-of-service,
-exploits, fuzzers, malware, contact third parties or broadcast to the whole
-network never run, whatever is asked. Every script's result is kept on its
-port or host, and Windows' SMB answer names the system when OS detection
-could not. For any other nmap option, run nmap yourself and `meow add` the
-XML.
-Each tool has a time limit and a 50 MB output cap, and is killed with
-everything it started when the session ends. Unfinished tasks are offered for
-resume the next time the workspace is opened.
-
-Each stage works from what the stage before it found with its own tool, kept
-with the task: the service inventory probes the ports the port inventory found
-open, and the crawl and the directory inventory visit the ports the scanner
-called a web server. Text shown in your terminal can add a host or a port to
-the map, but never a destination to a scan. Likewise a name: a certificate, a
-reverse DNS record or a line of text can name a host only while no other host
-has that name, and only the scanner resolving the name you asked for can move
-it.
-
-The mode also governs what is already queued. Switch to `light` and the tool
-that is running is stopped and the rest waits; switch from `aggressive` to
-`mild` and the running stage starts again with the mild settings. Switching up
-never makes an earlier request more active than it was asked for. A range is
-at most 65,536 addresses (an IPv4 `/16`, an IPv6 `/112`); queue a larger
-network in parts.
-
-## Evidence and conclusions
-
-Every fact carries five fields: `source`, `timestamp_utc`, `confidence`, the
-raw `evidence`, and a `verification_status`. Parsed facts are `Observed`.
-Vulnerability matches are `UnverifiedHypothesis`. Only you can mark one
-`Confirmed` or `FalsePositive` (in the HUD or the map), and an observation can
-never jump straight to confirmed.
-
-Vulnerability lookups use NIST NVD (by CPE name and by keyword), OSV.dev and
-the CISA KEV catalog. They send only software names and versions, are paced to
-NVD's rate limit, cached in the workspace, and fail fast when offline.
-
-A match means "this version number appears in the advisory", nothing more. An
-old server can match a hundred advisories at once, so the map, the HUD and the
-report start with **What to update**: one line per piece of software, naming
-the release that answers all of its matches (`Update Apache httpd 2.4.34 to
-2.4.60 or later, or close 8080/tcp if the service is not needed`) and whether
-that host is this machine or another one. Left out are advisories that name
-the software only as the platform another product runs on, and ones tied to an
-operating system the host does not run. After the update, scan the host again:
-matches the databases no longer return are removed, while anything you marked
-`Confirmed` or `FalsePositive` stays.
-
-## AI tiers (optional, started by hand)
-
-From the HUD: `L`, `C` and `R`. From the map: the buttons on a host.
-
-- **L, local**: an OpenAI-compatible server on your machine
-  (`http://localhost:1234/v1`). Free; nothing leaves: a server on this
-  machine is reached directly, never through a proxy from the environment or
-  the system settings.
-- **C, cloud triage**: three short sections: risk and a verification question,
-  hardening, and a detection rule.
-- **R, grounded research** (with web search): available once a hypothesis has
-  enough stack and route evidence. Sends public identifiers only.
-
-`C` and `R` run on the service you set up: the Claude API with your own Claude
-API key, or OpenRouter (or, for `C`, any other OpenAI-style service).
-
-Before any cloud request, addresses, internal names, paths, user names and
-secrets are replaced by placeholders such as `<<HOST_01>>`, and the request is
-refused if anything private is still detected. A host name is masked when the
-session knows it, when it is an internal one, and otherwise whenever it stands
-under a real top-level domain; the sites of software makers and advisory
-databases are left readable, as are file names. Names a scan reports in its
-own words (`Computer name:`, `NetBIOS_Domain_Name:`, `user=`) are masked
-wherever they appear. Secrets are found by their
-name (`password=`, `DB_PASSWORD=`, `aws_secret_access_key`, a session cookie)
-or their form (tokens, keys, hashes, UUIDs, random-looking strings). A
-password written like an ordinary word, with nothing naming it, cannot be
-told from a word. For that reason your own notes are not sent with a request
-that leaves this machine: the model is only told how many there are. Set
-`cloud_notes = true` under `[ai]` to send them, masked like the rest. The local model `L` gets the
-real text only while it is on this machine and yours: a "local" server at
-another address, or (on Linux) one that another login user runs on this
-machine, gets the same masked text, and the answer says so. Replies are unmasked locally
-and saved to `chats/<host>.md`. A reply gets back only the placeholders its own
-request held, and none inside a link to somewhere else: `https://<<HOST_01>>/admin`
-becomes your target's address, a placeholder in the address of another site
-stays a placeholder. What a model writes is saved as text that formats and
-does nothing else: no image, link or HTML of its making, in the chat file or
-in `REPORT.md` (in code it therefore shows `&lt;` for `<` before a letter).
-Text from scanned hosts is written into the report the same way. Scanned text is passed to the model as data in
-one JSON field, never as instructions. Cloud use is capped per day
-(`max_daily_usd`, `max_daily_calls`); when the cap is reached, `C` answers
-locally. Identical questions are answered from a cache at no cost.
-
-### Your own AI: `meow setup`
-
-Nothing about anyone's AI is built in. Each person who uses meow points it at
-their own model server or adds their own API key:
+To keep the workspace in `./.meow/` inside the current folder instead:
 
 ```sh
-meow setup            # full-screen Cat TUI wizard (on first bare `meow` too!)
-meow setup --plain    # plain line-by-line terminal menu
+meow --local
 ```
 
-Running `meow` with no arguments on a brand-new install (or running `meow setup`
-anytime) opens the interactive Cat-themed setup GUI: pick your default discovery
-mode, sniff local model servers (`p`), paste a cloud or optional NVD API key
-with hidden input, check scanner/wordlist readiness, test endpoints (`t`), and
-optionally launch straight into your first workspace.
+Type `exit` (or press `Ctrl-D`) at any time to close the session shell and save the workspace.
 
-- **A model on your machine**: it looks for LM Studio, Ollama and llama.cpp on
-  their usual ports, lists the models the server offers, and lets you pick one
-  or type another address.
-- **Your Claude API key**: the Claude API is used directly, with
-  `claude-opus-5-5` for both `C` and `R`. Research uses Claude's own web
-  search.
-- **Your OpenRouter key**, or another OpenAI-style service by its address
-  (`R` needs OpenRouter or a Claude key, for the web search).
-- **Remove the key**, or **check that it works** (with a Claude key this also
-  checks that the key is offered every model you named).
+### 2. Run commands or queue background recon
 
-A key is hidden as you type or paste it. Your setup is kept in
-`~/.meow/ai.toml`, which only you can read. It is not part of any workspace or
-repository, a key is never printed (only its last four characters), and a
-session that is already running uses the new setup for its next request.
+Anything you run in the session shell (`nmap`, `ping`, `curl`, `ssh`, `dig`, `git diff`) is observed passively. When a command discovers a host, open port, service banner, HTTP path, or configuration diff, `meow` records it in the workspace graph and looks up matching advisories in the background.
 
-**When a model declines.** With a Claude key, a request that a model's safety
-filter declines is asked again on the next model of your chain, in order. The
-default is `claude-opus-5-5`, then `claude-opus-4-6`, then `claude-opus-4-8`.
-Change it with `--fallback-models`; an empty chain leaves the choice to the
-Claude API. If every model declines, meow says so and names them. Declined
-attempts count toward the daily budget.
-
-**Cost with a Claude key.** The Claude API reports tokens, not money, so meow
-works the cost out from the list prices built into it (as published on
-2026-11-03; a model it does not know is priced as the most expensive one) plus
-one cent per web search. Treat the daily budget as a close estimate there.
-OpenRouter reports the exact cost itself.
-
-The same without questions, for scripts:
+For a full automated inventory of an authorized target, run `meow recon`:
 
 ```sh
-meow setup --provider claude --api-key-stdin < my-claude-key.txt
-meow setup --fallback-models claude-opus-4-6,claude-opus-4-8
-meow setup --provider openrouter --api-key-stdin < my-key.txt   # never as an argument
-meow setup --local-url http://localhost:11434/v1 --local-model llama3.2
-meow setup --show                            # what is set, and where the key comes from
-meow setup --check                           # try it all, exit 1 if something fails
+meow recon scanme.nmap.org
+```
+
+Or pass custom `nmap` flags after `--`:
+
+```sh
+meow recon 192.168.1.0/24 -- -p 22,80,443,8080
+```
+
+### 3. Open the live topology map or HUD
+
+From inside the session (or from another terminal window):
+
+```sh
+meow map          # opens the live topology map in your browser
+meow hud          # opens the terminal TUI companion panel
+```
+
+### 4. Generate the audit report
+
+When you are ready to export your findings:
+
+```sh
+meow report
+```
+
+This writes `REPORT.md` inside the workspace directory (`~/.meow/workspaces/<name>/REPORT.md` or `./.meow/REPORT.md`). You can also export the full workspace report or a single-host report directly from the browser map using **Export report (.md)** or **Print / PDF**.
+
+---
+
+## Command Reference
+
+| Command | Description |
+| :--- | :--- |
+| `meow` | Launch the first-time Cat Setup GUI, or list saved workspaces |
+| `meow <name>` | Open or resume the saved workspace `~/.meow/workspaces/<name>/` |
+| `meow --local` | Open or resume a workspace in `./.meow/` of the current directory |
+| `meow list` (`meow ls`) | List all saved workspaces in `~/.meow/workspaces/` |
+| `meow delete <name>` (`meow rm`) | Delete a saved workspace (`--local` for `./.meow/`, `-y` to skip confirmation) |
+| `meow mode <light\|mild\|noisy>` | Switch the discovery rate/noise profile of the session |
+| `meow recon <target> [-- <nmap_flags>...]` | Queue the 14-stage OSINT & service inventory for a host, domain, IP, or CIDR |
+| `meow map [--no-open]` | Open the live topology map in your browser (or print the URL with `--no-open`) |
+| `meow hud` | Attach the terminal TUI companion panel (`1` Hosts, `2` Queue, `3` Vault, `4` AI) |
+| `meow add <file> [--no-cve]` | Import an Nmap XML, katana/feroxbuster JSONL, log, or `git diff` file |
+| `meow report` | Compile the workspace into `REPORT.md` |
+| `meow setup` | Open the interactive Cat Setup GUI (or pass flags for scriptable setup) |
+| `meow tools [--yes]` | Check companion tools, wordlist, and location database, and install any missing ones |
+| `meow update [--check]` | Upgrade `meow` (via signed GitHub Release or source checkout) and refresh tools |
+
+> **Targeting a workspace from another terminal:** Helper commands (`mode`, `recon`, `map`, `hud`, `add`, `report`) automatically detect the active session when run inside a `meow` shell. From a separate terminal window, add `--session <name>` (or `--local`).
+
+---
+
+## Modes (`light`, `mild`, `noisy`)
+
+Every session runs in one of three modes:
+
+| Mode | Passive shell observation | `meow recon` | Tool pacing |
+| :--- | :--- | :--- | :--- |
+| `light` | Enabled | Disabled (refused) | Passive only — no active background scans |
+| `mild` *(default)* | Enabled | Enabled | Polite pacing (`nmap -T3`, low concurrency, 15 min stage timeout) |
+| `noisy` | Enabled | Enabled | Faster pacing (`nmap -T4`, higher concurrency, 30 min stage timeout) |
+
+Switch modes at any time with:
+
+```sh
+meow mode light
+meow mode mild
+meow mode noisy
+```
+
+---
+
+## What `meow recon` Does (14 Stages)
+
+`meow recon <target>` runs one stage at a time in the background so you can keep using your shell. Follow progress in `meow hud` (tab `2`) or on the live browser map.
+
+1. **`lan`** — Reads your local ARP/NDP neighbour cache and routing table to identify your local gateway and LAN neighbours without sending broadcast traffic.
+2. **`dns`** — Resolves `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT` (SPF/DMARC/verification), and reverse `PTR` records via system DNS with DNS-over-HTTPS fallback.
+3. **`asn`** — Queries Team Cymru DNS and RDAP to identify the target's Autonomous System Number (ASN), BGP prefix, cloud/ISP organization, and country, plus offline GeoIP city coordinates.
+4. **`subdomains`** — Queries Certificate Transparency logs (`crt.sh`) for domain targets to discover associated hostnames and subdomains passively.
+5. **`trace`** — Runs a bounded traceroute (`traceroute`, `tracepath`, or `tracert`) to map intermediate network hops and round-trip latency between your gateway and the target.
+6. **`ports`** — Runs `nmap` to discover open TCP ports on the target.
+7. **`services`** — Runs `nmap -sV` strictly on the open ports found in `ports` to fingerprint service banners, versions, and CPEs.
+8. **`headers`** — Inspects HTTP/HTTPS endpoints for server headers, security headers (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`), HTML `<title>`, `/robots.txt`, `/.well-known/security.txt`, and `/favicon.ico` framework hashes.
+9. **`waf-cdn`** — Detects edge WAF/CDN providers (Cloudflare, AWS CloudFront, Akamai, Fastly, Imperva, Sucuri, Azure Front Door, Google Cloud CDN) from HTTP headers and CNAME chains.
+10. **`tls-audit`** — Inspects TLS certificates (Subject, Issuer, validity dates, Subject Alternative Names) and checks supported TLS protocol versions (`TLSv1.0`–`TLSv1.3`), flagging deprecated protocols or expiring certificates.
+11. **`ssh-audit`** — Performs a zero-authentication RFC 4253 `SSH_MSG_KEXINIT` handshake on open SSH ports to inventory key-exchange, host-key, cipher, and MAC algorithms and flag weak cryptography (`ssh-rsa`, `ssh-dss`, `diffie-hellman-group1-sha1`, CBC/RC4 ciphers, MD5/SHA-1 MACs).
+12. **`cves`** — Grounds discovered product/version CPEs against OSV.dev, NVD, and the CISA Known Exploited Vulnerabilities (KEV) catalog, noting when Linux distribution banners (Ubuntu, Debian, RHEL) indicate backported security patches.
+13. **`crawl`** — Crawls discovered HTTP/HTTPS services with `katana` to inventory linked endpoints.
+14. **`dirs`** — Runs `feroxbuster` with the SecLists `common.txt` wordlist against discovered web services to find unlinked directories and files.
+
+If an external tool (`nmap`, `katana`, `feroxbuster`, `traceroute`, `openssl`) is not installed, `meow` marks that stage `skipped` with a clear reason and continues the remaining stages.
+
+---
+
+## Live Topology Map & Report Export
+
+Run `meow map` to open the local topology view in your browser (`127.0.0.1:<port>`, protected by a per-session token).
+
+- **Vertical OPSEC & transit path** — Traces your traffic from **You (Operator)** → **Local Gateway** → **WAN Egress / VPN Exit** (highlighting whether a VPN tunnel such as `utun`/`wg`/`tun` is active or direct ISP egress is exposed) → **Internet** (click to expand hop-by-hop traceroute latency) → **WAF / CDN Edge** → **ASN / Cloud Provider** compound group → **Target Hosts**.
+- **Host inspector & Associated Hosts** — Click any host node to inspect open ports, HTTP security headers, TLS certificate details, SSH algorithm inventories, discovered web paths, traceroute hops, and CVE hypotheses. Subdomains and TLS SANs discovered via passive OSINT appear in the **Associated Hosts** drawer with a one-click **Queue Recon** button.
+- **Hypothesis verification** — Every CVE match starts as an **Unverified Hypothesis** with a 6-step verification checklist. Confirming or dismissing a hypothesis updates both the map badge and `REPORT.md`.
+- **AI Triage (`[L]` Local / `[C]` Cloud / `[R]` Research)** — Ask a local or cloud AI model to prioritize findings for the selected host. The prompt preview shows the exact masked text (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before anything is sent.
+- **One-click Report Export** — Use **Export report (.md)** or **Print / PDF** in the top bar for the full workspace report, or inside any host drawer for a single-host report.
+
+---
+
+## Configuring AI & Settings (`meow setup`)
+
+Run `meow setup` with no flags to use the interactive **Cat Setup GUI**, or configure settings from the command line:
+
+```sh
+# Show current AI & tool configuration
+meow setup --show
+
+# Test connectivity to your configured local server and cloud API key
+meow setup --check
+
+# Store an OpenRouter or Claude API key safely via standard input (never saved in shell history)
+meow setup --provider openrouter --api-key-stdin
+meow setup --provider claude --api-key-stdin
+
+# Switch to local-only mode (never contact cloud AI services)
+meow setup --local-only --local-url http://127.0.0.1:11434 --local-model qwen2.5-coder:14b
+
+# Remove a stored cloud API key
 meow setup --forget-key
 ```
 
-A key in the environment also works and wins over the file: `ANTHROPIC_API_KEY`
-for the Claude API (`api.anthropic.com`), `OPENROUTER_API_KEY` for OpenRouter
-(`openrouter.ai`). Neither is sent to any other address; for another service,
-store its key with `--api-key-stdin`. It is read when the session starts (unless
-you pick **Local-Only** in `meow setup`, which sets `disable_cloud = true` in
-`~/.meow/ai.toml` and blocks all cloud AI traffic even when environment keys are
-set). Without any cloud key, `C` answers with the local model and `R` is
-unavailable; the map and the HUD say so.
+### Configuration files
 
-A key stays with the service it was entered for: `--provider` or `--cloud-url`
-naming another service, without `--api-key-stdin` in the same command, removes
-the stored key and says so.
+All user configuration lives in `~/.meow/` (or `$MEOW_HOME` if set) with owner-only (`0600`) permissions:
 
-## Configuration
+- **`~/.meow/ai.toml`** — AI provider, model names, local server URL, and API key (managed by `meow setup`).
+- **`~/.meow/config.toml`** — Scanner paths, wordlist path, NVD API key, and offline location database settings. Created automatically on first run with commented defaults:
 
-`~/.meow/config.toml` is created on first use, with comments. Sections:
-`default_mode`, `shell`, `[location]`, `[cve]`, `[recon]`, `[ai]`. Per-workspace overrides
-live in `profile.toml`. Your own AI setup is in `~/.meow/ai.toml` and overrides
-`[ai]`. `MEOW_HOME` moves the base directory.
+```toml
+[recon]
+nmap_bin = "nmap"
+katana_bin = "katana"
+feroxbuster_bin = "feroxbuster"
+wordlist = ""          # empty uses ~/.meow/wordlists/common.txt or system SecLists
 
-## Workspace files
+[cve]
+enabled = true
+nvd_api_key = ""       # optional NVD API key for higher rate limits
 
-```
-~/.meow/workspaces/<name>/
-  session.lock    kernel lock held by the running session
-  runtime.json    port and token of the running session (removed at exit)
-  profile.toml    mode and tool flag overrides
-  replay.sh       every command with its directory and exit code
-  graph.json      hosts, ports, paths, evidence, advisories
-  state.db        tasks, caches, vault, AI usage (SQLite)
-  chats/          AI replies per host
-  tmp/            shell shims and tool output being parsed
-  REPORT.md       written by `meow report`
+[location]
+enabled = true
+database = ""          # empty uses ~/.meow/geo/
 ```
 
-Directories are `0700` and files `0600` (current-user SID ACL on Windows), and
-symlinks are refused. Only use `--local` (`./.meow/`) inside directories you
-own and trust; prefer named workspaces (`meow <name>`) when inspecting
-untrusted folders. Your own shell startup files are never modified.
+---
 
-## Platform status
+## Troubleshooting
 
-Be aware of what has and has not been exercised:
+### `meow update` says `<path> is not a meow git checkout` or I installed via Homebrew
 
-- **macOS**: developed and verified on Apple silicon (`cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, and the full automated test suite
-  including real PTY, Zsh/Bash shims, Cat Setup TUI, HUD, coordinator, CVE,
-  installer and updater tests), plus end-to-end `./install.sh` and Homebrew tap
-  (`Formula/meow.rb`) verification.
-- **Linux**: developed and tested here, including real `nmap` runs against
-  `127.0.0.1` and live NVD, OSV and KEV lookups.
-- **Windows**: `install.ps1` and the Rust codebase (`x86_64-pc-windows-gnu`
-  ACL setup, console modes, Job Objects and PowerShell shim) compile and lint
-  cleanly, but have not yet been executed on a live Windows host.
-- `katana`, `feroxbuster`, OpenRouter and a local model server are exercised
-  through deterministic stand-ins in the automated test suite.
+- **If you installed with Homebrew (`brew install meow`):** Upgrade through Homebrew so Homebrew manages the binary and companion packages:
+  ```sh
+  brew update && brew upgrade meow
+  ```
+  If `brew upgrade meow` says `Error: jrdelt/meow/meow not installed`, install it first with `brew install meow`.
+- **If you installed from a git clone and deleted or moved that folder:** `meow update` automatically falls back to downloading the latest signed prebuilt release from GitHub Releases and installing it in place. If you moved your git clone and want to build from source instead, pass `--source <path-to-meow-clone>` or set `MEOW_SOURCE=<path-to-meow-clone>`.
 
-Use it only on systems you are authorized to assess.
+### macOS says the `.pkg` installer "cannot be opened because it is from an unidentified developer"
+
+Right-click (or Control-click) the `.pkg` file in Finder and choose **Open**, or install it directly from Terminal (which does not require Gatekeeper notarization):
+
+```sh
+sudo installer -pkg meow-0.2.0-macos-universal.pkg -target /
+```
+
+### `meow recon` says it is refused in `light` mode
+
+`light` mode is strictly passive so no active background packets are sent. Switch the session to `mild` (or `noisy`) mode before queuing recon:
+
+```sh
+meow mode mild
+meow recon <target>
+```
+
+### Missing `nmap`, `katana`, `feroxbuster`, wordlist, or location database
+
+Run `meow tools` at any time to check which companion tools and data files are installed and automatically install any missing ones:
+
+```sh
+meow tools
+```
+
+### `meow map` does not open a browser tab (or you are on SSH / headless Linux)
+
+Print the map URL directly to the terminal and open it by hand (or forward the localhost port over SSH):
+
+```sh
+meow map --no-open
+```
+
+### `Already inside meow session '<name>'`
+
+You are already inside an active `meow` shell. Run helper commands (`meow recon`, `meow map`, `meow hud`, `meow report`) directly, or type `exit` first if you want to switch to a different workspace.
+
+### Cloud or local AI requests fail
+
+Run the built-in connectivity check to see which endpoint or key needs attention:
+
+```sh
+meow setup --check
+```
+
+- For **OpenRouter** (`sk-or-...`) or **Claude API** (`sk-ant-...`), run `meow setup` to re-enter your key or switch providers.
+- For **Ollama** (`http://127.0.0.1:11434`) or **LM Studio** (`http://127.0.0.1:1234`), verify the local server is running and has at least one model pulled (`ollama list`).
+
+### Removing `meow`
+
+- **Homebrew:** `brew uninstall meow && brew untap Jrdelt/meow`
+- **Installer / Binary:** Remove `~/.cargo/bin/meow` (or `/usr/local/bin/meow`) and, if you want to remove all saved workspaces and keys, remove `~/.meow`.
+
+---
+
+## Security & License
+
+See [SECURITY.md](SECURITY.md) for how to report a security vulnerability privately. Released under the [MIT License](LICENSE).

@@ -1590,7 +1590,7 @@
 
   function downloadReport(urlPath, fallbackName) {
     var link = document.createElement('a');
-    link.href = urlPath;
+    link.href = withToken(urlPath);
     link.download = fallbackName;
     document.body.appendChild(link);
     link.click();

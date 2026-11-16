@@ -728,7 +728,7 @@ fn current_windows_identity() -> io::Result<&'static WindowsIdentitySids> {
 /// Runs a PowerShell ACL script against `path` (passed via `MEOW_ACL_PATH`,
 /// never interpolated into `-Command`), verifying NTFS owner SID and replacing
 /// the DACL so no pre-existing explicit ACEs for `Everyone` or other accounts
-/// survive (`ISS-032`).
+/// survive.
 #[cfg(windows)]
 fn run_windows_acl_script(path: &Path, script: &str) -> io::Result<()> {
     use std::os::windows::process::CommandExt;

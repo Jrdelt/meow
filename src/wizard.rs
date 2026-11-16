@@ -499,12 +499,12 @@ impl Wizard {
                     );
                 } else {
                     let key = trimmed.to_owned();
-                    if self.cloud_choice == CloudChoice::LocalOnly {
-                        if key.starts_with("sk-ant-") {
+                    if key.starts_with("sk-ant-") {
+                        if self.cloud_choice != CloudChoice::Claude {
                             self.select_cloud_choice(CloudChoice::Claude);
-                        } else {
-                            self.select_cloud_choice(CloudChoice::OpenRouter);
                         }
+                    } else if self.cloud_choice == CloudChoice::LocalOnly {
+                        self.select_cloud_choice(CloudChoice::OpenRouter);
                     }
                     let summary = setup::masked(&key);
                     self.cloud_api_key = Some(key);
@@ -1144,11 +1144,21 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
         hint: tool_hint("wordlist").to_owned(),
     });
     let geo_path = {
-        let db = Path::new(&config.location.database);
-        if db.is_absolute() {
-            db.to_path_buf()
+        let raw = config.location.database.trim();
+        let base = if raw.is_empty() {
+            home.root().join(crate::geoip::DIR)
         } else {
-            home.root().join(db)
+            let db = Path::new(raw);
+            if db.is_absolute() {
+                db.to_path_buf()
+            } else {
+                home.root().join(db)
+            }
+        };
+        if base.extension().and_then(|e| e.to_str()) == Some("mmdb") {
+            base
+        } else {
+            base.join(crate::geoip::CITY_FILE)
         }
     };
     let geo_found = std::fs::symlink_metadata(&geo_path)
@@ -2201,7 +2211,7 @@ mod tests {
         wiz.on_key(key(KeyCode::Enter));
         assert_eq!(wiz.cloud_api_key, None);
 
-        // Broken config.toml with an NVD secret fails Wizard::load without echoing the secret (ISS-029).
+        // Broken config.toml with an NVD secret fails Wizard::load without echoing the secret.
         Config::load_or_create(&home).unwrap();
         crate::workspace::write_private_atomic(
             &home.config_path(),

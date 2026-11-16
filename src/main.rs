@@ -268,7 +268,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         | Command::Update { .. }
         | Command::Tools { .. } => {
             unreachable!(
-                "`list`, `delete`, `setup` and `update` are not session helpers and returned above"
+                "`list`, `delete`, `setup`, `tools` and `update` are not session helpers and returned above"
             )
         }
         Command::Mode { mode, .. } => {
@@ -410,15 +410,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // The opener gets the path of a private page that leads to the
             // map, never the URL: program arguments are visible to every
             // user on the machine, and the URL holds the session token.
-            let page = workspace.tmp_dir().join(webui::OPENER_FILE);
             let opened = !no_open
-                && meow::workspace::create_private_subdir(&workspace.tmp_dir()).is_ok()
-                && meow::workspace::write_private_atomic(
-                    &page,
-                    webui::opener_page(&url).as_bytes(),
-                )
-                .is_ok()
-                && webui::open_in_browser(&page.to_string_lossy());
+                && webui::write_bootstrap(&workspace.tmp_dir(), &url)
+                    .map(|page| webui::open_in_browser(&page.to_string_lossy()))
+                    .unwrap_or(false);
             if opened {
                 println!(
                     "[+] Opened the topology map of '{}' in your browser (127.0.0.1:{})",

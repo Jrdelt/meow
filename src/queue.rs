@@ -1,13 +1,13 @@
 //! The background recon queue.
 //!
-//! `meow recon <target>` queues one task of four stages that run strictly
-//! one at a time: port inventory (`nmap`), service inventory (`nmap -sV` on
-//! the open ports only), web crawl (`katana`) and directory inventory
-//! (`feroxbuster`). Each tool runs with `stdin` closed, in its own process
-//! group (a Job Object on Windows), under a wall-clock timeout and an output
-//! size cap, and writes a structured file to `<workspace>/tmp/` that is
-//! parsed and then deleted. Stage status is kept in `state.db` so an
-//! interrupted task can be resumed when the session is reopened.
+//! `meow recon <target>` queues one task of 14 sequential stages (`lan`, `dns`,
+//! `asn`, `subdomains`, `trace`, `ports`, `services`, `headers`, `waf-cdn`,
+//! `tls-audit`, `ssh-audit`, `cves`, `crawl`, `dirs`) that run strictly one at
+//! a time. External tools (`nmap`, `katana`, `feroxbuster`, `traceroute`,
+//! `openssl`) run with `stdin` closed, under a wall-clock timeout and an output
+//! size cap, and write structured files to `<workspace>/tmp/` that are parsed
+//! and then deleted. Stage status is kept in `state.db` so an interrupted task
+//! can be resumed when the session is reopened.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1978,7 +1978,9 @@ async fn run_stage(
                     0
                 }
             };
-            state.mark_dirty();
+            if changed > 0 {
+                state.mark_dirty();
+            }
             Ok(StageEnd::Done(format!(
                 "{neighbors} neighbours, {routes} routes in ARP/NDP cache ({changed} new facts)"
             )))
@@ -2090,8 +2092,21 @@ async fn run_stage(
                 .local
                 .routes
                 .iter()
-                .find(|r| r.destination == "default" || r.destination == "0.0.0.0/0")
-                .and_then(|r| r.gateway.clone());
+                .filter_map(|r| {
+                    if r.destination == "default"
+                        || r.destination == "0.0.0.0/0"
+                        || r.destination == "::/0"
+                    {
+                        r.gateway.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .find(|gw| {
+                    gw.parse::<std::net::IpAddr>()
+                        .is_ok_and(|g| g.is_ipv4() == resolved_ip.is_ipv4())
+                })
+                .cloned();
             let ip_str = resolved_ip.to_string();
             let (observations, summary) =
                 match crate::osint::run_trace(&ip_str, local_gateway.as_deref()).await {

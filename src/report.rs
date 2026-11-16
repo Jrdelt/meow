@@ -680,7 +680,6 @@ pub fn render_host_report(inputs: &Inputs, address: &str) -> Option<String> {
     let canonical = host.address.clone();
     let chat_file = crate::ai::chat_file_name(&canonical);
     let mut sub_graph = Graph::default();
-    sub_graph.local = inputs.graph.local.clone();
     sub_graph.hosts.insert(canonical.clone(), host.clone());
     let tasks = inputs
         .tasks
@@ -706,8 +705,8 @@ pub fn render_host_report(inputs: &Inputs, address: &str) -> Option<String> {
         generated_utc: inputs.generated_utc.clone(),
         graph: sub_graph,
         tasks,
-        secrets: inputs.secrets.clone(),
-        replay: inputs.replay.clone(),
+        secrets: Vec::new(),
+        replay: None,
         chats,
     };
     Some(render(&filtered))

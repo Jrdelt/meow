@@ -1657,12 +1657,24 @@ impl Coordinator {
         queue::mark_running_interrupted(&lock(&db))?;
         let (tap, tap_rx) = mpsc::channel(TAP_QUEUE);
         // The location database for scanned servers (never falls back to CWD).
-        let geo_dir = if config.location.database.is_empty() {
+        let geo_dir = if config.location.database.trim().is_empty() {
             crate::workspace::MeowHome::from_env()
                 .ok()
                 .map(|home| home.root().join(geoip::DIR))
         } else {
-            Some(PathBuf::from(&config.location.database))
+            let p = PathBuf::from(config.location.database.trim());
+            let resolved = if p.is_absolute() {
+                p
+            } else {
+                crate::workspace::MeowHome::from_env()
+                    .map(|home| home.root().join(&p))
+                    .unwrap_or(p)
+            };
+            if resolved.extension().and_then(|e| e.to_str()) == Some("mmdb") {
+                resolved.parent().map(Path::to_path_buf)
+            } else {
+                Some(resolved)
+            }
         };
         let geo = GeoDb::from_optional_dir(geo_dir);
         let state = Arc::new(State {
