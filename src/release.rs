@@ -498,7 +498,7 @@ fn replace(new: &Path, exe: &Path) -> Result<()> {
                         err.error
                     );
                 }
-                return Ok(());
+                Ok(())
             }
             #[cfg(not(windows))]
             {

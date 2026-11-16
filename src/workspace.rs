@@ -575,7 +575,7 @@ fn is_valid_windows_sid(s: &str) -> bool {
 /// token's default owner SID (which is `S-1-5-32-544` `BUILTIN\Administrators`
 /// when elevated), or `NT AUTHORITY\SYSTEM` (`S-1-5-18`). Any folder or file
 /// created by another unprivileged Windows account fails this check.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(test)]
 fn is_trusted_windows_owner_sid(owner_sid: &str, user_sid: &str, token_owner_sid: &str) -> bool {
     is_valid_windows_sid(owner_sid)
         && (owner_sid.eq_ignore_ascii_case(user_sid)

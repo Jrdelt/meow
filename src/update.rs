@@ -852,7 +852,7 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // --check changes nothing; full update pulls and runs install.sh without running hooks.
-        run(&UpdateArgs {
+        let _ = run(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -860,7 +860,7 @@ mod tests {
         assert!(!clone.join("feat.txt").exists());
         assert!(!install_log.exists());
 
-        run(&UpdateArgs {
+        let _ = run(&UpdateArgs {
             check: false,
             source: Some(clone.clone()),
         })
