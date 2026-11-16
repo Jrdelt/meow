@@ -267,11 +267,28 @@ pub fn is_hidden(ch: char) -> bool {
     )
 }
 
+/// The start of `text`, at most `max` bytes, between two characters.
+pub fn head(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Makes scraped text safe to store, print in a terminal and embed in a
 /// prompt: control characters (including ESC) and characters nobody sees
 /// ([`is_hidden`]) are removed, newlines and tabs become spaces, and the
 /// result is capped at `max` bytes on a character boundary.
+///
+/// Only the start of a long text is looked at (sixteen times `max`, and at
+/// least 4 KiB): megabytes of spaces before the first word would otherwise
+/// be walked through again for every record cut from the same source.
 pub fn sanitize(text: &str, max: usize) -> String {
+    let text = head(text, max.saturating_mul(16).max(4096));
     let mut out = String::with_capacity(text.len().min(max));
     let mut last_space = false;
     for ch in text.chars() {
@@ -350,6 +367,22 @@ pub fn inert_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_start_of_a_long_text_is_looked_at() {
+        // Megabytes of spaces, then a word: the word is too far in to be
+        // evidence, and finding that out does not mean walking there.
+        let padded = format!("{}word", " ".repeat(8 * 1024 * 1024));
+        let started = std::time::Instant::now();
+        for _ in 0..2000 {
+            assert_eq!(sanitize(&padded, EVIDENCE_MAX), "");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(sanitize(&format!("{}word", " ".repeat(1000)), 100), "word");
+        assert_eq!(head("héllo", 2), "h");
+        assert_eq!(head("héllo", 3), "hé");
+        assert_eq!(head("abc", 10), "abc");
+    }
 
     #[test]
     fn characters_nobody_sees_are_removed() {

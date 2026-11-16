@@ -263,13 +263,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 n => format!(", {n} lines skipped"),
             };
             let total = parsed.observations.len();
-            let live = ipc::send(
-                &workspace,
-                &Request::Observations {
-                    items: parsed.observations.clone(),
-                    ground: !no_cve,
-                },
-            )?;
+            // Handed over, not copied: a large import is held once. It
+            // comes back if no session took it.
+            let request = Request::Observations {
+                items: parsed.observations,
+                ground: !no_cve,
+            };
+            let live = ipc::send(&workspace, &request)?;
+            let Request::Observations {
+                items: observations,
+                ..
+            } = request
+            else {
+                unreachable!("built above");
+            };
             if let Some(result) = live {
                 println!(
                     "[+] {} ({}): {total} facts parsed, {} new or updated{skipped}",
@@ -290,7 +297,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // No live session: work on the files directly.
             let path = workspace.graph_path();
             let mut graph = Graph::load(&path)?;
-            let changed = graph.apply_all(parsed.observations);
+            let changed = graph.apply_all(observations);
             graph.save(&path)?;
             if graph.is_full() {
                 println!(

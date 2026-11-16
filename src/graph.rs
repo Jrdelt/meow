@@ -381,6 +381,8 @@ pub struct NotOpen {
 
 /// The longest port list kept for one group of ports that were not open.
 const NOT_OPEN_MAX: usize = 600;
+/// How many such groups (`tcp closed`, `tcp filtered`, ...) one host keeps.
+const MAX_NOT_OPEN_GROUPS: usize = 16;
 
 /// A port list with nothing but numbers, commas and dashes, shortened to
 /// `NOT_OPEN_MAX` at a comma and ending in `,…` when anything was cut.
@@ -1590,8 +1592,12 @@ impl Graph {
                     count,
                     ports,
                 };
-                // The latest scan says which ports are not open now.
+                // The latest scan says which ports are not open now. The
+                // states are words from the file: only so many are kept.
                 let key = format!("{protocol} {state}");
+                if !host.not_open.contains_key(&key) && host.not_open.len() >= MAX_NOT_OPEN_GROUPS {
+                    return false;
+                }
                 host.not_open.insert(key, group.clone()) != Some(group)
             }
             Observation::Script {

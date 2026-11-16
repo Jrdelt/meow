@@ -16,6 +16,9 @@ use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::graph::Observation;
 
 const MAX_LINE: usize = 4096;
+/// How many addresses of sites, and how many `host:port` mentions, one line
+/// may yield. A line packed with hundreds says nothing a scan would.
+const MAX_PER_LINE: usize = 16;
 
 static URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>\\^`{|}]+"#).expect("valid regex"));
@@ -217,10 +220,17 @@ impl TextParser {
         // URLs first; what remains of the line is searched for host:port.
         let mut rest = String::with_capacity(line.len());
         let mut last = 0;
+        // With several addresses on a line, each keeps itself as evidence,
+        // not a copy of the whole line.
+        let crowded = URL.find_iter(line).nth(1).is_some();
+        let mut sites = 0;
         for found in URL.find_iter(line) {
             rest.push_str(&line[last..found.start()]);
             rest.push(' ');
             last = found.end();
+            if sites == MAX_PER_LINE {
+                continue;
+            }
             let text = found
                 .as_str()
                 .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
@@ -232,13 +242,14 @@ impl TextParser {
             }
             let address = url.host.canonical();
             self.web = Some((address.clone(), url.port, url.scheme.clone()));
+            sites += 1;
             out.push(Observation::Path {
                 address,
                 port: url.port,
                 scheme: url.scheme,
                 path: url.path,
                 status: None,
-                record: self.record(Confidence::Low, line),
+                record: self.record(Confidence::Low, if crowded { text } else { line }),
             });
         }
         rest.push_str(&line[last..]);
@@ -246,7 +257,13 @@ impl TextParser {
         let mentions = ENDPOINT_V4
             .captures_iter(&rest)
             .chain(ENDPOINT_V6.captures_iter(&rest));
+        let crowded = crowded
+            || ENDPOINT_V4.find_iter(&rest).count() + ENDPOINT_V6.find_iter(&rest).count() > 1;
+        let mut kept = 0;
         for found in mentions {
+            if kept == MAX_PER_LINE {
+                break;
+            }
             let Some(endpoint) = Endpoint::parse(&found[1]) else {
                 continue;
             };
@@ -267,8 +284,9 @@ impl TextParser {
                 version: None,
                 extra_info: None,
                 cpes: Vec::new(),
-                record: self.record(Confidence::Low, line),
+                record: self.record(Confidence::Low, if crowded { &found[1] } else { line }),
             });
+            kept += 1;
         }
         out
     }
@@ -378,6 +396,49 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
                 json["record"]["verification_status"],
                 serde_json::to_value(VerificationStatus::Observed).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn a_line_packed_with_addresses_yields_a_bounded_number_of_short_facts() {
+        // One 4 KB line: 95 site addresses and 95 host:port mentions.
+        let line: String = (0..95)
+            .map(|n| {
+                format!(
+                    "http://h{n}.example:8{:03}/a 10.9.{}.{}:81 ",
+                    n,
+                    n / 200,
+                    n % 200 + 1
+                )
+            })
+            .collect::<String>();
+        assert!(line.len() < MAX_LINE && line.len() > 3000, "{}", line.len());
+        let mut parser = TextParser::new(Source::PtyRegex);
+        let found = parser.feed(&line);
+        let sites = found
+            .iter()
+            .filter(|o| matches!(o, Observation::Path { .. }))
+            .count();
+        let mentions = found
+            .iter()
+            .filter(|o| matches!(o, Observation::Port { .. }))
+            .count();
+        assert_eq!((sites, mentions), (MAX_PER_LINE, MAX_PER_LINE));
+        // None of them carries a copy of the whole line.
+        for observation in &found {
+            let evidence = match observation {
+                Observation::Path { record, .. } | Observation::Port { record, .. } => {
+                    &record.evidence
+                }
+                other => panic!("{other:?}"),
+            };
+            assert!(evidence.len() < 64, "{evidence}");
+        }
+        // A line about one thing keeps itself as evidence, as before.
+        let found = parser.feed("panel moved to http://10.0.0.5:8080/admin last week");
+        match &found[0] {
+            Observation::Path { record, .. } => assert!(record.evidence.contains("last week")),
+            other => panic!("{other:?}"),
         }
     }
 

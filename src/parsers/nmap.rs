@@ -89,10 +89,86 @@ fn redirect_from_title(output: &str) -> Option<String> {
     WebUrl::parse(url).map(|_| url.to_owned())
 }
 
+/// nmap nests its elements about eight deep.
+const MAX_DEPTH: usize = 64;
+/// Elements and the text between them. A full 50 MB of nmap's XML holds
+/// about a million.
+const MAX_NODES: u32 = 4_000_000;
+/// Names read from one certificate, names of one host, and groups of ports
+/// that were not open: what the graph keeps of each at most.
+const MAX_NAMES_PER_CERT: usize = 128;
+const MAX_NAMES_PER_HOST: usize = 16;
+const MAX_NOT_OPEN_GROUPS: usize = 16;
+/// How much of one script's output is carried along. The graph keeps 2,000
+/// bytes of it; a certificate that lists 160,000 names is megabytes.
+const SCRIPT_OUTPUT_MAX: usize = 8000;
+
+/// Whether the elements of `xml` are nested more than `limit` deep. The
+/// parser descends once per level, and a stack that overflows cannot be
+/// caught: this has to be known before it starts.
+fn nested_deeper_than(xml: &str, limit: usize) -> bool {
+    let bytes = xml.as_bytes();
+    let skip_to = |from: usize, end: &[u8]| -> usize {
+        bytes[from..]
+            .windows(end.len())
+            .position(|window| window == end)
+            .map_or(bytes.len(), |at| from + at + end.len())
+    };
+    let (mut depth, mut at) = (0usize, 0usize);
+    while at < bytes.len() {
+        if bytes[at] != b'<' {
+            at += 1;
+            continue;
+        }
+        let rest = &bytes[at..];
+        if rest.starts_with(b"<!--") {
+            at = skip_to(at, b"-->");
+        } else if rest.starts_with(b"<![CDATA[") {
+            at = skip_to(at, b"]]>");
+        } else if rest.starts_with(b"<?") {
+            at = skip_to(at, b"?>");
+        } else if rest.starts_with(b"<!") {
+            at = skip_to(at, b">");
+        } else if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            at = skip_to(at, b">");
+        } else {
+            // A start tag ends at the first `>` outside a quoted value.
+            let (mut end, mut quote) = (at + 1, 0u8);
+            while end < bytes.len() {
+                match bytes[end] {
+                    b if quote != 0 && b == quote => quote = 0,
+                    b'"' | b'\'' if quote == 0 => quote = bytes[end],
+                    b'>' if quote == 0 => break,
+                    _ => {}
+                }
+                end += 1;
+            }
+            if bytes.get(end.wrapping_sub(1)) != Some(&b'/') {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            at = end + 1;
+        }
+    }
+    false
+}
+
 pub fn parse(xml: &str) -> Result<Vec<Observation>> {
+    // nmap writes `<!DOCTYPE nmaprun>` and declares nothing. A file that
+    // declares entities of its own can make a few kilobytes stand for
+    // gigabytes: a reference to one is replaced by its text each time.
+    if xml.contains("<!ENTITY") {
+        anyhow::bail!("the file declares its own XML entities, which nmap never writes");
+    }
+    if nested_deeper_than(xml, MAX_DEPTH) {
+        anyhow::bail!("the file's XML is nested more than {MAX_DEPTH} elements deep");
+    }
     let options = ParsingOptions {
         allow_dtd: true, // nmap writes <!DOCTYPE nmaprun>
-        ..ParsingOptions::default()
+        nodes_limit: MAX_NODES,
     };
     let doc = Document::parse_with_options(xml, options).context("not well-formed XML")?;
     let root = doc.root_element();
@@ -139,7 +215,7 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
         });
 
         if let Some(names) = child(host, "hostnames") {
-            for name in children(names, "hostname") {
+            for name in children(names, "hostname").take(MAX_NAMES_PER_HOST) {
                 if let Some(hostname) = attr(name, "name") {
                     // `user`: the name the scan was pointed at, resolved by
                     // the scanner. Anything else (`PTR`) is what the owner
@@ -180,8 +256,12 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                 .iter()
                 .find_map(|r| attr(*r, "proto"))
                 .unwrap_or_else(|| "tcp".to_owned());
-            let group = not_open.entry((protocol, state)).or_default();
-            group.0 += count;
+            let key = (protocol, state);
+            if !not_open.contains_key(&key) && not_open.len() >= MAX_NOT_OPEN_GROUPS {
+                continue;
+            }
+            let group = not_open.entry(key).or_default();
+            group.0 = group.0.saturating_add(count);
             for reason in reasons {
                 port_ranges(reason.attribute("ports").unwrap_or(""), &mut group.1);
             }
@@ -195,9 +275,12 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                 .unwrap_or_else(|| "open".to_owned());
             if state != "open" && state != "open|filtered" {
                 let protocol = attr(port, "protocol").unwrap_or_else(|| "tcp".to_owned());
-                let group = not_open.entry((protocol, state)).or_default();
-                group.0 += 1;
-                group.1.push((number, number));
+                let key = (protocol, state);
+                if not_open.contains_key(&key) || not_open.len() < MAX_NOT_OPEN_GROUPS {
+                    let group = not_open.entry(key).or_default();
+                    group.0 = group.0.saturating_add(1);
+                    group.1.push((number, number));
+                }
                 continue;
             }
             let protocol = match attr(port, "protocol") {
@@ -256,7 +339,10 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                 let output = script.attribute("output").unwrap_or("");
                 match script.attribute("id") {
                     Some("ssl-cert") => {
-                        for san in sans_from_ssl_cert(output) {
+                        for san in sans_from_ssl_cert(output)
+                            .into_iter()
+                            .take(MAX_NAMES_PER_CERT)
+                        {
                             out.push(Observation::TlsSan {
                                 address: address.clone(),
                                 port: number,
@@ -307,7 +393,7 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                         port: Some(number),
                         protocol: protocol.clone(),
                         id,
-                        output: output.to_owned(),
+                        output: crate::evidence::head(output, SCRIPT_OUTPUT_MAX).to_owned(),
                         record: EvidenceRecord::observed(
                             Source::NmapXml,
                             Confidence::High,
@@ -368,7 +454,7 @@ fn host_scripts(xml: &str, host: Node, address: &str, os_known: bool, out: &mut 
             port: None,
             protocol: "tcp".to_owned(),
             id,
-            output: output.to_owned(),
+            output: crate::evidence::head(output, SCRIPT_OUTPUT_MAX).to_owned(),
             record,
         });
     }
@@ -602,6 +688,111 @@ mod tests {
         ]><nmaprun><host><address addr="&h;" addrtype="ipv4"/></host></nmaprun>"#;
         // Either rejected or parsed without producing a host; never a hang.
         assert!(parse(bomb).map(|o| o.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn a_small_hostile_file_cannot_take_the_memory_or_the_stack() {
+        let started = std::time::Instant::now();
+        // 23 KB that stand for 5.7 GB: entity a is 4,000 bytes, b is 250
+        // times a, and one attribute holds 6,000 times b. Not nested deep
+        // enough for the parser's own limit to see it.
+        let bomb = format!(
+            "<?xml version=\"1.0\"?><!DOCTYPE nmaprun [<!ENTITY a \"{}\"><!ENTITY b \"{}\">]>\
+             <nmaprun><host><address addr=\"{}\" addrtype=\"ipv4\"/></host></nmaprun>",
+            "a".repeat(4000),
+            "&a;".repeat(250),
+            "&b;".repeat(6000)
+        );
+        assert!(bomb.len() < 30_000);
+        let error = format!("{:#}", parse(&bomb).unwrap_err());
+        assert!(error.contains("declares its own XML entities"), "{error}");
+
+        // 1,500 elements inside one another (10 KB) ended the program on a
+        // stack overflow. So would 2,000,000 in a file of the size allowed.
+        for depth in [1500usize, 2_000_000] {
+            let deep = format!(
+                "<nmaprun>{}{}</nmaprun>",
+                "<a>".repeat(depth),
+                "</a>".repeat(depth)
+            );
+            let error = format!("{:#}", parse(&deep).unwrap_err());
+            assert!(
+                error.contains("nested more than 64 elements deep"),
+                "{error}"
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+
+        // What nmap writes is not deep, however much of it there is, and a
+        // `>` or a tag-like text inside a value or a comment is not a level.
+        assert!(!nested_deeper_than(SAMPLE, 8), "nmap's own output");
+        assert!(nested_deeper_than(SAMPLE, 3));
+        let wide = format!(
+            "<r>{}</r>",
+            "<a b=\"x>y\" c='<z>'/><!-- <d><d><d> --><e></e>".repeat(1000)
+        );
+        assert!(!nested_deeper_than(&wide, 2));
+        assert!(nested_deeper_than("<a><b><c/></b></a>", 1));
+        assert!(!nested_deeper_than("<a><b><c/></b></a>", 2));
+        assert!(!nested_deeper_than("<![CDATA[<a><a><a>]]><?pi <a><a>?>", 0));
+        assert!(parse(SAMPLE).is_ok(), "the DOCTYPE nmap writes is fine");
+    }
+
+    #[test]
+    fn one_element_yields_a_bounded_number_of_facts() {
+        // A certificate with 160,000 names, a host with 4,000 kinds of
+        // "not open" and 2 MB of padding before its ports, and 500 names.
+        let names: String = (0..160_000)
+            .map(|n| format!("DNS:n{n}.example, "))
+            .collect();
+        let states: String = (0..4000)
+            .map(|n| {
+                format!(
+                    "<port protocol=\"tcp\" portid=\"{}\"><state state=\"s{n}\"/></port>",
+                    n % 60000 + 1
+                )
+            })
+            .collect();
+        let hostnames: String = (0..500)
+            .map(|n| format!("<hostname name=\"h{n}.example\" type=\"PTR\"/>"))
+            .collect();
+        let xml = format!(
+            "<nmaprun><host><status state=\"up\"/><address addr=\"10.0.0.5\" addrtype=\"ipv4\"/>\
+             <hostnames>{hostnames}</hostnames><ports>{}{states}\
+             <extraports state=\"closed\" count=\"4294967295\"/><extraports state=\"closed\" count=\"4294967295\"/>\
+             <port protocol=\"tcp\" portid=\"443\"><state state=\"open\"/>\
+             <script id=\"ssl-cert\" output=\"Subject Alternative Name: {names}\"/></port></ports></host></nmaprun>",
+            " ".repeat(2 * 1024 * 1024)
+        );
+        let started = std::time::Instant::now();
+        let observations = parse(&xml).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let count =
+            |wanted: fn(&Observation) -> bool| observations.iter().filter(|o| wanted(o)).count();
+        assert_eq!(
+            count(|o| matches!(o, Observation::TlsSan { .. })),
+            MAX_NAMES_PER_CERT
+        );
+        assert_eq!(
+            count(|o| matches!(o, Observation::NotOpen { .. })),
+            MAX_NOT_OPEN_GROUPS
+        );
+        assert_eq!(
+            count(|o| matches!(o, Observation::Hostname { .. })),
+            MAX_NAMES_PER_HOST
+        );
+        // Two counts that do not fit a number together do not end the program.
+        assert!(observations.iter().any(|o| matches!(o, Observation::NotOpen { state, count, .. } if state == "closed" && *count == u32::MAX)));
+        // Each record is cut from the start of its source, not walked whole.
+        let weight: usize = observations
+            .iter()
+            .map(|o| serde_json::to_string(o).unwrap().len())
+            .sum();
+        assert!(weight < 2 * 1024 * 1024, "{weight}");
     }
 
     #[test]
