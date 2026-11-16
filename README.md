@@ -350,7 +350,13 @@ that leaves this machine: the model is only told how many there are. Set
 real text only while it is on this machine and yours: a "local" server at
 another address, or (on Linux) one that another login user runs on this
 machine, gets the same masked text, and the answer says so. Replies are unmasked locally
-and saved to `chats/<host>.md`. Scanned text is passed to the model as data in
+and saved to `chats/<host>.md`. A reply gets back only the placeholders its own
+request held, and none inside a link to somewhere else: `https://<<HOST_01>>/admin`
+becomes your target's address, a placeholder in the address of another site
+stays a placeholder. What a model writes is saved as text that formats and
+does nothing else: no image, link or HTML of its making, in the chat file or
+in `REPORT.md` (in code it therefore shows `&lt;` for `<` before a letter).
+Text from scanned hosts is written into the report the same way. Scanned text is passed to the model as data in
 one JSON field, never as instructions. Cloud use is capped per day
 (`max_daily_usd`, `max_daily_calls`); when the cap is reached, `C` answers
 locally. Identical questions are answered from a cache at no cost.

