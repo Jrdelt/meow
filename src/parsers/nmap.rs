@@ -141,12 +141,20 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
         if let Some(names) = child(host, "hostnames") {
             for name in children(names, "hostname") {
                 if let Some(hostname) = attr(name, "name") {
+                    // `user`: the name the scan was pointed at, resolved by
+                    // the scanner. Anything else (`PTR`) is what the owner
+                    // of the address makes its reverse record say.
+                    let asked_for = attr(name, "type").is_some_and(|kind| kind == "user");
                     out.push(Observation::Hostname {
                         address: address.clone(),
                         hostname,
                         record: EvidenceRecord::observed(
                             Source::NmapXml,
-                            Confidence::Medium,
+                            if asked_for {
+                                Confidence::High
+                            } else {
+                                Confidence::Medium
+                            },
                             raw(xml, name),
                         ),
                     });
@@ -468,10 +476,7 @@ mod tests {
         let host = &graph.hosts["10.0.0.5"];
         assert_eq!(host.os.as_deref(), Some("Linux 5.4"));
         assert_eq!(host.mac.as_deref(), Some("00:0C:29:AA:BB:CC"));
-        assert_eq!(
-            host.hostnames.iter().collect::<Vec<_>>(),
-            ["app.lab.local", "portal.lab.local"]
-        );
+        assert_eq!(host.hostnames.iter().collect::<Vec<_>>(), ["app.lab.local"]);
         // Filtered ports are not recorded; open|filtered UDP is.
         assert_eq!(
             host.ports.keys().collect::<Vec<_>>(),

@@ -67,10 +67,13 @@ impl Lab {
         config.recon.nmap = tool(
             "nmap",
             &format!(
-                "{}[ -f '{fail}' ] && exit 1\ncase \" $* \" in\n*' -sV '*) cat > \"$out\" <<'XML'\n{SERVICES_XML}\nXML\n;;\n\
-                 *) cat > \"$out\" <<'XML'\n{PORTS_XML}\nXML\n;;\nesac",
+                // A test may put its own answers in ports.xml / services.xml.
+                "{}[ -f '{fail}' ] && exit 1\ncase \" $* \" in\n\
+                 *' -sV '*) if [ -f '{own}/services.xml' ]; then cat '{own}/services.xml' > \"$out\"; else cat > \"$out\" <<'XML'\n{SERVICES_XML}\nXML\nfi\n;;\n\
+                 *) if [ -f '{own}/ports.xml' ]; then cat '{own}/ports.xml' > \"$out\"; else cat > \"$out\" <<'XML'\n{PORTS_XML}\nXML\nfi\n;;\nesac",
                 find("-oX", "out"),
                 fail = fail.display(),
+                own = tmp.path().display(),
             ),
         );
         config.recon.katana = tool(
@@ -208,17 +211,17 @@ fn four_stages_run_in_order_one_at_a_time_and_fill_the_graph() {
     );
     assert!(
         calls[2].contains(" -sV ")
-            && calls[2].contains(" -p 22,443,80 ")
+            && calls[2].contains(" -p 22,80,443 ")
             && calls[2].ends_with(" -- 10.0.0.5"),
         "{}",
         calls[2]
     );
     assert!(
-        calls[4].contains("-u https://10.0.0.5 -jsonl -silent -nc -jc -fs fqdn -ct 5m -d 2 -o "),
+        calls[4].contains("-u http://10.0.0.5 -jsonl -silent -nc -jc -fs fqdn -ct 5m -d 2 -o "),
         "{}",
         calls[4]
     );
-    assert!(calls[6].contains("-u http://10.0.0.5 "), "{}", calls[6]);
+    assert!(calls[6].contains("-u https://10.0.0.5 "), "{}", calls[6]);
     assert!(
         calls[8].contains("--rate-limit 20 --scan-limit 1 --auto-bail --time-limit 10m --json -o "),
         "{}",
@@ -607,6 +610,174 @@ fn light_mode_stops_a_stage_between_its_runs() {
     wait_finished(&coordinator, id);
     assert_eq!(statuses(&coordinator, id), ["done"; 4]);
     assert_eq!(crawls(&lab), 3);
+}
+
+/// Text as the session's shell showed it, taken into the graph the way the
+/// terminal tap does.
+fn shown_in_the_terminal(coordinator: &Coordinator, text: &str) {
+    use meow::evidence::Source;
+    use meow::parsers::text::TextParser;
+    let items = TextParser::parse(Source::PtyRegex, text);
+    assert!(!items.is_empty(), "the text was understood");
+    coordinator
+        .state()
+        .execute(Command::Observations {
+            items,
+            ground: false,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_name_claimed_in_terminal_text_does_not_redirect_a_scan_of_that_name() {
+    let lab = Lab::new();
+    // The scanner resolves the name the user asked for to its real address.
+    std::fs::write(
+        lab.file("ports.xml"),
+        r#"<nmaprun><host><status state="up"/><address addr="203.0.113.50" addrtype="ipv4"/>
+<hostnames><hostname name="corp-web.example" type="user"/></hostnames><ports>
+<port protocol="tcp" portid="443"><state state="open"/><service name="https" method="table" conf="3"/></port>
+</ports></host></nmaprun>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        lab.file("services.xml"),
+        r#"<nmaprun><host><status state="up"/><address addr="203.0.113.50" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="443"><state state="open"/><service name="http" tunnel="ssl" product="nginx" method="probed" conf="10"/></port>
+</ports></host></nmaprun>"#,
+    )
+    .unwrap();
+    let coordinator = lab.start();
+    // A page shown in the terminal names another address as that site, one
+    // that sorts before the real one.
+    shown_in_the_terminal(
+        &coordinator,
+        "Welcome. Mirror: http://198.51.100.7/\nServer: x\nLocation: https://corp-web.example/\n\
+         Nmap scan report for corp-web.example (198.51.100.7)\n80/tcp open http nginx 1.0\n",
+    );
+    assert!(coordinator
+        .state()
+        .graph()
+        .hosts
+        .contains_key("198.51.100.7"));
+
+    let id = recon(&coordinator, "corp-web.example");
+    wait_finished(&coordinator, id);
+    let calls = lab.calls();
+    assert!(
+        !calls.iter().any(|call| call.contains("198.51.100.7")),
+        "a tool was sent to the claimed address: {calls:#?}"
+    );
+    // Every later stage went to what the port inventory found.
+    assert!(calls[0].ends_with(" -- corp-web.example"), "{}", calls[0]);
+    assert!(
+        calls[2].contains(" -sV ")
+            && calls[2].contains(" -p 443 ")
+            && calls[2].ends_with(" -- 203.0.113.50"),
+        "{}",
+        calls[2]
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("start katana")
+                && call.contains("-u https://203.0.113.50 ")),
+        "{calls:#?}"
+    );
+    assert_eq!(statuses(&coordinator, id), ["done"; 4]);
+    // And the name is the real host's now, whoever claimed it first.
+    let state = coordinator.state();
+    assert_eq!(
+        state.graph().host("corp-web.example").unwrap().address,
+        "203.0.113.50"
+    );
+}
+
+#[test]
+fn ports_that_only_terminal_text_calls_open_are_not_probed_or_crawled() {
+    let lab = Lab::new();
+    let coordinator = lab.start();
+    shown_in_the_terminal(
+        &coordinator,
+        "status page moved to http://10.0.0.20:9100/\nServer: x\n\
+         Discovered open port 6379/tcp on 10.0.0.21\n\
+         see also http://10.0.0.5:8081/ for the old panel\nServer: y\n",
+    );
+    {
+        let state = coordinator.state();
+        let graph = state.graph();
+        assert_eq!(graph.hosts["10.0.0.20"].ports["9100/tcp"].state, "open");
+        assert_eq!(graph.hosts["10.0.0.21"].ports["6379/tcp"].state, "open");
+    }
+    // The port inventory finds one host: 10.0.0.5 with 22, 80 and 443.
+    let id = recon(&coordinator, "10.0.0.0/24");
+    wait_finished(&coordinator, id);
+    assert_eq!(statuses(&coordinator, id), ["done"; 4]);
+    let calls = lab.calls();
+    for never in ["10.0.0.20", "10.0.0.21", "9100", "6379", "8081"] {
+        assert!(
+            !calls.iter().any(|call| call.contains(never)),
+            "{never} was probed: {calls:#?}"
+        );
+    }
+    assert!(calls[2].contains(" -p 22,80,443 ") && calls[2].ends_with(" -- 10.0.0.5"));
+    let crawled: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.starts_with("start katana") || call.starts_with("start feroxbuster"))
+        .collect();
+    assert_eq!(
+        crawled.len(),
+        4,
+        "two sites, crawled and listed: {crawled:#?}"
+    );
+}
+
+#[test]
+fn what_a_stage_found_is_checked_again_when_read_back() {
+    let lab = Lab::new();
+    std::fs::write(lab.file("hold"), "").unwrap();
+    let coordinator = lab.start();
+    let id = recon(&coordinator, "10.0.0.0/24");
+    wait_until("the port stage to start", || lab.calls().len() == 1);
+    coordinator.shutdown();
+    std::fs::remove_file(lab.file("hold")).unwrap();
+
+    // Someone with the workspace folder marks the port stage done and
+    // writes in what it "found": addresses outside the range, and a web
+    // port that is not among the open ones.
+    {
+        let db = meow::db::Db::open(&lab.workspace.state_db_path()).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE task_stages SET status = 'done', found = ?2 WHERE task_id = ?1 AND stage = 'ports'",
+                rusqlite::params![
+                    id,
+                    r#"{"up":3,"hosts":{"8.8.8.8":[53],"10.0.0.9":[22],"not an address":[1]},
+                        "web":[["8.8.8.8",53,false],["10.0.0.9",8080,true],["10.0.0.9",22,false]]}"#
+                ],
+            )
+            .unwrap();
+    }
+    let coordinator = lab.start();
+    coordinator.state().resume_unfinished().unwrap();
+    wait_finished(&coordinator, id);
+    let calls = lab.calls();
+    assert!(
+        !calls.iter().any(|call| call.contains("8.8.8.8")),
+        "{calls:#?}"
+    );
+    // The one entry inside the range is used as it stands.
+    assert!(
+        calls.iter().any(|call| call.contains(" -sV ")
+            && call.contains(" -p 22 ")
+            && call.ends_with(" -- 10.0.0.9")),
+        "{calls:#?}"
+    );
+    // A web port that is not among the open ones is not visited.
+    assert!(
+        !calls.iter().any(|call| call.contains(":8080")),
+        "{calls:#?}"
+    );
 }
 
 #[test]

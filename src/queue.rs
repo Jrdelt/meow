@@ -9,6 +9,7 @@
 //! parsed and then deleted. Stage status is kept in `state.db` so an
 //! interrupted task can be resumed when the session is reopened.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,7 +24,7 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::coordinator::State;
 use crate::db::Db;
 use crate::endpoint::{HostAddr, Target};
-use crate::graph::{Graph, Host};
+use crate::graph::{Graph, Host, Observation};
 use crate::mode::Mode;
 use crate::parsers;
 use crate::timeutil::now_rfc3339;
@@ -1373,6 +1374,8 @@ fn running_mode(state: &State, task: &TaskRow) -> Mode {
     task.mode.min(state.mode())
 }
 
+/// The hosts of the graph a target names, for looking up what is known
+/// about them. Never for deciding where a tool is sent: see [`Found`].
 fn hosts_in_target(graph: &Graph, target: &Target) -> Vec<Host> {
     match target {
         Target::Host(HostAddr::Name(name)) => graph.host(name).cloned().into_iter().collect(),
@@ -1389,41 +1392,193 @@ fn hosts_in_target(graph: &Graph, target: &Target) -> Vec<Host> {
     }
 }
 
-/// Parses a tool's output file into the graph, then deletes it.
-fn ingest(state: &State, output: &Path) -> Result<usize> {
-    ingest_only(state, output, None).map(|(changed, _)| changed)
+/// What a stage's own tool reported, kept with the task for the stages
+/// after it. They work from this alone and never from what the graph
+/// holds: the graph also learns from text shown in the terminal, and a line
+/// of text can call any port open and give any name to any address. The
+/// service stage probes the ports the port inventory found, and the crawl
+/// and directory stages visit what the scanner itself called a web server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Found {
+    /// How many hosts answered.
+    pub up: usize,
+    /// Addresses with their open TCP ports.
+    pub hosts: BTreeMap<String, Vec<u16>>,
+    /// Open ports the scanner called HTTP or HTTPS: (address, port, https).
+    pub web: Vec<(String, u16, bool)>,
 }
 
-type Names = std::collections::BTreeSet<String>;
+/// The most hosts and web ports kept for one task.
+const MAX_FOUND: usize = 4096;
 
-/// Like [`ingest`], but with `only` set, observations about any other host
-/// are dropped: a crawler reports the links a page makes to other sites,
-/// which says nothing about those sites. Returns the facts changed and the
-/// other hosts that were left out.
-fn ingest_only(state: &State, output: &Path, only: Option<&Names>) -> Result<(usize, Names)> {
-    let result = parsers::parse_file(output).map(|parsed| {
-        let mut dropped = Names::new();
-        let kept: Vec<_> = parsed
-            .observations
-            .into_iter()
-            .filter(|observation| {
-                let Some(names) = only else { return true };
-                let address = observation.address().unwrap_or("").to_ascii_lowercase();
-                let keep = names.contains(&address);
-                if !keep && !address.is_empty() {
-                    dropped.insert(address);
-                }
-                keep
-            })
-            .collect();
-        let changed = state.graph().apply_all(kept);
-        if changed > 0 {
-            state.mark_dirty();
+impl Found {
+    /// Whether a tool may be sent to `address` for `target`. For a range
+    /// or an address: inside it. For a name: the scanner resolved it, so
+    /// any address it reported.
+    fn belongs(address: &str, target: &Target) -> bool {
+        match (address.parse::<IpAddr>(), target) {
+            (Ok(_), Target::Host(HostAddr::Name(_))) => true,
+            (Ok(ip), _) => target.contains(ip),
+            (Err(_), _) => false,
         }
-        (changed, dropped)
+    }
+
+    /// Reads it out of a scanner's own output.
+    fn of(observations: &[Observation], target: &Target) -> Self {
+        let mut found = Found::default();
+        let mut up = BTreeSet::new();
+        let canonical = |address: &str| {
+            HostAddr::parse(address)
+                .map(|addr| addr.canonical())
+                .filter(|addr| Self::belongs(addr, target))
+        };
+        for observation in observations {
+            match observation {
+                Observation::Host { address, .. } => {
+                    up.extend(canonical(address));
+                }
+                Observation::Port {
+                    address,
+                    port,
+                    protocol,
+                    state,
+                    service,
+                    ..
+                } if protocol == "tcp" && state == "open" => {
+                    let Some(address) = canonical(address) else {
+                        continue;
+                    };
+                    let ports = found.hosts.entry(address.clone()).or_default();
+                    if !ports.contains(port) {
+                        ports.push(*port);
+                    }
+                    let service = service.as_deref().unwrap_or("");
+                    if service.contains("http") {
+                        let https = service.contains("https") || service.starts_with("ssl/");
+                        found.web.push((address, *port, https));
+                    }
+                }
+                Observation::Http {
+                    address,
+                    port,
+                    scheme,
+                    ..
+                } => {
+                    if let Some(address) = canonical(address) {
+                        found.web.push((address, *port, scheme == "https"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        found.up = up.len();
+        found.checked(target)
+    }
+
+    /// Drops whatever a tool may not be sent to. Applied to what was just
+    /// parsed and again to what is read back from the database, which is
+    /// only as trustworthy as the workspace folder.
+    fn checked(mut self, target: &Target) -> Self {
+        self.hosts
+            .retain(|address, ports| Self::belongs(address, target) && !ports.is_empty());
+        while self.hosts.len() > MAX_FOUND {
+            self.hosts.pop_last();
+        }
+        for ports in self.hosts.values_mut() {
+            ports.sort_unstable();
+            ports.dedup();
+        }
+        // A web port is one of the open ports; said twice, once as HTTPS,
+        // it is HTTPS.
+        let mut web: Vec<(String, u16, bool)> = Vec::new();
+        for (address, port, https) in std::mem::take(&mut self.web) {
+            if !self
+                .hosts
+                .get(&address)
+                .is_some_and(|ports| ports.contains(&port))
+            {
+                continue;
+            }
+            match web.iter().position(|(a, p, _)| *a == address && *p == port) {
+                Some(known) => web[known].2 |= https,
+                None if web.len() < MAX_FOUND => web.push((address, port, https)),
+                None => {}
+            }
+        }
+        self.web = web;
+        self
+    }
+
+    fn load(db: &Db, task: i64, stage: Stage, target: &Target) -> Self {
+        db.conn()
+            .query_row(
+                "SELECT found FROM task_stages WHERE task_id = ?1 AND stage = ?2",
+                params![task, stage.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|json| serde_json::from_str::<Found>(&json).ok())
+            .unwrap_or_default()
+            .checked(target)
+    }
+
+    fn save(&self, db: &Db, task: i64, stage: Stage) -> Result<()> {
+        db.conn().execute(
+            "UPDATE task_stages SET found = ?3 WHERE task_id = ?1 AND stage = ?2",
+            params![task, stage.as_str(), serde_json::to_string(self)?],
+        )?;
+        Ok(())
+    }
+
+    fn open_ports(&self) -> usize {
+        self.hosts.values().map(Vec::len).sum()
+    }
+}
+
+type Names = BTreeSet<String>;
+
+/// Reads a scanner's XML output, then deletes the file. A stage knows what
+/// its tool writes: the format is never guessed from the content, part of
+/// which the scanned server chose.
+fn read_scan(output: &Path) -> Result<Vec<Observation>> {
+    let parsed = parsers::read_capped(output).and_then(|xml| {
+        parsers::nmap::parse(&xml).with_context(|| format!("cannot parse {}", output.display()))
     });
     let _ = std::fs::remove_file(output);
-    result
+    parsed
+}
+
+/// Reads a crawler's JSON Lines output, then deletes the file.
+fn read_lines(output: &Path) -> Result<Vec<Observation>> {
+    let parsed = parsers::read_capped(output).map(|text| parsers::jsonl::parse(&text).0);
+    let _ = std::fs::remove_file(output);
+    parsed
+}
+
+/// Records observations in the graph. With `only` set, those about any
+/// other host are dropped: a crawler reports the links a page makes to
+/// other sites, which says nothing about those sites. Returns the facts
+/// changed and the other hosts that were left out.
+fn record(state: &State, observations: Vec<Observation>, only: Option<&Names>) -> (usize, Names) {
+    let mut dropped = Names::new();
+    let kept: Vec<_> = observations
+        .into_iter()
+        .filter(|observation| {
+            let Some(names) = only else { return true };
+            let address = observation.address().unwrap_or("").to_ascii_lowercase();
+            let keep = names.contains(&address);
+            if !keep && !address.is_empty() {
+                dropped.insert(address);
+            }
+            keep
+        })
+        .collect();
+    let changed = state.graph().apply_all(kept);
+    if changed > 0 {
+        state.mark_dirty();
+    }
+    (changed, dropped)
 }
 
 fn describe_failure(program: &str, outcome: &RunOutcome, limits: RunLimits) -> String {
@@ -1486,36 +1641,34 @@ async fn run_stage(
             let answered = std::fs::read_to_string(&command.output)
                 .ok()
                 .and_then(|xml| nmap_hosts_up(&xml));
-            let changed = ingest(state, &command.output)?;
-            let hosts = hosts_in_target(&state.graph(), target);
-            let open: usize = hosts.iter().map(|h| h.open_ports().count()).sum();
+            let observations = read_scan(&command.output)?;
+            let found = Found::of(&observations, target);
+            found.save(&state.db_lock(), task.id, stage)?;
+            let (changed, _) = record(state, observations, None);
             let silent = if answered == Some(0) {
                 discovery_hint(&task.extra_flags)
             } else {
                 String::new()
             };
             Ok(StageEnd::Done(format!(
-                "{} hosts up, {open} open ports ({changed} new facts){silent}",
-                hosts.len()
+                "{} hosts up, {} open ports ({changed} new facts){silent}",
+                found.up,
+                found.open_ports()
             )))
         }
         Stage::Services => {
-            let hosts: Vec<(String, Vec<u16>)> = hosts_in_target(&state.graph(), target)
+            // The ports the port inventory of this task found open.
+            let inventory = Found::load(&state.db_lock(), task.id, Stage::Ports, target);
+            let hosts: Vec<(String, Vec<u16>)> = inventory
+                .hosts
                 .iter()
-                .map(|host| {
-                    let ports = host
-                        .open_ports()
-                        .filter(|p| p.protocol == "tcp")
-                        .map(|p| p.number)
-                        .collect::<Vec<_>>();
-                    (host.address.clone(), ports)
-                })
-                .filter(|(_, ports)| !ports.is_empty())
+                .map(|(address, ports)| (address.clone(), ports.clone()))
                 .take(MAX_HOSTS_PER_STAGE)
                 .collect();
             if hosts.is_empty() {
                 return Ok(StageEnd::Skipped("no open TCP ports to inspect".to_owned()));
             }
+            let mut seen = Vec::new();
             let mut changed = 0;
             for (index, (address, ports)) in hosts.iter().enumerate() {
                 let (command, notices) = services_command(
@@ -1541,31 +1694,48 @@ async fn run_stage(
                     let _ = std::fs::remove_file(&command.output);
                     bail!(describe_failure(&command.program, &outcome, limits));
                 }
-                changed += ingest(state, &command.output)?;
+                let observations = read_scan(&command.output)?;
+                seen.extend(observations.iter().cloned());
+                changed += record(state, observations, None).0;
             }
+            // What the probes called a web server, on ports the inventory
+            // found open: that is where the next stages go.
+            let mut probed = Found::of(&seen, target);
+            probed.hosts = inventory.hosts.clone();
+            probed
+                .checked(target)
+                .save(&state.db_lock(), task.id, stage)?;
             Ok(StageEnd::Done(format!(
                 "{} hosts inspected ({changed} new facts)",
                 hosts.len()
             )))
         }
         Stage::Crawl | Stage::Dirs => {
-            let in_target = hosts_in_target(&state.graph(), target);
-            // What a crawl may add to: the hosts being crawled, by address
-            // or by any name they are known under.
-            let names: Names = in_target
+            // The web servers the service inventory of this task found, or
+            // without one, those the port inventory named.
+            let probed = {
+                let db = state.db_lock();
+                let services = Found::load(&db, task.id, Stage::Services, target);
+                match services.web.is_empty() {
+                    true => Found::load(&db, task.id, Stage::Ports, target),
+                    false => services,
+                }
+            };
+            // What a crawl may add to: the addresses being crawled, and the
+            // name the user asked for. Not a name a server gave itself.
+            let mut names: Names = probed.hosts.keys().cloned().collect();
+            if let Target::Host(HostAddr::Name(name)) = target {
+                names.insert(name.to_ascii_lowercase());
+            }
+            let urls: Vec<String> = probed
+                .web
                 .iter()
-                .flat_map(|host| {
-                    std::iter::once(host.address.clone()).chain(host.hostnames.iter().cloned())
-                })
-                .map(|name| name.to_ascii_lowercase())
-                .collect();
-            let urls: Vec<String> = in_target
-                .iter()
-                .flat_map(|host| {
-                    host.web_origins()
-                        .into_iter()
-                        .map(|(url, _)| url)
-                        .collect::<Vec<_>>()
+                .map(|(address, port, https)| {
+                    crate::endpoint::web_origin(
+                        if *https { "https" } else { "http" },
+                        address,
+                        *port,
+                    )
                 })
                 .take(MAX_URLS_PER_STAGE)
                 .collect();
@@ -1612,12 +1782,18 @@ async fn run_stage(
                     _ => {}
                 }
                 if command.output.is_file() {
-                    let (added, dropped) =
-                        ingest_only(state, &command.output, Some(&names)).unwrap_or_default();
-                    changed += added;
-                    elsewhere.extend(dropped);
-                    if outcome == RunOutcome::Stopped {
-                        let _ = std::fs::remove_file(&command.output);
+                    match read_lines(&command.output) {
+                        Ok(observations) => {
+                            let (added, dropped) = record(state, observations, Some(&names));
+                            changed += added;
+                            elsewhere.extend(dropped);
+                        }
+                        // Said, not swallowed: the stage did not see what
+                        // its tool found.
+                        Err(error) => state.notice(format!(
+                            "recon {}: the output of {} could not be read: {error:#}",
+                            task.target, command.program
+                        )),
                     }
                 }
                 if outcome == RunOutcome::Stopped {
@@ -2241,6 +2417,86 @@ mod tests {
             "recon 10.0.0.0/24: finished"
         );
         assert_eq!(task(&db, 999).unwrap(), None);
+    }
+
+    #[test]
+    fn a_stage_reads_its_tools_output_as_what_that_tool_writes() {
+        // A scanned server puts the marker of another format into a header.
+        // Guessed from the content this file was "XML", failed to parse, and
+        // the stage reported nothing found.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("ferox_1_0.jsonl");
+        std::fs::write(
+            &output,
+            "{\"type\":\"response\",\"url\":\"http://10.0.0.5/admin\",\"status\":403,\"headers\":{\"x-a\":\"<nmaprun\"}}\n\
+             {\"type\":\"response\",\"url\":\"http://10.0.0.5/login\",\"status\":200}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsers::detect(&std::fs::read_to_string(&output).unwrap()),
+            parsers::Format::NmapXml,
+            "what guessing makes of it"
+        );
+        let observations = read_lines(&output).unwrap();
+        assert_eq!(observations.len(), 2, "{observations:?}");
+        assert!(!output.exists(), "read once, then deleted");
+        // A scanner's output that is not XML is an error with the file's name.
+        let output = dir.path().join("nmap_ports_1.xml");
+        std::fs::write(&output, "not xml").unwrap();
+        let error = format!("{:#}", read_scan(&output).unwrap_err());
+        assert!(error.contains("nmap_ports_1.xml"), "{error}");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn what_a_scan_found_is_taken_from_its_own_output_only() {
+        let observations = parsers::nmap::parse(
+            r#"<nmaprun>
+<host><status state="up"/><address addr="10.0.0.5" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="443"><state state="open"/><service name="http" tunnel="ssl"/></port>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http"/></port>
+<port protocol="tcp" portid="22"><state state="open"/><service name="ssh"/></port>
+<port protocol="tcp" portid="25"><state state="filtered"/><service name="smtp"/></port>
+<port protocol="udp" portid="53"><state state="open"/><service name="domain"/></port>
+</ports></host>
+<host><status state="up"/><address addr="10.0.9.9" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="8080"><state state="open"/><service name="http-proxy"/></port>
+</ports></host>
+<host><status state="up"/><address addr="10.0.0.7" addrtype="ipv4"/><ports></ports></host>
+</nmaprun>"#,
+        )
+        .unwrap();
+        let range = target("10.0.0.0/24");
+        let found = Found::of(&observations, &range);
+        assert_eq!(found.up, 2, "the host outside the range is not counted");
+        assert_eq!(
+            found.hosts,
+            BTreeMap::from([("10.0.0.5".to_owned(), vec![22, 80, 443])])
+        );
+        assert_eq!(
+            found.web,
+            [
+                ("10.0.0.5".to_owned(), 443, true),
+                ("10.0.0.5".to_owned(), 80, false)
+            ]
+        );
+        assert_eq!(found.open_ports(), 3);
+        // For a name the scanner resolved, every address it reported.
+        let named = Found::of(&observations, &target("app.example.org"));
+        assert_eq!(named.hosts.len(), 2);
+        // Read back from a database, the same checks apply again.
+        let planted: Found = serde_json::from_str(
+            r#"{"hosts":{"10.0.0.5":[443,443,22],"192.0.2.1":[80],"x":[1],"10.0.0.6":[]},
+                "web":[["10.0.0.5",443,false],["10.0.0.5",443,true],["10.0.0.5",8443,true],["192.0.2.1",80,false]]}"#,
+        )
+        .unwrap();
+        let checked = planted.checked(&range);
+        assert_eq!(
+            checked.hosts,
+            BTreeMap::from([("10.0.0.5".to_owned(), vec![22, 443])])
+        );
+        assert_eq!(checked.web, [("10.0.0.5".to_owned(), 443, true)]);
+        assert_eq!(Found::default().checked(&range), Found::default());
     }
 
     #[test]

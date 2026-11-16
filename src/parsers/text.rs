@@ -315,10 +315,7 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
         );
 
         let app = &graph.hosts["10.0.0.5"];
-        assert_eq!(
-            app.hostnames.iter().collect::<Vec<_>>(),
-            ["app.lab.local", "sso.lab.local"]
-        );
+        assert_eq!(app.hostnames.iter().collect::<Vec<_>>(), ["app.lab.local"]);
         let ssh = &app.ports["22/tcp"];
         assert_eq!(ssh.service.as_deref(), Some("ssh"));
         assert_eq!(ssh.product.as_deref(), Some("OpenSSH"));

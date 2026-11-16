@@ -178,15 +178,24 @@ not json at all
     }
 
     #[test]
-    fn feroxbuster_lines_become_paths_and_redirect_names() {
+    fn feroxbuster_lines_become_paths_and_redirect_targets() {
         let (observations, skipped) = parse(FEROX);
         assert_eq!(skipped, 3, "configuration, statistics and the broken line");
         let mut graph = Graph::default();
         graph.apply_all(observations);
 
         let host = &graph.hosts["10.0.0.5"];
-        assert!(host.hostnames.contains("admin.lab.local"));
+        // A redirect's target is kept as where the port sends visitors,
+        // not as a name of the host.
+        assert!(host.hostnames.is_empty());
         let port = &host.ports["8080/tcp"];
+        assert!(port
+            .http
+            .as_ref()
+            .unwrap()
+            .location
+            .as_deref()
+            .is_some_and(|location| location.contains("admin.lab.local")));
         assert_eq!(
             port.http.as_ref().unwrap().server.as_deref(),
             Some("Apache/2.4.41")

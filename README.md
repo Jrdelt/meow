@@ -289,6 +289,15 @@ Each tool has a time limit and a 50 MB output cap, and is killed with
 everything it started when the session ends. Unfinished tasks are offered for
 resume the next time the workspace is opened.
 
+Each stage works from what the stage before it found with its own tool, kept
+with the task: the service inventory probes the ports the port inventory found
+open, and the crawl and the directory inventory visit the ports the scanner
+called a web server. Text shown in your terminal can add a host or a port to
+the map, but never a destination to a scan. Likewise a name: a certificate, a
+reverse DNS record or a line of text can name a host only while no other host
+has that name, and only the scanner resolving the name you asked for can move
+it.
+
 The mode also governs what is already queued. Switch to `light` and the tool
 that is running is stopped and the rest waits; switch from `aggressive` to
 `mild` and the running stage starts again with the mild settings. Switching up

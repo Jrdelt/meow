@@ -73,6 +73,8 @@ const MIGRATIONS: &[&str] = &[
          response    TEXT NOT NULL,
          created_utc TEXT NOT NULL
      ) WITHOUT ROWID;",
+    // 5: what each recon stage's own tool reported, for the stages after it.
+    "ALTER TABLE task_stages ADD COLUMN found TEXT NOT NULL DEFAULT '';",
 ];
 
 pub struct Db {

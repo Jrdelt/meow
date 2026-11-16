@@ -13,7 +13,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{path_segments, web_origin, HostAddr};
-use crate::evidence::{sanitize, EvidenceRecord, IllegalTransition, Source, VerificationStatus};
+use crate::evidence::{
+    sanitize, Confidence, EvidenceRecord, IllegalTransition, Source, VerificationStatus,
+};
 use crate::timeutil::now_rfc3339;
 use crate::workspace::write_private_atomic;
 
@@ -1180,7 +1182,15 @@ impl Graph {
 
     /// Records `name` for the host at `address`. If the name was known as a
     /// separate, name-keyed host, that host is folded into this one.
-    fn add_hostname(&mut self, address: &str, name: &str) -> bool {
+    ///
+    /// A name has one owner. `trusted` says who makes the claim: the scanner
+    /// about the name the user asked it to scan, or anything else (a line of
+    /// text, a certificate, a reverse DNS record), which whoever runs the
+    /// machine at `address` can make say what they like. An untrusted claim
+    /// never takes a name another host has, and never takes over a host the
+    /// operator has worked on: its advisories, with their verdicts, and its
+    /// notes stay where they are. A trusted one moves the name to this host.
+    fn add_hostname(&mut self, address: &str, name: &str, trusted: bool) -> bool {
         let Some(HostAddr::Name(name)) = HostAddr::parse(name) else {
             return false;
         };
@@ -1194,6 +1204,29 @@ impl Graph {
         if !host.hostnames.contains(&name) && host.hostnames.len() >= MAX_HOSTNAMES_PER_HOST {
             return false;
         }
+        if !trusted {
+            let taken = self
+                .hosts
+                .values()
+                .any(|other| other.address != key && other.hostnames.contains(&name));
+            let worked_on = self.hosts.get(&name).is_some_and(|named| {
+                !named.advisories.is_empty()
+                    || named
+                        .facts
+                        .iter()
+                        .any(|fact| fact.record.source == Source::ManualNote)
+            });
+            if taken || worked_on {
+                return false;
+            }
+        } else {
+            for other in self.hosts.values_mut() {
+                if other.address != key {
+                    other.hostnames.remove(&name);
+                }
+            }
+        }
+        let host = self.hosts.get_mut(&key).expect("host was just created");
         let added = host.hostnames.insert(name.clone());
         if let Some(named) = self.hosts.remove(&name) {
             let host = self.hosts.get_mut(&key).expect("host was just created");
@@ -1288,7 +1321,11 @@ impl Graph {
                 hostname,
                 record,
             } => {
-                if !self.add_hostname(&address, &hostname) {
+                // The scanner's word about the name it was told to scan:
+                // nmap marks that one `user`, and the parser rates it High.
+                let trusted =
+                    record.source == Source::NmapXml && record.confidence == Confidence::High;
+                if !self.add_hostname(&address, &hostname, trusted) {
                     return false;
                 }
                 let claim = format!("hostname {}", clean(&hostname.to_ascii_lowercase()));
@@ -1355,7 +1392,7 @@ impl Graph {
                 push_fact(&mut entry.facts, Fact { claim, record });
                 // Wildcards are certificate patterns, not hostnames.
                 if !san.starts_with('*') {
-                    self.add_hostname(&address, &san);
+                    self.add_hostname(&address, &san, false);
                 }
                 true
             }
@@ -1390,21 +1427,15 @@ impl Graph {
                     );
                     http.server = Some(server);
                 }
-                let mut redirect_host = None;
+                // Where a server sends its visitors is not what it is called:
+                // the target of a redirect stays a fact about this port.
                 if let Some(location) = clean_opt(location) {
                     let claim = format!("HTTP Location header: {location}");
                     push_fact(&mut entry.facts, Fact { claim, record });
-                    redirect_host = crate::endpoint::WebUrl::parse(&location)
-                        .map(|url| url.host)
-                        .filter(HostAddr::is_name);
                     http.location = Some(location);
                 }
                 entry.http = Some(http);
-                let changed = entry.http != before;
-                if let Some(name) = redirect_host {
-                    self.add_hostname(&address, &name.canonical());
-                }
-                changed
+                entry.http != before
             }
             Observation::Path {
                 address,
@@ -1793,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn sans_and_redirects_name_the_host_and_fold_in_name_keyed_hosts() {
+    fn a_certificate_names_the_host_and_folds_in_a_name_keyed_host_a_redirect_does_not() {
         let mut graph = Graph::default();
         // A crawl saw the site by name before any scan tied it to an IP.
         graph.apply(path("app.lab.local", 443, "/login", 200));
@@ -1823,11 +1854,13 @@ mod tests {
 
         assert_eq!(graph.hosts.len(), 1, "{:?}", graph.hosts.keys());
         let host = &graph.hosts["10.0.0.5"];
-        assert_eq!(
-            host.hostnames.iter().collect::<Vec<_>>(),
-            ["app.lab.local", "portal.lab.local"]
-        );
+        // Where the server sends its visitors is not what it is called.
+        assert_eq!(host.hostnames.iter().collect::<Vec<_>>(), ["app.lab.local"]);
         let p = &host.ports["443/tcp"];
+        assert_eq!(
+            p.http.as_ref().unwrap().location.as_deref(),
+            Some("https://portal.lab.local/sso")
+        );
         assert!(p.tls_sans.contains("*.lab.local"));
         assert_eq!(
             p.http.as_ref().unwrap().server.as_deref(),
@@ -1835,10 +1868,155 @@ mod tests {
         );
         // The crawl result recorded under the name now lives on the IP host.
         assert_eq!(p.paths.walk()[0].0, "/login");
-        // Later observations by name land on the same host.
-        graph.apply(path("portal.lab.local", 443, "/sso", 302));
+        // Later observations by the certificate's name land on the same
+        // host; the redirect's target is a host of its own.
+        graph.apply(path("app.lab.local", 443, "/account", 200));
         assert_eq!(graph.hosts.len(), 1);
         assert_eq!(graph.host("APP.lab.local.").unwrap().address, "10.0.0.5");
+        graph.apply(path("portal.lab.local", 443, "/sso", 302));
+        assert_eq!(graph.hosts.len(), 2);
+        assert!(graph.hosts.contains_key("portal.lab.local"));
+    }
+
+    fn hostname(address: &str, name: &str, source: Source, confidence: Confidence) -> Observation {
+        Observation::Hostname {
+            address: address.into(),
+            hostname: name.into(),
+            record: EvidenceRecord::observed(source, confidence, "x"),
+        }
+    }
+
+    #[test]
+    fn a_claimed_name_takes_nothing_from_the_host_that_has_it() {
+        // The operator has worked on portal.example: a confirmed finding
+        // and a note of their own.
+        let mut graph = Graph::default();
+        graph.apply(port("portal.example", 443, "https", Some("nginx")));
+        graph.add_advisory("portal.example", advisory("CVE-2021-23017"));
+        graph
+            .set_advisory_status(
+                "portal.example",
+                "CVE-2021-23017",
+                VerificationStatus::Confirmed,
+            )
+            .unwrap();
+        graph.apply(Observation::Note {
+            address: Some("portal.example".into()),
+            text: "admin panel, in scope".into(),
+            record: rec(Source::ManualNote),
+        });
+        let before = graph.hosts["portal.example"].clone();
+
+        // Another machine claims the name every way it can: a redirect, a
+        // certificate, a line of text, its reverse DNS record.
+        graph.apply(Observation::Http {
+            address: "10.0.0.66".into(),
+            port: 80,
+            scheme: "http".into(),
+            server: None,
+            location: Some("https://portal.example/login".into()),
+            record: rec(Source::FeroxJson),
+        });
+        graph.apply(Observation::TlsSan {
+            address: "10.0.0.66".into(),
+            port: 443,
+            san: "portal.example".into(),
+            record: rec(Source::TlsSan),
+        });
+        graph.apply(hostname(
+            "10.0.0.66",
+            "portal.example",
+            Source::PtyRegex,
+            Confidence::Medium,
+        ));
+        graph.apply(hostname(
+            "10.0.0.66",
+            "portal.example",
+            Source::NmapXml,
+            Confidence::Medium,
+        ));
+
+        assert_eq!(graph.hosts["portal.example"], before, "nothing moved");
+        assert!(graph.hosts["10.0.0.66"].hostnames.is_empty());
+        assert!(graph.hosts["10.0.0.66"].advisories.is_empty());
+        assert_eq!(
+            graph.host("portal.example").unwrap().address,
+            "portal.example"
+        );
+        // The certificate's name is still recorded as what the port presents.
+        assert!(graph.hosts["10.0.0.66"].ports["443/tcp"]
+            .tls_sans
+            .contains("portal.example"));
+
+        // The scanner resolving the name the user asked for does merge the
+        // hosts, verdict and note included.
+        graph.apply(hostname(
+            "203.0.113.50",
+            "portal.example",
+            Source::NmapXml,
+            Confidence::High,
+        ));
+        assert!(!graph.hosts.contains_key("portal.example"));
+        let real = graph.host("portal.example").unwrap();
+        assert_eq!(real.address, "203.0.113.50");
+        assert_eq!(
+            real.advisories[0].record.verification_status,
+            VerificationStatus::Confirmed
+        );
+        assert!(real
+            .facts
+            .iter()
+            .any(|fact| fact.claim == "admin panel, in scope"));
+    }
+
+    #[test]
+    fn a_name_has_one_owner_and_only_the_scanner_can_move_it() {
+        let mut graph = Graph::default();
+        // First come, first named, as long as nobody is sure.
+        assert!(graph.apply(hostname(
+            "10.0.0.5",
+            "app.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        assert!(!graph.apply(hostname(
+            "10.0.0.66",
+            "app.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        graph.apply(Observation::TlsSan {
+            address: "10.0.0.66".into(),
+            port: 443,
+            san: "app.lab.local".into(),
+            record: rec(Source::TlsSan),
+        });
+        assert_eq!(graph.host("app.lab.local").unwrap().address, "10.0.0.5");
+        assert!(graph.hosts["10.0.0.66"].hostnames.is_empty());
+
+        // An address that sorts first does not win by sorting first.
+        assert!(graph.apply(hostname(
+            "10.0.0.1",
+            "db.lab.local",
+            Source::LogRegex,
+            Confidence::Low
+        )));
+        assert!(graph.apply(hostname(
+            "10.0.0.9",
+            "db.lab.local",
+            Source::NmapXml,
+            Confidence::High
+        )));
+        assert_eq!(graph.host("db.lab.local").unwrap().address, "10.0.0.9");
+        assert!(graph.hosts["10.0.0.1"].hostnames.is_empty());
+        // And a later claim does not take it back.
+        assert!(!graph.apply(hostname(
+            "10.0.0.1",
+            "db.lab.local",
+            Source::PtyRegex,
+            Confidence::Medium
+        )));
+        assert_eq!(graph.host("db.lab.local").unwrap().address, "10.0.0.9");
     }
 
     #[test]
