@@ -374,11 +374,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             ..
         } => {
             let needs_session = || {
-                anyhow!(
-                    "`meow recon` needs a live session: start `meow {}` first; \
-                     the scan runs in the background of that session",
-                    workspace.name
-                )
+                if let Some(pid) = SessionLock::holder_pid(&workspace.lock_path()) {
+                    anyhow!(
+                        "session '{}' (pid {pid}) is not responding; resume or exit it first, \
+                         then run `meow recon` again",
+                        workspace.name
+                    )
+                } else {
+                    anyhow!(
+                        "`meow recon` needs a live session: start `meow {}` first; \
+                         the scan runs in the background of that session",
+                        workspace.name
+                    )
+                }
             };
             if ipc::send(&workspace, &Request::Ping)?.is_none() {
                 return Err(needs_session());
@@ -416,6 +424,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Map { no_open, .. } => {
             let live = ipc::send(&workspace, &Request::Ping)?.is_some();
             let Some(info) = ipc::runtime_info(&workspace).filter(|_| live) else {
+                if let Some(pid) = SessionLock::holder_pid(&workspace.lock_path()) {
+                    bail!(
+                        "session '{}' (pid {pid}) is not responding; resume or exit it first, \
+                         then run `meow map` again",
+                        workspace.name
+                    );
+                }
                 bail!(
                     "`meow map` needs a live session: start `meow {}` first",
                     workspace.name

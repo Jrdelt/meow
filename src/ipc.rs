@@ -18,12 +18,39 @@ use crate::workspace::{Workspace, LOCK_FILE, RUNTIME_FILE};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeout for fast coordinator control/query commands (`Ping`, `SetMode`, etc.).
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 /// A session that does not answer a ping within this time is not listed as
 /// running.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 const ERROR_REPLY_MAX_BYTES: usize = 64 * 1024;
 const REPLY_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks whether `pid` exists without delivering a signal.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+fn command_timeout(command: &Command) -> Duration {
+    match command {
+        Command::Observations { .. } => REQUEST_TIMEOUT,
+        _ => CONTROL_TIMEOUT,
+    }
+}
 
 /// Connection details of the live session in `dir`, if `session.lock` is
 /// currently held and `runtime.json` is readable and was written by the
@@ -37,7 +64,9 @@ const REPLY_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub fn runtime_info_in(dir: &Path) -> Option<RuntimeInfo> {
     let info = RuntimeInfo::read(&dir.join(RUNTIME_FILE))?;
     match SessionLock::check_free(&dir.join(LOCK_FILE)) {
-        Err(LockError::Held { pid: Some(holder) }) => (holder == info.pid).then_some(info),
+        Err(LockError::Held { pid: Some(holder) }) => {
+            (holder == info.pid && pid_is_alive(holder)).then_some(info)
+        }
         _ => None,
     }
 }
@@ -97,15 +126,25 @@ fn error_message(body: &Value) -> String {
 /// `Ok(None)` means nothing (or an unrelated service on a reused port) is
 /// listening there.
 pub async fn send_to(info: &RuntimeInfo, command: &Command) -> Result<Option<Value>> {
+    let timeout = command_timeout(command);
     let response = client()?
         .post(format!("{}/api/command", info.base_url()))
         .bearer_auth(&info.token)
+        .timeout(timeout)
         .json(command)
         .send()
         .await;
     let response = match response {
         Ok(response) => response,
         Err(error) if error.is_connect() => return Ok(None),
+        Err(error) if error.is_timeout() && matches!(command, Command::Ping) => return Ok(None),
+        Err(error) if error.is_timeout() => {
+            return Err(anyhow!(
+                "the session coordinator (pid {}) did not respond within {}s",
+                info.pid,
+                timeout.as_secs()
+            ));
+        }
         Err(error) => return Err(error).context("cannot reach the session coordinator"),
     };
     let status = response.status();
@@ -475,5 +514,63 @@ mod tests {
         let err = rt.block_on(send_to(&info, &Command::Ping)).unwrap_err();
         assert!(format!("{err:#}").contains("oversized reply"), "{err:#}");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn unresponsive_coordinator_never_hangs_ping_or_control_commands() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // Accept connections and hold them open silently (simulates a SIGSTOPed
+        // coordinator whose socket backlog still completes TCP handshakes).
+        let handle = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept() {
+                    held.push(stream);
+                }
+            }
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let info = RuntimeInfo {
+            pid: std::process::id(),
+            port,
+            token: "tok".to_owned(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(rt.block_on(send_to(&info, &Command::Ping)).unwrap(), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Ping took too long: {:?}",
+            started.elapsed()
+        );
+
+        let started = std::time::Instant::now();
+        let err = rt
+            .block_on(send_to(&info, &Command::SetMode { mode: Mode::Mild }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not respond"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "SetMode took too long: {:?}",
+            started.elapsed()
+        );
+
+        let _ = done_tx.send(());
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_distinguishes_current_and_nonexistent_pids() {
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(0));
+        assert!(!pid_is_alive(u32::MAX));
     }
 }

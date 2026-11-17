@@ -88,6 +88,55 @@ pub fn resolve_shell(configured: Option<&str>, env_shell: Option<&str>) -> Strin
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 
+/// Restores standard cooked flags on `ios` if canonical mode, echo, or signal
+/// generation were left disabled (e.g., after a prior process died from `kill -9`).
+/// Returns `true` if `ios` was modified; leaves already-cooked terminals intact.
+#[cfg(unix)]
+fn ensure_cooked_termios(ios: &mut libc::termios) -> bool {
+    let required_lflag = libc::ICANON | libc::ECHO | libc::ISIG;
+    if (ios.c_lflag & required_lflag) == required_lflag {
+        return false;
+    }
+    ios.c_iflag |= libc::BRKINT | libc::ICRNL | libc::IXON;
+    ios.c_oflag |= libc::OPOST | libc::ONLCR;
+    ios.c_lflag |=
+        libc::ICANON | libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ISIG | libc::IEXTEN;
+    true
+}
+
+/// Ensures the controlling terminal is in cooked mode on Unix before crossterm
+/// snapshots "original" settings and after exiting raw mode.
+pub fn ensure_cooked_terminal() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, RawFd};
+
+        fn fix_fd(fd: RawFd) {
+            // SAFETY: `termios` is plain C data filled by `tcgetattr`.
+            let mut ios: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(fd, &mut ios) } != 0 {
+                return;
+            }
+            if ensure_cooked_termios(&mut ios) {
+                // SAFETY: `ios` came from `tcgetattr` on `fd` with valid cooked flags set.
+                unsafe {
+                    libc::tcsetattr(fd, libc::TCSANOW, &ios);
+                }
+            }
+        }
+
+        if let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            fix_fd(tty.as_raw_fd());
+        } else if io::stdin().is_terminal() {
+            fix_fd(io::stdin().as_raw_fd());
+        }
+    }
+}
+
 /// Puts the real terminal into raw mode and restores it on drop. A panic on
 /// any thread restores it too, before the panic message is printed.
 struct TerminalGuard;
@@ -106,6 +155,7 @@ impl TerminalGuard {
                 previous(info);
             }));
         });
+        ensure_cooked_terminal();
         #[cfg(windows)]
         console::save_modes();
         terminal::enable_raw_mode().context("cannot switch the terminal to raw mode")?;
@@ -128,6 +178,7 @@ fn restore_terminal() {
         return;
     }
     let _ = terminal::disable_raw_mode();
+    ensure_cooked_terminal();
     #[cfg(windows)]
     console::restore_modes();
     let mut stdout = io::stdout();
@@ -534,6 +585,7 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
     let drained = drained_rx.recv_timeout(DRAIN_GRACE).is_ok();
     display_open.store(false, Ordering::Release);
     drop(watcher);
+    drop(master);
     drop(guard);
 
     let tap = if drained {
@@ -731,5 +783,27 @@ mod tests {
         let stats = worker.join().unwrap();
         assert_eq!(stats.lines_emitted, 0);
         assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_cooked_termios_repairs_raw_mode_and_leaves_cooked_mode_intact() {
+        // SAFETY: `termios` is plain C data zeroed and mutated by `cfmakeraw`.
+        let mut raw: libc::termios = unsafe { std::mem::zeroed() };
+        raw.c_iflag = libc::ICRNL | libc::IXON;
+        raw.c_oflag = libc::OPOST | libc::ONLCR;
+        raw.c_lflag = libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
+        assert!(!ensure_cooked_termios(&mut raw));
+
+        unsafe { libc::cfmakeraw(&mut raw) };
+        assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG), 0);
+        assert!(ensure_cooked_termios(&mut raw));
+        assert_eq!(
+            raw.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG),
+            libc::ICANON | libc::ECHO | libc::ISIG
+        );
+        assert_ne!(raw.c_iflag & libc::ICRNL, 0);
+        assert_ne!(raw.c_oflag & libc::OPOST, 0);
+        assert!(!ensure_cooked_termios(&mut raw));
     }
 }

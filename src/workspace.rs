@@ -148,8 +148,8 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
 
 /// CLI subcommand names and aliases that cannot be used as workspace names.
 pub const RESERVED_COMMANDS: &[&str] = &[
-    "list", "ls", "delete", "rm", "setup", "update", "tools", "add", "recon", "cve", "ask", "note",
-    "verdict", "map", "hud", "mode", "resume", "report", "help", "version",
+    "list", "ls", "status", "delete", "rm", "setup", "update", "tools", "add", "recon", "cve",
+    "ask", "note", "verdict", "map", "hud", "mode", "resume", "report", "help", "version",
 ];
 
 fn checked_name(raw: &str) -> Result<String> {
