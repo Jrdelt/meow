@@ -30,11 +30,13 @@ Homebrew installs `meow` along with `nmap`, `katana`, `feroxbuster`, and the Sec
 meow tools
 ```
 
-To upgrade a Homebrew installation later:
+To upgrade a Homebrew installation later, run `meow update` (which automatically delegates to `brew update && brew upgrade`), or run:
 
 ```sh
 brew update && brew upgrade meow
 ```
+
+To track the latest `main` branch instead of tagged releases, install with `--HEAD` (`brew install --HEAD meow`, or `brew uninstall meow && brew install --HEAD meow` if switching from a release install), after which `meow update` runs `brew upgrade --fetch-HEAD meow`.
 
 ### Option 2 — macOS `.pkg` installer
 
@@ -165,7 +167,7 @@ This writes `REPORT.md` inside the workspace directory (`~/.meow/workspaces/<nam
 | `meow report` | Compile the workspace into `REPORT.md` |
 | `meow setup` | Open the interactive Cat Setup GUI (or pass flags for scriptable setup) |
 | `meow tools [--yes]` | Check companion tools, wordlist, and location database, and install any missing ones |
-| `meow update [--check]` | Upgrade `meow` (via SHA-256 verified GitHub Release or source checkout) and refresh tools |
+| `meow update [--check]` | Upgrade `meow` (via Homebrew, SHA-256 verified GitHub Release, or source checkout) and refresh tools |
 
 > **Targeting a workspace from another terminal:** Helper commands (`mode`, `recon`, `map`, `hud`, `add`, `report`) automatically detect the active session when run inside a `meow` shell. From a separate terminal window, add `--session <name>` (or `--local`).
 
@@ -280,14 +282,18 @@ map = true
 
 ## Troubleshooting
 
-### `meow update` says `<path> is not a meow git checkout` or I installed via Homebrew
+### `meow update` says `<path> is not a meow git checkout` or `/private/tmp/... is a temporary build folder`
 
-- **If you installed with Homebrew (`brew install meow`):** Upgrade through Homebrew so Homebrew manages the binary and companion packages:
+- **If you installed with Homebrew (`brew install meow`):** Newer builds of `meow update` detect Homebrew automatically and run `brew update && brew upgrade` (or `brew upgrade --fetch-HEAD` for `--HEAD` installs). If an older binary prints the temporary build folder message, upgrade through Homebrew directly:
   ```sh
   brew update && brew upgrade meow
   ```
+  To switch from a tagged release to the latest `main` branch:
+  ```sh
+  brew uninstall meow && brew install --HEAD meow
+  ```
   If `brew upgrade meow` says `Error: jrdelt/meow/meow not installed`, install it first with `brew install meow`.
-- **If you installed from a git clone and deleted or moved that folder:** `meow update` automatically falls back to downloading the latest SHA-256 verified prebuilt release from GitHub Releases and installing it in place. If you moved your git clone and want to build from source instead, pass `--source <path-to-meow-clone>` or set `MEOW_SOURCE=<path-to-meow-clone>`.
+- **If you installed from a git clone and deleted or moved that folder:** `meow update` automatically falls back to downloading the latest SHA-256 verified prebuilt release from GitHub Releases and installing it in place (or pass `--source <path-to-meow-clone>` / set `MEOW_SOURCE=<path-to-meow-clone>` to build from a moved checkout).
 
 ### macOS says the `.pkg` installer "cannot be opened because it is from an unidentified developer"
 
