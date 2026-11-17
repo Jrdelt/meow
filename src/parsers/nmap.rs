@@ -228,6 +228,9 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
     let options = ParsingOptions {
         allow_dtd: true, // nmap writes <!DOCTYPE nmaprun>
         nodes_limit: MAX_NODES,
+        // External entities are never fetched or read: with no resolver
+        // roxmltree drops them, and a reference to one is an error.
+        entity_resolver: None,
     };
     let doc = Document::parse_with_options(xml, options).context("not well-formed XML")?;
     let root = doc.root_element();
