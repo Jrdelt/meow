@@ -34,6 +34,7 @@ pub mod tools;
 pub mod topology;
 pub mod update;
 pub mod vault;
+pub mod webfp;
 pub mod webui;
 pub mod wizard;
 pub mod workspace;

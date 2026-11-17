@@ -162,6 +162,80 @@ pub struct HttpInfo {
     pub robots_disallow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_txt: Option<String>,
+    /// The software stack: server, language, framework, CMS, libraries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tech: Vec<String>,
+    /// The cookies the page set, with their flags (never their values).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cookies: Vec<CookieCheck>,
+    /// A to F for the security headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_grade: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_notes: Vec<String>,
+    /// The site's own JavaScript files (paths on this port).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scripts: Vec<String>,
+    /// API paths and URLs named in those files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub js_endpoints: Vec<String>,
+    /// Keys found in those files: only their vault placeholder is kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub js_secrets: Vec<JsSecret>,
+}
+
+/// A cookie a page set: its name, the flags it carries, and what is wrong.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CookieCheck {
+    pub name: String,
+    pub flags: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
+}
+
+/// A key found in a JavaScript file. The key itself is in the vault; here
+/// is only its placeholder (`<<SEC_03>>`), a hint and where it was.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JsSecret {
+    pub kind: String,
+    pub token: String,
+    pub preview: String,
+    pub file: String,
+}
+
+/// A vault placeholder for a secret, and nothing else.
+fn is_secret_token(text: &str) -> bool {
+    text.strip_prefix("<<SEC_")
+        .and_then(|rest| rest.strip_suffix(">>"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn clean_list(list: Vec<String>, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in list {
+        let item = clean(&item);
+        if !item.is_empty() && !out.contains(&item) {
+            out.push(item);
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `mine` with the new items of `theirs` added, up to `max`.
+fn merge_list(mine: &mut Vec<String>, theirs: Vec<String>, max: usize) -> bool {
+    let before = mine.len();
+    for item in theirs {
+        if mine.len() >= max {
+            break;
+        }
+        if !mine.contains(&item) {
+            mine.push(item);
+        }
+    }
+    mine.len() != before
 }
 
 impl HttpInfo {
@@ -215,6 +289,33 @@ impl HttpInfo {
             .take(32)
             .collect();
         self.security_txt = clean_opt(self.security_txt.take());
+        self.tech = clean_list(std::mem::take(&mut self.tech), 24);
+        for cookie in &mut self.cookies {
+            cookie.name = sanitize(&cookie.name, 64);
+            cookie.flags = sanitize(&cookie.flags, 120);
+            cookie.issues = clean_list(std::mem::take(&mut cookie.issues), 6);
+        }
+        self.cookies.retain(|c| !c.name.is_empty());
+        self.cookies.truncate(24);
+        self.header_grade = self
+            .header_grade
+            .take()
+            .map(|g| sanitize(&g, 2))
+            .filter(|g| matches!(g.as_str(), "A" | "B" | "C" | "D" | "E" | "F"));
+        self.header_notes = clean_list(std::mem::take(&mut self.header_notes), 12);
+        self.scripts = clean_list(std::mem::take(&mut self.scripts), 40);
+        self.js_endpoints = clean_list(std::mem::take(&mut self.js_endpoints), 150);
+        for secret in &mut self.js_secrets {
+            secret.kind = sanitize(&secret.kind, 80);
+            secret.token = sanitize(&secret.token, 16);
+            secret.preview = sanitize(&secret.preview, 40);
+            secret.file = clean(&secret.file);
+        }
+        // Only a vault placeholder may stand for a key: never the key.
+        self.js_secrets.retain(|s| is_secret_token(&s.token));
+        self.js_secrets
+            .dedup_by(|a, b| a.token == b.token && a.file == b.file);
+        self.js_secrets.truncate(32);
     }
 
     pub fn absorb(&mut self, mut other: HttpInfo) -> bool {
@@ -266,6 +367,26 @@ impl HttpInfo {
                 self.robots_disallow.push(r);
             }
         }
+        merge_list(&mut self.tech, other.tech, 24);
+        // The latest page's cookies and header grade replace the earlier ones.
+        if !other.cookies.is_empty() {
+            self.cookies = other.cookies;
+        }
+        if other.header_grade.is_some() {
+            self.header_grade = other.header_grade;
+            self.header_notes = other.header_notes;
+        }
+        merge_list(&mut self.scripts, other.scripts, 40);
+        merge_list(&mut self.js_endpoints, other.js_endpoints, 150);
+        for secret in other.js_secrets {
+            let known = self
+                .js_secrets
+                .iter()
+                .any(|s| s.token == secret.token && s.file == secret.file);
+            if !known && self.js_secrets.len() < 32 {
+                self.js_secrets.push(secret);
+            }
+        }
         *self != before
     }
 
@@ -293,7 +414,22 @@ impl HttpInfo {
             + list(&self.missing_headers)
             + list(&self.tls_versions)
             + list(&self.tls_weak_ciphers)
-            + list(&self.robots_disallow))
+            + list(&self.robots_disallow)
+            + list(&self.tech)
+            + self
+                .cookies
+                .iter()
+                .map(|c| c.name.len() + c.flags.len() + list(&c.issues) + 8)
+                .sum::<usize>()
+            + opt(&self.header_grade)
+            + list(&self.header_notes)
+            + list(&self.scripts)
+            + list(&self.js_endpoints)
+            + self
+                .js_secrets
+                .iter()
+                .map(|s| s.kind.len() + s.token.len() + s.preview.len() + s.file.len() + 12)
+                .sum::<usize>())
     }
 }
 
@@ -2427,6 +2563,38 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_from_a_script_is_kept_only_as_its_vault_placeholder() {
+        let secret = |token: &str| JsSecret {
+            kind: "AWS access key ID".into(),
+            token: token.into(),
+            preview: "AKIA\u{2026} (20 chars)".into(),
+            file: "/app.js".into(),
+        };
+        let mut http = HttpInfo {
+            scheme: "https".into(),
+            js_secrets: vec![
+                secret("<<SEC_03>>"),
+                secret("AKIAPLAINTEXTKEY0001"),
+                secret("<<HOST_01>>"),
+                secret("<<SEC_>>"),
+            ],
+            header_grade: Some("Z".into()),
+            ..HttpInfo::default()
+        };
+        http.sanitize();
+        assert_eq!(http.js_secrets.len(), 1);
+        assert_eq!(http.js_secrets[0].token, "<<SEC_03>>");
+        assert_eq!(http.header_grade, None);
+        // Merging does the same.
+        let mut kept = HttpInfo::default();
+        kept.absorb(HttpInfo {
+            js_secrets: vec![secret("plain-secret-value-here")],
+            ..HttpInfo::default()
+        });
+        assert!(kept.js_secrets.is_empty());
+    }
     use crate::evidence::Confidence;
 
     fn rec(source: Source) -> EvidenceRecord {

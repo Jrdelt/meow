@@ -1,8 +1,8 @@
 //! The background recon queue.
 //!
-//! `meow recon <target>` queues one task of 15 sequential stages (`lan`, `dns`,
+//! `meow recon <target>` queues one task of 16 sequential stages (`lan`, `dns`,
 //! `asn`, `subdomains`, `mail-dns`, `trace`, `ports`, `services`, `headers`,
-//! `waf-cdn`, `tls-audit`, `ssh-audit`, `cves`, `crawl`, `dirs`) that run strictly one at
+//! `waf-cdn`, `tls-audit`, `ssh-audit`, `cves`, `crawl`, `js`, `dirs`) that run strictly one at
 //! a time. External tools (`nmap`, `katana`, `feroxbuster`, `traceroute`,
 //! `openssl`) run with `stdin` closed, under a wall-clock timeout and an output
 //! size cap, and write structured files to `<workspace>/tmp/` that are parsed
@@ -53,10 +53,11 @@ pub enum Stage {
     SshAudit,
     Cves,
     Crawl,
+    Js,
     Dirs,
 }
 
-pub const STAGES: [Stage; 15] = [
+pub const STAGES: [Stage; 16] = [
     Stage::Lan,
     Stage::Dns,
     Stage::Asn,
@@ -71,6 +72,7 @@ pub const STAGES: [Stage; 15] = [
     Stage::SshAudit,
     Stage::Cves,
     Stage::Crawl,
+    Stage::Js,
     Stage::Dirs,
 ];
 
@@ -91,6 +93,7 @@ impl Stage {
             Stage::SshAudit => "ssh-audit",
             Stage::Cves => "cves",
             Stage::Crawl => "crawl",
+            Stage::Js => "js",
             Stage::Dirs => "dirs",
         }
     }
@@ -2634,6 +2637,135 @@ async fn run_stage(
                 "{added_total} new advisories, {to_verify} hypotheses to verify ({changed} new facts)"
             )))
         }
+        Stage::Js => {
+            let probed = load_probed(state, task.id, target);
+            if probed.web.is_empty() {
+                return Ok(StageEnd::Skipped(
+                    "no HTTP or HTTPS port is open".to_owned(),
+                ));
+            }
+            let host_header = match target {
+                Target::Host(HostAddr::Name(name)) => Some(name.as_str()),
+                _ => None,
+            };
+            let max_files = if mode == Mode::Aggressive { 40 } else { 15 };
+            let (mut files, mut endpoints_found, mut keys_found) = (0usize, 0usize, 0usize);
+            let mut observations = Vec::new();
+            for (address, port, https) in probed.web.iter().take(MAX_URLS_PER_STAGE) {
+                if files >= max_files {
+                    break;
+                }
+                let paths: Vec<String> = {
+                    let graph = state.graph();
+                    graph
+                        .host(address)
+                        .and_then(|host| host.ports.get(&format!("{port}/tcp")))
+                        .map(|p| crate::webfp::script_paths(p, max_files - files))
+                        .unwrap_or_default()
+                };
+                if paths.is_empty() {
+                    continue;
+                }
+                let fetched = while_same_mode(
+                    &same_mode,
+                    crate::osint::fetch_scripts(
+                        address,
+                        host_header,
+                        *port,
+                        *https,
+                        &paths,
+                        2 * 1024 * 1024,
+                    ),
+                )
+                .await;
+                let Some(fetched) = fetched else {
+                    return Ok(StageEnd::ModeChanged);
+                };
+                let Ok(scripts) = fetched else {
+                    continue;
+                };
+                let mut endpoints = Vec::new();
+                let mut secrets = Vec::new();
+                let ev = |text: &str| {
+                    crate::evidence::EvidenceRecord::observed(
+                        crate::evidence::Source::JsScan,
+                        crate::evidence::Confidence::Medium,
+                        text,
+                    )
+                };
+                for (path, source) in &scripts {
+                    files += 1;
+                    let found = crate::webfp::extract_endpoints(source, 60);
+                    if !found.is_empty() {
+                        let shown: Vec<&str> = found.iter().take(12).map(String::as_str).collect();
+                        let more = found.len().saturating_sub(12);
+                        observations.push(Observation::Fact {
+                            address: address.clone(),
+                            port: Some(*port),
+                            protocol: "tcp".to_owned(),
+                            claim: format!(
+                                "JavaScript {path} names {} endpoints: {}{}",
+                                found.len(),
+                                shown.join(", "),
+                                if more > 0 {
+                                    format!(" (+{more} more)")
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            record: ev(&format!("GET {path}")),
+                        });
+                    }
+                    endpoints_found += found.len();
+                    endpoints.extend(found);
+                    // A key goes into the vault at once; only its
+                    // placeholder is kept anywhere else.
+                    for (kind, value) in crate::webfp::find_secrets(source) {
+                        let token = state.vault().register(crate::vault::Kind::Sec, &value);
+                        let preview = crate::webfp::preview(kind, &value);
+                        keys_found += 1;
+                        observations.push(Observation::Fact {
+                            address: address.clone(),
+                            port: Some(*port),
+                            protocol: "tcp".to_owned(),
+                            claim: format!(
+                                "exposed {kind} in {path}: kept in the vault as {token} ({preview})"
+                            ),
+                            record: ev(&format!("GET {path}: {kind} {token}")),
+                        });
+                        secrets.push(crate::graph::JsSecret {
+                            kind: kind.to_owned(),
+                            token,
+                            preview,
+                            file: path.clone(),
+                        });
+                    }
+                }
+                if !endpoints.is_empty() || !secrets.is_empty() {
+                    observations.push(Observation::WebMeta {
+                        address: address.clone(),
+                        port: *port,
+                        http: Box::new(crate::graph::HttpInfo {
+                            scheme: if *https { "https" } else { "http" }.to_owned(),
+                            js_endpoints: endpoints,
+                            js_secrets: secrets,
+                            ..crate::graph::HttpInfo::default()
+                        }),
+                        record: ev("JavaScript files of the site"),
+                    });
+                }
+            }
+            if files == 0 {
+                return Ok(StageEnd::Skipped(
+                    "no JavaScript files of the site's own were found (by the page or the crawl)"
+                        .to_owned(),
+                ));
+            }
+            let (changed, _) = record(state, observations, None);
+            Ok(StageEnd::Done(format!(
+                "{files} scripts read: {endpoints_found} endpoints, {keys_found} exposed keys ({changed} new facts)"
+            )))
+        }
         Stage::Crawl | Stage::Dirs => {
             // The web servers the service inventory of this task found, or
             // without one, those the port inventory named.
@@ -2783,6 +2915,7 @@ fn stage_file(stage: Stage) -> &'static str {
         Stage::SshAudit => "ssh_audit",
         Stage::Cves => "cves",
         Stage::Crawl => "katana",
+        Stage::Js => "js",
         Stage::Dirs => "ferox",
     }
 }

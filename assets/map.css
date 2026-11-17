@@ -52,6 +52,11 @@ main { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 20px; }
 .grade.bad { background: rgba(248, 81, 73, .16); color: var(--bad); border: 1px solid var(--bad); }
 .grade.info { background: #1b1e23; color: var(--dim); border: 1px solid #343840; }
 .row.faded { opacity: .6; }
+.grade.small { width: 26px; height: 26px; font-size: 15px; border-radius: 6px; }
+.grade-inline { display: inline-flex; justify-content: flex-end; }
+.cookie, .secret { text-align: right; padding: 2px 0; }
+.cookie .warn-text { font-size: 12px; }
+.secret .dim { font-size: 12px; overflow-wrap: anywhere; }
 #host-panels .glance .go { display: inline-flex; align-items: flex-start; justify-content: flex-end; gap: 6px; }
 #host-panels .glance .go .mark { margin-top: 1px; }
 #host-panels .glance button.link { color: var(--text); text-align: right; }

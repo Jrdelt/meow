@@ -2116,12 +2116,30 @@ pub fn detect_waf_from_headers(headers: &[(String, String)]) -> Option<String> {
 
 /// Runs the `headers` (and `/favicon.ico`, `/robots.txt`, `/.well-known/security.txt`)
 /// inspection for one `(address, port, tls)` web endpoint.
-pub async fn inspect_web_endpoint(
+/// A `Set-Cookie` header with its value left out (it can be a live session
+/// token): `sid=<value left out>; Path=/; HttpOnly`. Other headers as they are.
+fn redact_cookie_value(name: &str, value: &str) -> String {
+    if !name.eq_ignore_ascii_case("set-cookie") {
+        return value.to_owned();
+    }
+    let (pair, attributes) = value.split_once(';').unwrap_or((value, ""));
+    let cookie = pair.split('=').next().unwrap_or("").trim();
+    if attributes.is_empty() {
+        format!("{cookie}=<value left out>")
+    } else {
+        format!("{cookie}=<value left out>;{attributes}")
+    }
+}
+
+/// A client for one web server: the name pinned to the address it was
+/// checked to resolve to, no redirects, no proxy. Returns it with the
+/// server's base URL and the name pages are asked for.
+pub(crate) async fn pinned_web_client(
     address: &str,
     hostname: Option<&str>,
     port: u16,
     tls: bool,
-) -> Result<(Vec<Observation>, Option<String>, String)> {
+) -> Result<(reqwest::Client, String, String)> {
     let parsed_addr = HostAddr::parse(address)
         .with_context(|| format!("invalid web endpoint address '{address}'"))?;
     let resolved_hostname = match hostname {
@@ -2188,6 +2206,61 @@ pub async fn inspect_web_endpoint(
     let client = builder
         .build()
         .context("cannot build web inspector client")?;
+    Ok((client, base_url, host_for_url.to_owned()))
+}
+
+/// The site's own script files at `paths` on one web server, as text: at
+/// most `max_bytes` of each, and nothing that came back as an HTML page (a
+/// single-page app answers every path with its index).
+pub async fn fetch_scripts(
+    address: &str,
+    hostname: Option<&str>,
+    port: u16,
+    tls: bool,
+    paths: &[String],
+    max_bytes: usize,
+) -> Result<Vec<(String, String)>> {
+    let (client, base_url, _) = pinned_web_client(address, hostname, port, tls).await?;
+    let mut out = Vec::new();
+    for path in paths {
+        if !path.starts_with('/') || path.contains("//") || path.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let Ok(resp) = client.get(format!("{base_url}{path}")).send().await else {
+            continue;
+        };
+        if resp.status().as_u16() != 200 {
+            continue;
+        }
+        let kind = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if kind.contains("html") || kind.starts_with("image/") || kind.starts_with("font/") {
+            continue;
+        }
+        let Ok(bytes) = read_bytes_prefix(resp, max_bytes).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.trim_start().starts_with('<') {
+            continue;
+        }
+        out.push((path.clone(), text));
+    }
+    Ok(out)
+}
+
+pub async fn inspect_web_endpoint(
+    address: &str,
+    hostname: Option<&str>,
+    port: u16,
+    tls: bool,
+) -> Result<(Vec<Observation>, Option<String>, String)> {
+    let (client, base_url, site) = pinned_web_client(address, hostname, port, tls).await?;
+    let scheme = if tls { "https" } else { "http" };
 
     let root_resp = client
         .get(format!("{base_url}/"))
@@ -2206,6 +2279,7 @@ pub async fn inspect_web_endpoint(
     let body_text = String::from_utf8_lossy(&body_bytes);
     let title = extract_html_title(&body_text);
     let analysis = analyze_http_headers(&raw_headers);
+    let print = crate::webfp::fingerprint(&raw_headers, &body_text, &site, tls);
 
     // Fetch /robots.txt, /.well-known/security.txt, and /favicon.ico concurrently.
     let fetch_plain = |path: &'static str| {
@@ -2282,7 +2356,7 @@ pub async fn inspect_web_endpoint(
     let header_ev = raw_headers
         .iter()
         .take(20)
-        .map(|(k, v)| format!("{k}: {v}"))
+        .map(|(k, v)| format!("{k}: {}", redact_cookie_value(k, v)))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -2430,6 +2504,49 @@ pub async fn inspect_web_endpoint(
         });
     }
 
+    if !print.tech.is_empty() {
+        observations.push(Observation::Fact {
+            address: address.to_owned(),
+            port: Some(port),
+            protocol: "tcp".to_owned(),
+            claim: format!("web stack: {}", print.tech.join(", ")),
+            record: EvidenceRecord::observed(Source::HttpHeader, Confidence::Medium, &header_ev),
+        });
+    }
+    observations.push(Observation::Fact {
+        address: address.to_owned(),
+        port: Some(port),
+        protocol: "tcp".to_owned(),
+        claim: format!(
+            "security headers grade {}{}",
+            print.header_grade,
+            if print.header_notes.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", print.header_notes.join("; "))
+            }
+        ),
+        record: EvidenceRecord::observed(Source::HttpHeader, Confidence::High, &header_ev),
+    });
+    for cookie in print.cookies.iter().filter(|c| !c.issues.is_empty()) {
+        observations.push(Observation::Fact {
+            address: address.to_owned(),
+            port: Some(port),
+            protocol: "tcp".to_owned(),
+            claim: format!(
+                "cookie {} ({}): {}",
+                cookie.name,
+                cookie.flags,
+                cookie.issues.join("; ")
+            ),
+            record: EvidenceRecord::observed(
+                Source::HttpHeader,
+                Confidence::High,
+                &format!("Set-Cookie: {} ({})", cookie.name, cookie.flags),
+            ),
+        });
+    }
+
     let http_info = HttpInfo {
         scheme: scheme.to_owned(),
         server: analysis.server.clone(),
@@ -2443,6 +2560,11 @@ pub async fn inspect_web_endpoint(
         missing_headers: analysis.missing_security.clone(),
         robots_disallow,
         security_txt,
+        tech: print.tech,
+        cookies: print.cookies,
+        header_grade: Some(print.header_grade),
+        header_notes: print.header_notes,
+        scripts: print.scripts,
         ..HttpInfo::default()
     };
 
@@ -3370,6 +3492,76 @@ mod tests {
         assert_eq!(lookup_favicon_framework(116323821), Some("Spring Boot"));
         assert_eq!(lookup_favicon_framework(81586312), Some("Jenkins"));
         assert!(distro_backport_note("OpenSSH 6.6.1p1 Ubuntu 2ubuntu2.13").is_some());
+    }
+
+    #[tokio::test]
+    async fn scripts_are_read_from_the_site_and_html_answers_are_skipped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = std::sync::Arc::clone(&asked);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_owned();
+                log.lock().unwrap().push(path.clone());
+                let (kind, body) = match path.as_str() {
+                    "/app.js" => ("application/javascript", "fetch('/api/v2/orders')"),
+                    "/spa.js" => ("text/html", "<!doctype html><html></html>"),
+                    _ => ("text/plain", "not found"),
+                };
+                let status = if path == "/missing.js" {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let paths: Vec<String> = [
+            "/app.js",
+            "/spa.js",
+            "/missing.js",
+            "//elsewhere.test/x.js",
+            "relative.js",
+        ]
+        .iter()
+        .map(|p| (*p).to_owned())
+        .collect();
+        let got = fetch_scripts("127.0.0.1", None, port, false, &paths, 1024)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "/app.js");
+        assert!(got[0].1.contains("/api/v2/orders"));
+        // Paths that leave the site are never asked for.
+        let asked = asked.lock().unwrap();
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p.contains("elsewhere") || p.contains("relative")),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn cookie_values_are_left_out_of_header_evidence() {
+        assert_eq!(
+            redact_cookie_value("Set-Cookie", "sid=abc123; Path=/; HttpOnly"),
+            "sid=<value left out>; Path=/; HttpOnly"
+        );
+        assert_eq!(
+            redact_cookie_value("set-cookie", "a=b"),
+            "a=<value left out>"
+        );
+        assert_eq!(redact_cookie_value("Server", "nginx"), "nginx");
     }
 
     #[test]

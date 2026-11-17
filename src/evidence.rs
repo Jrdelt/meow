@@ -50,6 +50,8 @@ pub enum Source {
     Favicon,
     /// Intermediate route hop discovered by lightweight traceroute.
     Traceroute,
+    /// Endpoints and exposed keys read out of a site's JavaScript files.
+    JsScan,
 }
 
 impl Source {
@@ -77,6 +79,7 @@ impl Source {
             Source::WafCdn => "waf_cdn",
             Source::Favicon => "favicon",
             Source::Traceroute => "traceroute",
+            Source::JsScan => "js_scan",
         }
     }
 
@@ -564,6 +567,7 @@ mod tests {
             Source::WafCdn,
             Source::Favicon,
             Source::Traceroute,
+            Source::JsScan,
         ] {
             let wire = serde_json::to_string(&source).unwrap();
             assert_eq!(wire, format!("\"{}\"", source.as_str()));

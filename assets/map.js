@@ -1654,6 +1654,63 @@
       var http = port.http || null;
       if (!http && !sans.length && !paths) { return; }
       web.appendChild(el('h3', null, key));
+      // What the site is built with; an outdated library carries why.
+      if (http && http.tech && http.tech.length) {
+        var stack = el('div');
+        http.tech.forEach(function (name) {
+          var line = stack.appendChild(el('div'));
+          if (/\(older than|end of life/.test(name)) {
+            line.appendChild(marked(name, 'warn'));
+          } else {
+            line.textContent = name;
+          }
+        });
+        web.appendChild(row('Stack', stack));
+      }
+      if (http && http.header_grade) {
+        var graded = el('span', 'grade-inline');
+        graded.appendChild(el('span', 'grade small ' + gradeKind(http.header_grade), http.header_grade));
+        web.appendChild(row('Header grade', graded));
+        (http.header_notes || []).forEach(function (note) { web.appendChild(el('p', 'note why', note)); });
+      }
+      if (http && http.cookies && http.cookies.length) {
+        var jar = el('div');
+        http.cookies.forEach(function (cookie) {
+          var line = jar.appendChild(el('div', 'cookie'));
+          line.appendChild(el('span', null, cookie.name + ' '));
+          line.appendChild(el('span', 'dim', cookie.flags));
+          (cookie.issues || []).forEach(function (issue) {
+            line.appendChild(el('div', 'warn-text', issue));
+          });
+        });
+        web.appendChild(row('Cookies', jar));
+      }
+      // Keys found in the site's scripts: only their vault placeholder.
+      if (http && http.js_secrets && http.js_secrets.length) {
+        var keys = el('div');
+        http.js_secrets.forEach(function (secret) {
+          var line = keys.appendChild(el('div', 'secret'));
+          line.appendChild(marked(secret.kind, 'bad'));
+          line.appendChild(el('div', 'dim', secret.file + ' \u00b7 ' + secret.token + ' \u00b7 ' + secret.preview));
+        });
+        web.appendChild(row('Exposed keys', keys));
+        web.appendChild(el('p', 'note why', 'The keys themselves are in the vault, never shown here; ' +
+          'the report lists them to rotate. Test them only within the engagement\u2019s scope.'));
+      }
+      if (http && http.js_endpoints && http.js_endpoints.length) {
+        var named = fold('js-endpoints:' + key, 'names', false);
+        named.appendChild(el('summary', null, 'Endpoints in JavaScript (' + http.js_endpoints.length + ')'));
+        var list = named.appendChild(el('pre', 'reply'));
+        list.textContent = http.js_endpoints.join('\n');
+        web.appendChild(named);
+      }
+      if (http && http.scripts && http.scripts.length) {
+        var files = fold('js-files:' + key, 'names', false);
+        files.appendChild(el('summary', null, 'Script files (' + http.scripts.length + ')'));
+        var fileList = files.appendChild(el('pre', 'reply'));
+        fileList.textContent = http.scripts.join('\n');
+        web.appendChild(files);
+      }
       if (http && http.server) { web.appendChild(row('Server', http.server)); }
       if (http && http.powered_by) { web.appendChild(row('Powered by', http.powered_by)); }
       if (http && http.title) { web.appendChild(row('Title', http.title)); }
@@ -1900,7 +1957,7 @@
       adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : 'ok')));
     if (made.web) {
       // One short phrase per kind of problem, with the ports it was seen on.
-      var oldTls = [], weak = [], missing = [], edges = [];
+      var oldTls = [], weak = [], missing = [], edges = [], oldLibs = [], keyCount = 0, worstGrade = '';
       Object.keys(ports).forEach(function (key) {
         var http = (own(ports, key) || {}).http;
         if (!http) { return; }
@@ -1911,13 +1968,21 @@
         if ((http.tls_weak_ciphers || []).length) { weak.push(where); }
         if ((http.missing_headers || []).length) { missing.push(where); }
         if (http.waf && edges.indexOf(http.waf) < 0) { edges.push(http.waf); }
+        if ((http.js_secrets || []).length) { keyCount += http.js_secrets.length; }
+        if (http.header_grade && (!worstGrade || http.header_grade > worstGrade)) { worstGrade = http.header_grade; }
+        (http.tech || []).forEach(function (name) {
+          if (/\(older than|end of life/.test(name)) { oldLibs.push(name.split(' (')[0]); }
+        });
       });
       var flagged = [];
+      if (keyCount) { flagged.push(keyCount + (keyCount === 1 ? ' exposed key' : ' exposed keys') + ' in scripts'); }
+      if (worstGrade && worstGrade !== 'A') { flagged.push('headers grade ' + worstGrade); }
+      if (oldLibs.length) { flagged.push('outdated ' + oldLibs.join(', ')); }
       if (oldTls.length) { flagged.push('TLS 1.0/1.1 on ' + oldTls.join(', ')); }
       if (weak.length) { flagged.push('weak ciphers on ' + weak.join(', ')); }
-      if (missing.length) { flagged.push('headers missing on ' + missing.join(', ')); }
+      if (missing.length && !worstGrade) { flagged.push('headers missing on ' + missing.join(', ')); }
       box.appendChild(row('Web & TLS', go('web', flagged.concat(edges).join(' \u00b7 ') || 'nothing flagged',
-        flagged.length ? 'warn' : 'ok')));
+        keyCount ? 'bad' : flagged.length ? 'warn' : 'ok')));
     }
     if (host.dns_security) {
       var dnsInfo = host.dns_security;
@@ -1952,6 +2017,14 @@
     }
   }
 
+  function exposedKeys(host) {
+    var ports = host.ports || {};
+    return Object.keys(ports).reduce(function (sum, key) {
+      var http = (own(ports, key) || {}).http;
+      return sum + ((http && http.js_secrets) || []).length;
+    }, 0);
+  }
+
   function buildHostTabs(host, data, refocus) {
     var made = hostCards(host, data);
     var adv = advisoryCounts(host);
@@ -1972,6 +2045,7 @@
     };
     var badge = {
       ports: [String(openPorts), ''],
+      web: exposedKeys(host) ? [exposedKeys(host) + (exposedKeys(host) === 1 ? ' key' : ' keys'), 'bad'] : null,
       dns: host.dns_security ? [host.dns_security.grade || '?',
         { ok: '', warn: 'warn', bad: 'bad', info: '' }[gradeKind(host.dns_security.grade)]] : null,
       advisories: [String(adv.confirmed + adv.open), adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : ''],

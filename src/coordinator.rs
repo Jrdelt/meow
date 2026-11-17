@@ -337,6 +337,12 @@ impl State {
         lock(&self.graph)
     }
 
+    /// The Privacy Vault: where a key found during recon is kept, so only
+    /// its placeholder goes anywhere else.
+    pub fn vault(&self) -> MutexGuard<'_, Vault> {
+        lock(&self.vault)
+    }
+
     pub fn mode(&self) -> Mode {
         lock(&self.workspace).profile.mode
     }
