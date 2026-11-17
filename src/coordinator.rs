@@ -201,6 +201,11 @@ pub enum Command {
         #[serde(default)]
         address: Option<String>,
     },
+    /// "Check now" on a host's status card: one TCP connection attempt to
+    /// each of a few of its known open ports. Refused in light mode.
+    CheckHost {
+        address: String,
+    },
 }
 
 /// Where the device selected on the map is, for the round map.
@@ -222,6 +227,32 @@ pub struct TargetLocation {
     pub credit: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_url: Option<&'static str>,
+}
+
+/// The ports a "Check now" tries at most, and how long it waits for each.
+const CHECK_MAX_PORTS: usize = 6;
+const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Tried when no open TCP port is known yet.
+const CHECK_DEFAULT_PORTS: [u16; 3] = [443, 80, 22];
+
+/// The answer of one port to a "Check now".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortCheck {
+    pub port: u16,
+    /// `open` (it accepted), `closed` (it refused) or `no answer`.
+    pub state: String,
+    /// How long the connection took, when it was accepted.
+    pub ms: Option<f64>,
+}
+
+/// The last "Check now" of one host, or the one that is running.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostCheck {
+    pub at: String,
+    /// `checking`, `up` (a port accepted or refused: the host answered),
+    /// or `down` (nothing answered in time).
+    pub status: String,
+    pub ports: Vec<PortCheck>,
 }
 
 /// The AI request that is running, or the last one that finished.
@@ -275,6 +306,8 @@ pub struct State {
     target_pictures: Mutex<Vec<Picture>>,
     target_places: Mutex<std::collections::HashMap<String, Option<Place>>>,
     target_generation: std::sync::atomic::AtomicU64,
+    /// The last "Check now" of each host, by address.
+    checks: Mutex<std::collections::HashMap<String, HostCheck>>,
     ws_slots: Arc<tokio::sync::Semaphore>,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
@@ -551,6 +584,7 @@ impl State {
             "location": location,
             "target": target,
             "budget": budget,
+            "checks": &*lock(&self.checks),
         })
     }
 
@@ -672,6 +706,56 @@ impl State {
                     self.handle.spawn(location_loop(Arc::clone(self)));
                 }
                 Ok(json!({ "locating": true }))
+            }
+            Command::CheckHost { address } => {
+                if self.mode() == Mode::Light {
+                    bail!(
+                        "light mode sends no packets, so the host is not checked; \
+                         run `meow mode mild` (or aggressive) first"
+                    );
+                }
+                let host = self
+                    .graph()
+                    .host(&address)
+                    .cloned()
+                    .with_context(|| format!("{address} is not a host of this workspace"))?;
+                let Ok(ip) = host.address.parse::<std::net::IpAddr>() else {
+                    bail!("{} has no address to check yet", host.address);
+                };
+                let mut ports: Vec<u16> = host
+                    .open_ports()
+                    .filter(|port| port.protocol == "tcp")
+                    .map(|port| port.number)
+                    .take(CHECK_MAX_PORTS)
+                    .collect();
+                if ports.is_empty() {
+                    ports = CHECK_DEFAULT_PORTS.to_vec();
+                }
+                {
+                    let mut checks = lock(&self.checks);
+                    if checks
+                        .get(&host.address)
+                        .is_some_and(|c| c.status == "checking")
+                    {
+                        return Ok(json!({ "checking": true }));
+                    }
+                    checks.insert(
+                        host.address.clone(),
+                        HostCheck {
+                            at: now_rfc3339(),
+                            status: "checking".to_owned(),
+                            ports: Vec::new(),
+                        },
+                    );
+                }
+                self.touch();
+                self.handle.spawn(check_host(
+                    Arc::clone(self),
+                    host.address.clone(),
+                    ip,
+                    ports,
+                ));
+                Ok(json!({ "checking": true }))
             }
             Command::LocateHost { address } => {
                 let generation = self.target_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1245,6 +1329,60 @@ const MAX_CACHED_PLACES: usize = 1024;
 
 /// Finds where the device selected on the map is, then fetches its map's
 /// pictures. A newer selection wins: a stale answer is dropped.
+/// One connection attempt to `port`: accepted, refused, or no answer.
+async fn try_port(ip: std::net::IpAddr, port: u16) -> PortCheck {
+    let started = std::time::Instant::now();
+    let attempt = tokio::time::timeout(
+        CHECK_TIMEOUT,
+        tokio::net::TcpStream::connect(SocketAddr::new(ip, port)),
+    )
+    .await;
+    let (state, ms) = match attempt {
+        Ok(Ok(_stream)) => (
+            "open",
+            Some((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0),
+        ),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => ("closed", None),
+        _ => ("no answer", None),
+    };
+    PortCheck {
+        port,
+        state: state.to_owned(),
+        ms,
+    }
+}
+
+/// "Check now": tries the ports at the same time, then records the result.
+async fn check_host(state: Shared, address: String, ip: std::net::IpAddr, ports: Vec<u16>) {
+    let mut results =
+        futures_util::future::join_all(ports.iter().map(|port| try_port(ip, *port))).await;
+    results.sort_by_key(|check| check.port);
+    let answered = results.iter().any(|check| check.state != "no answer");
+    let status = if answered { "up" } else { "down" };
+    let open: Vec<String> = results
+        .iter()
+        .filter(|check| check.state == "open")
+        .map(|check| format!("{} ({:.0} ms)", check.port, check.ms.unwrap_or(0.0)))
+        .collect();
+    state.notice(format!(
+        "check {address}: {status}{}",
+        if open.is_empty() {
+            String::new()
+        } else {
+            format!(", answering on {}", open.join(", "))
+        }
+    ));
+    lock(&state.checks).insert(
+        address,
+        HostCheck {
+            at: now_rfc3339(),
+            status: status.to_owned(),
+            ports: results,
+        },
+    );
+    state.touch();
+}
+
 async fn locate_target(state: Shared, address: String, generation: u64) {
     let settings = state.config.location.clone();
     let mut target = TargetLocation {
@@ -1726,6 +1864,7 @@ impl Coordinator {
             target_pictures: Mutex::new(Vec::new()),
             target_places: Mutex::new(std::collections::HashMap::new()),
             target_generation: std::sync::atomic::AtomicU64::new(0),
+            checks: Mutex::new(std::collections::HashMap::new()),
             ws_slots: Arc::new(tokio::sync::Semaphore::new(MAX_WS_CONNECTIONS)),
             handle: runtime.handle().clone(),
         });
@@ -1852,6 +1991,75 @@ mod tests {
             workspace,
             coordinator,
         }
+    }
+
+    #[test]
+    fn check_now_connects_to_known_ports_only_outside_light_mode() {
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        // One port that answers, one that refuses.
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open_port = open.local_addr().unwrap().port();
+        let closed_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let record = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "scan");
+        for port in [open_port, closed_port] {
+            state.graph().apply(Observation::Port {
+                address: "127.0.0.1".into(),
+                port,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: None,
+                product: None,
+                version: None,
+                extra_info: None,
+                cpes: vec![],
+                record: record.clone(),
+            });
+        }
+        let check = || {
+            state.execute(Command::CheckHost {
+                address: "127.0.0.1".into(),
+            })
+        };
+        // Light mode sends nothing.
+        let error = format!("{:#}", check().unwrap_err());
+        assert!(error.contains("light mode sends no packets"), "{error}");
+        assert!(state.snapshot()["checks"].as_object().unwrap().is_empty());
+
+        state
+            .execute(Command::SetMode { mode: Mode::Mild })
+            .unwrap();
+        assert_eq!(check().unwrap()["checking"], true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            let result = state.snapshot()["checks"]["127.0.0.1"].clone();
+            if result["status"] != "checking" || std::time::Instant::now() > deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(result["status"], "up", "{result}");
+        let ports = result["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 2);
+        let answer = |port: u16| ports.iter().find(|p| p["port"] == port).unwrap().clone();
+        assert_eq!(answer(open_port)["state"], "open");
+        assert!(answer(open_port)["ms"].as_f64().is_some());
+        assert_eq!(answer(closed_port)["state"], "closed");
+        // A host the workspace does not know is not contacted.
+        let error = format!(
+            "{:#}",
+            state
+                .execute(Command::CheckHost {
+                    address: "192.0.2.77".into()
+                })
+                .unwrap_err()
+        );
+        assert!(error.contains("not a host of this workspace"), "{error}");
+        drop(open);
+        fx.coordinator.shutdown();
     }
 
     #[test]

@@ -1434,8 +1434,81 @@
   }
 
   // The cards of a selected host: only the ones there is something to say in.
+  // "2026-11-17T09:41:00Z" as "3 min ago", or the date when it is older.
+  function sinceText(at) {
+    var then = Date.parse(at || '');
+    if (!isFinite(then)) { return ''; }
+    var seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (seconds < 60) { return seconds + ' s ago'; }
+    if (seconds < 3600) { return Math.round(seconds / 60) + ' min ago'; }
+    if (seconds < 86400) { return Math.round(seconds / 3600) + ' h ago'; }
+    return String(at).slice(0, 10);
+  }
+
+  // Whether the host is there: what the scans saw, and what "Check now"
+  // found. "Check now" makes one connection to each of a few known open
+  // ports; light mode sends nothing, so there it is off.
+  function statusCard(host) {
+    var box = card('Server Status');
+    var check = own((state && state.checks) || {}, host.address) || null;
+    var facts = (host.facts || []).slice();
+    Object.keys(host.ports || {}).forEach(function (key) {
+      var port = own(host.ports, key);
+      (port && port.facts || []).forEach(function (fact) { facts.push(fact); });
+    });
+    var seenUp = '', lastScan = '';
+    facts.forEach(function (fact) {
+      // A fact's record is stored flat beside its claim.
+      var record = fact.record || fact;
+      var at = String(record.timestamp_utc || '');
+      if (!at) { return; }
+      if (fact.claim === 'host is up' && at > seenUp) { seenUp = at; }
+      if (record.source === 'nmap_xml' && at > lastScan) { lastScan = at; }
+    });
+    var openCount = Object.keys(host.ports || {}).filter(function (key) {
+      var port = own(host.ports, key);
+      return port && port.state === 'open';
+    }).length;
+
+    var status, kind;
+    if (check && check.status === 'checking') { status = 'checking\u2026'; kind = 'info'; }
+    else if (check && check.status === 'up') { status = 'up'; kind = 'ok'; }
+    else if (check && check.status === 'down') { status = 'not answering'; kind = 'bad'; }
+    else if (seenUp) { status = 'up when last scanned'; kind = 'ok'; }
+    else if (openCount) { status = 'answered on open ports'; kind = 'ok'; }
+    else { status = 'not checked yet'; kind = 'warn'; }
+    box.appendChild(row('Status', marked(status, kind)));
+    if (seenUp) {
+      var seenRow = box.appendChild(row('Seen up by a scan', sinceText(seenUp)));
+      seenRow.title = seenUp.slice(0, 19).replace('T', ' ') + ' UTC';
+    }
+    if (lastScan && lastScan !== seenUp) { box.appendChild(row('Last scan result', sinceText(lastScan))); }
+    box.appendChild(row('Open ports known', String(openCount)));
+    if (check && check.status !== 'checking') {
+      box.appendChild(row('Last checked', sinceText(check.at)));
+      var answers = (check.ports || []).map(function (p) {
+        return p.port + ' ' + p.state + (typeof p.ms === 'number' ? ' (' + p.ms.toFixed(0) + ' ms)' : '');
+      });
+      if (answers.length) { box.appendChild(row('Ports tried', answers.join(', '))); }
+      var fastest = (check.ports || []).filter(function (p) { return typeof p.ms === 'number'; })
+        .map(function (p) { return p.ms; }).sort(function (a, b) { return a - b; })[0];
+      if (typeof fastest === 'number') { box.appendChild(row('Connect time', fastest.toFixed(1) + ' ms')); }
+    }
+    var light = state && state.mode === 'light';
+    var actions = box.appendChild(el('div', 'actions'));
+    var button = actions.appendChild(el('button', null, check && check.status === 'checking' ? 'Checking\u2026' : 'Check now'));
+    button.disabled = !!light || !!(check && check.status === 'checking');
+    button.addEventListener('click', function () {
+      send({ cmd: 'check_host', address: host.address });
+    });
+    box.appendChild(el('p', 'note', light
+      ? 'Light mode sends no packets: switch to mild or aggressive to check.'
+      : 'Check now makes one connection to each of up to six known open ports (or 443, 80 and 22), and nothing else.'));
+    return box;
+  }
+
   function hostCards(host, data) {
-    var cards = [];
+    var cards = [statusCard(host)];
     var hostPorts = host.ports || {};
 
     // One line per port: number, state, service and the software that
