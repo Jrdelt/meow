@@ -699,7 +699,8 @@
     card.style.height = '';
     card.style.maxHeight = '';
     var short = Math.ceil(bh * READABLE_ZOOM + 2 * FIT_PADDING) - scroller.clientHeight;
-    if (short > 0) {
+    // Expanded, the card is the window: the drawing shrinks to fit it.
+    if (short > 0 && !mapExpanded) {
       card.style.maxHeight = 'none';
       card.style.height = Math.min(CARD_MAX, card.offsetHeight + short) + 'px';
     }
@@ -733,6 +734,40 @@
     if (recentre) {
       var router = cy.$('node.side');
       scroller.scrollLeft = router.length ? router.renderedPosition().x - scroller.clientWidth / 2 : 0;
+    }
+    if (!wide) { dodgeOverlay(); }
+  }
+
+  // The location card floats over the drawing's top-right corner. When a
+  // device or label would be under it, slide the drawing left, as far as
+  // the room on the left allows; the reader can fold the card for the rest.
+  function dodgeOverlay() {
+    var box = byId('where').firstElementChild;
+    if (!box || !box.offsetWidth) { return; }
+    var stage = byId('scroller').getBoundingClientRect(), over = box.getBoundingClientRect();
+    var edge = over.left - stage.left - 12, below = over.bottom - stage.top + 8;
+    var reach = -Infinity, start = Infinity;
+    cy.elements().forEach(function (item) {
+      var bb = item.renderedBoundingBox({ includeLabels: true });
+      if (!isFinite(bb.x1)) { return; }
+      start = Math.min(start, bb.x1);
+      if (bb.y1 < below) { reach = Math.max(reach, bb.x2); }
+    });
+    var overlap = reach - edge;
+    if (!(overlap > 0) || !isFinite(start)) { return; }
+    var shift = Math.min(overlap, Math.max(0, start - 16));
+    if (shift > 0) { cy.panBy({ x: -shift, y: 0 }); }
+    // Still over a device: fold the card into its pill, unless the reader
+    // opened it on purpose. It opens again when the window gets wider.
+    if (whereFolded || whereChosen) { return; }
+    var hidden = cy.nodes().some(function (node) {
+      var bb = node.renderedBoundingBox({ includeLabels: true });
+      return stage.left + bb.x1 < over.right && stage.left + bb.x2 > over.left &&
+        stage.top + bb.y1 < over.bottom && stage.top + bb.y2 > over.top;
+    });
+    if (hidden) {
+      whereFolded = whereAutoFolded = true;
+      renderWhere();
     }
   }
 
@@ -914,20 +949,45 @@
     dbCredit(why, target);
   }
 
-  // The drawing starts just below the note and the location card, so
-  // neither covers part of it: only the canvas' empty margin is under them.
-  function fitStage() {
-    var where = byId('where');
-    var top = Math.max(64, Math.ceil(where.offsetTop + where.offsetHeight + 12 - FIT_PADDING));
-    var scroller = byId('scroller');
-    if (scroller.style.top === top + 'px') { return; }
-    scroller.style.top = top + 'px';
-    cy.resize();
-    fitDrawing(false);
+  // The location card folds into a pill: when the reader folds it (kept
+  // for this tab), or by itself when it would hide part of the drawing (on
+  // a narrow screen it starts folded).
+  var whereFolded = window.innerWidth < 700, whereChosen = false;
+  try {
+    var foldedBefore = sessionStorage.getItem('meow-map-where');
+    if (foldedBefore) { whereFolded = foldedBefore === 'folded'; whereChosen = true; }
+  } catch (_) {}
+  var whereAutoFolded = whereFolded && !whereChosen;
+  function foldWhere(folded) {
+    whereFolded = folded;
+    whereChosen = true;
+    whereAutoFolded = false;
+    try { sessionStorage.setItem('meow-map-where', folded ? 'folded' : 'open'); } catch (_) {}
+    renderWhere();
   }
   window.addEventListener('resize', function () {
-    fitStage();
+    // Folded by itself: try it open again; it folds back if still in the way.
+    if (whereAutoFolded && window.innerWidth >= 700) {
+      whereFolded = whereAutoFolded = false;
+      renderWhere();
+    }
     fitDrawing(false);
+  });
+
+  // Expand: the map and the side column fill the window; Esc goes back.
+  var mapExpanded = false;
+  function expandMap(on) {
+    mapExpanded = on;
+    document.body.classList.toggle('map-full', on);
+    var button = byId('map-full');
+    button.setAttribute('aria-pressed', on ? 'true' : 'false');
+    button.textContent = on ? 'Back (Esc)' : 'Expand';
+    cy.resize();
+    fitDrawing(true);
+  }
+  byId('map-full').addEventListener('click', function () { expandMap(!mapExpanded); });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && mapExpanded) { expandMap(false); }
   });
   // Extracts the VPN adapter name from `"{name} {cidr}: carries ..."` across
   // Linux/macOS (`tun0`, `utun3`) and Windows (`WireGuard Tunnel`) + IPv6.
@@ -945,11 +1005,23 @@
     var where = state.location;
     // Drawn again only when something changed, so the pictures load once.
     var target = state.target && state.target.address === selectedAddress() ? state.target : null;
-    var key = JSON.stringify([vpn, where, mapCloser, target]);
+    var key = JSON.stringify([vpn, where, mapCloser, target, whereFolded]);
     if (key === whereDrawn) { return; }
     whereDrawn = key;
     // Top right: a blue pill when a VPN is up, the round map under it.
     var box = clear(byId('where')).appendChild(el('div', 'where-side'));
+    if (whereFolded) {
+      box.className = 'where-side folded';
+      if (vpn.length) { box.appendChild(el('span', 'vpn-pill', 'VPN ' + vpn.map(vpnName).join(', '))); }
+      var place = target && target.place ? placeName(target.place)
+        : where && where.status === 'found' && where.place ? placeName(where.place) : 'Location';
+      var open = box.appendChild(el('button', 'where-open', place + ' \u25be'));
+      open.type = 'button';
+      open.title = 'Show the location map';
+      open.addEventListener('click', function () { foldWhere(false); });
+      fitDrawing(false);
+      return;
+    }
     if (vpn.length) {
       var names = vpn.map(vpnName).join(', ');
       var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
@@ -977,7 +1049,15 @@
       why.appendChild(el('strong', null, 'Location unknown'));
       why.appendChild(el('span', 'dim', where.reason));
     }
-    fitStage();
+    // Something shown: a button folds it into a pill, out of the drawing.
+    if (box.firstChild) {
+      var fold = box.appendChild(el('button', 'where-fold', '\u2212'));
+      fold.type = 'button';
+      fold.title = 'Fold the location map';
+      fold.setAttribute('aria-label', 'Fold the location map');
+      fold.addEventListener('click', function () { foldWhere(true); });
+    }
+    fitDrawing(false);
   }
 
   function renderLegend() {
