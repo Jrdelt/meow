@@ -148,7 +148,7 @@ async fn read_bytes_prefix(mut resp: reqwest::Response, max_bytes: usize) -> Res
 
 /// True when `ip` is safe to accept as a DNS resolution result for `domain`.
 /// Blocks unspecified, broadcast, multicast, link-local / cloud metadata IMDS
-/// (`169.254.0.0/16`, `fe80::/10`), and loopback addresses unless `domain` is
+/// (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`), and loopback addresses unless `domain` is
 /// explicitly `localhost`, while still permitting RFC 1918 / RFC 4193 lab hosts.
 pub fn is_allowed_resolved_ip_for_name(domain: &str, ip: IpAddr) -> bool {
     let is_localhost = domain
@@ -157,11 +157,13 @@ pub fn is_allowed_resolved_ip_for_name(domain: &str, ip: IpAddr) -> bool {
         .eq_ignore_ascii_case("localhost");
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
+            // Alibaba Cloud's metadata service sits outside link-local.
             if v4.is_unspecified()
                 || v4.octets()[0] == 0
                 || v4.is_broadcast()
                 || v4.is_multicast()
                 || v4.is_link_local()
+                || v4.octets() == [100, 100, 100, 200]
             {
                 return false;
             }
@@ -172,7 +174,12 @@ pub fn is_allowed_resolved_ip_for_name(domain: &str, ip: IpAddr) -> bool {
         }
         IpAddr::V6(v6) => {
             let segs = v6.segments();
-            if v6.is_unspecified() || v6.is_multicast() || (segs[0] & 0xffc0) == 0xfe80 {
+            // AWS's metadata service over IPv6 is fd00:ec2::254.
+            if v6.is_unspecified()
+                || v6.is_multicast()
+                || (segs[0] & 0xffc0) == 0xfe80
+                || segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            {
                 return false;
             }
             if v6.is_loopback() && !is_localhost {
@@ -565,15 +572,93 @@ async fn query_doh(client: &reqwest::Client, qname: &str, rrtype: u16) -> Result
     bail!("DoH endpoints unreachable")
 }
 
-/// Queries a DNS record type via DoH JSON first, falling back to UDP RFC 1035
-/// queries against system nameservers.
+/// Name endings that only mean something on a local network.
+const LOCAL_SUFFIXES: &[&str] = &[
+    "local",
+    "localhost",
+    "internal",
+    "intranet",
+    "lan",
+    "home",
+    "corp",
+    "private",
+    "test",
+    "invalid",
+    "example",
+    "localdomain",
+    "home.arpa",
+];
+
+/// The address a reverse-lookup name (`5.0.0.10.in-addr.arpa`,
+/// `...ip6.arpa`) asks about.
+pub fn reverse_name_address(qname: &str) -> Option<IpAddr> {
+    let name = qname.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(rest) = name.strip_suffix(".in-addr.arpa") {
+        let mut octets: Vec<u8> = rest
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect::<Option<_>>()?;
+        if octets.len() != 4 {
+            return None;
+        }
+        octets.reverse();
+        return Some(IpAddr::from([octets[0], octets[1], octets[2], octets[3]]));
+    }
+    let rest = name.strip_suffix(".ip6.arpa")?;
+    let nibbles: Vec<u8> = rest
+        .split('.')
+        .map(|part| {
+            u8::from_str_radix(part, 16)
+                .ok()
+                .filter(|_| part.len() == 1)
+        })
+        .collect::<Option<_>>()?;
+    if nibbles.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, pair) in nibbles
+        .iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .enumerate()
+    {
+        bytes[index] = (pair[0] << 4) | pair[1];
+    }
+    Some(IpAddr::from(bytes))
+}
+
+/// Whether `qname` may be asked of a public resolver (DNS-over-HTTPS) or a
+/// public log (crt.sh). Not a name that only exists on a local network, and
+/// not the reverse name of a private address: those would tell a third
+/// party what the user is looking at inside their own network.
+pub fn may_ask_public_services(qname: &str) -> bool {
+    let name = qname.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(ip) = reverse_name_address(&name) {
+        return !is_non_public_ip(ip);
+    }
+    if name.ends_with(".arpa") || !name.contains('.') {
+        return false;
+    }
+    !LOCAL_SUFFIXES
+        .iter()
+        .any(|suffix| name == *suffix || name.ends_with(&format!(".{suffix}")))
+}
+
+/// Queries a DNS record type from this machine's own resolvers first, as
+/// the system would, and only then, for names that may be asked publicly,
+/// over DNS-over-HTTPS.
 pub async fn resolve_rr(client: &reqwest::Client, qname: &str, rrtype: u16) -> Vec<String> {
-    if let Ok(records) = query_doh(client, qname, rrtype).await {
+    if let Ok(records) = query_dns_udp(qname, rrtype).await {
         if !records.is_empty() {
             return records;
         }
     }
-    query_dns_udp(qname, rrtype).await.unwrap_or_default()
+    if !may_ask_public_services(qname) {
+        return Vec::new();
+    }
+    query_doh(client, qname, rrtype).await.unwrap_or_default()
 }
 
 /// Runs the passive `dns` stage for `target`.
@@ -596,10 +681,12 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
             let ptrs = resolve_rr(&client, &ptr_name, 12).await;
             for ptr in &ptrs {
                 let ev = format!("{ptr_name} IN PTR {ptr}");
+                // A reverse record says what the owner of the address chose
+                // to call it: a claim, never the name's resolution.
                 observations.push(Observation::Hostname {
                     address: ip_str.clone(),
                     hostname: ptr.clone(),
-                    record: EvidenceRecord::observed(Source::Dns, Confidence::High, &ev),
+                    record: EvidenceRecord::observed(Source::Dns, Confidence::Medium, &ev),
                 });
                 observations.push(Observation::Fact {
                     address: ip_str.clone(),
@@ -690,10 +777,11 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
                     let ptrs = resolve_rr(&client, &ptr_name, 12).await;
                     for ptr in &ptrs {
                         let ev = format!("{ptr_name} IN PTR {ptr}");
+                        // A claim of the address's owner (see above).
                         observations.push(Observation::Hostname {
                             address: primary_address.clone(),
                             hostname: ptr.clone(),
-                            record: EvidenceRecord::observed(Source::Dns, Confidence::High, &ev),
+                            record: EvidenceRecord::observed(Source::Dns, Confidence::Medium, &ev),
                         });
                         observations.push(Observation::Fact {
                             address: primary_address.clone(),
@@ -1221,6 +1309,13 @@ pub async fn run_subdomains(
     let Some(root) = root_domain(domain) else {
         bail!("'{domain}' has no registrable root domain");
     };
+    // A public log knows only public names; an internal one is not sent.
+    let internal_address = primary_address
+        .parse::<IpAddr>()
+        .is_ok_and(is_non_public_ip);
+    if !may_ask_public_services(&root) || internal_address {
+        bail!("'{domain}' is an internal name; it is not sent to crt.sh");
+    }
     let client = build_http_client(Duration::from_secs(10))?;
     let query = format!("%.{root}");
     let resp = client
@@ -2927,6 +3022,87 @@ pub fn distro_backport_note(text: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn internal_names_and_private_reverse_names_stay_off_public_services() {
+        assert_eq!(
+            reverse_name_address("5.0.0.10.in-addr.arpa"),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        let v6: IpAddr = "2001:db8::567:89ab".parse().unwrap();
+        assert_eq!(reverse_name_address(&reverse_dns_name(v6)), Some(v6));
+        assert_eq!(reverse_name_address("1.2.in-addr.arpa"), None);
+        for private in [
+            reverse_dns_name("10.0.0.5".parse().unwrap()),
+            reverse_dns_name("192.168.1.1".parse().unwrap()),
+            reverse_dns_name("fd00::1".parse().unwrap()),
+            "db.acme.corp".to_owned(),
+            "printer.local".to_owned(),
+            "nas.home.arpa".to_owned(),
+            "app.internal".to_owned(),
+            "fileserver".to_owned(),
+        ] {
+            assert!(!may_ask_public_services(&private), "{private}");
+        }
+        for public in [
+            reverse_dns_name("45.33.32.156".parse().unwrap()),
+            "scanme.nmap.org".to_owned(),
+            "example.com".to_owned(),
+        ] {
+            assert!(may_ask_public_services(&public), "{public}");
+        }
+    }
+
+    #[tokio::test]
+    async fn crt_sh_is_not_asked_about_an_internal_name() {
+        for (domain, address) in [
+            ("db.acme.corp", "10.0.0.5"),
+            ("portal.client.com", "10.0.0.7"),
+        ] {
+            let error = format!("{:#}", run_subdomains(domain, address).await.unwrap_err());
+            assert!(error.contains("not sent to crt.sh"), "{domain}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_reverse_record_is_a_claim_and_takes_no_name_from_another_host() {
+        use crate::graph::Graph;
+        let mut graph = Graph::default();
+        let rec = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "scan");
+        graph.apply(Observation::Port {
+            address: "portal.example".into(),
+            port: 443,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: None,
+            product: None,
+            version: None,
+            extra_info: None,
+            cpes: vec![],
+            record: rec,
+        });
+        graph.apply(Observation::Note {
+            address: Some("portal.example".into()),
+            text: "in scope".into(),
+            record: EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, "x"),
+        });
+        let before = graph.hosts["portal.example"].clone();
+        // What the dns stage records for a PTR answer.
+        graph.apply(Observation::Hostname {
+            address: "10.0.0.66".into(),
+            hostname: "portal.example".into(),
+            record: EvidenceRecord::observed(
+                Source::Dns,
+                Confidence::Medium,
+                "66.0.0.10.in-addr.arpa IN PTR portal.example",
+            ),
+        });
+        assert_eq!(graph.hosts["portal.example"], before);
+        assert_eq!(
+            graph.host("portal.example").unwrap().address,
+            "portal.example"
+        );
+    }
+
     fn build_kexinit_fixture(kex: &str, hostkeys: &str, ciphers: &str, macs: &str) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(20u8); // SSH_MSG_KEXINIT
@@ -3221,6 +3397,8 @@ traceroute to 45.33.32.156 (45.33.32.156), 15 hops max, 60 byte packets
             "::1".parse().unwrap()
         ));
         for blocked in [
+            "100.100.100.200",
+            "fd00:ec2::254",
             "127.0.0.1",
             "::1",
             "::ffff:127.0.0.1",

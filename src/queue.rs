@@ -1962,6 +1962,28 @@ async fn resolve_target_ips(state: &State, task_id: i64, target: &Target) -> Vec
     ips
 }
 
+/// Runs `work` while the mode stays what it was; `None` once it changed.
+/// The work is then dropped, which ends the programs it started and closes
+/// its connections: a switch to light mode stops a traceroute or a TLS or
+/// SSH handshake in progress, not only the next one.
+async fn while_same_mode<T>(
+    same_mode: &impl Fn() -> bool,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
+    let mut poll = tokio::time::interval(CAP_POLL);
+    loop {
+        tokio::select! {
+            done = &mut work => return Some(done),
+            _ = poll.tick() => {
+                if !same_mode() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 async fn run_stage(
     state: &Arc<State>,
     task: &TaskRow,
@@ -2133,13 +2155,18 @@ async fn run_stage(
                 })
                 .cloned();
             let ip_str = resolved_ip.to_string();
-            let (observations, summary) =
-                match crate::osint::run_trace(&ip_str, local_gateway.as_deref()).await {
-                    Ok(res) => res,
-                    Err(err) => {
-                        return Ok(StageEnd::Skipped(format!("traceroute unavailable: {err}")))
-                    }
-                };
+            let traced = while_same_mode(
+                &same_mode,
+                crate::osint::run_trace(&ip_str, local_gateway.as_deref()),
+            )
+            .await;
+            let (observations, summary) = match traced {
+                None => return Ok(StageEnd::ModeChanged),
+                Some(Ok(res)) => res,
+                Some(Err(err)) => {
+                    return Ok(StageEnd::Skipped(format!("traceroute unavailable: {err}")))
+                }
+            };
             if observations.is_empty() {
                 return Ok(StageEnd::Skipped(
                     "no intermediate traceroute hops observed".to_owned(),
@@ -2256,9 +2283,15 @@ async fn run_stage(
                 if !same_mode() {
                     return Ok(StageEnd::ModeChanged);
                 }
-                if let Ok((obs, detected_waf, _summary)) =
-                    crate::osint::inspect_web_endpoint(address, host_header, *port, *https).await
-                {
+                let inspected_now = while_same_mode(
+                    &same_mode,
+                    crate::osint::inspect_web_endpoint(address, host_header, *port, *https),
+                )
+                .await;
+                let Some(inspected_now) = inspected_now else {
+                    return Ok(StageEnd::ModeChanged);
+                };
+                if let Ok((obs, detected_waf, _summary)) = inspected_now {
                     if let Some(detected) = detected_waf {
                         waf.insert(address.clone(), detected);
                     }
@@ -2401,9 +2434,15 @@ async fn run_stage(
                 if !same_mode() {
                     return Ok(StageEnd::ModeChanged);
                 }
-                if let Ok((obs, _summary)) =
-                    crate::osint::run_tls_audit(address, host_header, *port).await
-                {
+                let Some(audit) = while_same_mode(
+                    &same_mode,
+                    crate::osint::run_tls_audit(address, host_header, *port),
+                )
+                .await
+                else {
+                    return Ok(StageEnd::ModeChanged);
+                };
+                if let Ok((obs, _summary)) = audit {
                     if !obs.is_empty() {
                         audited += 1;
                         observations.extend(obs);
@@ -2439,7 +2478,12 @@ async fn run_stage(
                 if !same_mode() {
                     return Ok(StageEnd::ModeChanged);
                 }
-                if let Ok((obs, _summary)) = crate::osint::audit_ssh_port(address, *port).await {
+                let Some(audit) =
+                    while_same_mode(&same_mode, crate::osint::audit_ssh_port(address, *port)).await
+                else {
+                    return Ok(StageEnd::ModeChanged);
+                };
+                if let Ok((obs, _summary)) = audit {
                     if !obs.is_empty() {
                         audited += 1;
                         observations.extend(obs);
@@ -2829,6 +2873,31 @@ pub async fn worker(state: Arc<State>, mut queue: mpsc::UnboundedReceiver<i64>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn work_in_progress_is_stopped_when_the_mode_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let changed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&changed);
+        let same = move || !flag.load(Ordering::SeqCst);
+        // A handshake that would take a minute (a slow SSH server).
+        let slow = tokio::time::sleep(Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        let switch = Arc::clone(&changed);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            switch.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(while_same_mode(&same, slow).await, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // Without a change the work finishes and its result comes back.
+        changed.store(false, Ordering::SeqCst);
+        assert_eq!(while_same_mode(&same, async { 7 }).await, Some(7));
+    }
 
     fn args(command: &ToolCommand) -> String {
         command.args.join(" ")

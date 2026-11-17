@@ -198,9 +198,9 @@ meow mode aggressive
 `meow recon <target>` runs one stage at a time in the background so you can keep using your shell. Follow progress in `meow hud` or on the live browser map.
 
 1. **`lan`** — Reads your local ARP/NDP neighbour cache and routing table to identify your local gateway and LAN neighbours without sending broadcast traffic.
-2. **`dns`** — Resolves `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT` (SPF/DMARC/verification), and reverse `PTR` records via system DNS with DNS-over-HTTPS fallback.
+2. **`dns`** — Resolves `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT` (SPF/DMARC/verification), and reverse `PTR` records through your own resolvers first, with DNS-over-HTTPS as a fallback only for public names. Internal names (`.local`, `.corp`, `.internal`, ...) and the reverse names of private addresses never go to a public resolver, and a reverse record never takes a name another host has.
 3. **`asn`** — Queries Team Cymru DNS and RDAP to identify the target's Autonomous System Number (ASN), BGP prefix, cloud/ISP organization, and country, plus offline GeoIP city coordinates.
-4. **`subdomains`** — Queries Certificate Transparency logs (`crt.sh`) for domain targets to discover associated hostnames and subdomains passively.
+4. **`subdomains`** — Queries Certificate Transparency logs (`crt.sh`) for public domain targets to discover associated hostnames and subdomains passively; an internal name, or one that resolves to a private address, is not sent.
 5. **`trace`** — Runs a bounded traceroute (`traceroute`, `tracepath`, or `tracert`) to map intermediate network hops and round-trip latency between your gateway and the target.
 6. **`ports`** — Runs `nmap` to discover open TCP ports on the target.
 7. **`services`** — Runs `nmap -sV` strictly on the open ports found in `ports` to fingerprint service banners, versions, and CPEs.
