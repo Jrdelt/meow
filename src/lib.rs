@@ -16,6 +16,7 @@ pub mod hud;
 pub mod ipc;
 pub mod location;
 pub mod lock;
+pub mod maildns;
 pub mod mode;
 pub mod observer;
 pub mod osint;

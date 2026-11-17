@@ -48,7 +48,7 @@ pub const REQUIRED_SECURITY_HEADERS: &[&str] = &[
 // Bounded HTTP helpers
 // ---------------------------------------------------------------------------
 
-fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
+pub(crate) fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT.min(timeout))
         .read_timeout(timeout)
@@ -463,6 +463,37 @@ pub fn parse_dns_wire_response(packet: &[u8], expected_txid: u16, qtype: u16) ->
                 }
                 (!parts.is_empty()).then(|| parts.join(""))
             }
+            // SRV: priority weight port target, as DNS-over-HTTPS writes it.
+            33 if rdata.len() >= 7 => {
+                let field = |at: usize| u16::from_be_bytes([rdata[at], rdata[at + 1]]);
+                read_dns_name(packet, rdata_start + 6)
+                    .map(|(target, _)| format!("{} {} {} {target}", field(0), field(2), field(4)))
+            }
+            // DS: key tag, algorithm, digest type (the digest is left out).
+            43 if rdata.len() >= 4 => Some(format!(
+                "{} {} {}",
+                u16::from_be_bytes([rdata[0], rdata[1]]),
+                rdata[2],
+                rdata[3]
+            )),
+            // DNSKEY: flags, protocol, algorithm (the key is left out).
+            48 if rdata.len() >= 4 => Some(format!(
+                "{} {} {}",
+                u16::from_be_bytes([rdata[0], rdata[1]]),
+                rdata[2],
+                rdata[3]
+            )),
+            // CAA: flags tag "value".
+            257 if rdata.len() >= 2 => {
+                let tag_len = rdata[1] as usize;
+                (2 + tag_len <= rdata.len())
+                    .then(|| {
+                        let tag = std::str::from_utf8(&rdata[2..2 + tag_len]).ok()?;
+                        let value = String::from_utf8_lossy(&rdata[2 + tag_len..]);
+                        Some(format!("{} {tag} \"{value}\"", rdata[0]))
+                    })
+                    .flatten()
+            }
             _ => None,
         };
         if let Some(val) = parsed {
@@ -497,6 +528,26 @@ fn system_nameservers() -> Vec<SocketAddr> {
     servers
 }
 
+/// The query with an EDNS0 OPT record asking for answers up to 1232 bytes,
+/// so that larger answers (DNSSEC keys, long TXT records) are not cut off.
+fn with_edns0(mut query: Vec<u8>) -> Vec<u8> {
+    if query.len() >= 12 {
+        query[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT = 1
+        query.push(0); // root name
+        query.extend_from_slice(&41u16.to_be_bytes()); // OPT
+        query.extend_from_slice(&1232u16.to_be_bytes()); // UDP payload size
+        query.extend_from_slice(&0u32.to_be_bytes()); // extended RCODE, flags
+        query.extend_from_slice(&0u16.to_be_bytes()); // no options
+    }
+    query
+}
+
+/// The response code of a DNS answer: 1 FORMERR and 4 NOTIMP mean the
+/// server did not understand the EDNS0 query.
+fn dns_rcode(packet: &[u8]) -> Option<u8> {
+    (packet.len() >= 4).then(|| packet[3] & 0x0F)
+}
+
 async fn query_dns_udp(qname: &str, qtype: u16) -> Result<Vec<String>> {
     let servers = system_nameservers();
     let mut txid_bytes = [0u8; 2];
@@ -505,34 +556,58 @@ async fn query_dns_udp(qname: &str, qtype: u16) -> Result<Vec<String>> {
     } else {
         ((qtype.wrapping_mul(31337)) ^ (qname.len() as u16)).max(1)
     };
-    let query = build_dns_query(txid, qname, qtype)?;
+    let plain = build_dns_query(txid, qname, qtype)?;
+    let extended = with_edns0(plain.clone());
     for server in servers.into_iter().take(2) {
-        let bind_addr = if server.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let Ok(sock) = UdpSocket::bind(bind_addr).await else {
-            continue;
-        };
-        if sock.connect(server).await.is_err() {
-            continue;
-        }
-        if tokio::time::timeout(Duration::from_secs(3), sock.send(&query))
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        let mut buf = [0u8; 2048];
-        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await {
-            let records = parse_dns_wire_response(&buf[..n], txid, qtype);
-            if !records.is_empty() {
-                return Ok(records);
+        // EDNS0 first; the plain query again only if the server refused it.
+        for query in [&extended, &plain] {
+            match ask_dns_server(server, query, txid, qtype).await {
+                DnsAnswer::Records(records) => return Ok(records),
+                DnsAnswer::EdnsRefused if std::ptr::eq(query, &extended) => continue,
+                _ => break,
             }
         }
     }
     Ok(Vec::new())
+}
+
+enum DnsAnswer {
+    Records(Vec<String>),
+    EdnsRefused,
+    Nothing,
+}
+
+async fn ask_dns_server(server: SocketAddr, query: &[u8], txid: u16, qtype: u16) -> DnsAnswer {
+    let bind_addr = if server.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let Ok(sock) = UdpSocket::bind(bind_addr).await else {
+        return DnsAnswer::Nothing;
+    };
+    if sock.connect(server).await.is_err() {
+        return DnsAnswer::Nothing;
+    }
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(3), sock.send(query)).await,
+        Ok(Ok(_))
+    ) {
+        return DnsAnswer::Nothing;
+    }
+    let mut buf = [0u8; 2048];
+    if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await {
+        let answer = &buf[..n];
+        let records = parse_dns_wire_response(answer, txid, qtype);
+        if !records.is_empty() {
+            return DnsAnswer::Records(records);
+        }
+        let same_query = answer.len() >= 2 && u16::from_be_bytes([answer[0], answer[1]]) == txid;
+        if same_query && matches!(dns_rcode(answer), Some(1 | 4)) {
+            return DnsAnswer::EdnsRefused;
+        }
+    }
+    DnsAnswer::Nothing
 }
 
 async fn query_doh(client: &reqwest::Client, qname: &str, rrtype: u16) -> Result<Vec<String>> {
@@ -544,6 +619,10 @@ async fn query_doh(client: &reqwest::Client, qname: &str, rrtype: u16) -> Result
         15 => "MX",
         16 => "TXT",
         28 => "AAAA",
+        33 => "SRV",
+        43 => "DS",
+        48 => "DNSKEY",
+        257 => "CAA",
         _ => return Ok(Vec::new()),
     };
     for endpoint in [
@@ -3291,6 +3370,59 @@ mod tests {
         assert_eq!(lookup_favicon_framework(116323821), Some("Spring Boot"));
         assert_eq!(lookup_favicon_framework(81586312), Some("Jenkins"));
         assert!(distro_backport_note("OpenSSH 6.6.1p1 Ubuntu 2ubuntu2.13").is_some());
+    }
+
+    #[test]
+    fn srv_caa_ds_and_dnskey_answers_are_read_and_queries_carry_edns0() {
+        // A response to `example.test` with one answer of `qtype`.
+        fn answer(qtype: u16, rdata: &[u8]) -> Vec<u8> {
+            let mut packet = build_dns_query(0x1234, "example.test", qtype).unwrap();
+            packet[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+            packet.extend_from_slice(&0xC00Cu16.to_be_bytes());
+            packet.extend_from_slice(&qtype.to_be_bytes());
+            packet.extend_from_slice(&1u16.to_be_bytes());
+            packet.extend_from_slice(&300u32.to_be_bytes());
+            packet.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            packet.extend_from_slice(rdata);
+            packet
+        }
+        let mut srv = vec![0, 0, 0, 5, 0x01, 0x85];
+        for label in ["dc1", "example", "test"] {
+            srv.push(label.len() as u8);
+            srv.extend_from_slice(label.as_bytes());
+        }
+        srv.push(0);
+        assert_eq!(
+            parse_dns_wire_response(&answer(33, &srv), 0x1234, 33),
+            ["0 5 389 dc1.example.test"]
+        );
+        let mut caa = vec![0, 5];
+        caa.extend_from_slice(b"issueletsencrypt.org");
+        assert_eq!(
+            parse_dns_wire_response(&answer(257, &caa), 0x1234, 257),
+            ["0 issue \"letsencrypt.org\""]
+        );
+        assert_eq!(
+            parse_dns_wire_response(&answer(43, &[0x09, 0x43, 13, 2, 0xAB, 0xCD]), 0x1234, 43),
+            ["2371 13 2"]
+        );
+        assert_eq!(
+            parse_dns_wire_response(&answer(48, &[0x01, 0x01, 3, 13, 0x99]), 0x1234, 48),
+            ["257 3 13"]
+        );
+        // A CAA tag longer than the record is refused, not read past the end.
+        assert!(parse_dns_wire_response(&answer(257, &[0, 40, b'i']), 0x1234, 257).is_empty());
+
+        let plain = build_dns_query(7, "example.test", 48).unwrap();
+        let extended = with_edns0(plain.clone());
+        assert_eq!(&extended[10..12], &[0, 1]);
+        assert_eq!(extended.len(), plain.len() + 11);
+        assert_eq!(
+            &extended[plain.len()..plain.len() + 5],
+            &[0, 0, 41, 0x04, 0xD0]
+        );
+        assert_eq!(dns_rcode(&[0, 7, 0x81, 0x81]), Some(1));
     }
 
     #[test]

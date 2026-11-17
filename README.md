@@ -160,7 +160,7 @@ This writes `REPORT.md` inside the workspace directory (`~/.meow/workspaces/<nam
 | `meow list` (`meow ls`) | List all saved workspaces in `~/.meow/workspaces/` |
 | `meow delete <name>` (`meow rm`) | Delete a saved workspace (`--local` for `./.meow/`, `-y` to skip confirmation) |
 | `meow mode <light\|mild\|aggressive>` | Switch the discovery rate/load profile of the session |
-| `meow recon <target> [-- <nmap_flags>...]` | Queue the 14-stage OSINT & service inventory for a host, domain, IP, or CIDR |
+| `meow recon <target> [-- <nmap_flags>...]` | Queue the 15-stage OSINT & service inventory for a host, domain, IP, or CIDR |
 | `meow map [--no-open]` | Open the live topology map in your browser (or print the URL with `--no-open`) |
 | `meow hud` | Attach the terminal TUI companion panel (`Tab` panels, `a` AI view, `m` machine view, `1`/`2`/`3` mode) |
 | `meow add <file> [--no-cve]` | Import an Nmap XML, katana/feroxbuster JSONL, log, or `git diff` file |
@@ -193,7 +193,7 @@ meow mode aggressive
 
 ---
 
-## What `meow recon` Does (14 Stages)
+## What `meow recon` Does (15 Stages)
 
 `meow recon <target>` runs one stage at a time in the background so you can keep using your shell. Follow progress in `meow hud` or on the live browser map.
 
@@ -201,16 +201,17 @@ meow mode aggressive
 2. **`dns`** — Resolves `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT` (SPF/DMARC/verification), and reverse `PTR` records through your own resolvers first, with DNS-over-HTTPS as a fallback only for public names. Internal names (`.local`, `.corp`, `.internal`, ...) and the reverse names of private addresses never go to a public resolver, and a reverse record never takes a name another host has.
 3. **`asn`** — Queries Team Cymru DNS and RDAP to identify the target's Autonomous System Number (ASN), BGP prefix, cloud/ISP organization, and country, plus offline GeoIP city coordinates.
 4. **`subdomains`** — Queries Certificate Transparency logs (`crt.sh`) for public domain targets to discover associated hostnames and subdomains passively; an internal name, or one that resolves to a private address, is not sent.
-5. **`trace`** — Runs a bounded traceroute (`traceroute`, `tracepath`, or `tracert`) to map intermediate network hops and round-trip latency between your gateway and the target.
-6. **`ports`** — Runs `nmap` to discover open TCP ports on the target.
-7. **`services`** — Runs `nmap -sV` strictly on the open ports found in `ports` to fingerprint service banners, versions, and CPEs.
-8. **`headers`** — Inspects HTTP/HTTPS endpoints for server headers, security headers (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`), HTML `<title>`, `/robots.txt`, `/.well-known/security.txt`, and `/favicon.ico` framework hashes.
-9. **`waf-cdn`** — Detects edge WAF/CDN providers (Cloudflare, AWS CloudFront, Akamai, Fastly, Imperva, Sucuri, Azure Front Door, Google Cloud CDN) from HTTP headers and CNAME chains.
-10. **`tls-audit`** — Inspects TLS certificates (Subject, Issuer, validity dates, Subject Alternative Names) and checks supported TLS protocol versions (`TLSv1.0`–`TLSv1.3`), flagging deprecated protocols or expiring certificates.
-11. **`ssh-audit`** — Performs a zero-authentication RFC 4253 `SSH_MSG_KEXINIT` handshake on open SSH ports to inventory key-exchange, host-key, cipher, and MAC algorithms and flag weak cryptography (`ssh-rsa`, `ssh-dss`, `diffie-hellman-group1-sha1`, CBC/RC4 ciphers, MD5/SHA-1 MACs).
-12. **`cves`** — Grounds discovered product/version CPEs against OSV.dev, NVD, and the CISA Known Exploited Vulnerabilities (KEV) catalog, noting when Linux distribution banners (Ubuntu, Debian, RHEL) indicate backported security patches.
-13. **`crawl`** — Crawls discovered HTTP/HTTPS services with `katana` to inventory linked endpoints.
-14. **`dirs`** — Runs `feroxbuster` with the SecLists `common.txt` wordlist against discovered web services to find unlinked directories and files.
+5. **`mail-dns`** — For domain targets, grades mail and DNS protection A–F: SPF (its `-all`/`~all` ending and the 10-lookup limit), DMARC (policy, coverage, reports), DKIM (24 common selectors, key length), CAA (which certificate authorities may issue) and DNSSEC (DS at the parent, DNSKEY in the zone), and names the mail provider. It lists services the domain publishes in SRV records and well-known names (`_ldap`, `_kerberos`, `_gc`, `_sip`, `_autodiscover`, `autodiscover`, `lyncdiscover`, `enterpriseenrollment`), which often reveal Active Directory or Microsoft 365, and checks for wildcard DNS: two made-up names are looked up, and each certificate-log name is marked as resolving, answering only through the wildcard (so it may not exist), or gone. Only DNS questions are asked, the same way as `dns`; nothing is sent to the target's servers. Results appear in the host's **DNS & Mail** tab on the map.
+6. **`trace`** — Runs a bounded traceroute (`traceroute`, `tracepath`, or `tracert`) to map intermediate network hops and round-trip latency between your gateway and the target.
+7. **`ports`** — Runs `nmap` to discover open TCP ports on the target.
+8. **`services`** — Runs `nmap -sV` strictly on the open ports found in `ports` to fingerprint service banners, versions, and CPEs.
+9. **`headers`** — Inspects HTTP/HTTPS endpoints for server headers, security headers (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`), HTML `<title>`, `/robots.txt`, `/.well-known/security.txt`, and `/favicon.ico` framework hashes.
+10. **`waf-cdn`** — Detects edge WAF/CDN providers (Cloudflare, AWS CloudFront, Akamai, Fastly, Imperva, Sucuri, Azure Front Door, Google Cloud CDN) from HTTP headers and CNAME chains.
+11. **`tls-audit`** — Inspects TLS certificates (Subject, Issuer, validity dates, Subject Alternative Names) and checks supported TLS protocol versions (`TLSv1.0`–`TLSv1.3`), flagging deprecated protocols or expiring certificates.
+12. **`ssh-audit`** — Performs a zero-authentication RFC 4253 `SSH_MSG_KEXINIT` handshake on open SSH ports to inventory key-exchange, host-key, cipher, and MAC algorithms and flag weak cryptography (`ssh-rsa`, `ssh-dss`, `diffie-hellman-group1-sha1`, CBC/RC4 ciphers, MD5/SHA-1 MACs).
+13. **`cves`** — Grounds discovered product/version CPEs against OSV.dev, NVD, and the CISA Known Exploited Vulnerabilities (KEV) catalog, noting when Linux distribution banners (Ubuntu, Debian, RHEL) indicate backported security patches.
+14. **`crawl`** — Crawls discovered HTTP/HTTPS services with `katana` to inventory linked endpoints.
+15. **`dirs`** — Runs `feroxbuster` with the SecLists `common.txt` wordlist against discovered web services to find unlinked directories and files.
 
 If an external tool (`nmap`, `katana`, `feroxbuster`, `traceroute`, `openssl`) is not installed, `meow` marks that stage `skipped` with a clear reason and continues the remaining stages.
 

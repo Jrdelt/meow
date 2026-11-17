@@ -297,6 +297,130 @@ impl HttpInfo {
     }
 }
 
+/// How well a domain protects its mail and its DNS, from the `mail-dns`
+/// stage: graded checks (SPF, DMARC, DKIM, CAA, DNSSEC), the services its
+/// SRV records publish, and whether made-up names answer (wildcard DNS).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DnsSecurity {
+    pub domain: String,
+    /// A to F, from the graded checks.
+    pub grade: String,
+    #[serde(default)]
+    pub checks: Vec<DnsCheck>,
+    #[serde(default)]
+    pub services: Vec<DnsService>,
+    /// The addresses a made-up name under the domain resolves to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wildcard: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subdomains: Vec<SubdomainCheck>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DnsCheck {
+    /// `SPF`, `DMARC`, `DKIM`, `CAA`, `DNSSEC`, `Mail`.
+    pub name: String,
+    /// `ok`, `warn`, `bad` or `info`.
+    pub status: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub advice: String,
+}
+
+/// A service a domain publishes in DNS: an SRV record or a well-known name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DnsService {
+    pub record: String,
+    pub target: String,
+    pub meaning: String,
+}
+
+/// A name from the certificate logs, looked up: `resolves`, `wildcard`
+/// (only the wildcard answers, so it may not exist) or `gone`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubdomainCheck {
+    pub name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+}
+
+impl DnsSecurity {
+    pub fn sanitize(&mut self) {
+        let status = |s: &str| match s {
+            "ok" | "warn" | "bad" | "info" => s.to_owned(),
+            _ => "info".to_owned(),
+        };
+        self.domain = clean(&self.domain);
+        self.grade = sanitize(&self.grade, 2);
+        for check in &mut self.checks {
+            check.name = sanitize(&check.name, 32);
+            check.status = status(&check.status);
+            check.value = clean(&check.value);
+            check.advice = clean(&check.advice);
+        }
+        self.checks.retain(|c| !c.name.is_empty());
+        self.checks.truncate(12);
+        for service in &mut self.services {
+            service.record = clean(&service.record);
+            service.target = clean(&service.target);
+            service.meaning = clean(&service.meaning);
+        }
+        self.services.retain(|s| !s.record.is_empty());
+        self.services.truncate(32);
+        self.wildcard = std::mem::take(&mut self.wildcard)
+            .into_iter()
+            .map(|a| clean(&a))
+            .filter(|a| !a.is_empty())
+            .take(8)
+            .collect();
+        for sub in &mut self.subdomains {
+            sub.name = clean(&sub.name);
+            sub.status = match sub.status.as_str() {
+                "resolves" | "wildcard" | "gone" => sub.status.clone(),
+                _ => "gone".to_owned(),
+            };
+            sub.addresses = std::mem::take(&mut sub.addresses)
+                .into_iter()
+                .map(|a| clean(&a))
+                .filter(|a| !a.is_empty())
+                .take(8)
+                .collect();
+        }
+        self.subdomains.retain(|s| !s.name.is_empty());
+        self.subdomains.truncate(32);
+    }
+
+    pub fn weight(&self) -> usize {
+        let checks: usize = self
+            .checks
+            .iter()
+            .map(|c| c.name.len() + c.status.len() + c.value.len() + c.advice.len() + 16)
+            .sum();
+        let services: usize = self
+            .services
+            .iter()
+            .map(|s| s.record.len() + s.target.len() + s.meaning.len() + 12)
+            .sum();
+        let subs: usize = self
+            .subdomains
+            .iter()
+            .map(|s| {
+                s.name.len()
+                    + s.status.len()
+                    + s.addresses.iter().map(|a| a.len() + 4).sum::<usize>()
+                    + 12
+            })
+            .sum();
+        2 * (self.domain.len()
+            + self.grade.len()
+            + checks
+            + services
+            + subs
+            + self.wildcard.iter().map(|a| a.len() + 4).sum::<usize>())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Port {
     pub number: u16,
@@ -550,6 +674,9 @@ pub struct Host {
     /// Ports the latest scan tried that were not open, by `<protocol> <state>`.
     #[serde(default)]
     pub not_open: BTreeMap<String, NotOpen>,
+    /// Mail and DNS protection of the domain this host was found under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_security: Option<DnsSecurity>,
 }
 
 /// Ports a scan tried that did not answer as open.
@@ -791,6 +918,12 @@ pub enum Observation {
         address: String,
         port: u16,
         http: Box<HttpInfo>,
+        record: EvidenceRecord,
+    },
+    /// Mail and DNS protection of a domain, kept on the host it resolves to.
+    DnsSecurity {
+        address: String,
+        info: Box<DnsSecurity>,
         record: EvidenceRecord,
     },
 }
@@ -1166,6 +1299,11 @@ impl Observation {
                 record,
                 ..
             } => address.len() + http.weight() / 2 + record.evidence.len(),
+            Observation::DnsSecurity {
+                address,
+                info,
+                record,
+            } => address.len() + info.weight() / 2 + record.evidence.len(),
         };
         2 * text + ITEM_OVERHEAD
     }
@@ -1183,7 +1321,8 @@ impl Observation {
             | Observation::Script { address, .. }
             | Observation::Fact { address, .. }
             | Observation::HostMeta { address, .. }
-            | Observation::WebMeta { address, .. } => Some(address),
+            | Observation::WebMeta { address, .. }
+            | Observation::DnsSecurity { address, .. } => Some(address),
             Observation::Note { address, .. } => address.as_deref(),
         }
     }
@@ -1470,6 +1609,13 @@ impl Graph {
                     ports,
                     facts,
                     advisories,
+                    dns_security: host
+                        .dns_security
+                        .map(|mut info| {
+                            info.sanitize();
+                            info
+                        })
+                        .filter(|info| !info.domain.is_empty()),
                     not_open: host
                         .not_open
                         .into_values()
@@ -2103,6 +2249,22 @@ impl Graph {
                     }
                 }
                 changed
+            }
+            Observation::DnsSecurity {
+                address,
+                info,
+                record: _,
+            } => {
+                let Some(host) = self.host_entry(&address) else {
+                    return false;
+                };
+                let mut info = *info;
+                info.sanitize();
+                if info.domain.is_empty() || host.dns_security.as_ref() == Some(&info) {
+                    return false;
+                }
+                host.dns_security = Some(info);
+                true
             }
             Observation::Note {
                 address,

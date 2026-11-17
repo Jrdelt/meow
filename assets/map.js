@@ -1298,11 +1298,21 @@
     if (mentioned.length) {
       var names = list.appendChild(fold('mentioned', 'names', false));
       names.appendChild(el('summary', null, 'Names only mentioned (' + mentioned.length + ')'));
-      names.appendChild(el('p', 'note', 'These appeared in the terminal or a log, usually inside a URL. ' +
-        'meow has not contacted them and they are not part of the network drawn above.'));
+      names.appendChild(el('p', 'note', 'These appeared in the terminal, a log (usually inside a URL) or the ' +
+        'certificate logs. meow has not connected to them and they are not part of the network drawn above.'));
       mentioned.forEach(function (entry) {
         var what = (entry.ports || []).join(', ') || 'no port';
         if (entry.paths) { what += ' · ' + entry.paths + (entry.paths === 1 ? ' path' : ' paths'); }
+        // How the name answers in DNS: one only a wildcard answers for may
+        // not exist, so it is faded.
+        if (entry.dns_status === 'wildcard') {
+          var faded = names.appendChild(row(entry.name, marked('wildcard only, may not exist', 'warn')));
+          faded.className += ' faded';
+          faded.title = entry.dns || '';
+          return;
+        }
+        if (entry.dns_status === 'gone') { what = 'no DNS record now · ' + what; }
+        if (entry.dns_status === 'resolves') { what = (entry.dns || 'resolves') + ' · ' + what; }
         names.appendChild(row(entry.name, what, 'dim'));
       });
     }
@@ -1774,8 +1784,54 @@
   // The selected host's cards sit in tabs under its name. The Advisory
   // card and the AI answer move into their tab while that host is selected,
   // and back to their own place on the page otherwise.
-  var HOST_TABS = [['overview', 'Overview'], ['ports', 'Ports'], ['web', 'Web & TLS'],
+  var HOST_TABS = [['overview', 'Overview'], ['ports', 'Ports'], ['web', 'Web & TLS'], ['dns', 'DNS & Mail'],
     ['advisories', 'Advisories'], ['evidence', 'Evidence'], ['notes', 'Notes & AI']];
+
+  // A to F: green, amber or red.
+  function gradeKind(grade) {
+    return /^[AB]$/.test(grade) ? 'ok' : grade === 'C' ? 'warn' : /^[DF]$/.test(grade) ? 'bad' : 'info';
+  }
+
+  // DNS & Mail: the graded checks, the services the domain publishes, and
+  // whether made-up names answer (wildcard DNS).
+  function dnsCard(info) {
+    var box = card('DNS & Mail \u2014 ' + info.domain);
+    var head = box.appendChild(el('div', 'grade-line'));
+    head.appendChild(el('span', 'grade ' + gradeKind(info.grade), info.grade || '?'));
+    head.appendChild(el('span', 'dim', 'SPF, DMARC, DKIM, CAA and DNSSEC graded together. ' +
+      'An A means mail cannot easily be forged and certificates and answers are protected.'));
+    (info.checks || []).forEach(function (check) {
+      box.appendChild(row(check.name, marked(check.value, check.status)));
+      if (check.advice) { box.appendChild(el('p', 'note why', check.advice)); }
+    });
+    var services = info.services || [];
+    box.appendChild(el('h3', null, 'Published services (' + services.length + ')'));
+    if (!services.length) {
+      box.appendChild(el('p', 'note', 'No SRV records or well-known service names found.'));
+    }
+    services.forEach(function (service) {
+      var where = el('span');
+      where.appendChild(el('div', null, service.target));
+      where.appendChild(el('div', 'dim', service.meaning));
+      box.appendChild(row(service.record, where));
+    });
+    box.appendChild(el('h3', null, 'Wildcard DNS'));
+    box.appendChild((info.wildcard || []).length
+      ? row('Made-up names', marked('resolve to ' + info.wildcard.join(', '), 'warn'))
+      : row('Made-up names', marked('do not resolve (no wildcard)', 'ok')));
+    var subs = info.subdomains || [];
+    if (subs.length) {
+      box.appendChild(el('h3', null, 'Certificate-log names (' + subs.length + ')'));
+      subs.forEach(function (sub) {
+        var value = sub.status === 'wildcard' ? marked('only the wildcard answers: may not exist', 'warn')
+          : sub.status === 'gone' ? marked('no DNS record now', 'info')
+          : marked((sub.addresses || []).join(', '), 'ok');
+        var line = box.appendChild(row(sub.name, value));
+        if (sub.status !== 'resolves') { line.className += ' faded'; }
+      });
+    }
+    return box;
+  }
   var hostTab = 'overview';
   try { hostTab = sessionStorage.getItem('meow-map-tab') || 'overview'; } catch (_) {}
   var movable = table();
@@ -1863,6 +1919,13 @@
       box.appendChild(row('Web & TLS', go('web', flagged.concat(edges).join(' \u00b7 ') || 'nothing flagged',
         flagged.length ? 'warn' : 'ok')));
     }
+    if (host.dns_security) {
+      var dnsInfo = host.dns_security;
+      var weak = (dnsInfo.checks || []).filter(function (c) { return c.status === 'bad' || c.status === 'warn'; })
+        .map(function (c) { return c.name; });
+      box.appendChild(row('DNS & Mail', go('dns', 'grade ' + (dnsInfo.grade || '?') +
+        (weak.length ? ' \u00b7 check ' + weak.join(', ') : ''), gradeKind(dnsInfo.grade))));
+    }
     var newest = '';
     made.facts.forEach(function (fact) {
       var at = String((fact.record || fact).timestamp_utc || '');
@@ -1902,12 +1965,15 @@
       overview: [made.status, glanceCard(host, made, adv)],
       ports: [made.ports],
       web: made.web ? [made.web] : null,
+      dns: host.dns_security ? [dnsCard(host.dns_security)] : null,
       advisories: [movable['card-advisory'].node],
       evidence: [made.evidence],
       notes: aiHere ? [made.ai, made.note, movable['card-ai'].node] : [made.ai, made.note]
     };
     var badge = {
       ports: [String(openPorts), ''],
+      dns: host.dns_security ? [host.dns_security.grade || '?',
+        { ok: '', warn: 'warn', bad: 'bad', info: '' }[gradeKind(host.dns_security.grade)]] : null,
       advisories: [String(adv.confirmed + adv.open), adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : ''],
       evidence: [String(made.facts.length), ''],
       notes: aiHere ? [reply.running ? 'AI\u2026' : 'AI', reply.error ? 'bad' : 'info'] : null
@@ -1941,7 +2007,7 @@
     showTab(hostTab, refocus, true);
   }
 
-  // Arrow keys, Home and End move between tabs; 1 to 6 open one directly.
+  // Arrow keys, Home and End move between tabs; 1 to 7 open one directly.
   byId('host-tabs').addEventListener('keydown', function (event) {
     var tabs = Array.prototype.slice.call(this.querySelectorAll('[role="tab"]'));
     var at = tabs.indexOf(document.activeElement);

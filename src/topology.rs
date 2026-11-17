@@ -1197,11 +1197,30 @@ impl Topology {
                     .map(|p| crate::evidence::sanitize(p, 32))
                     .collect();
                 let paths: usize = host.ports.values().map(|port| port.paths.count()).sum();
-                json!({
+                let mut entry = json!({
                     "name": crate::evidence::sanitize(&host.address, 200),
                     "ports": ports,
                     "paths": paths
-                })
+                });
+                // How the name answers in DNS (the `mail-dns` stage): a name
+                // only the wildcard answers for may not exist at all.
+                if let Some(text) = host
+                    .facts
+                    .iter()
+                    .rev()
+                    .find_map(|fact| fact.claim.strip_prefix("DNS: "))
+                {
+                    let status = if text.starts_with("only the wildcard") {
+                        "wildcard"
+                    } else if text.starts_with("no address record") {
+                        "gone"
+                    } else {
+                        "resolves"
+                    };
+                    entry["dns"] = json!(crate::evidence::sanitize(text, 200));
+                    entry["dns_status"] = json!(status);
+                }
+                entry
             })
             .collect();
         json!({ "nodes": nodes, "edges": edges, "mentioned": mentioned })
@@ -1735,6 +1754,29 @@ mod tests {
             drawn["mentioned"],
             json!([ { "name": "claude.ai", "ports": ["443/tcp"], "paths": 1 } ])
         );
+
+        // A certificate-log name the mail-dns stage found only the wildcard
+        // answers for is listed as such.
+        graph.apply(Observation::Fact {
+            address: "old.example.test".into(),
+            port: None,
+            protocol: "ip".into(),
+            claim: "DNS: only the wildcard *.example.test answers for this name; it may not exist"
+                .into(),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "lookup"),
+        });
+        let drawn = Topology::build(&graph).cytoscape(&graph);
+        let old = drawn["mentioned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "old.example.test")
+            .expect("listed");
+        assert_eq!(old["dns_status"], "wildcard");
+        assert!(old["dns"]
+            .as_str()
+            .unwrap()
+            .starts_with("only the wildcard"));
     }
 
     #[test]

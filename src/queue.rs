@@ -1,8 +1,8 @@
 //! The background recon queue.
 //!
-//! `meow recon <target>` queues one task of 14 sequential stages (`lan`, `dns`,
-//! `asn`, `subdomains`, `trace`, `ports`, `services`, `headers`, `waf-cdn`,
-//! `tls-audit`, `ssh-audit`, `cves`, `crawl`, `dirs`) that run strictly one at
+//! `meow recon <target>` queues one task of 15 sequential stages (`lan`, `dns`,
+//! `asn`, `subdomains`, `mail-dns`, `trace`, `ports`, `services`, `headers`,
+//! `waf-cdn`, `tls-audit`, `ssh-audit`, `cves`, `crawl`, `dirs`) that run strictly one at
 //! a time. External tools (`nmap`, `katana`, `feroxbuster`, `traceroute`,
 //! `openssl`) run with `stdin` closed, under a wall-clock timeout and an output
 //! size cap, and write structured files to `<workspace>/tmp/` that are parsed
@@ -39,6 +39,8 @@ pub enum Stage {
     Dns,
     Asn,
     Subdomains,
+    #[serde(rename = "mail-dns", alias = "mail_dns")]
+    MailDns,
     Trace,
     Ports,
     Services,
@@ -54,11 +56,12 @@ pub enum Stage {
     Dirs,
 }
 
-pub const STAGES: [Stage; 14] = [
+pub const STAGES: [Stage; 15] = [
     Stage::Lan,
     Stage::Dns,
     Stage::Asn,
     Stage::Subdomains,
+    Stage::MailDns,
     Stage::Trace,
     Stage::Ports,
     Stage::Services,
@@ -78,6 +81,7 @@ impl Stage {
             Stage::Dns => "dns",
             Stage::Asn => "asn",
             Stage::Subdomains => "subdomains",
+            Stage::MailDns => "mail-dns",
             Stage::Trace => "trace",
             Stage::Ports => "ports",
             Stage::Services => "services",
@@ -94,6 +98,7 @@ impl Stage {
     fn parse(text: &str) -> Option<Self> {
         match text {
             "waf_cdn" => Some(Stage::WafCdn),
+            "mail_dns" => Some(Stage::MailDns),
             "tls_audit" => Some(Stage::TlsAudit),
             "ssh_audit" => Some(Stage::SshAudit),
             _ => STAGES.into_iter().find(|stage| stage.as_str() == text),
@@ -2121,6 +2126,45 @@ async fn run_stage(
             let (changed, _) = record(state, observations, None);
             Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
         }
+        Stage::MailDns => {
+            let Target::Host(HostAddr::Name(domain)) = target else {
+                return Ok(StageEnd::Skipped(
+                    "target is an IP or CIDR, not a domain name".to_owned(),
+                ));
+            };
+            let dns_found = Found::load(&state.db_lock(), task.id, Stage::Dns, target);
+            let primary_address = dns_found
+                .ips
+                .first()
+                .cloned()
+                .unwrap_or_else(|| domain.clone());
+            // The names the certificate logs gave, to see which really resolve.
+            let ct_names: Vec<String> = state
+                .graph()
+                .hosts
+                .values()
+                .filter(|host| {
+                    host.facts
+                        .iter()
+                        .any(|fact| fact.record.source == crate::evidence::Source::CtLog)
+                })
+                .map(|host| host.address.clone())
+                .collect();
+            let ran = while_same_mode(
+                &same_mode,
+                crate::maildns::run(domain, &primary_address, &ct_names),
+            )
+            .await;
+            let (observations, summary) = match ran {
+                None => return Ok(StageEnd::ModeChanged),
+                Some(Ok(res)) => res,
+                Some(Err(err)) => {
+                    return Ok(StageEnd::Skipped(format!("DNS lookups unavailable: {err}")))
+                }
+            };
+            let (changed, _) = record(state, observations, None);
+            Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+        }
         Stage::Trace => {
             let Some(resolved_ip) = resolve_target_ips(state, task.id, target)
                 .await
@@ -2729,6 +2773,7 @@ fn stage_file(stage: Stage) -> &'static str {
         Stage::Dns => "dns",
         Stage::Asn => "asn",
         Stage::Subdomains => "subdomains",
+        Stage::MailDns => "mail_dns",
         Stage::Trace => "trace",
         Stage::Ports => "nmap_ports",
         Stage::Services => "nmap_svc",
@@ -3371,15 +3416,10 @@ mod tests {
         assert_eq!(statuses(&db), ["pending"; STAGES.len()]);
         assert_eq!(row.describe(), "recon 10.0.0.0/24: lan pending");
 
-        for s in [
-            Stage::Lan,
-            Stage::Dns,
-            Stage::Asn,
-            Stage::Subdomains,
-            Stage::Trace,
-            Stage::Ports,
-        ] {
-            set_stage(&db, id, s, "done", "ok").unwrap();
+        // Every stage before `services` is done; `services` is running.
+        let running = STAGES.iter().position(|s| *s == Stage::Services).unwrap();
+        for s in &STAGES[..running] {
+            set_stage(&db, id, *s, "done", "ok").unwrap();
         }
         set_stage(&db, id, Stage::Services, "running", "").unwrap();
         assert_eq!(unfinished(&db).unwrap().len(), 1);
@@ -3387,17 +3427,26 @@ mod tests {
         // The session dies here; on reopen the running stage is interrupted.
         assert_eq!(mark_running_interrupted(&db).unwrap(), 1);
         let after = statuses(&db);
-        assert_eq!(&after[..6], &["done"; 6]);
-        assert_eq!(after[6], "interrupted");
-        assert_eq!(&after[7..], &["pending"; 7]);
+        assert!(after[..running].iter().all(|s| s == "done"), "{after:?}");
+        assert_eq!(after[running], "interrupted");
+        assert!(
+            after[running + 1..].iter().all(|s| s == "pending"),
+            "{after:?}"
+        );
         let row = task(&db, id).unwrap().unwrap();
         assert!(row.unfinished());
         assert_eq!(row.describe(), "recon 10.0.0.0/24: services interrupted");
 
         decline(&db, id).unwrap();
         let declined = statuses(&db);
-        assert_eq!(&declined[..6], &["done"; 6]);
-        assert_eq!(&declined[6..], &["skipped"; 8]);
+        assert!(
+            declined[..running].iter().all(|s| s == "done"),
+            "{declined:?}"
+        );
+        assert!(
+            declined[running..].iter().all(|s| s == "skipped"),
+            "{declined:?}"
+        );
         assert!(unfinished(&db).unwrap().is_empty());
         assert_eq!(
             task(&db, id).unwrap().unwrap().describe(),
