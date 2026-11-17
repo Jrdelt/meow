@@ -38,7 +38,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List every saved workspace and whether its session is running
-    #[command(visible_alias = "ls")]
+    #[command(visible_aliases = ["ls", "status"])]
     List,
     /// Set up your own AI, discovery mode & CVE preferences (opens the interactive Cat GUI on a TTY)
     Setup {
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn list_and_ls_show_the_listing_without_starting_a_session() {
-        for word in ["list", "ls"] {
+        for word in ["list", "ls", "status"] {
             let cli = parse(&[word]).unwrap();
             assert!(cli.name.is_none(), "{word} parsed as a workspace name");
             assert!(matches!(cli.command, Some(Command::List)));

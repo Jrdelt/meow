@@ -87,6 +87,7 @@ typeset -g _meow_replay=@REPLAY@
 typeset -g _meow_last_cwd=@LAST_CWD@
 typeset -g _meow_profile=@PROFILE@
 typeset -g _meow_pending=
+typeset -g _meow_tty_frozen=
 
 @REFRESH_MODE@
 @RATE_WARNING@
@@ -109,6 +110,12 @@ _meow_preexec() {
 # Stage 2: after it has finished, before the next prompt.
 _meow_precmd() {
   local code=$?
+  if [[ -z $_meow_tty_frozen ]]; then
+    _meow_tty_frozen=1
+    # Freeze the cooked tty state after startup scripts finish so a SIGKILLed
+    # child program cannot leave the session shell stuck in raw mode (~ISIG).
+    ttyctl -f 2>/dev/null || true
+  fi
   if [[ ${precmd_functions[1]-} != _meow_precmd ]]; then
     precmd_functions=(_meow_precmd ${precmd_functions[@]:+${precmd_functions[@]:#_meow_precmd}})
   fi
@@ -657,6 +664,7 @@ mod tests {
         let hooks = read(dir.join("hooks.zsh"));
         assert!(hooks.contains("add-zsh-hook preexec _meow_preexec"));
         assert!(hooks.contains("add-zsh-hook precmd _meow_precmd"));
+        assert!(hooks.contains("ttyctl -f"));
         assert_filled(&hooks);
 
         // zsh reads the user's own .zshrc; a shim left by an older version

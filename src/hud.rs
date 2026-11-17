@@ -1162,6 +1162,7 @@ impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
+        crate::pty::ensure_cooked_terminal();
     }
 }
 
@@ -1180,6 +1181,7 @@ pub fn run(workspace: &Workspace) -> Result<()> {
         if socket.is_none() {
             model.snapshot = Some(Snapshot::offline(workspace)?);
         }
+        crate::pty::ensure_cooked_terminal();
         let mut terminal =
             ratatui::try_init().context("cannot take over the terminal (is this a TTY?)")?;
         let _restore = TerminalRestore;

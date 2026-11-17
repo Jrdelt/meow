@@ -533,6 +533,7 @@ impl Drop for RawModeGuard {
             ratatui::crossterm::event::DisableBracketedPaste
         );
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        crate::pty::ensure_cooked_terminal();
     }
 }
 
@@ -549,6 +550,7 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     }
     // Echo goes off before the prompt shows: a key pasted the moment the
     // prompt appears must not be echoed by the terminal.
+    crate::pty::ensure_cooked_terminal();
     terminal::enable_raw_mode().context("cannot switch the terminal to hidden input")?;
     let raw_guard = RawModeGuard;
     let mut out = std::io::stdout();

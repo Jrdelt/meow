@@ -1836,6 +1836,7 @@ impl Drop for WizardTerminalGuard {
             .write_all(b"\x1b[?2004l\x1b[?1000l\x1b[?25h")
             .and_then(|()| std::io::stdout().flush());
         ratatui::restore();
+        crate::pty::ensure_cooked_terminal();
     }
 }
 
@@ -1851,6 +1852,7 @@ fn run_loop(home: &MeowHome, first_run: bool) -> Result<WizardOutcome> {
         anyhow::bail!("cannot open the interactive setup GUI (requires a TTY)");
     }
     let mut wizard = Wizard::load(home, first_run)?;
+    crate::pty::ensure_cooked_terminal();
     let mut terminal =
         ratatui::try_init().context("cannot initialize terminal for meow setup GUI")?;
     let _guard = WizardTerminalGuard;
