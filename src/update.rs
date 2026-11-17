@@ -76,7 +76,9 @@ fn verify_checkout_security(dir: &Path, explicit_source: bool) -> Result<()> {
     let safe_dir = sanitize(&dir.display().to_string(), 400);
     if !explicit_source && is_ephemeral_tmp_path(dir) {
         bail!(
-            "{safe_dir} is in a temporary build folder. Pass `--source <folder>` with your meow git checkout (or upgrade with your package manager)."
+            "{safe_dir} is a temporary build folder (for example from Homebrew) that no longer exists. \
+             Upgrade with `brew update && brew upgrade meow` (or `brew reinstall --HEAD meow` for the latest main branch), \
+             or pass `--source <folder>` with a meow git checkout."
         );
     }
     for ancestor in dir.ancestors().skip(1) {
@@ -591,6 +593,169 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomebrewInstall {
+    prefix: PathBuf,
+    formula: String,
+    keg_version: String,
+    is_head: bool,
+}
+
+/// Recognizes a binary installed inside a Homebrew Cellar:
+/// `<prefix>/Cellar/<formula>/<keg_version>/bin/<exe>`.
+#[cfg(any(unix, test))]
+fn parse_homebrew_cellar_exe(canon_exe: &Path) -> Option<HomebrewInstall> {
+    if !canon_exe.is_absolute() {
+        return None;
+    }
+    let bin_dir = canon_exe.parent()?;
+    if bin_dir.file_name()?.to_str()? != "bin" {
+        return None;
+    }
+    let keg_dir = bin_dir.parent()?;
+    let keg_version = keg_dir.file_name()?.to_str()?.to_owned();
+    if keg_version.is_empty() || keg_version.starts_with('-') {
+        return None;
+    }
+    let formula_dir = keg_dir.parent()?;
+    let formula = formula_dir.file_name()?.to_str()?.to_owned();
+    if formula.is_empty()
+        || formula.starts_with('-')
+        || !formula
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+    {
+        return None;
+    }
+    let cellar_dir = formula_dir.parent()?;
+    if cellar_dir.file_name()?.to_str()? != "Cellar" {
+        return None;
+    }
+    let prefix = cellar_dir.parent()?.to_path_buf();
+    if prefix.as_os_str().is_empty() {
+        return None;
+    }
+    let is_head = keg_version.starts_with("HEAD");
+    Some(HomebrewInstall {
+        prefix,
+        formula,
+        keg_version,
+        is_head,
+    })
+}
+
+#[cfg(unix)]
+fn detect_homebrew_install() -> Option<(HomebrewInstall, PathBuf)> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe().ok()?;
+    let canon = std::fs::canonicalize(&exe).ok()?;
+    let hb = parse_homebrew_cellar_exe(&canon)?;
+    if is_ephemeral_tmp_path(&hb.prefix) {
+        return None;
+    }
+    let brew = hb.prefix.join("bin").join("brew");
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let link_meta = std::fs::symlink_metadata(&brew).ok()?;
+    if link_meta.uid() != me && link_meta.uid() != 0 {
+        return None;
+    }
+    let target_meta = std::fs::metadata(&brew).ok()?;
+    if !target_meta.is_file()
+        || (target_meta.uid() != me && target_meta.uid() != 0)
+        || target_meta.mode() & 0o002 != 0
+    {
+        return None;
+    }
+    Some((hb, brew))
+}
+
+#[cfg(unix)]
+fn brew_command(brew_bin: &Path) -> Command {
+    let mut cmd = Command::new(brew_bin);
+    for var in GIT_ENV_SCRUB {
+        cmd.env_remove(var);
+    }
+    if let Some(path) = sanitized_path_env() {
+        cmd.env("PATH", path);
+    } else {
+        cmd.env_remove("PATH");
+    }
+    cmd
+}
+
+#[cfg(unix)]
+fn run_homebrew_update(hb: &HomebrewInstall, brew_bin: &Path, check: bool) -> Result<ExitCode> {
+    let safe_formula = sanitize(&hb.formula, 64);
+    let safe_ver = sanitize(&hb.keg_version, 64);
+    if check {
+        println!("[+] Installed via Homebrew ({safe_formula} {safe_ver}). Checking with brew...");
+        let mut cmd = brew_command(brew_bin);
+        cmd.arg("outdated").arg("--quiet");
+        if hb.is_head {
+            cmd.arg("--fetch-HEAD");
+        }
+        let out = cmd
+            .arg(&hb.formula)
+            .stdin(Stdio::null())
+            .output()
+            .context("cannot run brew outdated")?;
+        if !out.status.success() {
+            bail!(
+                "brew outdated failed: {}",
+                sanitize_block(&String::from_utf8_lossy(&out.stderr), 1000)
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.trim().is_empty() {
+            println!("[+] Already up to date in Homebrew ({safe_formula} {safe_ver}).");
+            if !hb.is_head {
+                println!(
+                    "[+] Note: Homebrew stable tracks tagged releases; run `brew reinstall --HEAD {safe_formula}` to track the latest main branch."
+                );
+            }
+        } else {
+            let head_flag = if hb.is_head { " --fetch-HEAD" } else { "" };
+            println!(
+                "[+] Update available in Homebrew: {}",
+                sanitize(stdout.trim(), 120)
+            );
+            println!(
+                "[+] Run `meow update` (or `brew upgrade{head_flag} {safe_formula}`) to install it."
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("[+] Installed via Homebrew ({safe_formula} {safe_ver}) — running brew update...");
+    let status = brew_command(brew_bin)
+        .arg("update")
+        .status()
+        .context("cannot run brew update")?;
+    if !status.success() {
+        bail!("brew update failed (see the messages above)");
+    }
+
+    println!("[+] Running brew upgrade for {safe_formula}...");
+    let mut up = brew_command(brew_bin);
+    up.env("HOMEBREW_NO_AUTO_UPDATE", "1").arg("upgrade");
+    if hb.is_head {
+        up.arg("--fetch-HEAD");
+    }
+    let status = up
+        .arg(&hb.formula)
+        .status()
+        .context("cannot run brew upgrade")?;
+    if !status.success() {
+        bail!("brew upgrade failed (see the messages above)");
+    }
+    println!(
+        "[+] Homebrew update finished. Sessions that are open keep the old version until you close and reopen them."
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     // Installed from a GitHub Release: download the newest release instead,
     // unless a checkout to update was named.
@@ -598,6 +763,12 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         args.source.is_some() || std::env::var_os(SOURCE_ENV).is_some_and(|v| !v.is_empty());
     if crate::release::BUILD.is_some() && !explicit_source {
         return crate::release::run(args.check);
+    }
+    #[cfg(unix)]
+    if !explicit_source {
+        if let Some((hb, brew_bin)) = detect_homebrew_install() {
+            return run_homebrew_update(&hb, &brew_bin, args.check);
+        }
     }
     let dir = source_dir(args.source.as_deref());
     let safe_dir = sanitize(&dir.display().to_string(), 400);
@@ -967,5 +1138,46 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("git remote URL"), "{err:#}");
+    }
+
+    #[test]
+    fn homebrew_cellar_paths_are_recognized_and_sanitized() {
+        let root = if cfg!(windows) {
+            r"C:\opt\homebrew"
+        } else {
+            "/opt/homebrew"
+        };
+        let stable = PathBuf::from(root)
+            .join("Cellar")
+            .join("meow")
+            .join("0.2.0")
+            .join("bin")
+            .join("meow");
+        let parsed = parse_homebrew_cellar_exe(&stable).expect("stable cellar path");
+        assert_eq!(parsed.prefix, PathBuf::from(root));
+        assert_eq!(parsed.formula, "meow");
+        assert_eq!(parsed.keg_version, "0.2.0");
+        assert!(!parsed.is_head);
+
+        let head = PathBuf::from(root)
+            .join("Cellar")
+            .join("meow")
+            .join("HEAD-cccc85c_1")
+            .join("bin")
+            .join("meow");
+        let parsed_head = parse_homebrew_cellar_exe(&head).expect("HEAD cellar path");
+        assert!(parsed_head.is_head);
+        assert_eq!(parsed_head.keg_version, "HEAD-cccc85c_1");
+
+        // Reject flag-like formula names and non-Cellar paths.
+        let bad_formula = PathBuf::from(root)
+            .join("Cellar")
+            .join("-evil")
+            .join("0.2.0")
+            .join("bin")
+            .join("meow");
+        assert!(parse_homebrew_cellar_exe(&bad_formula).is_none());
+        let plain_bin = PathBuf::from(root).join("bin").join("meow");
+        assert!(parse_homebrew_cellar_exe(&plain_bin).is_none());
     }
 }
