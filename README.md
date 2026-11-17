@@ -48,13 +48,13 @@ sudo installer -pkg meow-0.2.0-macos-arm64.pkg -target /
 
 Then run `meow tools` once in your terminal to install any missing companion scanners (`nmap`, `katana`, `feroxbuster`), the web wordlist, and the offline location database.
 
-### Option 3 — One-line installer (macOS & Linux)
+### Option 3 — Build from source with the installer (macOS & Linux)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Jrdelt/meow/main/install.sh | sh
+git clone https://github.com/Jrdelt/meow.git && cd meow && ./install.sh
 ```
 
-The installer downloads the prebuilt release binary for your platform (verifying its SHA-256 digest against `SHA256SUMS`) or builds from source if no prebuilt archive matches, and sets up `nmap`, `katana`, `feroxbuster`, the SecLists `common.txt` wordlist (`~/.meow/wordlists/common.txt`), and the DB-IP Lite offline location database (`~/.meow/geo/`).
+The installer builds `meow` from the clone it is part of (installing Rust through `rustup` if needed) and sets up `nmap`, `katana`, `feroxbuster`, the SecLists `common.txt` wordlist (`~/.meow/wordlists/common.txt`), and the DB-IP Lite offline location database (`~/.meow/geo/`).
 
 Installer flags (when running `./install.sh` from a git clone):
 
@@ -293,7 +293,7 @@ map = true
   brew uninstall meow && brew install --HEAD meow
   ```
   If `brew upgrade meow` says `Error: jrdelt/meow/meow not installed`, install it first with `brew install meow`.
-- **If you installed from a git clone and deleted or moved that folder:** `meow update` automatically falls back to downloading the latest SHA-256 verified prebuilt release from GitHub Releases and installing it in place (or pass `--source <path-to-meow-clone>` / set `MEOW_SOURCE=<path-to-meow-clone>` to build from a moved checkout).
+- **If you installed from a git clone and deleted or moved that folder:** pass `--source <path-to-meow-clone>` (or set `MEOW_SOURCE=<path-to-meow-clone>`) to update from the moved checkout, or install a release download (`.pkg`, `.tar.gz`, `.zip`): a meow installed from a release updates itself from GitHub Releases, SHA-256 verified.
 
 ### macOS says the `.pkg` installer "cannot be opened because it is from an unidentified developer"
 

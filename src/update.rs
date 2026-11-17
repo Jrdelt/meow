@@ -797,7 +797,28 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
     )
     .context("the checked-out branch does not track a branch on GitHub")?;
-    let remote_name = upstream.split('/').next().unwrap_or("origin");
+    // The remote the branch is configured to pull from. Taking it from the
+    // tracking ref's name ("origin/main") would let a branch whose remote is
+    // another one, with a refspec that writes to origin's refs, be checked
+    // as origin and fetched from elsewhere.
+    let branch = git(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .context("the folder is not on a branch")?;
+    let remote_owned = git(
+        &dir,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:remotename)",
+            "--",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    let remote_name = remote_owned.trim();
+    if remote_name.is_empty() || !upstream.starts_with(&format!("{remote_name}/")) {
+        bail!(
+            "the branch's remote does not match its upstream {}; check `git remote -v` and the branch's settings",
+            sanitize(&upstream, 120)
+        );
+    }
     validate_remote_name(remote_name)?;
     let remote_urls = git(
         &dir,
@@ -860,8 +881,12 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     }
 
     if !incoming.is_empty() {
-        git_live(&dir, local_remote, &["pull", "--ff-only", "--quiet"])
-            .context("the pull could not fast-forward; the folder's branch has its own commits")?;
+        // What was fetched and checked above, merged without contacting
+        // anything again: a `git pull` would fetch once more, from whatever
+        // remote the branch's settings name.
+        git(&dir, &["merge", "--ff-only", "--quiet", "@{u}"]).context(
+            "the update could not fast-forward; the folder's branch has its own commits",
+        )?;
     }
 
     verify_checkout_security(&dir, explicit_source)?;
@@ -1105,6 +1130,51 @@ mod tests {
             std::fs::read_to_string(&install_log).unwrap().trim(),
             "ran --yes"
         );
+
+        // The branch pulls from another remote whose refspec writes to
+        // origin's refs: `@{u}` still reads origin/main. The update must
+        // not take origin's word for it, nor contact the other remote.
+        std::fs::write(work.join("feat2.txt"), "ok").unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-qm", "feat: two"]);
+        test_git(&work, &["push", "-q", "origin", "HEAD:main"]);
+        test_git(
+            &clone,
+            &["remote", "add", "evil", "ftp://127.0.0.1:9/evil.git"],
+        );
+        test_git(
+            &clone,
+            &[
+                "config",
+                "remote.evil.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        test_git(&clone, &["config", "branch.main.remote", "evil"]);
+        tighten_tree(&clone);
+        let err = run(&UpdateArgs {
+            check: false,
+            source: Some(clone.clone()),
+        })
+        .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("does not match its upstream")
+                || said.contains("git remote URL")
+                || said.contains("ftp"),
+            "{said}"
+        );
+        assert!(!clone.join("feat2.txt").exists(), "nothing was merged");
+        test_git(&clone, &["config", "branch.main.remote", "origin"]);
+        test_git(&clone, &["remote", "remove", "evil"]);
+        tighten_tree(&clone);
+        // Back to normal, the checked fetch is merged without a second one.
+        let _ = run(&UpdateArgs {
+            check: false,
+            source: Some(clone.clone()),
+        })
+        .unwrap();
+        assert!(clone.join("feat2.txt").exists());
 
         // Local modifications refuse pulling.
         std::fs::write(clone.join("install.sh"), "echo dirty\n").unwrap();

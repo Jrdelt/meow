@@ -88,6 +88,12 @@ done
 
 # The tools need no source tree: meow runs this script from its own copy.
 if [ "$tools_only" = no ]; then
+    # Piped into sh ($0 is then "sh"), this would build whatever folder the
+    # user happens to be in. It builds only the clone it is part of.
+    if [ ! -f "$0" ] || [ "$(basename -- "$0")" != install.sh ]; then
+        die "Clone the repository and run ./install.sh from it (piping this script into sh is not supported):
+    git clone https://github.com/Jrdelt/meow.git && cd meow && ./install.sh"
+    fi
     case "$0" in
     /* | ./* | ../*) script_dir=$(dirname "$0") ;;
     *) script_dir=$(dirname "./$0") ;;
@@ -263,24 +269,32 @@ fetch() {
     *) return 1 ;;
     esac
     max_dl=${3:-$GEO_MAX_PACKED}
+    # Both tools write to a pipe that stops after max_dl + 1 bytes: curl's
+    # --max-filesize only holds when the server states the size (before curl
+    # 8.4), and wget has no such option. The exit status is kept in a file
+    # inside a private folder made for this download, never at a name in a
+    # shared /tmp that someone else could have prepared.
+    rc_dir=$(mktemp -d "${TMPDIR:-/tmp}/meow-fetch.XXXXXX") || return 1
     if have curl; then
-        curl --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 5 --max-filesize "$max_dl" -fsSL -o "$2" "$1"
+        { curl --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 5 \
+            --max-filesize "$max_dl" -fsSL "$1" || echo $? >"$rc_dir/rc"; } \
+            | head -c "$((max_dl + 1))" >"$2"
     else
         # wget follows a redirect to http:// even with --https-only, so it
-        # follows none; bound the stream to max_dl bytes while checking status.
-        wget_rc="$2.rc"
-        rm -f "$wget_rc"
-        { wget --https-only --max-redirect=0 -q -O - "$1" || echo $? >"$wget_rc"; } \
+        # follows none.
+        { wget --https-only --max-redirect=0 -q -O - "$1" || echo $? >"$rc_dir/rc"; } \
             | head -c "$((max_dl + 1))" >"$2"
-        if [ -f "$wget_rc" ]; then
-            rm -f "$2" "$wget_rc"
-            return 1
-        fi
-        actual_dl=$(wc -c <"$2" | tr -d ' ')
-        if [ "${actual_dl:-0}" -gt "$max_dl" ]; then
-            rm -f "$2"
-            return 1
-        fi
+    fi
+    if [ -f "$rc_dir/rc" ]; then
+        rm -rf "$rc_dir"
+        rm -f "$2"
+        return 1
+    fi
+    rm -rf "$rc_dir"
+    actual_dl=$(wc -c <"$2" | tr -d ' ')
+    if [ "${actual_dl:-0}" -gt "$max_dl" ]; then
+        rm -f "$2"
+        return 1
     fi
 }
 

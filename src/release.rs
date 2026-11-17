@@ -561,10 +561,7 @@ fn replace(new: &Path, exe: &Path) -> Result<()> {
             }
             println!("[+] {safe_dir} needs administrator rights: sudo asks for your password");
             let status = Command::new("/usr/bin/sudo")
-                .arg("/usr/bin/install")
-                .args(["-m", "0755", "--"])
-                .arg(new)
-                .arg(exe)
+                .args(sudo_replace_args(new, exe, &random_suffix()?))
                 .status()
                 .context("cannot run sudo")?;
             if !status.success() {
@@ -582,6 +579,33 @@ fn replace(new: &Path, exe: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+/// Sixteen random hexadecimal characters.
+fn random_suffix() -> Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no secure random source: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// What sudo runs to put `new` in place of `exe` in a folder only root can
+/// write: copied under a new name beside `exe`, then renamed over it in one
+/// step. `install` straight onto `exe` removes it first and writes the new
+/// one in place, so for a moment there is no meow, or half of one if the
+/// copy is cut off. One `sh` with the paths as its arguments, so the
+/// password is asked once and no path is ever read as shell text.
+fn sudo_replace_args(new: &Path, exe: &Path, suffix: &str) -> Vec<std::ffi::OsString> {
+    let staged = exe.with_file_name(format!(".meow-update-{suffix}"));
+    vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "/usr/bin/install -m 0755 -- \"$1\" \"$2\" && /bin/mv -f -- \"$2\" \"$3\" || { /bin/rm -f -- \"$2\"; exit 1; }"
+            .into(),
+        "meow-update".into(),
+        new.into(),
+        staged.into(),
+        exe.into(),
+    ]
 }
 
 fn clean_current_exe_path(exe: PathBuf) -> PathBuf {
@@ -687,6 +711,56 @@ pub fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_owned_meow_is_replaced_by_renaming_a_full_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new = tmp.path().join("new-meow");
+        let exe = tmp.path().join("bin").join("meow");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&new, "new").unwrap();
+        std::fs::write(&exe, "old").unwrap();
+        let args = sudo_replace_args(&new, &exe, "0123456789abcdef");
+        assert_eq!(args[0], "/bin/sh");
+        assert_eq!(
+            args[5],
+            exe.with_file_name(".meow-update-0123456789abcdef")
+                .into_os_string()
+        );
+        assert_eq!(args[6], exe.clone().into_os_string());
+        // The same commands, run without sudo here: the target is never
+        // written in place, and nothing is left behind.
+        let status = std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
+        assert!(!exe.with_file_name(".meow-update-0123456789abcdef").exists());
+        // A path that looks like shell text is only ever a path.
+        let odd = tmp.path().join("bin").join("me$(touch pwned);ow");
+        std::fs::write(&odd, "old").unwrap();
+        let args = sudo_replace_args(&new, &odd, "fedcba9876543210");
+        assert!(std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            !tmp.path().join("bin").join("pwned").exists()
+                && !std::path::Path::new("pwned").exists()
+        );
+        // A failed copy leaves the old meow and no staged file.
+        let args = sudo_replace_args(&tmp.path().join("missing"), &exe, "1111111111111111");
+        assert!(!std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
+        assert!(!exe.with_file_name(".meow-update-1111111111111111").exists());
+    }
 
     #[test]
     fn versions_compare_by_number_and_prerelease() {
