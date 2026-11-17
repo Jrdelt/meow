@@ -1592,7 +1592,6 @@
   }
 
   function hostCards(host, data) {
-    var cards = [statusCard(host)];
     var hostPorts = host.ports || {};
 
     // One line per port: number, state, service and the software that
@@ -1634,10 +1633,9 @@
       ports.appendChild(el('p', 'note', 'Tried and ' + group.state + ' (' + group.count + ' ' + group.protocol +
         (group.count === 1 ? ' port' : ' ports') + ')' + (group.ports ? ': ' + group.ports.split(',').join(', ') : '.')));
     });
-    cards.push(ports);
 
     // What the web ports gave away: server headers, certificate names, paths.
-    var web = card('Web');
+    var web = card('Web & TLS');
     Object.keys(hostPorts).forEach(function (key) {
       var port = own(hostPorts, key);
       if (!port) { return; }
@@ -1691,7 +1689,6 @@
       }
       if (paths) { web.appendChild(pathTree(port.paths, { left: 300 })); }
     });
-    if (web.childNodes.length > 1) { cards.push(web); }
 
     var ai = card('Ask AI');
     var lists = own(state.checklists, host.address) || {};
@@ -1734,7 +1731,6 @@
         }
       });
     }
-    cards.push(ai);
 
     var evidence = card('Evidence');
     var facts = (host.facts || []).slice();
@@ -1749,7 +1745,6 @@
       line.appendChild(el('div', 'dim', fact.source + ' · ' + fact.confidence + ' · ' + fact.verification_status));
     });
     if (!facts.length) { evidence.appendChild(el('p', 'note', 'Nothing recorded yet.')); }
-    cards.push(evidence);
 
     var note = card('Add a note');
     var box = note.appendChild(el('textarea'));
@@ -1772,9 +1767,201 @@
         delete noteDrafts[host.address];
       }
     });
-    cards.push(note);
-    return cards;
+    return { status: statusCard(host), ports: ports, web: web.childNodes.length > 1 ? web : null,
+      ai: ai, evidence: evidence, note: note, facts: facts };
   }
+
+  // The selected host's cards sit in tabs under its name. The Advisory
+  // card and the AI answer move into their tab while that host is selected,
+  // and back to their own place on the page otherwise.
+  var HOST_TABS = [['overview', 'Overview'], ['ports', 'Ports'], ['web', 'Web & TLS'],
+    ['advisories', 'Advisories'], ['evidence', 'Evidence'], ['notes', 'Notes & AI']];
+  var hostTab = 'overview';
+  try { hostTab = sessionStorage.getItem('meow-map-tab') || 'overview'; } catch (_) {}
+  var movable = table();
+  ['card-advisory', 'card-ai'].forEach(function (id) {
+    var node = byId(id);
+    var home = document.createComment(' ' + id + ' ');
+    node.parentNode.insertBefore(home, node);
+    movable[id] = { node: node, home: home };
+  });
+  // Every moved card back home, before the panels it was in are cleared.
+  function parkMovables() {
+    Object.keys(movable).forEach(function (id) {
+      var entry = movable[id];
+      if (entry.home.nextSibling !== entry.node) {
+        entry.home.parentNode.insertBefore(entry.node, entry.home.nextSibling);
+      }
+    });
+  }
+
+  function advisoryCounts(host) {
+    var counts = { confirmed: 0, open: 0, kev: 0 };
+    (host.advisories || []).forEach(function (advisory) {
+      var status = advisory.verification_status;
+      if (status === 'Confirmed') { counts.confirmed += 1; return; }
+      if (status === 'FalsePositive') { return; }
+      counts.open += 1;
+      if (advisory.kev) { counts.kev += 1; }
+    });
+    return counts;
+  }
+
+  // Overview: one line per tab, each a link to it.
+  function glanceCard(host, made, adv) {
+    var box = card('At a Glance');
+    box.className += ' glance';
+    function go(key, text, kind) {
+      var holder = el('span', 'go');
+      var link = holder.appendChild(el('button', 'link', text));
+      link.type = 'button';
+      link.addEventListener('click', function () { showTab(key, true); });
+      if (kind) { holder.appendChild(document.createTextNode(' ')); holder.appendChild(mark(kind)); }
+      return holder;
+    }
+    var ports = host.ports || {};
+    var open = Object.keys(ports).map(function (key) { return own(ports, key); }).filter(function (port) {
+      return port && port.state === 'open';
+    }).sort(function (a, b) { return a.number - b.number; });
+    var list = open.slice(0, 10).map(function (port) {
+      return port.number + (port.protocol && port.protocol !== 'tcp' ? '/' + port.protocol : '') +
+        (port.service ? ' ' + port.service : '');
+    }).join(', ') + (open.length > 10 ? ', +' + (open.length - 10) + ' more' : '');
+    box.appendChild(row('Open ports', go('ports', open.length ? list : 'none seen yet')));
+    var software = [];
+    open.forEach(function (port) {
+      var name = [port.product, port.version].filter(Boolean).join(' ');
+      if (name && software.indexOf(name) < 0) { software.push(name); }
+    });
+    if (software.length) {
+      box.appendChild(row('Software', software.slice(0, 4).join(', ') +
+        (software.length > 4 ? ', +' + (software.length - 4) + ' more' : '')));
+    }
+    var words = [];
+    if (adv.confirmed) { words.push(adv.confirmed + ' confirmed'); }
+    if (adv.open) { words.push(adv.open + ' to verify' + (adv.kev ? ' (' + adv.kev + ' known exploited)' : '')); }
+    box.appendChild(row('Advisories', go('advisories', words.join(' \u00b7 ') || 'none matched',
+      adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : 'ok')));
+    if (made.web) {
+      // One short phrase per kind of problem, with the ports it was seen on.
+      var oldTls = [], weak = [], missing = [], edges = [];
+      Object.keys(ports).forEach(function (key) {
+        var http = (own(ports, key) || {}).http;
+        if (!http) { return; }
+        var where = key.replace(/\/tcp$/, '');
+        if ((http.tls_versions || []).some(function (v) { return v === 'TLS 1.0' || v === 'TLS 1.1'; })) {
+          oldTls.push(where);
+        }
+        if ((http.tls_weak_ciphers || []).length) { weak.push(where); }
+        if ((http.missing_headers || []).length) { missing.push(where); }
+        if (http.waf && edges.indexOf(http.waf) < 0) { edges.push(http.waf); }
+      });
+      var flagged = [];
+      if (oldTls.length) { flagged.push('TLS 1.0/1.1 on ' + oldTls.join(', ')); }
+      if (weak.length) { flagged.push('weak ciphers on ' + weak.join(', ')); }
+      if (missing.length) { flagged.push('headers missing on ' + missing.join(', ')); }
+      box.appendChild(row('Web & TLS', go('web', flagged.concat(edges).join(' \u00b7 ') || 'nothing flagged',
+        flagged.length ? 'warn' : 'ok')));
+    }
+    var newest = '';
+    made.facts.forEach(function (fact) {
+      var at = String((fact.record || fact).timestamp_utc || '');
+      if (at > newest) { newest = at; }
+    });
+    var count = made.facts.length;
+    box.appendChild(row('Evidence', go('evidence', count + (count === 1 ? ' fact' : ' facts') +
+      (newest ? ', newest ' + sinceText(newest) : ''))));
+    return box;
+  }
+
+  function showTab(key, focus, quiet) {
+    if (!byId('tab-' + key)) { key = 'overview'; }
+    Array.prototype.forEach.call(byId('host-tabs').querySelectorAll('[role="tab"]'), function (tab) {
+      var on = tab.getAttribute('data-tab') === key;
+      tab.setAttribute('aria-selected', on ? 'true' : 'false');
+      tab.tabIndex = on ? 0 : -1;
+      byId(tab.getAttribute('aria-controls')).hidden = !on;
+      if (on && focus) { tab.focus(); }
+    });
+    if (!quiet) {
+      hostTab = key;
+      try { sessionStorage.setItem('meow-map-tab', key); } catch (_) {}
+    }
+  }
+
+  function buildHostTabs(host, data, refocus) {
+    var made = hostCards(host, data);
+    var adv = advisoryCounts(host);
+    var reply = state.ai || {};
+    var aiHere = reply.address === host.address && !!(reply.running || reply.text || reply.error);
+    var openPorts = Object.keys(host.ports || {}).filter(function (key) {
+      var port = own(host.ports, key);
+      return port && port.state === 'open';
+    }).length;
+    var content = {
+      overview: [made.status, glanceCard(host, made, adv)],
+      ports: [made.ports],
+      web: made.web ? [made.web] : null,
+      advisories: [movable['card-advisory'].node],
+      evidence: [made.evidence],
+      notes: aiHere ? [made.ai, made.note, movable['card-ai'].node] : [made.ai, made.note]
+    };
+    var badge = {
+      ports: [String(openPorts), ''],
+      advisories: [String(adv.confirmed + adv.open), adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : ''],
+      evidence: [String(made.facts.length), ''],
+      notes: aiHere ? [reply.running ? 'AI\u2026' : 'AI', reply.error ? 'bad' : 'info'] : null
+    };
+    var names = associatedNamesFor(host, data);
+    byId('host-title').textContent = (names.hosts[0] && names.hosts[0] !== host.address
+      ? names.hosts[0] + ' \u00b7 ' : '') + host.address;
+    var tabs = clear(byId('host-tabs')), panels = byId('host-panels');
+    HOST_TABS.forEach(function (entry) {
+      var key = entry[0], items = content[key];
+      if (!items) { return; }
+      var tab = tabs.appendChild(el('button'));
+      tab.type = 'button';
+      tab.id = 'tab-' + key;
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-controls', 'panel-' + key);
+      tab.setAttribute('data-tab', key);
+      tab.appendChild(el('span', null, entry[1]));
+      var count = own(badge, key);
+      if (count) { tab.appendChild(el('span', 'count' + (count[1] ? ' ' + count[1] : ''), count[0])); }
+      tab.addEventListener('click', function () { showTab(key, false); });
+      var panel = panels.appendChild(el('div', 'panel'));
+      panel.id = 'panel-' + key;
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', tab.id);
+      items.forEach(function (item) { panel.appendChild(item); });
+    });
+    byId('card-host').hidden = false;
+    // The tab the reader chose stays open across refreshes and hosts; one
+    // this host does not have shows Overview without forgetting the choice.
+    showTab(hostTab, refocus, true);
+  }
+
+  // Arrow keys, Home and End move between tabs; 1 to 6 open one directly.
+  byId('host-tabs').addEventListener('keydown', function (event) {
+    var tabs = Array.prototype.slice.call(this.querySelectorAll('[role="tab"]'));
+    var at = tabs.indexOf(document.activeElement);
+    if (at < 0) { return; }
+    var to = { ArrowRight: (at + 1) % tabs.length, ArrowLeft: (at - 1 + tabs.length) % tabs.length,
+      Home: 0, End: tabs.length - 1 }[event.key];
+    if (to === undefined) { return; }
+    event.preventDefault();
+    showTab(tabs[to].getAttribute('data-tab'), true);
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.altKey || event.ctrlKey || event.metaKey || byId('card-host').hidden) { return; }
+    var target = event.target;
+    if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) { return; }
+    var number = /^[1-9]$/.test(event.key) ? Number(event.key) : 0;
+    var tabs = byId('host-tabs').querySelectorAll('[role="tab"]');
+    if (!number || number > tabs.length) { return; }
+    showTab(tabs[number - 1].getAttribute('data-tab'), false);
+    byId('card-host').scrollIntoView({ block: 'nearest' });
+  });
 
   function downloadReport(urlPath, fallbackName) {
     var link = document.createElement('a');
@@ -1820,17 +2007,22 @@
   var lastDetailId = null;
   function renderDetail() {
     var detail = byId('detail');
-    var cards = byId('host-cards');
+    var panels = byId('host-panels');
     // Keep cursor/focus and per-host note draft across live refreshes.
     var sameHost = selected && selected === lastDetailId;
-    var draft = sameHost ? cards.querySelector('textarea') : null;
+    var draft = sameHost ? panels.querySelector('textarea') : null;
     var draftText = draft ? draft.value : '';
     var hadFocus = draft && document.activeElement === draft;
     var selStart = hadFocus ? draft.selectionStart : null;
     var selEnd = hadFocus ? draft.selectionEnd : null;
+    var tabFocused = sameHost && document.activeElement &&
+      document.activeElement.getAttribute && document.activeElement.getAttribute('role') === 'tab';
     lastDetailId = selected;
     clear(detail);
-    clear(cards);
+    parkMovables();
+    clear(panels);
+    clear(byId('host-tabs'));
+    byId('card-host').hidden = true;
     var data = selectedNodeData();
     if (!data) {
       byId('detail-title').textContent = 'Selected';
@@ -1909,8 +2101,8 @@
       });
       var exportPdf = exportActions.appendChild(el('button', null, 'Print / PDF'));
       exportPdf.addEventListener('click', function () { window.print(); });
-      hostCards(host, data).forEach(function (one) { cards.appendChild(one); });
-      var box = cards.querySelector('textarea');
+      buildHostTabs(host, data, tabFocused);
+      var box = panels.querySelector('textarea');
       if (box && hadFocus) {
         box.focus();
         if (typeof selStart === 'number' && typeof selEnd === 'number') {

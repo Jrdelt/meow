@@ -26,6 +26,34 @@ main { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 20px; }
 .card > h2 { color: var(--accent); font: 800 24px/1.15 system-ui, sans-serif; margin: 0 0 10px; overflow-wrap: anywhere; }
 .card h3 { color: var(--accent); font: 700 16px/1.2 system-ui, sans-serif; margin: 14px 0 4px; }
 #card-advisory { margin-bottom: 14px; }
+/* The selected host: a tab bar under its name, one panel of cards per tab. */
+#card-host { margin-bottom: 14px; }
+#card-host[hidden] { display: none; }
+#card-host .host-head h2 { color: var(--accent); font: 800 24px/1.15 system-ui, sans-serif; margin: 0 0 8px; overflow-wrap: anywhere; }
+#host-tabs { display: flex; gap: 2px; overflow-x: auto; border-bottom: 1px solid var(--line); scrollbar-width: thin; }
+#host-tabs [role="tab"] { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; margin-bottom: -1px; padding: 8px 14px 9px; color: var(--dim); font: 600 14.5px/1.2 system-ui, sans-serif; white-space: nowrap; }
+#host-tabs [role="tab"]:hover { color: var(--text); }
+#host-tabs [role="tab"][aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+#host-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#host-tabs .count { padding: 1px 7px; border-radius: 999px; background: #23262c; color: var(--dim); font: 600 11.5px/1.45 var(--mono); }
+#host-tabs .count.bad { background: rgba(248, 81, 73, .2); color: var(--bad); }
+#host-tabs .count.warn { background: rgba(227, 179, 65, .18); color: var(--warn); }
+#host-tabs .count.info { background: rgba(57, 197, 207, .16); color: var(--info); }
+#host-panels > .panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 14px; align-items: start; padding-top: 14px; }
+#host-panels > .panel[hidden] { display: none; }
+#host-panels .card { background: #0e1013; margin: 0; }
+#host-panels .card > h2 { font-size: 18px; }
+#host-panels #card-advisory, #host-panels #card-ai { grid-column: 1 / -1; margin: 0; }
+#host-panels .glance .row .value { text-align: right; }
+#host-panels .glance .go { display: inline-flex; align-items: flex-start; justify-content: flex-end; gap: 6px; }
+#host-panels .glance .go .mark { margin-top: 1px; }
+#host-panels .glance button.link { color: var(--text); text-align: right; }
+#host-panels .glance button.link::after { content: " \203A"; color: var(--accent); }
+#host-panels .glance button.link:hover { color: var(--accent); text-decoration: none; }
+@media print {
+  #host-tabs { display: none; }
+  #host-panels > .panel[hidden] { display: grid !important; }
+}
 #cards { columns: 340px 4; column-gap: 14px; }
 #cards .card { break-inside: avoid; margin: 0 0 14px; }
 .group-of-cards { display: contents; }
