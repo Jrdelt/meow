@@ -789,37 +789,132 @@ impl Topology {
                     continue;
                 }
                 if let Ok(Some(place)) = db.lookup(ip) {
-                    let loc = match (&place.city, &place.region) {
-                        (Some(c), Some(r)) if !c.is_empty() && !r.is_empty() => {
-                            Some(format!("{c}, {r}"))
-                        }
-                        (Some(c), _) if !c.is_empty() => Some(c.clone()),
-                        (None, Some(r)) if !r.is_empty() => Some(r.clone()),
-                        _ => place.country.clone(),
-                    };
                     let net = place
                         .network
                         .as_deref()
                         .or_else(|| (idx + 2 >= total).then_some(host.asn.as_deref()).flatten());
-                    hop.label = match (net, loc) {
-                        (Some(n), Some(l)) => {
-                            Some(crate::evidence::sanitize(&format!("{n} - {l}"), 80))
-                        }
-                        (None, Some(l)) if idx + 2 >= total => {
-                            Some(crate::evidence::sanitize(&format!("Edge Node - {l}"), 80))
-                        }
-                        (None, Some(l)) => Some(crate::evidence::sanitize(
-                            &format!("ISP Backbone - {l}"),
-                            80,
-                        )),
-                        (Some(n), None) => Some(crate::evidence::sanitize(n, 80)),
-                        (None, None) => hop.label.clone(),
+                    // The place goes in a field of its own (see
+                    // `describe_hop`); the role names the network.
+                    hop.label = match net {
+                        Some(n) => Some(crate::evidence::sanitize(n, 80)),
+                        None if idx + 2 >= total => Some("Edge Node".to_owned()),
+                        None => hop.label.clone(),
                     };
                 }
             }
         }
 
         hops
+    }
+
+    /// What kind of network an address belongs to, in words.
+    fn address_scope(ip: IpAddr) -> &'static str {
+        match ip.to_canonical() {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                if v4.is_loopback() {
+                    "loopback"
+                } else if v4.is_private() {
+                    "private (RFC 1918)"
+                } else if v4.is_link_local() {
+                    "link-local"
+                } else if a == 100 && (b & 0xc0) == 64 {
+                    "carrier-grade NAT (ISP internal)"
+                } else if v4.is_documentation() || (a == 198 && (b & 0xfe) == 18) {
+                    "reserved (documentation / testing)"
+                } else if v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified() || a >= 240
+                {
+                    "reserved"
+                } else {
+                    "public IPv4"
+                }
+            }
+            IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                if v6.is_loopback() {
+                    "loopback"
+                } else if (first & 0xfe00) == 0xfc00 {
+                    "unique local (private IPv6)"
+                } else if (first & 0xffc0) == 0xfe80 {
+                    "link-local"
+                } else if v6.is_multicast() || v6.is_unspecified() {
+                    "reserved"
+                } else if first == 0x2001 && v6.segments()[1] == 0x0db8 {
+                    "reserved (documentation)"
+                } else {
+                    "public IPv6"
+                }
+            }
+        }
+    }
+
+    /// Adds what is known about one traceroute hop to its map data: where
+    /// its address is (from the offline location database), the network it
+    /// belongs to, what kind of address it is, the latency it adds, and for
+    /// the last hop what recon found about the target itself. Nothing here
+    /// is looked up outside this machine.
+    fn describe_hop(
+        out: &mut Value,
+        hop: &crate::osint::TraceHop,
+        host: &Host,
+        geo: Option<&crate::geoip::GeoDb>,
+        previous_rtt: Option<f64>,
+    ) {
+        let clean = |text: &str| crate::evidence::sanitize(text, 120);
+        let is_target = hop.address == host.address;
+        out["is_target"] = json!(is_target);
+        if let (Some(now), Some(before)) = (hop.rtt_ms, previous_rtt) {
+            out["rtt_delta_ms"] = json!(((now - before) * 10.0).round() / 10.0);
+        }
+        let Ok(ip) = hop.address.parse::<IpAddr>() else {
+            out["scope"] = json!(if hop.address.contains('*') {
+                "no reply (ICMP filtered or rate-limited)"
+            } else {
+                "name only"
+            });
+            return;
+        };
+        out["scope"] = json!(Self::address_scope(ip));
+        out["ip_version"] = json!(if ip.to_canonical().is_ipv4() { 4 } else { 6 });
+        // A hop's own name, when traceroute gave one (often a router's
+        // reverse DNS, which names the carrier and the city).
+        if let Some(label) = hop.label.as_deref() {
+            if label.contains('.') && !label.contains(' ') && label != hop.address {
+                out["reverse_dns"] = json!(clean(label));
+            }
+        }
+        if !crate::osint::is_non_public_ip(ip) {
+            if let Some(Ok(Some(place))) = geo.map(|db| db.lookup(ip)) {
+                out["location"] = json!({
+                    "city": place.city.as_deref().map(clean),
+                    "region": place.region.as_deref().map(clean),
+                    "country": place.country.as_deref().map(clean),
+                    "latitude": (place.latitude * 1000.0).round() / 1000.0,
+                    "longitude": (place.longitude * 1000.0).round() / 1000.0,
+                });
+                if let Some(network) = place.network.as_deref() {
+                    out["network"] = json!(clean(network));
+                }
+            }
+        }
+        if is_target {
+            let mut target = json!({
+                "open_ports": host.open_ports().count(),
+                "hostnames": host.hostnames.iter().take(8).map(|n| clean(n)).collect::<Vec<_>>(),
+            });
+            for (key, value) in [
+                ("asn", &host.asn),
+                ("bgp_prefix", &host.bgp_prefix),
+                ("country", &host.country),
+                ("waf_cdn", &host.waf_cdn),
+                ("os", &host.os),
+            ] {
+                if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
+                    target[key] = json!(clean(value));
+                }
+            }
+            out["target"] = target;
+        }
     }
 
     /// Elements for Cytoscape.js. Every node carries its role (which picture
@@ -937,16 +1032,22 @@ impl Topology {
                     if !trace_hops.is_empty() {
                         let hop_count = trace_hops.len();
                         let rtt_ms = trace_hops.iter().rev().find_map(|h| h.rtt_ms);
+                        let mut previous_rtt: Option<f64> = None;
                         let serialized_hops: Vec<Value> = trace_hops
                             .iter()
                             .map(|h| {
-                                json!({
+                                let mut hop = json!({
                                     "hop": h.hop,
                                     "address": crate::evidence::sanitize(&h.address, 80),
                                     "label": h.label.as_deref().map(|l| crate::evidence::sanitize(l, 120)),
                                     "rtt_ms": h.rtt_ms,
                                     "formatted": crate::evidence::sanitize(&h.formatted(), 200),
-                                })
+                                });
+                                Self::describe_hop(&mut hop, h, host, geo, previous_rtt);
+                                if h.rtt_ms.is_some() {
+                                    previous_rtt = h.rtt_ms;
+                                }
+                                hop
                             })
                             .collect();
                         data["hop_count"] = json!(hop_count);
@@ -1861,6 +1962,27 @@ mod tests {
     }
 
     #[test]
+    fn a_hop_address_is_described_in_words() {
+        for (address, scope) in [
+            ("192.168.1.1", "private (RFC 1918)"),
+            ("100.64.0.1", "carrier-grade NAT (ISP internal)"),
+            ("169.254.1.1", "link-local"),
+            ("8.8.8.8", "public IPv4"),
+            ("198.51.100.7", "reserved (documentation / testing)"),
+            ("2600:3c01::f03c:91ff:fe18:bb2f", "public IPv6"),
+            ("fd00::1", "unique local (private IPv6)"),
+            ("fe80::1", "link-local"),
+            ("::ffff:10.0.0.1", "private (RFC 1918)"),
+        ] {
+            assert_eq!(
+                Topology::address_scope(address.parse().unwrap()),
+                scope,
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
     fn cytoscape_includes_traceroute_hops_compact_ports_and_internet_transit_summary() {
         let mut graph = lab();
         let record = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "scan");
@@ -1939,6 +2061,22 @@ Hop 3: 45.33.32.156         (scanme.nmap.org)                 23.1 ms";
         assert_eq!(host["data"]["hop_count"], 3);
         assert_eq!(host["data"]["rtt_ms"], 23.1);
         assert_eq!(host["data"]["trace_hops"].as_array().unwrap().len(), 3);
+        // Each hop says what kind of address it is and the latency it adds;
+        // the last one carries what recon found about the target.
+        let hops = host["data"]["trace_hops"].as_array().unwrap();
+        assert_eq!(hops[0]["scope"], "private (RFC 1918)");
+        assert_eq!(hops[0]["is_target"], false);
+        assert!(hops[0].get("rtt_delta_ms").is_none());
+        assert_eq!(hops[1]["scope"], "public IPv4");
+        assert_eq!(hops[1]["rtt_delta_ms"], 20.8);
+        assert_eq!(hops[2]["is_target"], true);
+        assert_eq!(hops[2]["rtt_delta_ms"], 0.5);
+        assert_eq!(hops[2]["reverse_dns"], "scanme.nmap.org");
+        assert_eq!(hops[2]["target"]["asn"], "AS63949 · Akamai / Linode");
+        assert_eq!(hops[2]["target"]["bgp_prefix"], "45.33.32.0/24");
+        assert_eq!(hops[2]["target"]["open_ports"], 3);
+        // Without the location database there is no place, and no guess.
+        assert!(hops.iter().all(|hop| hop.get("location").is_none()));
 
         let internet = nodes
             .iter()

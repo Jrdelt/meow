@@ -532,12 +532,16 @@
           activeHops.forEach(function (hop, idx) {
             var hopId = 'hop:' + hop.hop;
             var rttText = (hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
+            var where = hopPlace(hop);
             var hopLabel = 'Hop ' + hop.hop + ': ' + hop.address +
-              (hop.label ? '  (' + hop.label + ')' : '') + '   ' + rttText;
+              (hop.label ? '  (' + hop.label + ')' : '') + '   ' + rttText +
+              (where ? '\n' + where : '');
             data[hopId] = {
               id: hopId, kind: 'hop', role: hop.address === '* * *' ? 'segment' : 'router',
               icon: hop.address === '* * *' ? 'segment' : 'router',
-              why: 'intermediate traceroute hop ' + hop.hop,
+              why: hop.is_target
+                ? 'the target itself, the last hop of the traceroute'
+                : 'intermediate traceroute hop ' + hop.hop,
               label: hopLabel,
               hop: hop
             };
@@ -1263,6 +1267,7 @@
     });
 
     var notices = (state.notices || []).slice(-25).reverse();
+    byId('notices-count').textContent = notices.length ? '(' + notices.length + ')' : '';
     renderList(byId('notices'), notices, 'Nothing yet.', function (notice) {
       var item = el('li');
       item.appendChild(el('span', 'dim', String(notice.at || '').slice(11, 19) + ' '));
@@ -1433,30 +1438,38 @@
     var cards = [];
     var hostPorts = host.ports || {};
 
-    // Each open port and its service; then the software that answered on
-    // each (the versions); then what the scan tried that was not open.
-    var ports = card('Open Ports');
-    var versions = [], closed = [];
-    Object.keys(hostPorts).sort(function (a, b) {
-      return hostPorts[a].number - hostPorts[b].number || (a < b ? -1 : 1);
-    }).forEach(function (key) {
-      var port = own(hostPorts, key);
-      if (!port) { return; }
-      if (port.state !== 'open') { closed.push(key + ' (' + port.state + ')'); return; }
-      var name = String(port.number) + (port.protocol === 'tcp' ? '' : '/' + port.protocol);
-      var service = /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || 'open');
-      ports.appendChild(row(name, marked(service.toUpperCase(), 'ok')));
-      var software = [port.product, port.version].filter(Boolean).join(' ');
-      if (software) {
-        versions.push([name, software + (port.extra_info ? ' (' + port.extra_info + ')' : '')]);
-      }
+    // One line per port: number, state, service and the software that
+    // answered, open ports first.
+    var ports = card('Ports');
+    var stateRank = function (state) {
+      return state === 'open' ? 0 : /filtered/.test(state || '') ? 1 : 2;
+    };
+    var keys = Object.keys(hostPorts).filter(function (key) { return !!own(hostPorts, key); });
+    keys.sort(function (a, b) {
+      var pa = hostPorts[a], pb = hostPorts[b];
+      return stateRank(pa.state) - stateRank(pb.state) || pa.number - pb.number || (a < b ? -1 : 1);
     });
-    if (!data.open_ports) { ports.appendChild(el('p', 'note', 'None seen open.')); }
-    if (versions.length) {
-      ports.appendChild(el('h3', null, 'Versions'));
-      versions.forEach(function (version) { ports.appendChild(row(version[0], version[1])); });
+    var grid = keys.length ? ports.appendChild(el('div', 'port-table')) : null;
+    if (grid) {
+      var head = grid.appendChild(el('div', 'port-line port-head'));
+      ['Port', 'State', 'Service', 'Version'].forEach(function (name) { head.appendChild(el('span', null, name)); });
     }
-    if (closed.length) { ports.appendChild(el('p', 'note', 'Seen before, not open now: ' + closed.join(', '))); }
+    keys.forEach(function (key) {
+      var port = own(hostPorts, key);
+      var line = grid.appendChild(el('div', 'port-line'));
+      line.appendChild(el('span', 'num', String(port.number) +
+        (port.protocol && port.protocol !== 'tcp' ? '/' + port.protocol : '')));
+      var stateText = String(port.state || 'unverified');
+      var stateClass = stateText === 'open' ? 'open' : /filtered/.test(stateText) ? 'filtered' : 'closed';
+      line.appendChild(el('span', 'state ' + stateClass, stateText));
+      var service = /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || '—');
+      var svc = line.appendChild(el('span', 'svc', service));
+      svc.title = service;
+      var software = [port.product, port.version].filter(Boolean).join(' ');
+      var ver = line.appendChild(el('span', 'ver' + (software ? ' known' : ''), software || '—'));
+      if (port.extra_info) { ver.appendChild(el('span', 'extra', ' (' + port.extra_info + ')')); }
+    });
+    if (!keys.length) { ports.appendChild(el('p', 'note', 'No port seen yet.')); }
     var notOpen = host.not_open || {};
     Object.keys(notOpen).forEach(function (key) {
       var group = own(notOpen, key);
@@ -1616,10 +1629,16 @@
   }
 
   function formatHopLine(hop) {
-    if (hop && hop.formatted) { return hop.formatted; }
-    var rtt = (hop && hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
-    var lbl = (hop && hop.label) ? (' (' + hop.label + ') ') : ' ';
-    return 'Hop ' + (hop ? hop.hop : '?') + ': ' + (hop ? hop.address : '?') + lbl + rtt;
+    var line;
+    if (hop && hop.formatted) {
+      line = hop.formatted;
+    } else {
+      var rtt = (hop && hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
+      var lbl = (hop && hop.label) ? (' (' + hop.label + ') ') : ' ';
+      line = 'Hop ' + (hop ? hop.hop : '?') + ': ' + (hop ? hop.address : '?') + lbl + rtt;
+    }
+    var where = hop ? hopPlace(hop) : '';
+    return line + (where ? '  \u2014 ' + where : '');
   }
 
   function appendTracerouteSection(container, traceHops, openByDefault) {
@@ -1786,11 +1805,7 @@
         detail.appendChild(el('p', 'note', 'Run `recon <target>` to measure intermediate traceroute hops and round-trip latency across the Internet.'));
       }
     } else if (data.kind === 'hop' && data.hop) {
-      byId('detail-title').textContent = 'Traceroute Hop ' + data.hop.hop;
-      detail.appendChild(row('Hop', String(data.hop.hop)));
-      detail.appendChild(row('Address', data.hop.address || '* * *'));
-      if (data.hop.label) { detail.appendChild(row('Node / Role', data.hop.label)); }
-      detail.appendChild(row('RTT latency', (data.hop.rtt_ms !== null && data.hop.rtt_ms !== undefined) ? (data.hop.rtt_ms.toFixed(1) + ' ms') : '—'));
+      appendHopDetail(detail, data.hop);
     } else if (data.kind === 'waf') {
       byId('detail-title').textContent = 'WAF / CDN Edge';
       detail.appendChild(row('Provider', marked(data.waf || 'WAF / CDN', 'info')));
@@ -1805,6 +1820,66 @@
       detail.appendChild(row('Name', data.label || data.id || ''));
     }
     detail.appendChild(drawnAs(data));
+  }
+
+  // Where a hop's address is, in words: "Fremont, California, United States".
+  function hopPlace(hop) {
+    var loc = hop.location;
+    if (!loc) { return ''; }
+    return [loc.city, loc.region, loc.country].filter(Boolean).join(', ');
+  }
+
+  // Everything known about one traceroute hop: where it is, whose network
+  // it is, what kind of address, the latency it adds; for the last hop, what
+  // recon found about the target.
+  function appendHopDetail(detail, hop) {
+    byId('detail-title').textContent = hop.is_target
+      ? 'Traceroute Hop ' + hop.hop + ' (target)'
+      : 'Traceroute Hop ' + hop.hop;
+    detail.appendChild(row('Hop', String(hop.hop)));
+    detail.appendChild(row('Address', hop.address || '* * *'));
+    if (hop.scope) { detail.appendChild(row('Address type', hop.scope)); }
+    if (hop.label && hop.label !== hop.network && hop.label !== hop.reverse_dns) {
+      detail.appendChild(row('Node / Role', hop.label));
+    }
+    if (hop.reverse_dns) { detail.appendChild(row('Reverse DNS', hop.reverse_dns)); }
+    var place = hopPlace(hop);
+    if (place) {
+      detail.appendChild(row('Location', place));
+      var loc = hop.location;
+      if (typeof loc.latitude === 'number' && typeof loc.longitude === 'number') {
+        detail.appendChild(row('Coordinates', loc.latitude.toFixed(3) + ', ' + loc.longitude.toFixed(3) + ' (approximate)'));
+      }
+    } else if (hop.scope && /^public/.test(hop.scope)) {
+      detail.appendChild(row('Location', 'not in the location database'));
+    } else if (hop.scope && hop.address && hop.address.indexOf('*') < 0) {
+      detail.appendChild(row('Location', 'none: not a public address'));
+    }
+    if (hop.network) { detail.appendChild(row('Network / ASN', hop.network)); }
+    var rtt = (hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? hop.rtt_ms.toFixed(1) + ' ms' : '—';
+    detail.appendChild(row('RTT latency', rtt));
+    if (typeof hop.rtt_delta_ms === 'number') {
+      var delta = hop.rtt_delta_ms;
+      var deltaText = (delta >= 0 ? '+' : '') + delta.toFixed(1) + ' ms vs previous hop';
+      detail.appendChild(row('Added latency', delta >= 40 ? marked(deltaText + ' (long link)', 'info') : deltaText));
+    }
+    var target = hop.target;
+    if (target) {
+      detail.appendChild(el('h3', null, 'Target'));
+      if (target.hostnames && target.hostnames.length) { detail.appendChild(row('Names', target.hostnames.join(', '))); }
+      if (target.asn) { detail.appendChild(row('ASN / Provider', target.asn)); }
+      if (target.bgp_prefix) { detail.appendChild(row('BGP prefix', target.bgp_prefix)); }
+      if (target.country) { detail.appendChild(row('Country (registry)', target.country)); }
+      if (target.waf_cdn) { detail.appendChild(row('WAF / CDN', marked(target.waf_cdn, 'info'))); }
+      if (target.os) { detail.appendChild(row('Operating system', target.os)); }
+      detail.appendChild(row('Open ports', String(target.open_ports || 0)));
+      var pick = detail.appendChild(el('div', 'actions'));
+      var go = pick.appendChild(el('button', null, 'Show host'));
+      go.addEventListener('click', function () { select('host:' + hop.address); });
+    }
+    if (hop.location) {
+      detail.appendChild(el('p', 'note', 'Location from the offline DB-IP Lite database: city-level and approximate; routers are often registered where their network is, not where they stand.'));
+    }
   }
 
   function appendInlineCodeOnly(parent, text) {
@@ -2142,6 +2217,33 @@
     research: '[R] Grounded Research'
   };
 
+  // A triage answer has a red-team part and a blue-team part. Each goes in
+  // its own panel, side by side; anything before them stays above. An answer
+  // without them (research, an older reply) is shown as it is.
+  var TEAM_HEADINGS = [
+    { re: /^##\s+Red Team\b.*$/m, cls: 'team-red', title: 'Red Team \u2014 Authorized Pen Test' },
+    { re: /^##\s+Blue Team\b.*$/m, cls: 'team-blue', title: 'Blue Team \u2014 SOC Defense' }
+  ];
+  function renderTriage(container, text) {
+    var found = TEAM_HEADINGS.map(function (team) {
+      var match = team.re.exec(text);
+      return match ? { team: team, at: match.index, after: match.index + match[0].length } : null;
+    }).filter(Boolean).sort(function (a, b) { return a.at - b.at; });
+    if (!found.length) {
+      renderAiMarkdown(container, text);
+      return;
+    }
+    var before = text.slice(0, found[0].at);
+    if (/\S/.test(before)) { renderAiMarkdown(container.appendChild(el('div')), before); }
+    var columns = container.appendChild(el('div', 'teams'));
+    found.forEach(function (part, index) {
+      var end = index + 1 < found.length ? found[index + 1].at : text.length;
+      var panel = columns.appendChild(el('section', 'team ' + part.team.cls));
+      panel.appendChild(el('h3', 'team-title', part.team.title));
+      renderAiMarkdown(panel.appendChild(el('div', 'team-body')), text.slice(part.after, end));
+    });
+  }
+
   function renderAiPanel() {
     if (!state) { return; }
     var panel = byId('card-ai');
@@ -2215,7 +2317,7 @@
 
       var body = clear(byId('ai-body'));
       if (reply.text) {
-        renderAiMarkdown(body, reply.text);
+        renderTriage(body, String(reply.text));
       } else if (reply.running) {
         body.appendChild(el('p', 'dim', 'Waiting for first tokens from model\u2026'));
       }
