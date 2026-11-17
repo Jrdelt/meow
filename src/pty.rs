@@ -87,6 +87,33 @@ pub fn resolve_shell(configured: Option<&str>, env_shell: Option<&str>) -> Strin
 
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
+/// The thread that runs the session and owns the terminal.
+static SESSION_THREAD: std::sync::OnceLock<thread::ThreadId> = std::sync::OnceLock::new();
+/// The name of the threads the PTY host starts for the session.
+const PTY_THREAD: &str = "meow-pty";
+
+/// Whether a panic on the current thread ends the session, so the terminal
+/// must be given back: on the session's own thread or one of the PTY host's.
+/// A fault in a background task (the coordinator's, contained by its
+/// runtime) leaves the session running, and taking raw mode away from it
+/// would garble the screen and let the next Ctrl-C kill meow unsaved.
+fn panic_ends_the_session() -> bool {
+    let current = thread::current();
+    SESSION_THREAD.get() == Some(&current.id()) || current.name() == Some(PTY_THREAD)
+}
+
+/// `thread::spawn` for the PTY host's own threads: named, so that a panic on
+/// one of them still gives the terminal back.
+fn spawn_pty<F, T>(work: F) -> thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new()
+        .name(PTY_THREAD.to_owned())
+        .spawn(work)
+        .expect("cannot start a thread")
+}
 
 /// Restores standard cooked flags on `ios` if canonical mode, echo, or signal
 /// generation were left disabled (e.g., after a prior process died from `kill -9`).
@@ -148,10 +175,13 @@ impl TerminalGuard {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(None);
         }
+        let _ = SESSION_THREAD.set(thread::current().id());
         PANIC_HOOK.call_once(|| {
             let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
-                restore_terminal();
+                if panic_ends_the_session() {
+                    restore_terminal();
+                }
                 previous(info);
             }));
         });
@@ -368,7 +398,7 @@ fn signal_end_of_input(pty: &mut dyn Write, session_over: &AtomicBool) {
 
 /// Runs the C filter off the display path and hands clean lines to `sink`.
 fn spawn_tap_worker(chunks: Receiver<Vec<u8>>, mut sink: LineSink) -> JoinHandle<TapStats> {
-    thread::spawn(move || {
+    spawn_pty(move || {
         let mut filter = TapFilter::new();
         for chunk in chunks {
             for line in filter.feed(&chunk) {
@@ -408,7 +438,7 @@ impl Watcher {
         let mut signals =
             Signals::new([SIGWINCH, SIGTERM, SIGHUP]).context("cannot install signal handlers")?;
         let handle = signals.handle();
-        let thread = thread::spawn(move || {
+        let thread = spawn_pty(move || {
             for signal in signals.forever() {
                 if signal == SIGWINCH {
                     sync_size(&master);
@@ -433,7 +463,7 @@ impl Watcher {
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
-        let thread = thread::spawn(move || {
+        let thread = spawn_pty(move || {
             let mut last = terminal::size().ok();
             while !stopped.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(250));
@@ -557,7 +587,7 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
             io::stdout().flush()
         }
     }
-    thread::spawn(move || {
+    spawn_pty(move || {
         pump_output_while(
             reader,
             GatedStdout(Arc::clone(&pump_display_open)),
@@ -572,7 +602,7 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
     let session_over = Arc::new(AtomicBool::new(false));
     let input_over = Arc::clone(&session_over);
     let mut writer = writer;
-    thread::spawn(move || {
+    spawn_pty(move || {
         pump_input(io::stdin().lock(), &mut *writer);
         signal_end_of_input(&mut *writer, &input_over);
     });
@@ -604,6 +634,24 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fault_in_a_background_thread_leaves_the_terminal_to_the_session() {
+        // A thread of the coordinator's runtime.
+        let other = thread::Builder::new()
+            .name("meow-coordinator".into())
+            .spawn(panic_ends_the_session)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!other);
+        // The PTY host's own threads, and the session's thread, do end it.
+        assert!(spawn_pty(panic_ends_the_session).join().unwrap());
+        let _ = SESSION_THREAD.set(thread::current().id());
+        if SESSION_THREAD.get() == Some(&thread::current().id()) {
+            assert!(panic_ends_the_session());
+        }
+    }
     use std::io::Cursor;
 
     fn collecting_sink() -> (LineSink, Arc<Mutex<Vec<String>>>) {
@@ -753,7 +801,7 @@ mod tests {
         let over = Arc::new(AtomicBool::new(false));
         let stopper = Arc::clone(&over);
         let seen = Arc::clone(&received);
-        let watcher = thread::spawn(move || {
+        let watcher = spawn_pty(move || {
             while seen.lock().unwrap().len() < 4 {
                 thread::sleep(Duration::from_millis(20));
             }

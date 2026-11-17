@@ -198,7 +198,9 @@ static int is_secret_prompt(const uint8_t *line, uint32_t len)
             return 1;
         }
     }
-    for (colon = 0; colon < tlen; colon++) {
+    /* Prompts are short: only colons near the start are looked at, so a
+     * line made of colons costs no more than any other line. */
+    for (colon = 0; colon < tlen && colon < TAP_PROMPT_SCAN; colon++) {
         if (trimmed[colon] == ':' && is_secret_prefix(trimmed, colon + 1u)) {
             return 1;
         }
@@ -387,6 +389,7 @@ static void escape(tap_state_t *st, uint8_t b, tap_out_t *out)
         st->csi_invalid = 0;
         st->csi_nparams = 0;
         st->csi_alt_hit = 0;
+        st->csi_sub = 0;
     } else if (b == ']') {
         string_begin(st, 1);
     } else if (b == 'P' || b == 'X' || b == '^' || b == '_') {
@@ -446,7 +449,13 @@ static void csi_dispatch(tap_state_t *st, uint8_t final, tap_out_t *out)
         return;
     }
     if (st->csi_private == '?') {
-        /* DECSET / DECRST: alternate screen buffer (smcup / rmcup). */
+        /* DECSET / DECRST: alternate screen buffer (smcup / rmcup). Terminals
+         * ignore a DEC mode with sub-parameters (':') or a very long list,
+         * so the tap does too: switching where the terminal does not would
+         * stop capture while the screen shows nothing different. */
+        if (st->csi_sub || st->csi_nparams > TAP_DEC_MAX_PARAMS) {
+            return;
+        }
         if (st->csi_alt_hit && (final == 'h' || final == 'l')) {
             set_alt_screen(st, final == 'h' ? 1 : 0);
         }
@@ -498,6 +507,9 @@ static void csi(tap_state_t *st, uint8_t b, tap_out_t *out)
             st->csi_param = st->csi_param * 10u + (uint32_t)(b - '0');
         }
     } else if (b == ';' || b == ':') {
+        if (b == ':') {
+            st->csi_sub = 1;
+        }
         csi_param_end(st);
     } else if (b >= 0x3C && b <= 0x3F) {
         if (st->csi_seen) {
@@ -528,8 +540,11 @@ static void string_body(tap_state_t *st, uint8_t b)
         st->mode = TAP_STRING_ESC;
     } else if (b == 0x18 || b == 0x1A || (b == 0x07 && st->str_is_osc)) {
         st->mode = TAP_GROUND;
-    } else if (++st->str_len > TAP_STRING_MAX) {
-        st->mode = TAP_GROUND; /* unterminated: give up on it */
+    } else if (st->str_len < TAP_STRING_MAX) {
+        /* A long string stays a string until ESC, BEL, CAN or SUB ends it,
+         * as in the terminal: going back to text early would read what the
+         * screen never showed. */
+        st->str_len++;
     }
 }
 

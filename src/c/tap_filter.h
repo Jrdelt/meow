@@ -32,6 +32,10 @@ extern "C" {
 /* An OSC/DCS/APC/PM/SOS string longer than this is treated as unterminated
  * and abandoned, so a stray introducer cannot swallow the stream forever. */
 #define TAP_STRING_MAX 65536u
+/* DEC private modes with more parameters than this are not acted on. */
+#define TAP_DEC_MAX_PARAMS 16u
+/* How far into a line a password prompt's colon is looked for. */
+#define TAP_PROMPT_SCAN 256u
 
 typedef enum tap_mode {
     TAP_GROUND = 0,    /* plain text */
@@ -72,6 +76,7 @@ typedef struct tap_state {
     uint8_t csi_invalid; /* malformed sequence; ignore on dispatch */
     uint8_t csi_nparams; /* parameters completed so far (saturating) */
     uint8_t csi_alt_hit; /* a parameter was 47, 1047 or 1049 */
+    uint8_t csi_sub;     /* a ':' sub-parameter was seen */
     uint8_t str_is_osc;  /* current string is an OSC (BEL terminates it) */
 
     uint8_t u8_need; /* UTF-8 continuation bytes still expected */

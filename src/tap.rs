@@ -388,13 +388,67 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_osc_does_not_swallow_the_stream() {
+    fn a_long_osc_string_hides_what_the_terminal_hides_and_ends_where_it_does() {
+        // A title string of 70,000 bytes with text inside it: the terminal
+        // shows none of it, so none of it may reach the parsers.
+        let mut filter = TapFilter::new();
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(vec![b'A'; 70_000]);
+        input.extend_from_slice(b"\r\nINJECTED http://10.9.9.9:8080/\r\n\x07visible\r\n");
+        assert_eq!(filter.feed(&input), ["visible"]);
+        // A string that is never ended still ends at the next ESC, as the
+        // shell's next prompt sends one: capture is not lost for good.
         let mut filter = TapFilter::new();
         filter.feed(b"\x1b]0;never closed");
         filter.feed(&vec![b'x'; 70_000]);
-        // Past TAP_STRING_MAX the string is abandoned and text flows again.
-        let lines = filter.feed(b"\nvisible\n");
+        let lines = filter.feed(b"\x1b[0m\nvisible\n");
         assert_eq!(lines.last().map(String::as_str), Some("visible"));
+    }
+
+    #[test]
+    fn a_dec_mode_the_terminal_ignores_does_not_stop_capture() {
+        for sequence in [
+            b"\x1b[?1049:1h".to_vec(),
+            [&b"\x1b[?"[..], &b"1;".repeat(40), b"1049h"].concat(),
+            [&b"\x1b[?"[..], &b"1;".repeat(31), b"1049h"].concat(),
+        ] {
+            let mut filter = TapFilter::new();
+            let mut input = sequence;
+            input.extend_from_slice(b"22/tcp open ssh\r\n");
+            assert_eq!(filter.feed(&input), ["22/tcp open ssh"]);
+            assert!(!filter.in_alt_screen());
+        }
+        // The real thing still pauses capture, and leaving resumes it.
+        let mut filter = TapFilter::new();
+        assert!(filter.feed(b"\x1b[?1049hfull screen\r\n").is_empty());
+        assert!(filter.in_alt_screen());
+        assert_eq!(filter.feed(b"\x1b[?1049lback\r\n"), ["back"]);
+        assert!(!filter.in_alt_screen());
+    }
+
+    #[test]
+    fn lines_of_colons_cost_no_more_than_other_lines() {
+        let mut filter = TapFilter::new();
+        let mut line = vec![b':'; 4000];
+        line.extend_from_slice(b"x\r\n");
+        let started = std::time::Instant::now();
+        for _ in 0..256 {
+            filter.feed(&line);
+        }
+        // About 6.5 s with the whole line scanned (optimised), far more in a
+        // debug build.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        // A prompt is still recognised.
+        let mut filter = TapFilter::new();
+        let lines = filter.feed(b"bob@host's password: hunter2\r\nafter\r\n");
+        assert!(
+            !lines.iter().any(|line| line.contains("hunter2")),
+            "{lines:?}"
+        );
     }
 
     #[test]
