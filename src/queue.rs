@@ -1,7 +1,7 @@
 //! The background recon queue.
 //!
-//! `meow recon <target>` queues one task of 16 sequential stages (`lan`, `dns`,
-//! `asn`, `subdomains`, `mail-dns`, `trace`, `ports`, `services`, `headers`,
+//! `meow recon <target>` queues one task of 17 sequential stages (`lan`, `dns`,
+//! `asn`, `subdomains`, `mail-dns`, `trace`, `ports`, `udp`, `services`, `headers`,
 //! `waf-cdn`, `tls-audit`, `ssh-audit`, `cves`, `crawl`, `js`, `dirs`) that run strictly one at
 //! a time. External tools (`nmap`, `katana`, `feroxbuster`, `traceroute`,
 //! `openssl`) run with `stdin` closed, under a wall-clock timeout and an output
@@ -43,6 +43,7 @@ pub enum Stage {
     MailDns,
     Trace,
     Ports,
+    Udp,
     Services,
     Headers,
     #[serde(rename = "waf-cdn", alias = "waf_cdn")]
@@ -57,7 +58,7 @@ pub enum Stage {
     Dirs,
 }
 
-pub const STAGES: [Stage; 16] = [
+pub const STAGES: [Stage; 17] = [
     Stage::Lan,
     Stage::Dns,
     Stage::Asn,
@@ -65,6 +66,7 @@ pub const STAGES: [Stage; 16] = [
     Stage::MailDns,
     Stage::Trace,
     Stage::Ports,
+    Stage::Udp,
     Stage::Services,
     Stage::Headers,
     Stage::WafCdn,
@@ -86,6 +88,7 @@ impl Stage {
             Stage::MailDns => "mail-dns",
             Stage::Trace => "trace",
             Stage::Ports => "ports",
+            Stage::Udp => "udp",
             Stage::Services => "services",
             Stage::Headers => "headers",
             Stage::WafCdn => "waf-cdn",
@@ -932,6 +935,77 @@ pub fn ports_command(
         },
         notices,
     )
+}
+
+/// The UDP services worth knowing about, by port. Scanned by name rather
+/// than nmap's "top ports": every one of these says something about the
+/// network or is a known way in.
+pub const UDP_PORTS: &str =
+    "U:53,67,69,88,111,123,137,161,389,500,514,520,623,1194,1434,1900,2049,4500,5060,5353,5683,11211,51820";
+
+/// What an open UDP service means for a test, and for the defender.
+pub fn udp_note(port: u16) -> Option<&'static str> {
+    Some(match port {
+        53 => "DNS server: check whether it answers recursive queries for anyone (open resolver) or allows zone transfers",
+        69 => "TFTP: no authentication; files can often be read by name (configs, firmware)",
+        111 => "RPC portmapper: lists the RPC services (NFS, NIS) the host offers",
+        123 => "NTP: check for the monlist command (amplification) and what version it reports",
+        137 => "NetBIOS name service: gives away the machine and domain names",
+        161 => "SNMP: v1/v2c sends its community string in the clear; default communities (public/private) can expose the whole configuration",
+        389 => "CLDAP: Active Directory answers it; it can be abused for amplification",
+        500 | 4500 => "IKE (IPsec VPN): the VPN gateway; aggressive mode can leak a crackable pre-shared key hash",
+        514 => "Syslog: logs sent in the clear; anyone can write fake entries",
+        520 => "RIP: routing protocol exposed; routes can be read or injected",
+        623 => "IPMI (BMC): IPMI 2.0 hands out password hashes before login (RAKP, CVE-2013-4786); the management controller of a server",
+        1194 => "OpenVPN",
+        1434 => "SQL Server Browser: lists the SQL Server instances and their ports",
+        1900 => "SSDP/UPnP: device discovery exposed; used for amplification",
+        2049 => "NFS: check which exports are offered and to whom",
+        5060 => "SIP: VoIP signalling; extensions can often be enumerated",
+        5353 => "mDNS: announces the device's services and names beyond the local network",
+        5683 => "CoAP (IoT): often unauthenticated device control; used for amplification",
+        11211 => "memcached: no authentication by default; a large amplification source",
+        51820 => "WireGuard VPN",
+        67 => "DHCP server",
+        88 => "Kerberos: an Active Directory domain controller or Kerberos realm",
+        _ => return None,
+    })
+}
+
+/// The UDP scan (aggressive mode, as root): the services in [`UDP_PORTS`]
+/// on `targets`, with a light version probe to tell open from no answer.
+pub fn udp_command(
+    settings: &ReconSettings,
+    targets: &[String],
+    ipv6: bool,
+    output: &Path,
+) -> ToolCommand {
+    let mut args: Vec<String> = [
+        "-sU",
+        "-sV",
+        "--version-intensity",
+        "2",
+        "-T4",
+        "--max-retries",
+        "1",
+        "--host-timeout",
+        "15m",
+        "-p",
+        UDP_PORTS,
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    if ipv6 {
+        args.push("-6".to_owned());
+    }
+    args.extend(["-oX".to_owned(), path_arg(output), "--".to_owned()]);
+    args.extend(targets.iter().cloned());
+    ToolCommand {
+        program: settings.nmap.clone(),
+        args,
+        output: output.to_path_buf(),
+    }
 }
 
 /// Stage 2: service inventory, only on the ports stage 1 found open.
@@ -2258,6 +2332,91 @@ async fn run_stage(
                 found.open_ports()
             )))
         }
+        Stage::Udp => {
+            if mode != Mode::Aggressive {
+                return Ok(StageEnd::Skipped(
+                    "UDP scanning runs only in aggressive mode: it is slow and needs root"
+                        .to_owned(),
+                ));
+            }
+            if !privileged {
+                return Ok(StageEnd::Skipped(format!(
+                    "UDP scanning needs root (nmap -sU sends raw packets): start the session with sudo, or run `sudo nmap -sU -sV -p {UDP_PORTS} {target}` and `meow add` its XML"
+                )));
+            }
+            // A host as named; a network only where the TCP scan found hosts.
+            let targets: Vec<String> = match target {
+                Target::Host(_) => vec![target.to_string()],
+                Target::Network(_) => Found::load(&state.db_lock(), task.id, Stage::Ports, target)
+                    .hosts
+                    .keys()
+                    .take(16)
+                    .cloned()
+                    .collect(),
+            };
+            if targets.is_empty() {
+                return Ok(StageEnd::Skipped(
+                    "no host in the range answered the TCP scan".to_owned(),
+                ));
+            }
+            let ipv6 = match target {
+                Target::Host(host) => host.ip().is_some_and(|ip| ip.is_ipv6()),
+                Target::Network(network) => network.is_ipv6(),
+            };
+            let command = udp_command(&settings, &targets, ipv6, &out(".xml"));
+            let outcome = run_tool_while(&command, limits, same_mode).await;
+            if outcome == RunOutcome::Stopped {
+                remove_regular_file(&command.output);
+                return Ok(StageEnd::ModeChanged);
+            }
+            if outcome == RunOutcome::NotInstalled {
+                return Ok(StageEnd::Skipped(install_hint(&command.program)));
+            }
+            if !matches!(outcome, RunOutcome::Exited(Some(0))) {
+                remove_regular_file(&command.output);
+                bail!(describe_failure(&command.program, &outcome, limits));
+            }
+            let (_, mut observations) = read_scan_with_up(&command.output)?;
+            let (mut open, mut maybe) = (0usize, 0usize);
+            let mut notes = Vec::new();
+            for observation in &observations {
+                if let Observation::Port {
+                    address,
+                    port,
+                    protocol,
+                    state: port_state,
+                    ..
+                } = observation
+                {
+                    if protocol != "udp" {
+                        continue;
+                    }
+                    if port_state == "open" {
+                        open += 1;
+                        if let Some(note) = udp_note(*port) {
+                            notes.push(Observation::Fact {
+                                address: address.clone(),
+                                port: Some(*port),
+                                protocol: "udp".to_owned(),
+                                claim: format!("UDP {port} open: {note}"),
+                                record: crate::evidence::EvidenceRecord::observed(
+                                    crate::evidence::Source::NmapXml,
+                                    crate::evidence::Confidence::High,
+                                    &format!("nmap -sU: {port}/udp open"),
+                                ),
+                            });
+                        }
+                    } else if port_state.contains("open") {
+                        maybe += 1;
+                    }
+                }
+            }
+            observations.extend(notes);
+            let (changed, _) = record(state, observations, None);
+            Ok(StageEnd::Done(format!(
+                "{open} UDP services answered, {maybe} open|filtered (no answer, so maybe open) ({changed} new facts)"
+            )))
+        }
         Stage::Services => {
             // The ports the port inventory of this task found open.
             let inventory = Found::load(&state.db_lock(), task.id, Stage::Ports, target);
@@ -2908,6 +3067,7 @@ fn stage_file(stage: Stage) -> &'static str {
         Stage::MailDns => "mail_dns",
         Stage::Trace => "trace",
         Stage::Ports => "nmap_ports",
+        Stage::Udp => "nmap_udp",
         Stage::Services => "nmap_svc",
         Stage::Headers => "headers",
         Stage::WafCdn => "waf_cdn",
@@ -3051,6 +3211,65 @@ pub async fn worker(state: Arc<State>, mut queue: mpsc::UnboundedReceiver<i64>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_udp_scan_names_its_services_and_explains_open_ones() {
+        let settings = ReconSettings::default();
+        let command = udp_command(
+            &settings,
+            &["203.0.113.5".to_owned()],
+            false,
+            Path::new("/tmp/out.xml"),
+        );
+        assert_eq!(command.program, "nmap");
+        assert_eq!(&command.args[..2], ["-sU", "-sV"]);
+        let ports = command.args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(command.args[ports + 1], UDP_PORTS);
+        assert_eq!(
+            command.args[command.args.len() - 2..],
+            ["--", "203.0.113.5"]
+        );
+        assert!(!command.args.contains(&"-6".to_owned()));
+        assert!(udp_command(
+            &settings,
+            &["2001:db8::5".to_owned()],
+            true,
+            Path::new("o.xml")
+        )
+        .args
+        .contains(&"-6".to_owned()));
+        validate_nmap_flags(&command.args[..command.args.len() - 4]).unwrap();
+        // Every port scanned has a note, and the notes are about UDP services.
+        for port in UDP_PORTS.trim_start_matches("U:").split(',') {
+            let port: u16 = port.parse().unwrap();
+            assert!(udp_note(port).is_some(), "no note for {port}");
+        }
+        assert!(udp_note(161).unwrap().contains("SNMP"));
+        assert!(udp_note(623).unwrap().contains("IPMI"));
+        assert!(udp_note(9999).is_none());
+
+        // nmap's UDP answers: open, open|filtered, and the rest closed.
+        let xml = r#"<?xml version="1.0"?><!DOCTYPE nmaprun><nmaprun scanner="nmap" args="nmap -sU">
+<host><status state="up"/><address addr="203.0.113.5" addrtype="ipv4"/><ports>
+<extraports state="closed" count="20"><extrareasons reason="port-unreach" count="20" proto="udp" ports="53,67,69"/></extraports>
+<port protocol="udp" portid="161"><state state="open" reason="udp-response"/><service name="snmp" product="net-snmp" method="probed" conf="10"/></port>
+<port protocol="udp" portid="123"><state state="open|filtered" reason="no-response"/><service name="ntp" method="table" conf="3"/></port>
+</ports></host><runstats><hosts up="1" down="0" total="1"/></runstats></nmaprun>"#;
+        let observations = parsers::nmap::parse(xml).unwrap();
+        let state_of = |number: u16| {
+            observations.iter().find_map(|o| match o {
+                Observation::Port {
+                    port,
+                    protocol,
+                    state,
+                    ..
+                } if *port == number && protocol == "udp" => Some(state.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(state_of(161).as_deref(), Some("open"));
+        assert_eq!(state_of(123).as_deref(), Some("open|filtered"));
+    }
 
     #[tokio::test]
     async fn work_in_progress_is_stopped_when_the_mode_changes() {
