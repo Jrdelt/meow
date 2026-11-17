@@ -33,6 +33,8 @@
   var state = null;
   var selected = null;
   var drawn = '';
+  var pendingAiScroll = false;
+  var lastAiKey = '';
 
   // The map is drawn top-down, like a home-network diagram: the Internet
   // cloud at the top, your router (or access point) under it, and every
@@ -1091,6 +1093,7 @@
     renderHosts();
     renderAdvisory();
     renderWhere();
+    renderAiPanel();
   }
 
   var MULTI_TLDS = ['co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au',
@@ -1534,6 +1537,7 @@
         button.title = 'Needs stack and route evidence first (see the checklist).';
       }
       button.addEventListener('click', function () {
+        pendingAiScroll = true;
         send({ cmd: 'ai', tier: tier[0], address: host.address });
       });
     });
@@ -1548,10 +1552,17 @@
     }
     var reply = state.ai || {};
     if (reply.address === host.address && (reply.running || reply.text || reply.error)) {
-      var answer = ai.appendChild(el('div', 'box'));
-      answer.appendChild(el('div', 'dim', reply.running ? 'Running ...' : (reply.summary || '')));
-      answer.appendChild(el('pre', 'reply', reply.text || ''));
-      if (reply.error) { answer.appendChild(el('div', 'bad-text', reply.error)); }
+      ai.appendChild(row('Status', reply.running
+        ? marked('streaming below ...', 'info')
+        : (reply.error ? marked('error (see below)', 'bad') : marked('ready below', 'ok'))));
+      var jumpWrap = ai.appendChild(el('div', 'actions'));
+      var jumpBtn = jumpWrap.appendChild(el('button', null, 'Jump to triage output ↓'));
+      jumpBtn.addEventListener('click', function () {
+        var panel = byId('card-ai');
+        if (panel && !panel.hidden) {
+          panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
     }
     cards.push(ai);
 
@@ -1796,12 +1807,442 @@
     detail.appendChild(drawnAs(data));
   }
 
+  function appendInlineCodeOnly(parent, text) {
+    var buf = '';
+    var i = 0;
+    function flush() {
+      if (buf) {
+        parent.appendChild(document.createTextNode(buf));
+        buf = '';
+      }
+    }
+    while (i < text.length) {
+      if (text.charAt(i) === '`') {
+        var tickEnd = i;
+        while (tickEnd < text.length && text.charAt(tickEnd) === '`') { tickEnd += 1; }
+        var ticks = text.slice(i, tickEnd);
+        var closeIdx = text.indexOf(ticks, tickEnd);
+        if (closeIdx > tickEnd) {
+          flush();
+          parent.appendChild(el('code', null, text.slice(tickEnd, closeIdx)));
+          i = closeIdx + ticks.length;
+          continue;
+        }
+        buf += ticks;
+        i = tickEnd;
+        continue;
+      }
+      buf += text.charAt(i);
+      i += 1;
+    }
+    flush();
+  }
+
+  // Inline Markdown formatting built strictly out of text nodes and safe
+  // inline elements (code, strong, em). No links or images are created from
+  // AI or target text.
+  function appendInlineFormatted(parent, text) {
+    var buf = '';
+    var i = 0;
+    function flush() {
+      if (buf) {
+        parent.appendChild(document.createTextNode(buf));
+        buf = '';
+      }
+    }
+    while (i < text.length) {
+      var ch = text.charAt(i);
+      if (ch === '`') {
+        var tickEnd = i;
+        while (tickEnd < text.length && text.charAt(tickEnd) === '`') { tickEnd += 1; }
+        var ticks = text.slice(i, tickEnd);
+        var closeIdx = text.indexOf(ticks, tickEnd);
+        if (closeIdx > tickEnd) {
+          flush();
+          parent.appendChild(el('code', null, text.slice(tickEnd, closeIdx)));
+          i = closeIdx + ticks.length;
+          continue;
+        }
+        buf += ticks;
+        i = tickEnd;
+        continue;
+      }
+      if (ch === '[') {
+        var mid = text.indexOf('](', i + 1);
+        if (mid > i + 1) {
+          var label = text.slice(i + 1, mid);
+          if (label.indexOf('[') < 0 && label.indexOf('\n') < 0) {
+            var closeParen = text.indexOf(')', mid + 2);
+            if (closeParen > mid + 2) {
+              var rawUrl = text.slice(mid + 2, closeParen).trim();
+              if (/^https?:\/\/\S+$/.test(rawUrl)) {
+                flush();
+                if (label.trim() && label.trim() !== rawUrl) {
+                  parent.appendChild(document.createTextNode(label + ' ('));
+                  parent.appendChild(el('code', null, rawUrl));
+                  parent.appendChild(document.createTextNode(')'));
+                } else {
+                  parent.appendChild(el('code', null, rawUrl));
+                }
+                i = closeParen + 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
+      if (ch === '*' && text.charAt(i + 1) === '*') {
+        if (text.charAt(i + 2) !== '*') {
+          var boldEnd = text.indexOf('**', i + 2);
+          if (boldEnd > i + 2) {
+            flush();
+            var strong = parent.appendChild(el('strong'));
+            appendInlineCodeOnly(strong, text.slice(i + 2, boldEnd));
+            i = boldEnd + 2;
+            continue;
+          }
+        }
+        var starEnd = i;
+        while (starEnd < text.length && text.charAt(starEnd) === '*') { starEnd += 1; }
+        buf += text.slice(i, starEnd);
+        i = starEnd;
+        continue;
+      }
+      if (ch === '*') {
+        var prev = i === 0 ? ' ' : text.charAt(i - 1);
+        var afterOpen = text.charAt(i + 1);
+        if (afterOpen && afterOpen !== ' ' && /[\s(\[{"']/.test(prev)) {
+          var emEnd = text.indexOf('*', i + 1);
+          if (emEnd > i + 1 && text.charAt(emEnd - 1) !== ' ' && text.charAt(emEnd + 1) !== '*') {
+            var next = emEnd + 1 >= text.length ? ' ' : text.charAt(emEnd + 1);
+            if (/[\s)\]}.,;:!?"']/.test(next)) {
+              flush();
+              var em = parent.appendChild(el('em'));
+              appendInlineCodeOnly(em, text.slice(i + 1, emEnd));
+              i = emEnd + 1;
+              continue;
+            }
+          }
+        }
+      }
+      buf += ch;
+      i += 1;
+    }
+    flush();
+  }
+
+  function parseCodeFence(line) {
+    var m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!m) { return null; }
+    if (m[1].charAt(0) === '`' && m[2].indexOf('`') >= 0) { return null; }
+    var lang = m[2].trim().split(/\s+/)[0] || '';
+    return { fenceChar: m[1].charAt(0), fenceLen: m[1].length, lang: lang };
+  }
+
+  function isHrLine(line) {
+    return /^ {0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/.test(line);
+  }
+
+  function isHeadingLine(line) {
+    return /^ {0,3}#{1,6}\s+\S/.test(line);
+  }
+
+  function isTableRow(line) {
+    return line.indexOf('|') >= 0;
+  }
+
+  function splitTableCells(line) {
+    var trimmed = line.trim();
+    if (trimmed.charAt(0) === '|') { trimmed = trimmed.slice(1); }
+    if (trimmed.charAt(trimmed.length - 1) === '|') { trimmed = trimmed.slice(0, -1); }
+    return trimmed.split('|').map(function (c) { return c.trim(); });
+  }
+
+  function isTableSeparator(line) {
+    if (!isTableRow(line)) { return false; }
+    var cells = splitTableCells(line);
+    if (!cells.length) { return false; }
+    return cells.every(function (c) { return /^:?-{3,}:?$/.test(c); });
+  }
+
+  function matchListItem(line) {
+    if (isHrLine(line)) { return null; }
+    var u = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    if (u) { return { type: 'ul', indent: u[1].length, num: 1, text: u[2] }; }
+    var o = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(line);
+    if (o) { return { type: 'ol', indent: o[1].length, num: parseInt(o[2], 10) || 1, text: o[3] }; }
+    return null;
+  }
+
+  function renderAiMarkdown(container, rawText) {
+    var lines = String(rawText || '').replace(/\r\n?/g, '\n').split('\n');
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!/\S/.test(line)) {
+        i += 1;
+        continue;
+      }
+      var fence = parseCodeFence(line);
+      if (fence) {
+        i += 1;
+        var closeRe = new RegExp('^ {0,3}' + fence.fenceChar + '{' + fence.fenceLen + ',}\\s*$');
+        var codeLines = [];
+        while (i < lines.length && !closeRe.test(lines[i])) {
+          codeLines.push(lines[i]);
+          i += 1;
+        }
+        if (i < lines.length) { i += 1; }
+        var block = container.appendChild(el('div', 'code-block'));
+        if (fence.lang) {
+          block.appendChild(el('div', 'code-lang', fence.lang));
+        }
+        var pre = block.appendChild(el('pre'));
+        pre.appendChild(el('code', null, codeLines.join('\n')));
+        continue;
+      }
+      var headMatch = /^ {0,3}(#{1,6})\s+(.*?)\s*#*$/.exec(line);
+      if (headMatch) {
+        var hNode = container.appendChild(el(headMatch[1].length <= 2 ? 'h3' : 'h4'));
+        appendInlineFormatted(hNode, headMatch[2]);
+        i += 1;
+        continue;
+      }
+      if (isHrLine(line)) {
+        container.appendChild(el('hr'));
+        i += 1;
+        continue;
+      }
+      if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+        var headers = splitTableCells(line);
+        var tbl = container.appendChild(el('table'));
+        var thead = tbl.appendChild(el('thead'));
+        var headTr = thead.appendChild(el('tr'));
+        headers.forEach(function (cell) {
+          var th = headTr.appendChild(el('th'));
+          appendInlineFormatted(th, cell);
+        });
+        i += 2;
+        var tbody = tbl.appendChild(el('tbody'));
+        while (i < lines.length && /\S/.test(lines[i]) && isTableRow(lines[i])) {
+          var rowCells = splitTableCells(lines[i]);
+          var tr = tbody.appendChild(el('tr'));
+          for (var c = 0; c < Math.max(headers.length, rowCells.length); c += 1) {
+            var td = tr.appendChild(el('td'));
+            appendInlineFormatted(td, rowCells[c] || '');
+          }
+          i += 1;
+        }
+        continue;
+      }
+      if (/^ {0,3}>/.test(line)) {
+        var bq = container.appendChild(el('blockquote'));
+        var quotePara = [];
+        while (i < lines.length && /^ {0,3}>/.test(lines[i])) {
+          var qText = lines[i].replace(/^ {0,3}>\s?/, '');
+          if (!/\S/.test(qText)) {
+            if (quotePara.length) {
+              var qp = bq.appendChild(el('p'));
+              appendInlineFormatted(qp, quotePara.join(' '));
+              quotePara = [];
+            }
+          } else {
+            quotePara.push(qText.trim());
+          }
+          i += 1;
+        }
+        if (quotePara.length) {
+          var lastQp = bq.appendChild(el('p'));
+          appendInlineFormatted(lastQp, quotePara.join(' '));
+        }
+        continue;
+      }
+      var firstItem = matchListItem(line);
+      if (firstItem) {
+        var listEl = container.appendChild(el(firstItem.type));
+        if (firstItem.type === 'ol' && firstItem.num > 1) {
+          listEl.start = firstItem.num;
+        }
+        var baseIndent = firstItem.indent;
+        var lastLi = null;
+        var subList = null;
+        var subType = null;
+        while (i < lines.length) {
+          if (!/\S/.test(lines[i])) {
+            var nextIdx = i + 1;
+            while (nextIdx < lines.length && !/\S/.test(lines[nextIdx])) { nextIdx += 1; }
+            if (nextIdx >= lines.length) { i = nextIdx; break; }
+            var peekItem = matchListItem(lines[nextIdx]);
+            if (peekItem && (peekItem.type === firstItem.type || peekItem.indent >= baseIndent + 2)) {
+              i = nextIdx;
+            } else {
+              break;
+            }
+          }
+          if (parseCodeFence(lines[i]) || isHeadingLine(lines[i]) || isHrLine(lines[i]) || /^ {0,3}>/.test(lines[i])) {
+            break;
+          }
+          var item = matchListItem(lines[i]);
+          if (item) {
+            if (item.indent >= baseIndent + 2 && lastLi) {
+              if (!subList || subType !== item.type) {
+                subList = lastLi.appendChild(el(item.type));
+                subType = item.type;
+              }
+              var subLi = subList.appendChild(el('li'));
+              appendInlineFormatted(subLi, item.text);
+              i += 1;
+              continue;
+            }
+            if (item.type === firstItem.type) {
+              lastLi = listEl.appendChild(el('li'));
+              subList = null;
+              subType = null;
+              appendInlineFormatted(lastLi, item.text);
+              i += 1;
+              continue;
+            }
+            break;
+          }
+          if (/^\s{2,}\S/.test(lines[i]) && lastLi) {
+            lastLi.appendChild(document.createTextNode(' '));
+            appendInlineFormatted(lastLi, lines[i].trim());
+            i += 1;
+            continue;
+          }
+          break;
+        }
+        continue;
+      }
+      var paraLines = [];
+      while (i < lines.length && /\S/.test(lines[i])) {
+        if (paraLines.length && (
+          parseCodeFence(lines[i]) ||
+          isHeadingLine(lines[i]) ||
+          isHrLine(lines[i]) ||
+          /^ {0,3}>/.test(lines[i]) ||
+          matchListItem(lines[i]) ||
+          (isTableRow(lines[i]) && i + 1 < lines.length && isTableSeparator(lines[i + 1]))
+        )) {
+          break;
+        }
+        paraLines.push(lines[i].trim());
+        i += 1;
+      }
+      if (paraLines.length) {
+        var p = container.appendChild(el('p'));
+        appendInlineFormatted(p, paraLines.join(' '));
+      }
+    }
+  }
+
+  var TIER_TITLES = {
+    local: '[L] Local Triage',
+    cloud: '[C] Cloud Triage',
+    research: '[R] Grounded Research'
+  };
+
+  function renderAiPanel() {
+    if (!state) { return; }
+    var panel = byId('card-ai');
+    if (!panel) { return; }
+    var reply = state.ai || {};
+    if (!reply.running && !reply.text && !reply.error) {
+      panel.hidden = true;
+      lastAiKey = '';
+      return;
+    }
+    panel.hidden = false;
+    var onSameHost = !!(reply.address && selectedAddress() === reply.address);
+    var aiKey = JSON.stringify([
+      !!reply.running,
+      reply.tier || '',
+      reply.address || '',
+      reply.summary || '',
+      reply.error || '',
+      onSameHost,
+      reply.text || ''
+    ]);
+    if (aiKey !== lastAiKey) {
+      lastAiKey = aiKey;
+      var tierLabel = own(TIER_TITLES, reply.tier) || 'AI Triage';
+      byId('ai-title').textContent = tierLabel + (reply.address ? ' \u2014 ' + reply.address : '');
+
+      var badges = clear(byId('ai-badges'));
+      if (reply.running) {
+        badges.appendChild(el('span', 'badge warn', 'streaming\u2026'));
+      } else if (reply.error) {
+        badges.appendChild(el('span', 'badge bad', 'error'));
+      } else {
+        badges.appendChild(el('span', 'badge ok', 'complete'));
+      }
+
+      if (reply.address && !onSameHost) {
+        var hostBtn = badges.appendChild(el('button', null, 'Select ' + reply.address));
+        hostBtn.addEventListener('click', function () {
+          select('host:' + reply.address);
+        });
+      }
+
+      if (reply.text) {
+        var rawCopy = String(reply.text);
+        var copyBtn = badges.appendChild(el('button', null, 'Copy Markdown'));
+        copyBtn.addEventListener('click', function () {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(rawCopy).then(function () {
+              copyBtn.textContent = 'Copied';
+              setTimeout(function () { copyBtn.textContent = 'Copy Markdown'; }, 1800);
+            }, function () {
+              flash('Clipboard copy was blocked by the browser.');
+            });
+          } else {
+            flash('Clipboard API is unavailable in this browser.');
+          }
+        });
+      }
+
+      var meta = byId('ai-meta');
+      if (reply.summary) {
+        meta.hidden = false;
+        meta.textContent = reply.summary;
+      } else if (reply.running) {
+        meta.hidden = false;
+        meta.textContent = 'Streaming response for ' + (reply.address || 'selected host') + '\u2026';
+      } else {
+        meta.hidden = true;
+        meta.textContent = '';
+      }
+
+      var body = clear(byId('ai-body'));
+      if (reply.text) {
+        renderAiMarkdown(body, reply.text);
+      } else if (reply.running) {
+        body.appendChild(el('p', 'dim', 'Waiting for first tokens from model\u2026'));
+      }
+
+      var errBox = byId('ai-error');
+      if (reply.error) {
+        errBox.hidden = false;
+        errBox.textContent = reply.error;
+      } else {
+        errBox.hidden = true;
+        errBox.textContent = '';
+      }
+    }
+
+    if (pendingAiScroll) {
+      pendingAiScroll = false;
+      panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+
   function render() {
     renderHeader();
     renderGraph();
     renderWhere();
     renderSide();
     renderDetail();
+    renderAiPanel();
   }
 
   cy.on('tap', 'node', function (event) {

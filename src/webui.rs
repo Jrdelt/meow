@@ -425,4 +425,25 @@ mod tests {
         assert_eq!(asset("../Cargo.toml").status(), StatusCode::NOT_FOUND);
         assert_eq!(asset("map.html").status(), StatusCode::NOT_FOUND);
     }
+
+    #[test]
+    fn ai_triage_panel_renders_full_width_below_cards() {
+        let notices_end = PAGE
+            .find("id=\"notices\"")
+            .expect("notices list inside #cards");
+        let cards_close = PAGE[notices_end..]
+            .find("</div>")
+            .map(|offset| notices_end + offset)
+            .expect("closing </div> for #cards");
+        let ai_card = PAGE.find("id=\"card-ai\"").expect("#card-ai section");
+        let main_close = PAGE.find("</main>").expect("closing </main>");
+        assert!(
+            ai_card > cards_close && ai_card < main_close,
+            "#card-ai must appear after #cards and inside <main>"
+        );
+        assert!(STYLE.contains("#card-ai"));
+        assert!(STYLE.contains(".ai-prose"));
+        assert!(SCRIPT.contains("function renderAiMarkdown("));
+        assert!(SCRIPT.contains("function renderAiPanel("));
+    }
 }
