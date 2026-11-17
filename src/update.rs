@@ -77,7 +77,7 @@ fn verify_checkout_security(dir: &Path, explicit_source: bool) -> Result<()> {
     if !explicit_source && is_ephemeral_tmp_path(dir) {
         bail!(
             "{safe_dir} is a temporary build folder (for example from Homebrew) that no longer exists. \
-             Upgrade with `brew update && brew upgrade meow` (or `brew reinstall --HEAD meow` for the latest main branch), \
+             Upgrade with `brew update && brew upgrade meow` (or `brew uninstall meow && brew install --HEAD meow` for the latest main branch), \
              or pass `--source <folder>` with a meow git checkout."
         );
     }
@@ -712,7 +712,7 @@ fn run_homebrew_update(hb: &HomebrewInstall, brew_bin: &Path, check: bool) -> Re
             println!("[+] Already up to date in Homebrew ({safe_formula} {safe_ver}).");
             if !hb.is_head {
                 println!(
-                    "[+] Note: Homebrew stable tracks tagged releases; run `brew reinstall --HEAD {safe_formula}` to track the latest main branch."
+                    "[+] Note: Homebrew stable tracks tagged releases; run `brew uninstall {safe_formula} && brew install --HEAD {safe_formula}` to track the latest main branch."
                 );
             }
         } else {
