@@ -1,14 +1,19 @@
-### What's New in `meow` v0.2.0
+### What's New in `meow` v0.2.1
 
-- **Expanded 14-Stage `recon <target>` OSINT & Triage Pipeline (`mild` mode):**
-  - Passive & non-intrusive stages run automatically alongside port/service discovery: `lan` (passive ARP/NDP neighbour sweep), `dns` (DoH/UDP `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT`, and reverse `PTR`), `asn` (Team Cymru DNS + RDAP + offline DB-IP Lite location database fallback), `subdomains` (`crt.sh` Certificate Transparency), `trace` (traceroute hop & RTT latency parser), `ports`, `services`, `headers` (`GET /`, `/robots.txt`, `/.well-known/security.txt`, MurmurHash3 `/favicon.ico` framework fingerprinting), `waf-cdn` (Cloudflare, Akamai, CloudFront, Fastly, AWS WAF detection before `dirs`), `tls-audit` (TLS 1.0–1.3, weak ciphers, X.509 SANs & validity), `ssh-audit` (RFC 4253 `SSH_MSG_KEXINIT` algorithm audit), `cves` (OSV.dev + NVD CPE/CVE hypothesis matcher with distro backport awareness), `crawl`, and `dirs`.
-- **Rich OPSEC & Transit Topology Map:**
-  - Vertical OPSEC pipeline: `You` -> `Gateway` -> `WAN Egress · <IP> (<ISP>)` (or dashed cyan `VPN Exit` tunnel) -> `Internet (<N> hops · <X> ms)` (click to expand intermediate traceroute hops with per-hop RTT & GeoIP labels) -> optional `WAF / CDN` shield node -> compound `ASN / Cloud Provider` box grouping sibling hosts -> rich target labels (`<hostname> (<ip>)`, compact ports, city, and verification status badge).
-  - **Associated Hosts** panel & `Host Info` grouping discovered names into **Domains** (registrable apex domains) and **Hosts** (subdomains/FQDNs).
-- **One-Click Engagement Report Export:**
-  - Export per-host or full-workspace Markdown reports or Print/PDF directly from the browser map, combining Host Info, Open Ports, Web & TLS posture, confirmed/hypothesis Advisories, Evidence facts, operator notes, and AI remediation transcripts.
-- **Security Hardening & Cross-Platform Audit:**
-  - Comprehensive security audit across Unix, macOS, and Windows (ConPTY & Job Objects, path/ACL/SID validation, bounded XML/JSON/DNS/HTTP parsers, zero-trust Privacy Vault masking, and strict CSP/DOM sanitization).
+- **Map: easier to read.**
+  - **Ports** card shows each port on one line: number, state (open, filtered or closed), service and version. The separate versions section is gone; open ports come first.
+  - **Notices** card is folded by default and shows a count; click it to open.
+  - **Traceroute hops** show where each hop is (city, region, country), its network and ASN, reverse DNS, address type, round-trip time and the latency the hop adds (long links are flagged). The last hop is marked as the target, with its open ports and a button to open the host.
+  - **Server Status** card on each host: whether a scan has seen it up, the last scan result, known open ports, and a **Check now** button that tries a few known ports (not in light mode).
+- **Cloud triage in two parts:** a **Red Team** plan for an authorized penetration test (what to look at first, how to verify it without harm, what evidence to keep) and a **Blue Team** plan for a SOC (patches and hardening, detection, monitoring and response), shown side by side on the map.
+- **Security fixes from a full audit:**
+  - Names on a private network (and reverse lookups) are no longer sent to public DNS-over-HTTPS or to crt.sh; cloud metadata addresses are refused.
+  - Downloads from NVD, CISA KEV, OSV and map tile servers have size limits; error messages no longer carry request URLs.
+  - The map no longer keeps its session key in a cookie; a reload still works in the same tab.
+  - `meow update` only fast-forwards from the configured remote; root-owned installs are replaced by renaming a full copy.
+  - `install.sh` refuses to run from a pipe and limits download sizes.
+  - Terminal filter: long OSC strings and odd DEC modes can no longer hide or stop capture; long lines of colons cost no extra time.
+  - Recon stages stop when the mode changes mid-stage.
 
 ---
 

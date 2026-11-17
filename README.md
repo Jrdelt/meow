@@ -43,7 +43,7 @@ To track the latest `main` branch instead of tagged releases, install with `--HE
 Download the `.pkg` installer for your Mac (`meow-<version>-macos-arm64.pkg` for Apple Silicon or `meow-<version>-macos-x86_64.pkg` for Intel) from the [latest GitHub Release](https://github.com/Jrdelt/meow/releases/latest) and open it, or install from the terminal:
 
 ```sh
-sudo installer -pkg meow-0.2.0-macos-arm64.pkg -target /
+sudo installer -pkg meow-0.2.1-macos-arm64.pkg -target /
 ```
 
 Then run `meow tools` once in your terminal to install any missing companion scanners (`nmap`, `katana`, `feroxbuster`), the web wordlist, and the offline location database.
@@ -300,7 +300,7 @@ map = true
 On macOS 15 (Sequoia) and newer, open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** (on macOS 14 and earlier, Control-click the `.pkg` in Finder and choose **Open**), or install directly from Terminal:
 
 ```sh
-sudo installer -pkg meow-0.2.0-macos-arm64.pkg -target /
+sudo installer -pkg meow-0.2.1-macos-arm64.pkg -target /
 ```
 
 ### `meow recon` says it is refused in `light` mode
