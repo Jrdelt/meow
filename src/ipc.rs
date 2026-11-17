@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::StatusCode;
 use serde_json::Value;
 
@@ -178,11 +178,25 @@ pub fn send(workspace: &Workspace, command: &Command) -> Result<Option<Value>> {
     let Some(info) = runtime_info(workspace) else {
         return Ok(None);
     };
-    tokio::runtime::Builder::new_current_thread()
+    let answer = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("cannot start the async runtime")?
-        .block_on(send_to(&info, command))
+        .block_on(send_to(&info, command))?;
+    // `None` makes a helper work on the files instead. While the session
+    // still holds the workspace that would be lost: the session writes its
+    // own graph over the file when it next saves. A session that is only
+    // slow to answer is an error to retry, not an absent one.
+    if answer.is_none()
+        && !matches!(command, Command::Ping)
+        && SessionLock::is_held(&workspace.dir.join(LOCK_FILE))
+    {
+        bail!(
+            "the session (pid {}) holds this workspace but did not take the request; try again in a moment",
+            info.pid
+        );
+    }
+    Ok(answer)
 }
 
 /// True when a session is open on the workspace in `dir` and answers. Only
@@ -401,6 +415,48 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
         assert!(!SessionLock::is_held(&lock));
         assert_eq!(runtime_info_in(dir), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_that_holds_the_workspace_but_does_not_answer_is_not_treated_as_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        // The session holds the lock and wrote its runtime file, but its
+        // port takes no connection (busy, or its backlog is full).
+        let _held = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        std::fs::write(
+            workspace.runtime_path(),
+            serde_json::to_vec(&RuntimeInfo {
+                pid: std::process::id(),
+                port,
+                token: "0123456789abcdef".repeat(4),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // An import must not fall back to writing graph.json, which the
+        // session would overwrite: it is an error to retry.
+        let error = send(
+            &workspace,
+            &Command::Observations {
+                items: vec![],
+                ground: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not take the request"),
+            "{error:#}"
+        );
+        // A liveness ping still just says "not answering".
+        assert_eq!(send(&workspace, &Command::Ping).unwrap(), None);
     }
 
     #[test]

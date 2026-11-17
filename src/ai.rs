@@ -1745,15 +1745,25 @@ pub fn chat_file_name(address: &str) -> String {
         })
         .collect();
     let trimmed = safe.trim_matches('.');
-    if trimmed.is_empty() {
-        return "_host.md".to_owned();
-    }
-    let first_label = trimmed.split('.').next().unwrap_or("");
-    if is_windows_reserved_stem(first_label) {
-        format!("_{trimmed}.md")
+    let stem = if trimmed.is_empty() {
+        "_host".to_owned()
+    } else if is_windows_reserved_stem(trimmed.split('.').next().unwrap_or("")) {
+        format!("_{trimmed}")
     } else {
-        format!("{trimmed}.md")
+        trimmed.to_owned()
+    };
+    if stem == address {
+        return format!("{stem}.md");
     }
+    // The name had to be changed to be a file name, so two hosts could end
+    // up with the same one (`2001:db8::7` and a host named `2001_db8__7`),
+    // and one host's report would carry the other's AI notes. A changed
+    // name gets part of a hash of the real one, after a `~`, which no
+    // unchanged name can contain.
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(address.as_bytes());
+    let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{stem}~{tag}.md")
 }
 
 /// Appends a reply to the host's local Markdown file (unmasked, `0600`).
@@ -3076,8 +3086,15 @@ mod tests {
                 0o600
             );
         }
-        assert_eq!(chat_file_name("fe80::1%eth0"), "fe80__1_eth0.md");
-        assert_eq!(chat_file_name("../../etc/passwd"), "_.._etc_passwd.md");
+        assert!(chat_file_name("fe80::1%eth0").starts_with("fe80__1_eth0~"));
+        assert!(chat_file_name("../../etc/passwd").starts_with("_.._etc_passwd~"));
+        // A name that needed no change is the file name, as before.
+        assert_eq!(chat_file_name("10.10.10.5"), "10.10.10.5.md");
+        assert_eq!(chat_file_name("app.lab.local"), "app.lab.local.md");
+        // Two hosts that would share a file no longer do.
+        assert_ne!(chat_file_name("2001:db8::7"), chat_file_name("2001_db8__7"));
+        assert_eq!(chat_file_name("2001_db8__7"), "2001_db8__7.md");
+        assert!(chat_file_name("2001:db8::7").contains('~'));
 
         // A reply that tries to be more than text is saved as text.
         let hostile = Outcome {
@@ -3200,10 +3217,10 @@ mod tests {
         assert!(!dbg_overrides.contains("sk-ant-super-secret-value"));
         assert!(dbg_overrides.contains("[REDACTED]"));
 
-        assert_eq!(chat_file_name("CON"), "_CON.md");
-        assert_eq!(chat_file_name("nul.local"), "_nul.local.md");
-        assert_eq!(chat_file_name("com1"), "_com1.md");
-        assert_eq!(chat_file_name("..."), "_host.md");
+        assert!(chat_file_name("CON").starts_with("_CON~"));
+        assert!(chat_file_name("nul.local").starts_with("_nul.local~"));
+        assert!(chat_file_name("com1").starts_with("_com1~"));
+        assert!(chat_file_name("...").starts_with("_host~"));
 
         let dir = tempfile::tempdir().unwrap();
         let graph = lab();

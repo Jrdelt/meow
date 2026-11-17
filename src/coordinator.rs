@@ -911,10 +911,6 @@ fn deny(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "ok": false, "error": message }))).into_response()
 }
 
-fn cookie_name(port: u16) -> String {
-    format!("meow_token_{port}")
-}
-
 /// `Host` must be a single loopback address matching the coordinator's port.
 fn host_allowed(headers: &HeaderMap, port: u16) -> bool {
     let mut values = headers.get_all(header::HOST).iter();
@@ -949,12 +945,11 @@ fn origin_allowed(headers: &HeaderMap, port: u16) -> bool {
     })
 }
 
-enum PresentedToken {
-    Direct(String),
-    Cookies(Vec<String>),
-}
-
-fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<PresentedToken> {
+/// The session token a request carries: in its `Authorization` header or
+/// its `?token=` query. Never a cookie: browsers send a cookie of
+/// 127.0.0.1 to every port of 127.0.0.1, so any other program listening
+/// there would be handed the token.
+fn token_from(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     let mut auth_values = headers.get_all(header::AUTHORIZATION).iter();
     if let Some(first) = auth_values.next() {
         if auth_values.next().is_some() {
@@ -968,7 +963,7 @@ fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<Pre
         if bearer.is_empty() {
             return None;
         }
-        return Some(PresentedToken::Direct(bearer.to_owned()));
+        return Some(bearer.to_owned());
     }
     if let Some(q) = query {
         let mut found: Option<String> = None;
@@ -981,44 +976,10 @@ fn token_from(headers: &HeaderMap, query: Option<&str>, port: u16) -> Option<Pre
             }
         }
         if let Some(token) = found {
-            return Some(PresentedToken::Direct(token));
+            return Some(token);
         }
     }
-    let scoped_prefix = format!("{}=", cookie_name(port));
-    let mut cookies = Vec::new();
-    for cookie_hdr in headers.get_all(header::COOKIE) {
-        let Ok(cookie_str) = cookie_hdr.to_str() else {
-            continue;
-        };
-        for part in cookie_str.split(';') {
-            let trimmed = part.trim();
-            if let Some(val) = trimmed.strip_prefix(&scoped_prefix) {
-                if !val.is_empty() && cookies.len() < 16 {
-                    cookies.push(val.to_owned());
-                }
-            }
-        }
-    }
-    (!cookies.is_empty()).then_some(PresentedToken::Cookies(cookies))
-}
-
-/// RFC 6265 cookies on `127.0.0.1` are shared across ports (`SameSite=Strict`
-/// treats `127.0.0.1:9999` and `127.0.0.1:8765` as same-site), whereas Fetch
-/// Metadata marks cross-port requests `Sec-Fetch-Site: same-site`. When a
-/// browser sends `Sec-Fetch-Site` on a cookie-authenticated request, only
-/// `same-origin` or user-initiated `none` (reload/address bar) is allowed.
-fn sec_fetch_site_allowed_for_cookie(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all("sec-fetch-site").iter();
-    let Some(value) = values.next() else {
-        return true;
-    };
-    if values.next().is_some() {
-        return false;
-    }
-    value.to_str().is_ok_and(|site| {
-        let site = site.trim();
-        site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none")
-    })
+    None
 }
 
 async fn guard(AxumState(state): AxumState<Shared>, request: Request, next: Next) -> Response {
@@ -1046,43 +1007,20 @@ async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response
     if !origin_allowed(headers, state.port) {
         return refuse(StatusCode::FORBIDDEN, "cross-origin request refused");
     }
-    let Some(presented) = token_from(headers, request.uri().query(), state.port) else {
+    let Some(presented) = token_from(headers, request.uri().query()) else {
+        // A reload of the map, which keeps its token out of the address
+        // bar: a page without secrets that reads it back from the tab.
+        if request.method() == axum::http::Method::GET {
+            match request.uri().path() {
+                "/" => return webui::reload_page(),
+                "/reload.js" => return webui::reload_script(),
+                _ => {}
+            }
+        }
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     };
-    let from_cookie = match presented {
-        PresentedToken::Direct(token) => {
-            if !constant_time_eq(&token, &state.token) {
-                return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
-            }
-            false
-        }
-        PresentedToken::Cookies(tokens) => {
-            let mut matched = false;
-            for candidate in &tokens {
-                if constant_time_eq(candidate, &state.token) {
-                    matched = true;
-                }
-            }
-            if !matched {
-                return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
-            }
-            true
-        }
-    };
-    if from_cookie {
-        let safe_read_route = matches!(
-            *request.method(),
-            axum::http::Method::GET | axum::http::Method::HEAD
-        ) && request.uri().path() != "/ws";
-        if !safe_read_route {
-            return refuse(
-                StatusCode::FORBIDDEN,
-                "cookie authentication is restricted to read-only page and asset requests",
-            );
-        }
-        if !sec_fetch_site_allowed_for_cookie(headers) {
-            return refuse(StatusCode::FORBIDDEN, "cross-origin cookie request refused");
-        }
+    if !constant_time_eq(&presented, &state.token) {
+        return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     }
     match tokio::time::timeout(REQUEST_BODY_TIMEOUT, next.run(request)).await {
         Ok(response) => response,
@@ -1214,17 +1152,7 @@ async fn serve_socket(
 }
 
 async fn index(AxumState(state): AxumState<Shared>) -> Response {
-    let mut response = webui::page(&state.token, &state.page_key);
-    if response.status() == StatusCode::OK {
-        if let Ok(cookie) = HeaderValue::from_str(&format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Strict",
-            cookie_name(state.port),
-            state.token
-        )) {
-            response.headers_mut().insert(header::SET_COOKIE, cookie);
-        }
-    }
-    response
+    webui::page(&state.token, &state.page_key)
 }
 
 async fn asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -2337,6 +2265,25 @@ mod tests {
         })
     }
 
+    /// A GET with only the Host header, as raw text: status line, headers
+    /// and body.
+    fn raw_request(info: &RuntimeInfo, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", info.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            info.port
+        )
+        .unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        reply
+    }
+
     fn bearer(info: &RuntimeInfo) -> String {
         format!("Bearer {}", info.token)
     }
@@ -2514,8 +2461,15 @@ mod tests {
         let fx = fixture();
         let info = fx.coordinator.info();
         for path in ["/api/state", "/", "/ws", "/map/tile/8/44/89"] {
-            let (status, _) = request(&info, "GET", path, &[], None);
-            assert_eq!(status, 401, "{path} without a token");
+            let (status, body) = request(&info, "GET", path, &[], None);
+            if path == "/" {
+                // The secret-free page a reload gets (see
+                // `a_cookie_never_carries_or_grants_the_token`).
+                assert_eq!(status, 200);
+                assert!(!body.to_string().contains(&info.token));
+            } else {
+                assert_eq!(status, 401, "{path} without a token");
+            }
             let (status, _) = request(&info, "GET", &format!("{path}?token=wrong"), &[], None);
             assert_eq!(status, 401, "{path} with a wrong token");
         }
@@ -3075,34 +3029,52 @@ mod tests {
     }
 
     #[test]
-    fn query_token_overrides_stale_cookie_and_empty_query_uses_port_cookie() {
+    fn a_cookie_never_carries_or_grants_the_token() {
         let fx = fixture();
         let info = fx.coordinator.info();
-        let stale = format!("{}=stale; meow_token=stale", cookie_name(info.port));
-        // Opening a fresh session URL with a stale cookie from an earlier run succeeds.
-        let (status, _) = request(
-            &info,
-            "GET",
-            &format!("/?token={}", info.token),
-            &[("Cookie", &stale)],
-            None,
+        // The page is served without setting a cookie: browsers would send
+        // it to every other port of 127.0.0.1.
+        let reply = raw_request(&info, &format!("/?token={}", info.token));
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(
+            !reply.to_ascii_lowercase().contains("set-cookie"),
+            "{reply}"
         );
-        assert_eq!(status, 200);
 
-        // Reloading after history.replaceState (or empty ?token=) authenticates via port-scoped cookie.
-        let valid_cookie = format!(
-            "meow_token_9999=other; {}={}",
-            cookie_name(info.port),
-            info.token
+        // A cookie with the right value opens nothing.
+        let cookie = format!(
+            "meow_token_{}={}; meow_token={}",
+            info.port, info.token, info.token
         );
+        for path in [
+            "/api/state",
+            "/api/state?token=",
+            "/assets/map.js",
+            "/map/tile/1/0/0",
+        ] {
+            let (status, _) = request(&info, "GET", path, &[("Cookie", &cookie)], None);
+            assert_eq!(status, 401, "{path}");
+        }
         let (status, _) = request(
             &info,
-            "GET",
-            "/api/state?token=",
-            &[("Cookie", &valid_cookie)],
-            None,
+            "POST",
+            "/api/command",
+            &[("Cookie", &cookie)],
+            Some(json!({"cmd": "set_mode", "mode": "aggressive"})),
         );
-        assert_eq!(status, 200);
+        assert_eq!(status, 401);
+        // A reload without the token gets a page with no secret in it,
+        // whose script finds the token in the tab's own storage.
+        let reply = raw_request(&info, "/");
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(!reply.contains(&info.token), "{reply}");
+        assert!(reply.contains("/reload.js"), "{reply}");
+        let script = raw_request(&info, "/reload.js");
+        assert!(
+            script.contains("sessionStorage.getItem('meow-map-token')"),
+            "{script}"
+        );
+        assert!(!script.contains(&info.token));
 
         // Duplicate Host or Origin headers are refused.
         let mut headers = HeaderMap::new();
@@ -3156,41 +3128,13 @@ mod tests {
 
         let fx = fixture();
         let info = fx.coordinator.info();
-        let valid_cookie = format!("{}={}", cookie_name(info.port), info.token);
-
-        // 3. Cross-port (`Sec-Fetch-Site: same-site`) and external (`cross-site`)
-        // cookie-riding requests are refused, while `same-origin` and `none` pass.
-        for blocked in ["same-site", "cross-site"] {
-            let (status, _) = request(
-                &info,
-                "GET",
-                "/api/state",
-                &[("Cookie", &valid_cookie), ("Sec-Fetch-Site", blocked)],
-                None,
-            );
-            assert_eq!(status, 403, "blocked Sec-Fetch-Site={blocked}");
-        }
-        for allowed in ["same-origin", "none"] {
-            let (status, _) = request(
-                &info,
-                "GET",
-                "/api/state",
-                &[("Cookie", &valid_cookie), ("Sec-Fetch-Site", allowed)],
-                None,
-            );
-            assert_eq!(status, 200, "allowed Sec-Fetch-Site={allowed}");
-        }
-
-        // 4. Malformed or duplicate Authorization headers and duplicate `?token=`
-        // query parameters never fall back to a valid cookie.
+        // 4. Malformed or duplicate Authorization headers and duplicate
+        // `?token=` query parameters are refused.
         let (status, _) = request(
             &info,
             "GET",
             "/api/state",
-            &[
-                ("Authorization", "Basic dXNlcjpwYXNz"),
-                ("Cookie", &valid_cookie),
-            ],
+            &[("Authorization", "Basic dXNlcjpwYXNz")],
             None,
         );
         assert_eq!(status, 401);
@@ -3198,65 +3142,32 @@ mod tests {
         let mut dup_auth = HeaderMap::new();
         dup_auth.append(header::AUTHORIZATION, bearer(&info).parse().unwrap());
         dup_auth.append(header::AUTHORIZATION, bearer(&info).parse().unwrap());
-        dup_auth.insert(header::COOKIE, valid_cookie.parse().unwrap());
-        assert!(token_from(&dup_auth, None, info.port).is_none());
+        assert!(token_from(&dup_auth, None).is_none());
 
         let (status, _) = request(
             &info,
             "GET",
             &format!("/api/state?token={}&token={}", info.token, info.token),
-            &[("Cookie", &valid_cookie)],
+            &[],
             None,
         );
         assert_eq!(status, 401);
 
-        // 4b. Cookie authentication is rejected on state-changing POST routes
-        // and WebSocket upgrades (blocking cookie-based CSRF and CSWSH), legacy
-        // unscoped `meow_token=` cookies are rejected, and a stale duplicate
-        // port cookie does not shadow a valid port cookie on read-only GETs.
-        let (status, _) = request(
-            &info,
-            "POST",
-            "/api/command",
-            &[("Cookie", &valid_cookie)],
-            Some(json!({"cmd": "mode", "mode": "mild"})),
-        );
-        assert_eq!(status, 403);
-
-        let legacy_cookie = format!("meow_token={}", info.token);
-        let (status, _) = request(
-            &info,
-            "GET",
-            "/api/state",
-            &[("Cookie", &legacy_cookie)],
-            None,
-        );
-        assert_eq!(status, 401);
-
-        let shadowed_cookie = format!(
-            "{}=stale_wrong_value; {}",
-            cookie_name(info.port),
-            valid_cookie
-        );
-        let (status, _) = request(
-            &info,
-            "GET",
-            "/api/state",
-            &[("Cookie", &shadowed_cookie)],
-            None,
-        );
-        assert_eq!(status, 200);
-
+        // A WebSocket with only a cookie is refused.
         block_on(async {
             let ws_cookie_url = format!("ws://127.0.0.1:{}/ws", info.port);
             let mut req = ws_cookie_url.as_str().into_client_request().unwrap();
-            req.headers_mut()
-                .insert(header::COOKIE, valid_cookie.parse().unwrap());
+            req.headers_mut().insert(
+                header::COOKIE,
+                format!("meow_token_{}={}", info.port, info.token)
+                    .parse()
+                    .unwrap(),
+            );
             let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
             let tokio_tungstenite::tungstenite::Error::Http(resp) = err else {
-                panic!("expected HTTP 403 refusal for cookie-only /ws, got {err:?}");
+                panic!("expected an HTTP refusal for cookie-only /ws, got {err:?}");
             };
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         });
 
         // 5. Upgraded WebSockets are bounded by MAX_WS_CONNECTIONS and release

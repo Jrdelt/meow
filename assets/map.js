@@ -14,6 +14,10 @@
   }
 
   var token = new URLSearchParams(location.search).get('token') || scriptToken();
+  // Kept in this tab's own storage, which browsers keep apart for each
+  // port, so that a reload (with the token gone from the address bar) can
+  // find it again. Never a cookie: those reach every port of 127.0.0.1.
+  try { if (/^[0-9a-f]{64}$/.test(token)) { sessionStorage.setItem('meow-map-token', token); } } catch (_) {}
   if (location.search && window.history && typeof window.history.replaceState === 'function') {
     window.history.replaceState(null, '', location.pathname);
   }
