@@ -1857,7 +1857,7 @@ mod tests {
     #[test]
     fn location_off_means_no_picture_requests_for_a_selected_server_either() {
         use std::sync::atomic::AtomicUsize;
-        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        const JPEG: &[u8] = crate::tiles::TEST_JPEG;
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1943,7 +1943,7 @@ mod tests {
 
     #[test]
     fn the_map_asks_once_and_the_estimate_lands_in_the_snapshot() {
-        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        const JPEG: &[u8] = crate::tiles::TEST_JPEG;
         // A stand-in lookup and map picture service on its own thread.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

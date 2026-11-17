@@ -329,6 +329,52 @@ fn store_tile(template: &str, picture: &Picture) {
     ));
 }
 
+/// The widest and tallest a map picture may say it is.
+const PICTURE_MAX_PIXELS: u32 = 1024;
+
+/// The start of a JPEG that says it is 256 pixels square, for tests.
+#[cfg(test)]
+pub(crate) const TEST_JPEG: &[u8] = &[
+    0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0xFF,
+    0xC0, 0, 0x0B, 8, 1, 0, 1, 0, 1, 1, 0x11, 0,
+];
+
+/// The width and height a JPEG or PNG declares, read from its header.
+pub fn picture_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let number = |at: usize, len: usize| -> Option<u32> {
+        bytes.get(at..at + len).map(|part| {
+            part.iter()
+                .fold(0u32, |sum, byte| (sum << 8) | u32::from(*byte))
+        })
+    };
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        // The first chunk is IHDR: width and height open it.
+        return (bytes.get(12..16) == Some(b"IHDR")).then_some((number(16, 4)?, number(20, 4)?));
+    }
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    // JPEG: segments, each a marker and a length, up to the frame header.
+    let mut at = 2;
+    while bytes.get(at) == Some(&0xFF) {
+        let marker = *bytes.get(at + 1)?;
+        if marker == 0xFF {
+            at += 1;
+            continue;
+        }
+        let frame = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if frame {
+            return Some((number(at + 7, 2)?, number(at + 5, 2)?));
+        }
+        let length = number(at + 2, 2)? as usize;
+        if length < 2 {
+            return None;
+        }
+        at += 2 + length;
+    }
+    None
+}
+
 async fn fetch_one(http: &reqwest::Client, template: &str, spot: &TileSpot) -> Result<Picture> {
     if let Some(hit) = cached_tile(template, spot) {
         return Ok(hit);
@@ -337,6 +383,8 @@ async fn fetch_one(http: &reqwest::Client, template: &str, spot: &TileSpot) -> R
         .get(tile_url(template, spot.z, spot.x, spot.y))
         .send()
         .await
+        // Without the address, which may hold a key and is shown on the page.
+        .map_err(reqwest::Error::without_url)
         .context("the map picture service did not answer")?;
     if !response.status().is_success() {
         bail!(
@@ -360,6 +408,7 @@ async fn fetch_one(http: &reqwest::Client, template: &str, spot: &TileSpot) -> R
     while let Some(chunk) = response
         .chunk()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("a map picture was cut off")?
     {
         if bytes.len().saturating_add(chunk.len()) > PICTURE_MAX_BYTES {
@@ -369,6 +418,14 @@ async fn fetch_one(http: &reqwest::Client, template: &str, spot: &TileSpot) -> R
     }
     let media_type = picture_type(&bytes)
         .context("the map picture service sent something other than a JPEG or PNG picture")?;
+    // A map picture is 256 or 512 pixels square. A small file can declare
+    // tens of thousands, which the page would then have to unpack.
+    match picture_size(&bytes) {
+        Some((width, height))
+            if (1..=PICTURE_MAX_PIXELS).contains(&width)
+                && (1..=PICTURE_MAX_PIXELS).contains(&height) => {}
+        _ => bail!("the map picture service sent a picture that is not the size of a map picture"),
+    }
     let picture = Picture {
         z: spot.z,
         x: spot.x,
@@ -584,13 +641,35 @@ mod tests {
         assert_eq!(picture_type(b""), None);
     }
 
+    #[test]
+    fn the_size_a_picture_declares_is_read_from_its_header() {
+        let png = |w: u32, h: u32| {
+            let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            b.extend_from_slice(&w.to_be_bytes());
+            b.extend_from_slice(&h.to_be_bytes());
+            b
+        };
+        assert_eq!(picture_size(&png(256, 256)), Some((256, 256)));
+        assert_eq!(picture_size(&png(30_000, 30_000)), Some((30_000, 30_000)));
+        assert_eq!(picture_size(TEST_JPEG), Some((256, 256)));
+        // A JPEG with a segment before its frame header, 512 by 384.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE1, 0, 4, 1, 2, 0xFF, 0xC2, 0, 0x0B, 8, 1, 0x80, 2, 0, 1, 1, 0x11,
+            0,
+        ];
+        assert_eq!(picture_size(&jpeg), Some((512, 384)));
+        assert_eq!(picture_size(b"\x89PNG\r\n\x1a\n\0\0\0\rXXXX"), None);
+        assert_eq!(picture_size(&[0xFF, 0xD8, 0xFF]), None);
+        assert_eq!(picture_size(b"<html>"), None);
+    }
+
     #[tokio::test]
     async fn the_tiles_are_fetched_cached_and_checked() {
         use axum::extract::{Path, State};
         use axum::routing::get;
         use std::sync::{Arc, Mutex};
 
-        const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        const JPEG: &[u8] = TEST_JPEG;
         let asked: Arc<Mutex<Vec<String>>> = Arc::default();
         let app = axum::Router::new()
             .route(
@@ -606,6 +685,16 @@ mod tests {
                 ),
             )
             .route("/page/{z}/{x}/{y}", get(|| async { "<!doctype html>" }))
+            // A small file that says it is 30,000 pixels square.
+            .route(
+                "/vast/{z}/{x}/{y}",
+                get(|| async {
+                    let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+                    b.extend_from_slice(&30_000u32.to_be_bytes());
+                    b.extend_from_slice(&30_000u32.to_be_bytes());
+                    b
+                }),
+            )
             .route(
                 "/moved/{z}/{x}/{y}",
                 get(|Path((z, x, y)): Path<(u8, u32, u32)>| async move {
@@ -671,6 +760,7 @@ mod tests {
 
         for (path, why) in [
             ("page", "other than a JPEG or PNG"),
+            ("vast", "not the size of a map picture"),
             ("huge", "larger than 1024 KB"),
             ("missing", "HTTP 404"),
             // A redirect is an answer, not somewhere to go.

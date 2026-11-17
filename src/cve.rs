@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -892,7 +892,17 @@ pub struct CveClient {
     nvd_gate: tokio::sync::Mutex<Option<Instant>>,
 }
 
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// The most that is read of one answer, by what real answers need: a page
+/// of 200 NVD records, the whole KEV catalog, an OSV answer or record.
+const NVD_MAX_BYTES: usize = 16 * 1024 * 1024;
+const KEV_MAX_BYTES: usize = 8 * 1024 * 1024;
+const OSV_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// An OSV record larger than this is used and not kept in the cache.
+const OSV_CACHE_MAX: usize = 256 * 1024;
+/// Real answers are mostly text: far more than this many bytes for each
+/// value they hold. One made of nothing but tiny values costs about ninety
+/// times its size in memory once it is read into a tree.
+const MIN_BYTES_PER_VALUE: usize = 8;
 const NVD_PAGE_SIZE: usize = 200;
 const NVD_MAX_PAGES: usize = 5;
 
@@ -900,22 +910,57 @@ fn cache_key(kind: &str, value: &str) -> String {
     format!("{kind}:{}", value.to_ascii_lowercase())
 }
 
-async fn read_json_bounded(mut response: reqwest::Response, label: &str) -> Result<Value> {
-    if let Some(len) = response.content_length() {
-        if len > MAX_HTTP_BODY_BYTES as u64 {
-            bail!("{label} response exceeds {MAX_HTTP_BODY_BYTES} bytes");
+/// Roughly how many values a JSON text holds: the commas, colons and
+/// opening brackets outside its strings.
+fn value_count(json: &[u8]) -> usize {
+    let (mut count, mut in_string, mut escaped) = (0usize, false, false);
+    for byte in json {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b',' | b':' | b'[' | b'{' => count += 1,
+                _ => {}
+            }
         }
+    }
+    count
+}
+
+/// Reads one answer of at most `max` bytes as JSON. A request error is
+/// reported without its address: a mirror's address may hold a key.
+async fn read_json_bounded(
+    mut response: reqwest::Response,
+    label: &str,
+    max: usize,
+) -> Result<Value> {
+    let too_large = || anyhow!("{label} answered with more than {} MB", max / (1024 * 1024));
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(too_large());
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("failed reading {label} response"))?
     {
-        if bytes.len() + chunk.len() > MAX_HTTP_BODY_BYTES {
-            bail!("{label} response exceeds {MAX_HTTP_BODY_BYTES} bytes");
+        if bytes.len() + chunk.len() > max {
+            return Err(too_large());
         }
         bytes.extend_from_slice(&chunk);
+    }
+    if value_count(&bytes).saturating_mul(MIN_BYTES_PER_VALUE) > bytes.len().max(64 * 1024) {
+        bail!("{label} sent an answer that is almost all structure and no content; not read");
     }
     serde_json::from_slice(&bytes).with_context(|| format!("{label} sent invalid JSON"))
 }
@@ -1125,7 +1170,8 @@ impl CveClient {
             let maybe_truncated = found.len() >= NVD_PAGE_SIZE * NVD_MAX_PAGES;
             return Ok((found, maybe_truncated));
         }
-        let mut found = Vec::new();
+        let mut found: Vec<NvdCve> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut start_index = 0usize;
         let mut truncated = true;
         for _ in 0..NVD_MAX_PAGES {
@@ -1162,11 +1208,13 @@ impl CveClient {
                 }
                 let response = request.send().await;
                 *last = Some(Instant::now());
-                let response = response.context("NVD request failed")?;
+                let response = response
+                    .map_err(reqwest::Error::without_url)
+                    .context("NVD request failed")?;
                 if !response.status().is_success() {
                     bail!("NVD answered HTTP {}", response.status());
                 }
-                read_json_bounded(response, "NVD").await?
+                read_json_bounded(response, "NVD", NVD_MAX_BYTES).await?
             };
             let page_items = body
                 .get("vulnerabilities")
@@ -1176,8 +1224,13 @@ impl CveClient {
                 .get("totalResults")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
+            // A page holds the 200 records that were asked for. More than
+            // that is not NVD answering, and is not read further.
+            if page_items > NVD_PAGE_SIZE {
+                bail!("NVD answered with {page_items} records on a page of {NVD_PAGE_SIZE}");
+            }
             for cve in parse_nvd(&body) {
-                if !found.iter().any(|existing: &NvdCve| existing.id == cve.id) {
+                if seen.insert(cve.id.clone()) {
                     found.push(cve);
                 }
             }
@@ -1215,11 +1268,12 @@ impl CveClient {
                 .client(&self.settings.kev_url)
                 .get(&self.settings.kev_url)
                 .send()
-                .await?;
+                .await
+                .map_err(reqwest::Error::without_url)?;
             if !response.status().is_success() {
                 bail!("HTTP {}", response.status());
             }
-            read_json_bounded(response, "CISA KEV").await
+            read_json_bounded(response, "CISA KEV", KEV_MAX_BYTES).await
         }
         .await;
         match fetched {
@@ -1279,11 +1333,12 @@ impl CveClient {
                 .json(&json!({ "queries": queries }))
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("OSV request failed")?;
             if !response.status().is_success() {
                 bail!("OSV answered HTTP {}", response.status());
             }
-            let body: Value = read_json_bounded(response, "OSV").await?;
+            let body: Value = read_json_bounded(response, "OSV", OSV_MAX_BYTES).await?;
             let results = body
                 .get("results")
                 .and_then(Value::as_array)
@@ -1336,12 +1391,18 @@ impl CveClient {
             .get(&url)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("OSV request failed")?;
         if !response.status().is_success() {
             bail!("OSV answered HTTP {} for {id}", response.status());
         }
-        let body: Value = read_json_bounded(response, "OSV").await?;
-        self.store(&key, &body.to_string());
+        let body: Value = read_json_bounded(response, "OSV", OSV_MAX_BYTES).await?;
+        // A record is a few kilobytes. One far larger is used this once and
+        // not kept: the cache does not grow by megabytes per advisory.
+        let text = body.to_string();
+        if text.len() <= OSV_CACHE_MAX {
+            self.store(&key, &text);
+        }
         Ok(body)
     }
 
@@ -2028,6 +2089,54 @@ mod tests {
         osv_detail: AtomicUsize,
         api_keys: Mutex<Vec<Option<String>>>,
         queries: Mutex<Vec<String>>,
+    }
+
+    #[tokio::test]
+    async fn oversized_or_padded_answers_are_refused_and_a_page_is_at_most_200_records() {
+        use axum::routing::get;
+        let app = Router::new()
+            // More records on a page than were asked for.
+            .route(
+                "/many/nvd",
+                get(|| async {
+                    let items: Vec<Value> = (0..5_000)
+                        .map(|i| json!({ "cve": { "id": format!("CVE-2026-{i:07}"),
+                            "descriptions": [{ "lang": "en", "value": "a real-looking description of the issue" }] } }))
+                        .collect();
+                    Json(json!({ "totalResults": 5_000, "vulnerabilities": items }))
+                }),
+            )
+            // 8 MB of nothing but structure.
+            .route(
+                "/padded/nvd",
+                get(|| async {
+                    let junk = vec![json!({ "": 0 }); 1_000_000];
+                    Json(json!({ "totalResults": 0, "vulnerabilities": [], "x": junk }))
+                }),
+            )
+            // More than the NVD limit.
+            .route(
+                "/huge/nvd",
+                get(|| async { format!("{{\"x\":\"{}\"}}", "a".repeat(NVD_MAX_BYTES + 10)) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (path, expected) in [
+            ("many", "5000 records on a page of 200"),
+            ("padded", "almost all structure"),
+            ("huge", "more than 16 MB"),
+        ] {
+            let started = std::time::Instant::now();
+            let error = client(&format!("{base}/{path}"), None)
+                .nvd_by_cpe("cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*")
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(expected), "{path}: {error}");
+            assert!(started.elapsed() < Duration::from_secs(20), "{path}");
+        }
+        assert_eq!(value_count(br#"{"a":[1,2,{"b":"x,y:[{"}]}"#), 7);
     }
 
     async fn mock_server() -> (String, Arc<Mock>) {

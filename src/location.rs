@@ -314,6 +314,9 @@ pub async fn lookup(url: &str) -> Result<Place> {
         .header("Accept", "application/json")
         .send()
         .await
+        // Without the address, which may hold a token and is shown on the
+        // map page.
+        .map_err(reqwest::Error::without_url)
         .context("the location service did not answer")?;
     if !response.status().is_success() {
         bail!("the location service answered HTTP {}", response.status());
@@ -328,6 +331,7 @@ pub async fn lookup(url: &str) -> Result<Place> {
     while let Some(chunk) = response
         .chunk()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("the location service response was cut off")?
     {
         if bytes.len().saturating_add(chunk.len()) > LOOKUP_MAX_BYTES {
