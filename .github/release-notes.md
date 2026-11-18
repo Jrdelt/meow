@@ -1,19 +1,18 @@
-### What's New in `meow` v0.2.1
+### What's New in `meow` v0.2.2
 
-- **Map: easier to read.**
-  - **Ports** card shows each port on one line: number, state (open, filtered or closed), service and version. The separate versions section is gone; open ports come first.
-  - **Notices** card is folded by default and shows a count; click it to open.
-  - **Traceroute hops** show where each hop is (city, region, country), its network and ASN, reverse DNS, address type, round-trip time and the latency the hop adds (long links are flagged). The last hop is marked as the target, with its open ports and a button to open the host.
-  - **Server Status** card on each host: whether a scan has seen it up, the last scan result, known open ports, and a **Check now** button that tries a few known ports (not in light mode).
-- **Cloud triage in two parts:** a **Red Team** plan for an authorized penetration test (what to look at first, how to verify it without harm, what evidence to keep) and a **Blue Team** plan for a SOC (patches and hardening, detection, monitoring and response), shown side by side on the map.
-- **Security fixes from a full audit:**
-  - Names on a private network (and reverse lookups) are no longer sent to public DNS-over-HTTPS or to crt.sh; cloud metadata addresses are refused.
-  - Downloads from NVD, CISA KEV, OSV and map tile servers have size limits; error messages no longer carry request URLs.
-  - The map no longer keeps its session key in a cookie; a reload still works in the same tab.
-  - `meow update` only fast-forwards from the configured remote; root-owned installs are replaced by renaming a full copy.
-  - `install.sh` refuses to run from a pipe and limits download sizes.
-  - Terminal filter: long OSC strings and odd DEC modes can no longer hide or stop capture; long lines of colons cost no extra time.
-  - Recon stages stop when the mode changes mid-stage.
+- **Three new recon stages (17 in all):**
+  - **`mail-dns`** grades a domain's mail and DNS protection A–F (SPF, DMARC, DKIM, CAA, DNSSEC), names its mail provider, lists services it publishes in DNS (Active Directory, Microsoft 365, SIP…), and spots wildcard DNS so made-up subdomains are not taken for real hosts.
+  - **`udp`** checks 23 security-relevant UDP services such as SNMP, IPMI, NTP and DNS (aggressive mode, as root).
+  - **`js`** reads the site's own JavaScript for API endpoints and exposed keys. A key goes straight into the Privacy Vault; only a placeholder like `<<SEC_03>>` is ever shown.
+- **Web fingerprinting:** `headers` now names the software stack (flagging outdated libraries), checks cookie flags, and grades the security headers A–F.
+- **Map:**
+  - The drawing fills the window; your location floats in a corner and folds away. **Expand** gives the map the whole window.
+  - A selected host's details are in tabs: Overview, Ports, Web & TLS, DNS & Mail, Advisories, Evidence, Notes & AI.
+  - Much less text: explanations moved into hover hints, and empty cards are hidden.
+- **AI triage and the report** now use the DNS & Mail grade, the stack, cookie and header findings, JS endpoints and exposed keys (by placeholder). New names are masked before anything reaches a cloud model.
+- **`recon.skip`** in `config.toml` turns stages off, e.g. `skip = ["udp", "js"]`.
+- **Security:** release builds no longer hold a write token; Windows folder permissions and installer downloads are now tested on Windows in CI; cookie values are no longer kept in stored header evidence.
+- **Dependencies updated:** dirs 7, getrandom 0.4, ipnetwork 0.21, roxmltree 0.21, signal-hook 0.4, tokio-tungstenite 0.30, toml 1.2.
 
 ---
 
