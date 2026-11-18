@@ -35,13 +35,17 @@ Out of scope: vulnerabilities in the systems you scan (that is what meow
 reports on), and problems in nmap, katana or feroxbuster themselves, which
 belong to those projects.
 
-## Local workspaces (`--local`)
+## Session folders (`./meow/`)
 
-Prefer named workspaces (`meow <name>`, stored under `~/.meow/workspaces/`)
-when inspecting untrusted directories. Only pass `--local` (`./.meow/`) inside
-directories you own and trust: meow verifies directory ownership, refuses
-symlinks, and disables SQLite schema execution (`trusted_schema = OFF`), but
-shared or world-writable parent directories remain untrusted.
+New sessions are saved in `./meow/<name>/` of the folder you pick (the one
+meow runs from by default). On macOS and Linux meow refuses a folder that
+another user owns or can write to, or that sits in one they could change
+(a sticky folder like `/tmp` is fine). It keeps `./meow` private (`0700`,
+or a current-user ACL on Windows), never follows a link there, and disables
+SQLite schema execution (`trusted_schema = OFF`). A session that came with
+a cloned, unpacked, copied or moved folder is not opened until you accept
+it. On Windows, and when working inside untrusted or shared directories,
+use `meow <name> --home` (`~/.meow/workspaces/`).
 
 ## Supported versions
 

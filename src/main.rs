@@ -2,7 +2,7 @@
 //! dispatch.
 
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -16,6 +16,7 @@ use meow::db::Db;
 use meow::graph::Graph;
 use meow::hud;
 use meow::ipc;
+use meow::lineedit;
 use meow::lock::{LockError, SessionLock};
 use meow::mode::Mode;
 use meow::observer;
@@ -31,7 +32,7 @@ use meow::webui;
 use meow::wizard::{self, WizardOutcome};
 use meow::workspace::{
     self, format_listing, list_workspaces, private_open_options, resolve_helper_dir, Config,
-    MeowHome, SessionEnv, SessionState, Workspace,
+    Location, MeowHome, SessionEnv, SessionState, Workspace,
 };
 
 /// Debug aid: when set to a file path, the clean lines produced by the
@@ -90,8 +91,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// `meow list` and a bare `meow`: every saved workspace, the `./.meow/` of
-/// this directory, and which of them have a session open right now.
+/// `meow list` and a bare `meow`: every session, wherever it is saved, and
+/// which of them have a session open right now.
 fn print_listing(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCode> {
     let mut workspaces = list_workspaces(home, cwd)?;
     for workspace in &mut workspaces {
@@ -178,11 +179,7 @@ fn delete_workspace(
     let target = workspace::find_for_deletion(home, cwd, name)?;
     let safe_name = sanitize_terminal_line(&target.name, 64);
     let safe_dir = sanitize_path_display(&target.dir);
-    let label = if target.local {
-        format!("the local workspace '{safe_name}'")
-    } else {
-        format!("workspace '{safe_name}'")
-    };
+    let label = format!("workspace '{safe_name}'");
     if env.workspace.as_deref() == Some(target.dir.as_path()) {
         bail!("You are inside the session of {label}; exit it first");
     }
@@ -210,7 +207,7 @@ fn delete_workspace(
             return Ok(ExitCode::from(1));
         }
     }
-    workspace::delete(&target)?;
+    workspace::delete(home, &target)?;
     println!("[+] Deleted {label} ({safe_dir})");
     Ok(ExitCode::SUCCESS)
 }
@@ -228,7 +225,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let Some(command) = &cli.command else {
         return match &cli.name {
             None => open_bare(&home, &cwd, &env),
-            Some(name) => start_session(&home, &cwd, name, cli.local),
+            Some(name) => start_session(&home, &cwd, name, cli.local, cli.home),
         };
     };
     let Some(target) = command.session_arg() else {
@@ -281,7 +278,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
-    workspace.ensure_own(&home)?;
+    workspace.ensure_own(&home, &cwd)?;
     match command {
         Command::List
         | Command::Delete { .. }
@@ -478,15 +475,139 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// Whether there is someone at a terminal to ask.
+fn can_ask() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Asks where to save the new session `name`: a folder, which gets
+/// `meow/<name>/`. `None` when the user cancels. Without a terminal the
+/// current folder is used if it can hold the session.
+fn choose_folder(home: &MeowHome, cwd: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let warn_if_synced = |folder: &Path| {
+        if workspace::looks_cloud_synced(folder) {
+            println!(
+                "[!] This folder looks synced to a cloud service: scan data would be uploaded with it."
+            );
+        }
+    };
+    if !can_ask() {
+        if let Err(reason) = workspace::check_new_folder(home, cwd, name) {
+            bail!(
+                "Cannot save '{name}' in {}: {reason}. Run meow from a project folder, or add --home",
+                sanitize_path_display(cwd)
+            );
+        }
+        warn_if_synced(cwd);
+        return Ok(Some(cwd.to_path_buf()));
+    }
+    println!("[?] Save session '{name}' in:");
+    let user_home = dirs::home_dir();
+    let mut default = cwd.display().to_string();
+    loop {
+        let Some(answer) =
+            lineedit::ask("    Folder", &default).context("cannot read the answer")?
+        else {
+            return Ok(None);
+        };
+        let folder = match workspace::folder_from_answer(cwd, &answer, user_home.as_deref()) {
+            Ok(folder) => folder,
+            Err(reason) => {
+                println!("[!] {reason}");
+                continue;
+            }
+        };
+        default = folder.display().to_string();
+        println!(
+            "    -> {}",
+            sanitize_path_display(&workspace::sessions_dir(&folder).join(name))
+        );
+        if let Err(reason) = workspace::check_new_folder(home, &folder, name) {
+            println!("[!] Not there: {reason}");
+            continue;
+        }
+        if std::fs::symlink_metadata(&folder).is_err() {
+            print!("[?] It does not exist yet. Create it? [Y/n] ");
+            std::io::stdout().flush().ok();
+            let mut yes = String::new();
+            let read = std::io::stdin()
+                .read_line(&mut yes)
+                .context("cannot read the answer")?;
+            if read == 0 {
+                return Ok(None);
+            }
+            if yes.trim().to_ascii_lowercase().starts_with('n') {
+                continue;
+            }
+            if let Err(error) = workspace::create_folder(&folder) {
+                let said = sanitize_terminal_line(&error.to_string(), 300);
+                println!("[!] Cannot create it: {said}");
+                continue;
+            }
+            if let Err(reason) = workspace::check_new_folder(home, &folder, name) {
+                println!("[!] Not there: {reason}");
+                continue;
+            }
+        }
+        if workspace::prepare_sessions_dir(&folder).is_err() {
+            println!("[!] Not there: cannot write to it");
+            continue;
+        }
+        warn_if_synced(&folder);
+        return Ok(Some(folder));
+    }
+}
+
+/// Where `meow <name>` opens: `--home`, `--local`, an existing session of
+/// that name, or a new one in the folder the user picks. `None` when the
+/// user cancels.
+fn session_location(
+    home: &MeowHome,
+    cwd: &Path,
+    name: &str,
+    local: bool,
+    at_home: bool,
+) -> Result<Option<Location>> {
+    if at_home {
+        return workspace::home_location(home, cwd, name).map(Some);
+    }
+    if local {
+        return workspace::local_location(home, cwd, name).map(Some);
+    }
+    if let Some(found) = workspace::find_session(home, cwd, name)? {
+        return Ok(Some(found));
+    }
+    if let Some(away) = workspace::unreachable_session(home, name) {
+        let said = format!(
+            "Session '{name}' is saved at {}, which cannot be reached now",
+            sanitize_path_display(&away)
+        );
+        if !can_ask() {
+            bail!("{said}. Connect it, or use --local or --home for a new one");
+        }
+        println!("[!] {said}.");
+    }
+    Ok(choose_folder(home, cwd, name)?.map(Location::Folder))
+}
+
 /// `meow <name>`: open the workspace, take its lock and run the shell until
 /// it exits. The process exit code is the shell's.
-fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result<ExitCode> {
+fn start_session(
+    home: &MeowHome,
+    cwd: &Path,
+    name: &str,
+    local: bool,
+    at_home: bool,
+) -> Result<ExitCode> {
+    let Some(location) = session_location(home, cwd, name, local, at_home)? else {
+        println!("[+] Nothing created");
+        return Ok(ExitCode::from(1));
+    };
     let config = Config::load_or_create(home)?;
-    let (mut workspace, created) =
-        Workspace::open_or_create(home, cwd, name, local, config.default_mode)?;
+    let (mut workspace, created) = Workspace::open_at(home, &location, name, config.default_mode)?;
     let foreign = workspace.is_foreign(home);
     if foreign {
-        accept_foreign_workspace(home, &mut workspace, config.default_mode)?;
+        accept_foreign_workspace(home, cwd, &mut workspace, config.default_mode)?;
     }
     let _lock = SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
         LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
@@ -644,12 +765,11 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
     Ok(())
 }
 
-/// Background tasks left unfinished by an earlier session: ask whether to
-/// resume them. Without a terminal nothing is started unattended.
-/// A `./.meow` that was already in the folder, made by someone else: says
+/// A session that was already in the folder, made by someone else: says
 /// what it would bring and opens it only on an explicit yes.
 fn accept_foreign_workspace(
     home: &MeowHome,
+    cwd: &Path,
     workspace: &mut Workspace,
     default_mode: Mode,
 ) -> Result<()> {
@@ -693,10 +813,23 @@ fn accept_foreign_workspace(
     println!(
         "    Queued scans would run against targets its author chose once you leave light mode."
     );
+    // Only a command that leads back to this folder: `meow delete <name>`
+    // finds the user's own session of that name first.
+    let (remove, removes) =
+        match workspace::commands_for(home, cwd, &workspace.dir, &workspace.name).1 {
+            Some(delete) => (
+                format!("remove it with `{delete}`"),
+                format!("`{delete}` removes it"),
+            ),
+            None => (
+                "delete that folder".to_owned(),
+                "Deleting that folder removes it".to_owned(),
+            ),
+        };
     if !std::io::stdin().is_terminal() {
         bail!(
             "Not opened: there is no terminal to ask on. Run this in a terminal to accept it, \
-             or remove it with `meow delete --local`"
+             or {remove}"
         );
     }
     print!("[?] Use it as your own? [y/N] ");
@@ -706,11 +839,13 @@ fn accept_foreign_workspace(
         .read_line(&mut answer)
         .context("cannot read the answer")?;
     if !answer.trim().to_ascii_lowercase().starts_with('y') {
-        bail!("Not opened. `meow delete --local` removes it; a new one is made the next time");
+        bail!("Not opened. {removes}");
     }
     workspace.adopt(home, default_mode)
 }
 
+/// Background tasks left unfinished by an earlier session: ask whether to
+/// resume them. Without a terminal nothing is started unattended.
 fn offer_resume(state: &coordinator::State) -> Result<()> {
     let unfinished = queue::unfinished(&state.db_lock())?;
     if unfinished.is_empty() {

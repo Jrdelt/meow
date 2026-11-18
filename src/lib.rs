@@ -13,6 +13,7 @@ pub mod geoip;
 pub mod graph;
 pub mod hud;
 pub mod ipc;
+pub mod lineedit;
 pub mod location;
 pub mod lock;
 pub mod maildns;

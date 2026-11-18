@@ -8,7 +8,7 @@
 
 `meow` wraps your normal interactive shell (`zsh`, `bash`, `fish`, or `pwsh`), passively observes authorized reconnaissance and command output, grounds discovered services against public vulnerability feeds, maps your OPSEC transit path and target topology on a live local canvas, and compiles a Markdown or printable PDF audit report.
 
-Everything stays on your machine in a private workspace (`~/.meow/workspaces/<name>/` or `./.meow/`). When you ask a cloud AI model for triage notes, `meow` masks IP addresses, hostnames, domains, emails, MAC addresses, and credentials into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine, and restores the real values locally when the reply returns.
+Everything stays on your machine in a private session folder (`./meow/<name>/` in the folder you run `meow` from, unless you pick another). When you ask a cloud AI model for triage notes, `meow` masks IP addresses, hostnames, domains, emails, MAC addresses, and credentials into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine, and restores the real values locally when the reply returns.
 
 > **Authorized use only.** Use `meow` only on systems and networks you own or have explicit written permission to test. `meow` inventories services, configurations, and public advisories to help operators patch and verify systems; it never generates exploits or attacks.
 
@@ -84,7 +84,7 @@ meow
 
 The 5-step setup wizard walks you through:
 
-1. **Welcome & Overview** — how sessions, masking, and local workspaces work.
+1. **Welcome & Overview** — how sessions, masking, and session folders work.
 2. **Cloud AI Provider** — choose **OpenRouter**, **Anthropic (Claude API)**, or **Local-Only (Offline)**, paste your API key (kept hidden), and pick triage/research models.
 3. **Local AI Server** — configure an optional local server (`Ollama` on `http://127.0.0.1:11434/v1` or `LM Studio` on `http://127.0.0.1:1234/v1`) for completely offline `[L]` local triage.
 4. **CVE Feeds & Offline GeoIP** — toggle public vulnerability lookups (NVD, OSV.dev, CISA KEV), optionally add an NVD API key for higher rate limits, and enable offline IP geolocation.
@@ -102,13 +102,20 @@ You can re-open this wizard any time with `meow setup` (or pass `meow setup --pl
 meow acme
 ```
 
-This opens your normal shell inside the `acme` workspace (`~/.meow/workspaces/acme/`). Your prompt is prefixed with `(meow:acme:light)` (reflecting the active workspace and mode) so you always know a session is active, and `meow` prints the localhost URL for the live topology map.
+A new session asks where to save it. Press Enter to keep the folder you are in, or edit the path first:
 
-To keep the workspace in `./.meow/` inside the current folder instead:
-
-```sh
-meow acme --local
+```text
+[?] Save session 'acme' in:
+    Folder: /Users/j/Desktop
+    -> /Users/j/Desktop/meow/acme
 ```
+
+Sessions saved in the same folder share one `meow/` folder there (`meow/acme/`, `meow/beta/`). It is private and has a `.gitignore`, so git leaves it out. `meow acme` reopens the same session from any folder.
+
+Then your normal shell opens inside the session. Your prompt is prefixed with `(meow:acme:light)` (reflecting the active session and mode) so you always know a session is active, and `meow` prints the localhost URL for the live topology map.
+
+- `meow acme --local` saves in `./meow/acme/` here without asking.
+- `meow acme --home` saves in `~/.meow/workspaces/acme/` without asking. Sessions made there (and old `./.meow/` ones) by earlier versions keep working.
 
 Type `exit` (or press `Ctrl-D`) at any time to close the session shell and save the workspace.
 
@@ -148,7 +155,7 @@ When you are ready to export your findings:
 meow report
 ```
 
-This writes `REPORT.md` inside the workspace directory (`~/.meow/workspaces/<name>/REPORT.md` or `./.meow/REPORT.md`). You can also export the full workspace report or a single-host report directly from the browser map using **Export report (.md)** or **Print / PDF**.
+This writes `REPORT.md` inside the session folder (for example `./meow/acme/REPORT.md`). You can also export the full workspace report or a single-host report directly from the browser map using **Export report (.md)** or **Print / PDF**.
 
 ---
 
@@ -156,11 +163,12 @@ This writes `REPORT.md` inside the workspace directory (`~/.meow/workspaces/<nam
 
 | Command | Description |
 | :--- | :--- |
-| `meow` | Launch the first-time Cat Setup GUI, or list saved workspaces |
-| `meow <name>` | Open or resume the saved workspace `~/.meow/workspaces/<name>/` |
-| `meow <name> --local` | Open or resume a workspace in `./.meow/` of the current directory |
-| `meow list` (`meow ls`) | List all saved workspaces in `~/.meow/workspaces/` |
-| `meow delete <name>` (`meow rm`) | Delete a saved workspace (`--local` for `./.meow/`, `-y` to skip confirmation) |
+| `meow` | Launch the first-time Cat Setup GUI, or list your sessions |
+| `meow <name>` | Open the session `<name>` from any folder; a new one asks where to save it (`./meow/<name>/` by default) |
+| `meow <name> --local` | Save or open it in `./meow/<name>/` of this folder without asking |
+| `meow <name> --home` | Save or open it in `~/.meow/workspaces/<name>/` without asking |
+| `meow list` (`meow ls`) | List every session and where it lives |
+| `meow delete <name>` (`meow rm`) | Delete a session (`--local` for the one in this folder, `-y` to skip confirmation) |
 | `meow mode <light\|mild\|aggressive>` | Switch the discovery rate/load profile of the session |
 | `meow recon <target> [-- <nmap_flags>...]` | Queue the 17-stage OSINT & service inventory for a host, domain, IP, or CIDR |
 | `meow map [--no-open]` | Open the live topology map in your browser (or print the URL with `--no-open`) |
@@ -371,7 +379,7 @@ meow setup --check
 ### Removing `meow`
 
 - **Homebrew:** `brew uninstall meow && brew untap Jrdelt/meow`
-- **Installer / Binary:** Remove `~/.cargo/bin/meow` (or `/usr/local/bin/meow`) and, if you want to remove all saved workspaces and keys, remove `~/.meow`.
+- **Installer / Binary:** Remove `~/.cargo/bin/meow` (or `/usr/local/bin/meow`). To remove your settings, keys and sessions too, delete `~/.meow` and any `meow/` session folders (`meow list` shows where they are).
 
 ---
 

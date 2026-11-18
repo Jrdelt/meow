@@ -1,8 +1,8 @@
 //! Command-line interface definitions (`clap` derive).
 //!
-//! `meow` and `meow <name>` start a session; `meow list` shows every saved
-//! workspace and `meow delete` removes one; every other subcommand is a
-//! helper that targets an existing
+//! `meow` and `meow <name>` start a session (a new one asks where to save
+//! it); `meow list` shows every saved workspace and `meow delete` removes
+//! one; every other subcommand is a helper that targets an existing
 //! workspace: `--local`, `--session`, or the session of the current shell
 //! (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
 
@@ -23,13 +23,17 @@ use crate::workspace::validate_name;
     after_help = "Run `meow` on a fresh install (or `meow setup` anytime) for the interactive cat setup GUI."
 )]
 pub struct Cli {
-    /// Workspace to create or resume (~/.meow/workspaces/<NAME>/)
+    /// Session to open; a new one asks where to save it (./meow/<NAME>/ here by default)
     #[arg(value_name = "NAME", value_parser = validate_name)]
     pub name: Option<String>,
 
-    /// Keep the workspace in ./.meow/ instead of ~/.meow/workspaces/
-    #[arg(long, requires = "name")]
+    /// Save or open it in ./meow/<NAME>/ of this folder without asking
+    #[arg(long, requires = "name", conflicts_with = "home")]
     pub local: bool,
+
+    /// Save or open it in ~/.meow/workspaces/<NAME>/ without asking
+    #[arg(long, requires = "name")]
+    pub home: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -98,7 +102,7 @@ pub enum Command {
     /// Delete a saved workspace and everything in it
     #[command(visible_alias = "rm")]
     Delete {
-        /// Workspace to delete (~/.meow/workspaces/<NAME>/)
+        /// Workspace to delete (found as `meow <NAME>` finds it)
         #[arg(
             value_name = "NAME",
             value_parser = validate_name,
@@ -106,7 +110,7 @@ pub enum Command {
             conflicts_with = "local"
         )]
         name: Option<String>,
-        /// Delete the workspace in ./.meow/ of the current directory
+        /// Delete the session in ./meow/ (or ./.meow/) of this folder
         #[arg(long)]
         local: bool,
         /// Do not ask for confirmation
@@ -166,11 +170,11 @@ pub enum Command {
 /// the session of the current shell.
 #[derive(Debug, Clone, Default, Args)]
 pub struct SessionArg {
-    /// Target the workspace in ./.meow/ of the current directory
+    /// Target the session in ./meow/ (or ./.meow/) of this folder
     #[arg(long, conflicts_with = "session")]
     pub local: bool,
 
-    /// Target the saved workspace <NAME>
+    /// Target the workspace <NAME>
     #[arg(long, value_name = "NAME", value_parser = validate_name)]
     pub session: Option<String>,
 }
@@ -256,7 +260,7 @@ mod tests {
     #[test]
     fn bare_invocation_lists_workspaces() {
         let cli = parse(&[]).unwrap();
-        assert!(cli.name.is_none() && cli.command.is_none() && !cli.local);
+        assert!(cli.name.is_none() && cli.command.is_none() && !cli.local && !cli.home);
         assert!(cli.starts_session());
     }
 
@@ -267,13 +271,25 @@ mod tests {
         assert!(cli.starts_session());
 
         let cli = parse(&["acme-lab", "--local"]).unwrap();
-        assert!(cli.local);
+        assert!(cli.local && !cli.home);
+
+        let cli = parse(&["acme-lab", "--home"]).unwrap();
+        assert!(cli.home && !cli.local);
+        assert_eq!(
+            parse(&["acme-lab", "--home", "--local"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ArgumentConflict
+        );
     }
 
     #[test]
-    fn local_requires_a_name() {
-        let err = parse(&["--local"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    fn local_and_home_require_a_name() {
+        for flag in ["--local", "--home"] {
+            let err = parse(&[flag]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{flag}");
+        }
+        assert!(parse(&["report", "--home"]).is_err());
     }
 
     #[test]

@@ -920,10 +920,15 @@ mod tests {
     #[test]
     fn placeholders_in_paths_are_not_filled_again() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = MeowHome::at(tmp.path().join("p@HISTORY@$(touch x)@HOOKS@'@REPLAY@")).unwrap();
-        let ws = Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light)
+        let home = MeowHome::at(tmp.path().join("home")).unwrap();
+        let made = Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light)
             .unwrap()
             .0;
+        // meow refuses to open a session at such a path; the hooks must
+        // still keep it one quoted word.
+        let odd = tmp.path().join("p@HISTORY@$(touch x)@HOOKS@'@REPLAY@");
+        std::fs::rename(&made.dir, &odd).unwrap();
+        let ws = Workspace { dir: odd, ..made };
         prepare(&ws, "bash", None).unwrap();
         let hooks = read(ws.tmp_dir().join("shell").join("hooks.bash"));
         let line =

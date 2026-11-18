@@ -601,7 +601,9 @@ impl Wizard {
                         Ok(valid) => {
                             self.launch_workspace = valid.clone();
                             self.set_status(
-                                format!("Will launch session '{valid}' right after saving!"),
+                                format!(
+                                    "Will launch session '{valid}' right after saving (it asks where to save it)."
+                                ),
                                 false,
                             );
                         }
@@ -1766,6 +1768,10 @@ fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
                         ),
                         DIM,
                     ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Sessions:      ", DIM),
+                    Span::raw("./meow/<name>/ in the folder you pick (asked once)"),
                 ]),
             ];
             if !wizard.test_results.is_empty() {
