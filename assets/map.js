@@ -197,6 +197,16 @@
     return line;
   }
 
+  // A hover hint: the long explanation, kept off the page.
+  function hint(node, text) {
+    if (text) { node.title = text; }
+    return node;
+  }
+  // "no HttpOnly: page scripts can read it" -> "no HttpOnly".
+  function short(text) {
+    return String(text || '').split(/: | \(/)[0];
+  }
+
   function card(title) {
     var box = el('section', 'card');
     box.appendChild(el('h2', null, title));
@@ -1074,10 +1084,10 @@
       bar.style.borderColor = key[2];
       item.appendChild(el('span', null, key[1]));
     });
-    legend.appendChild(el('span', 'item note', 'Other devices are drawn connected the way you are (assumed: meow only sees your own link).'));
-    var hint = legend.appendChild(el('span', 'item note', 'More devices to the side: scroll left and right, or drag the background.'));
-    hint.id = 'scroll-hint';
-    hint.hidden = true;
+    legend.title = 'Other devices are drawn connected the way you are (assumed: meow only sees your own link).';
+    var more = legend.appendChild(el('span', 'item note', 'Scroll sideways for more'));
+    more.id = 'scroll-hint';
+    more.hidden = true;
   }
 
   // Why a node is drawn the way it is. A hint, not a finding.
@@ -1152,7 +1162,17 @@
         lines.appendChild(el('div', section.warn ? 'warn-text' : null, line));
       });
       if (section.open) {
-        box.appendChild(row(section.title, lines));
+        // One short value; the sentence it came from is the hint.
+        var text = section.lines.join(' ');
+        var tools = (text.match(/`([^`]+)`/g) || []).map(function (t) { return t.slice(1, -1); });
+        var value = /not installed/.test(text) && tools.length ? tools.join(', ') + ' not installed'
+          : text.length > 32 ? short(text) : text;
+        box.appendChild(hint(row(section.title, value, section.warn ? 'warn-text' : null), section.lines.join('\n')));
+        return;
+      }
+      // A table with nothing in it is left out.
+      if (/\(0\)$/.test(section.title) || !section.lines.length ||
+          (section.lines.length === 1 && /^none$/i.test(section.lines[0]))) {
         return;
       }
       var table = tables.appendChild(card(section.title));
@@ -1160,8 +1180,8 @@
       table.appendChild(lines);
     });
     if (machine.observed_utc) {
-      box.appendChild(el('p', 'note', 'Read from this machine at ' + machine.observed_utc.slice(11, 19) +
-        ' UTC. Nothing was sent to find this out.'));
+      box.title = 'Read from this machine at ' + machine.observed_utc.slice(11, 19) +
+        ' UTC. Nothing was sent to find this out.';
     }
   }
 
@@ -1232,7 +1252,7 @@
     var hosts = state.topology.nodes.filter(function (node) { return node.data.kind === 'host'; });
     hosts.sort(function (a, b) { return sortKey(a.data) < sortKey(b.data) ? -1 : 1; });
     if (!hosts.length) {
-      list.appendChild(el('p', 'note', 'None yet. Work in the session shell, or import a scan with `meow add <file>`.'));
+      list.appendChild(hint(el('p', 'note', 'No hosts yet.'), 'Work in the session shell, or import a scan with `meow add <file>`.'));
     } else {
       var selData = selectedNodeData();
       var onlyAddr = selData && selData.kind === 'host' && selData.address ? selData.address : null;
@@ -1297,9 +1317,8 @@
     var mentioned = state.topology.mentioned || [];
     if (mentioned.length) {
       var names = list.appendChild(fold('mentioned', 'names', false));
-      names.appendChild(el('summary', null, 'Names only mentioned (' + mentioned.length + ')'));
-      names.appendChild(el('p', 'note', 'These appeared in the terminal, a log (usually inside a URL) or the ' +
-        'certificate logs. meow has not connected to them and they are not part of the network drawn above.'));
+      names.appendChild(hint(el('summary', null, 'Names only mentioned (' + mentioned.length + ')'),
+        'Seen in the terminal, a log or the certificate logs. meow has not connected to them.'));
       mentioned.forEach(function (entry) {
         var what = (entry.ports || []).join(', ') || 'no port';
         if (entry.paths) { what += ' · ' + entry.paths + (entry.paths === 1 ? ' path' : ' paths'); }
@@ -1332,17 +1351,23 @@
       earlier[task.target] = [];
       latest.push(task);
     });
-    renderList(byId('tasks'), latest, 'No recon tasks yet.', function (task) {
+    byId('tasks').parentNode.hidden = !latest.length;
+    renderList(byId('tasks'), latest, '', function (task) {
       var item = el('li');
+      var stages = task.stages || [];
+      var count = function (status) { return stages.filter(function (s) { return s.status === status; }).length; };
+      var running = stages.filter(function (s) { return s.status === 'running'; }).map(function (s) { return s.stage; });
+      var summary = count('done') + '/' + stages.length + ' done' +
+        (running.length ? ' \u00b7 ' + running.join(', ') + ' running' : '') +
+        (count('skipped') ? ' \u00b7 ' + count('skipped') + ' skipped' : '');
       item.appendChild(el('div', 'label', 'recon ' + task.target));
-      (task.stages || []).forEach(function (stage) {
-        var kind = { done: 'ok', running: 'warn', failed: 'bad', interrupted: 'bad' }[stage.status] || 'info';
-        var line = item.appendChild(row(stage.stage, marked(stage.status, kind)));
-        line.title = stage.detail || '';
-        // Why a stage was skipped or failed, and how to fix it, in plain view.
-        if (stage.detail && (stage.status === 'skipped' || stage.status === 'failed')) {
-          item.appendChild(el('div', 'note why', stage.detail));
-        }
+      item.appendChild(el('div', 'dim run-summary', summary));
+      // Only stages that failed, stopped or were skipped get a line; the
+      // reason is the hint.
+      stages.forEach(function (stage) {
+        if (!/failed|interrupted|skipped/.test(stage.status)) { return; }
+        var kind = stage.status === 'skipped' ? 'info' : 'bad';
+        item.appendChild(hint(row(stage.stage, marked(stage.status, kind)), stage.detail));
       });
       var older = earlier[task.target];
       if (older.length) {
@@ -1473,9 +1498,9 @@
         line.appendChild(el('div', 'dim', 'On ' + entry.address + (here ? ' (this machine)' : ' (another machine, not this one)') +
           ' · answers ' + count));
       });
-      todo.appendChild(el('p', 'note', (elsewhere ? 'An update has to be made on the machine named, by whoever looks after it. ' : '') +
-        'Every entry below was matched by version number only and is not proof: a system that takes security updates ' +
-        'from its vendor often has the fix under the same version number. After updating, scan again; what no longer matches is removed.'));
+      todo.appendChild(hint(el('p', 'note', 'Matched by version only, not proof. Rescan after updating.'),
+        (elsewhere ? 'An update has to be made on the machine named, by whoever looks after it. ' : '') +
+        'A system that takes security updates from its vendor often has the fix under the same version number.'));
     }
     var hostsMap = (state.graph && state.graph.hosts) || {};
     Object.keys(hostsMap).forEach(function (address) {
@@ -1517,13 +1542,12 @@
         section.appendChild(advisoryItem(entry.address, entry.advisory, group.kind === 'issue' ? 'bad' : group.kind, !only));
       });
       if (group.items.length > 80) {
-        section.appendChild(el('p', 'note', (group.items.length - 80) + ' more not shown; see `meow hud` or the report.'));
+        section.appendChild(el('p', 'note', '+' + (group.items.length - 80) + ' more in the report'));
       }
     });
     if (!shown) {
-      box.appendChild(el('p', 'note', only
-        ? 'Nothing matched for this host. Matches from the vulnerability databases appear here as hypotheses to verify.'
-        : 'Nothing to decide yet. When the software meow sees matches a known vulnerability, it appears here as a hypothesis to verify, never as a finding.'));
+      box.appendChild(hint(el('p', 'note', only ? 'No matches for this host.' : 'Nothing to decide yet.'),
+        'Software that matches a known vulnerability appears here as a hypothesis to verify.'));
     }
   }
 
@@ -1573,17 +1597,17 @@
     else { status = 'not checked yet'; kind = 'warn'; }
     box.appendChild(row('Status', marked(status, kind)));
     if (seenUp) {
-      var seenRow = box.appendChild(row('Seen up by a scan', sinceText(seenUp)));
+      var seenRow = box.appendChild(row('Last seen up', sinceText(seenUp)));
       seenRow.title = seenUp.slice(0, 19).replace('T', ' ') + ' UTC';
     }
-    if (lastScan && lastScan !== seenUp) { box.appendChild(row('Last scan result', sinceText(lastScan))); }
-    box.appendChild(row('Open ports known', String(openCount)));
+    if (lastScan && lastScan !== seenUp) { box.appendChild(row('Last scan', sinceText(lastScan))); }
+    box.appendChild(row('Open ports', String(openCount)));
     if (check && check.status !== 'checking') {
       box.appendChild(row('Last checked', sinceText(check.at)));
       var answers = (check.ports || []).map(function (p) {
         return p.port + ' ' + p.state + (typeof p.ms === 'number' ? ' (' + p.ms.toFixed(0) + ' ms)' : '');
       });
-      if (answers.length) { box.appendChild(row('Ports tried', answers.join(', '))); }
+      if (answers.length) { box.appendChild(row('Tried', answers.join(', '))); }
       var fastest = (check.ports || []).filter(function (p) { return typeof p.ms === 'number'; })
         .map(function (p) { return p.ms; }).sort(function (a, b) { return a - b; })[0];
       if (typeof fastest === 'number') { box.appendChild(row('Connect time', fastest.toFixed(1) + ' ms')); }
@@ -1595,9 +1619,9 @@
     button.addEventListener('click', function () {
       send({ cmd: 'check_host', address: host.address });
     });
-    box.appendChild(el('p', 'note', light
+    button.title = light
       ? 'Light mode sends no packets: switch to mild or aggressive to check.'
-      : 'Check now makes one connection to each of up to six known open ports (or 443, 80 and 22), and nothing else.'));
+      : 'One connection to each of up to six known open ports (or 443, 80 and 22), and nothing else.';
     return box;
   }
 
@@ -1635,13 +1659,13 @@
       var ver = line.appendChild(el('span', 'ver' + (software ? ' known' : ''), software || '—'));
       if (port.extra_info) { ver.appendChild(el('span', 'extra', ' (' + port.extra_info + ')')); }
     });
-    if (!keys.length) { ports.appendChild(el('p', 'note', 'No port seen yet.')); }
+    if (!keys.length) { ports.appendChild(el('p', 'note', 'No ports yet.')); }
     var notOpen = host.not_open || {};
     Object.keys(notOpen).forEach(function (key) {
       var group = own(notOpen, key);
       if (!group) { return; }
-      ports.appendChild(el('p', 'note', 'Tried and ' + group.state + ' (' + group.count + ' ' + group.protocol +
-        (group.count === 1 ? ' port' : ' ports') + ')' + (group.ports ? ': ' + group.ports.split(',').join(', ') : '.')));
+      ports.appendChild(hint(el('p', 'note', group.count + ' ' + group.protocol + ' ' + group.state),
+        group.ports ? group.ports.split(',').join(', ') : ''));
     });
 
     // What the web ports gave away: server headers, certificate names, paths.
@@ -1656,32 +1680,31 @@
       web.appendChild(el('h3', null, key));
       // What the site is built with; an outdated library carries why.
       if (http && http.tech && http.tech.length) {
-        var stack = el('div');
-        http.tech.forEach(function (name) {
-          var line = stack.appendChild(el('div'));
-          if (/\(older than|end of life/.test(name)) {
-            line.appendChild(marked(name, 'warn'));
-          } else {
-            line.textContent = name;
-          }
+        var stack = el('span');
+        http.tech.forEach(function (name, index) {
+          if (index) { stack.appendChild(document.createTextNode(', ')); }
+          var old = /\(older than|end of life/.test(name);
+          stack.appendChild(hint(el('span', old ? 'warn-text' : null, name.split(' (')[0] + (old ? ' \u26a0' : '')),
+            old ? name : ''));
         });
         web.appendChild(row('Stack', stack));
       }
       if (http && http.header_grade) {
         var graded = el('span', 'grade-inline');
+        var missingCount = (http.header_notes || []).filter(function (n) { return /^missing /.test(n); })
+          .map(function (n) { return n.split(', ').length; })[0] || 0;
+        if (missingCount) { graded.appendChild(el('span', 'dim', missingCount + ' missing ')); }
         graded.appendChild(el('span', 'grade small ' + gradeKind(http.header_grade), http.header_grade));
-        web.appendChild(row('Header grade', graded));
-        (http.header_notes || []).forEach(function (note) { web.appendChild(el('p', 'note why', note)); });
+        web.appendChild(hint(row('Headers', graded), (http.header_notes || []).join('\n')));
       }
       if (http && http.cookies && http.cookies.length) {
         var jar = el('div');
         http.cookies.forEach(function (cookie) {
-          var line = jar.appendChild(el('div', 'cookie'));
-          line.appendChild(el('span', null, cookie.name + ' '));
-          line.appendChild(el('span', 'dim', cookie.flags));
-          (cookie.issues || []).forEach(function (issue) {
-            line.appendChild(el('div', 'warn-text', issue));
-          });
+          var issues = (cookie.issues || []).map(short);
+          var line = jar.appendChild(hint(el('div', 'cookie'), cookie.flags + ((cookie.issues || []).length
+            ? '\n' + cookie.issues.join('\n') : '')));
+          line.appendChild(el('span', null, cookie.name));
+          if (issues.length) { line.appendChild(el('span', 'warn-text', ' \u2014 ' + issues.join(', '))); }
         });
         web.appendChild(row('Cookies', jar));
       }
@@ -1689,17 +1712,15 @@
       if (http && http.js_secrets && http.js_secrets.length) {
         var keys = el('div');
         http.js_secrets.forEach(function (secret) {
-          var line = keys.appendChild(el('div', 'secret'));
-          line.appendChild(marked(secret.kind, 'bad'));
-          line.appendChild(el('div', 'dim', secret.file + ' \u00b7 ' + secret.token + ' \u00b7 ' + secret.preview));
+          keys.appendChild(hint(el('div', 'secret'), secret.file + ' \u00b7 ' + secret.preview))
+            .appendChild(marked(short(secret.kind) + ' \u00b7 ' + secret.token, 'bad'));
         });
-        web.appendChild(row('Exposed keys', keys));
-        web.appendChild(el('p', 'note why', 'The keys themselves are in the vault, never shown here; ' +
+        web.appendChild(hint(row('Exposed keys', keys), 'The keys are in the vault, never shown here; ' +
           'the report lists them to rotate. Test them only within the engagement\u2019s scope.'));
       }
       if (http && http.js_endpoints && http.js_endpoints.length) {
         var named = fold('js-endpoints:' + key, 'names', false);
-        named.appendChild(el('summary', null, 'Endpoints in JavaScript (' + http.js_endpoints.length + ')'));
+        named.appendChild(el('summary', null, 'JS endpoints (' + http.js_endpoints.length + ')'));
         var list = named.appendChild(el('pre', 'reply'));
         list.textContent = http.js_endpoints.join('\n');
         web.appendChild(named);
@@ -1711,8 +1732,10 @@
         fileList.textContent = http.scripts.join('\n');
         web.appendChild(files);
       }
-      if (http && http.server) { web.appendChild(row('Server', http.server)); }
-      if (http && http.powered_by) { web.appendChild(row('Powered by', http.powered_by)); }
+      // The stack already names the server and what powers it.
+      var stacked = http && http.tech && http.tech.length;
+      if (http && http.server && !stacked) { web.appendChild(row('Server', http.server)); }
+      if (http && http.powered_by && !stacked) { web.appendChild(row('Powered by', http.powered_by)); }
       if (http && http.title) { web.appendChild(row('Title', http.title)); }
       if (http && http.waf) { web.appendChild(row('WAF / CDN', marked(http.waf, 'info'))); }
       if (http && http.favicon_hash !== null && http.favicon_hash !== undefined) {
@@ -1720,7 +1743,7 @@
         web.appendChild(row('Favicon hash', fav));
       }
       if (http && http.location) { web.appendChild(row('Redirects to', http.location)); }
-      if (http && http.security_headers) {
+      if (http && http.security_headers && !http.header_grade) {
         var secHdrs = Array.isArray(http.security_headers)
           ? http.security_headers
           : Object.keys(http.security_headers).filter(function (k) {
@@ -1730,7 +1753,7 @@
           web.appendChild(row('Security headers', marked(secHdrs.join(', '), 'ok')));
         }
       }
-      if (http && http.missing_headers && http.missing_headers.length) {
+      if (http && http.missing_headers && http.missing_headers.length && !http.header_grade) {
         web.appendChild(row('Missing headers', marked(http.missing_headers.join(', '), 'warn')));
       }
       if (http && http.tls_versions && http.tls_versions.length) {
@@ -1738,14 +1761,14 @@
         web.appendChild(row('TLS versions', marked(http.tls_versions.join(', '), hasLegacy ? 'warn' : 'ok')));
       }
       if (http && http.tls_weak_ciphers && http.tls_weak_ciphers.length) {
-        web.appendChild(row('Weak TLS ciphers', marked(http.tls_weak_ciphers.join(', '), 'warn')));
+        web.appendChild(row('Weak ciphers', marked(http.tls_weak_ciphers.join(', '), 'warn')));
       }
       if (http && (http.tls_subject || http.tls_issuer)) {
         var certParts = [http.tls_subject, http.tls_issuer ? 'issuer ' + http.tls_issuer : null].filter(Boolean);
-        web.appendChild(row('TLS certificate', certParts.join(' · ')));
+        web.appendChild(row('Certificate', certParts.join(' · ')));
       }
       if (http && (http.tls_not_before || http.tls_not_after)) {
-        web.appendChild(row('Cert validity', [http.tls_not_before || '?', http.tls_not_after || '?'].join(' -> ')));
+        web.appendChild(row('Valid', [http.tls_not_before || '?', http.tls_not_after || '?'].join(' \u2192 ')));
       }
       sans.forEach(function (name) { web.appendChild(row('Certificate name', name)); });
       if (http && http.robots_disallow && http.robots_disallow.length) {
@@ -1780,23 +1803,9 @@
       ai.appendChild(row('Cloud today', '$' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
         (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
     } else {
-      ai.appendChild(el('p', 'note', 'No cloud API key yet: [C] answers with the local model and [R] is ' +
-        'unavailable. Run `meow setup` in any terminal to add your own key or to choose your local model. ' +
+      ai.appendChild(hint(el('p', 'note', 'No cloud key: run `meow setup`.'),
+        '[C] answers with the local model and [R] is unavailable until a key is added. ' +
         'It applies to this session at once.'));
-    }
-    var reply = state.ai || {};
-    if (reply.address === host.address && (reply.running || reply.text || reply.error)) {
-      ai.appendChild(row('Status', reply.running
-        ? marked('streaming below ...', 'info')
-        : (reply.error ? marked('error (see below)', 'bad') : marked('ready below', 'ok'))));
-      var jumpWrap = ai.appendChild(el('div', 'actions'));
-      var jumpBtn = jumpWrap.appendChild(el('button', null, 'Jump to triage output ↓'));
-      jumpBtn.addEventListener('click', function () {
-        var panel = byId('card-ai');
-        if (panel && !panel.hidden) {
-          panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      });
     }
 
     var evidence = card('Evidence');
@@ -1853,35 +1862,28 @@
   // whether made-up names answer (wildcard DNS).
   function dnsCard(info) {
     var box = card('DNS & Mail \u2014 ' + info.domain);
-    var head = box.appendChild(el('div', 'grade-line'));
-    head.appendChild(el('span', 'grade ' + gradeKind(info.grade), info.grade || '?'));
-    head.appendChild(el('span', 'dim', 'SPF, DMARC, DKIM, CAA and DNSSEC graded together. ' +
-      'An A means mail cannot easily be forged and certificates and answers are protected.'));
+    var badge = el('span', 'grade-inline');
+    badge.appendChild(el('span', 'grade small ' + gradeKind(info.grade), info.grade || '?'));
+    box.appendChild(hint(row('Grade', badge), 'SPF, DMARC, DKIM, CAA and DNSSEC graded together.'));
     (info.checks || []).forEach(function (check) {
-      box.appendChild(row(check.name, marked(check.value, check.status)));
-      if (check.advice) { box.appendChild(el('p', 'note why', check.advice)); }
+      box.appendChild(hint(row(check.name, marked(check.value, check.status)), check.advice));
     });
+    box.appendChild((info.wildcard || []).length
+      ? hint(row('Wildcard', marked(info.wildcard.join(', '), 'warn')), 'Made-up names under the domain resolve.')
+      : row('Wildcard', marked('none', 'ok')));
     var services = info.services || [];
-    box.appendChild(el('h3', null, 'Published services (' + services.length + ')'));
-    if (!services.length) {
-      box.appendChild(el('p', 'note', 'No SRV records or well-known service names found.'));
+    if (services.length) {
+      box.appendChild(el('h3', null, 'Services (' + services.length + ')'));
     }
     services.forEach(function (service) {
-      var where = el('span');
-      where.appendChild(el('div', null, service.target));
-      where.appendChild(el('div', 'dim', service.meaning));
-      box.appendChild(row(service.record, where));
+      box.appendChild(hint(row(service.record, service.target), service.meaning));
     });
-    box.appendChild(el('h3', null, 'Wildcard DNS'));
-    box.appendChild((info.wildcard || []).length
-      ? row('Made-up names', marked('resolve to ' + info.wildcard.join(', '), 'warn'))
-      : row('Made-up names', marked('do not resolve (no wildcard)', 'ok')));
     var subs = info.subdomains || [];
     if (subs.length) {
-      box.appendChild(el('h3', null, 'Certificate-log names (' + subs.length + ')'));
+      box.appendChild(el('h3', null, 'Certificate names (' + subs.length + ')'));
       subs.forEach(function (sub) {
-        var value = sub.status === 'wildcard' ? marked('only the wildcard answers: may not exist', 'warn')
-          : sub.status === 'gone' ? marked('no DNS record now', 'info')
+        var value = sub.status === 'wildcard' ? marked('wildcard only', 'warn')
+          : sub.status === 'gone' ? marked('no record', 'info')
           : marked((sub.addresses || []).join(', '), 'ok');
         var line = box.appendChild(row(sub.name, value));
         if (sub.status !== 'resolves') { line.className += ' faded'; }
@@ -1941,15 +1943,7 @@
         (port.service ? ' ' + port.service : '');
     }).join(', ') + (open.length > 10 ? ', +' + (open.length - 10) + ' more' : '');
     box.appendChild(row('Open ports', go('ports', open.length ? list : 'none seen yet')));
-    var software = [];
-    open.forEach(function (port) {
-      var name = [port.product, port.version].filter(Boolean).join(' ');
-      if (name && software.indexOf(name) < 0) { software.push(name); }
-    });
-    if (software.length) {
-      box.appendChild(row('Software', software.slice(0, 4).join(', ') +
-        (software.length > 4 ? ', +' + (software.length - 4) + ' more' : '')));
-    }
+
     var words = [];
     if (adv.confirmed) { words.push(adv.confirmed + ' confirmed'); }
     if (adv.open) { words.push(adv.open + ' to verify' + (adv.kev ? ' (' + adv.kev + ' known exploited)' : '')); }
@@ -1981,15 +1975,17 @@
       if (oldTls.length) { flagged.push('TLS 1.0/1.1 on ' + oldTls.join(', ')); }
       if (weak.length) { flagged.push('weak ciphers on ' + weak.join(', ')); }
       if (missing.length && !worstGrade) { flagged.push('headers missing on ' + missing.join(', ')); }
-      box.appendChild(row('Web & TLS', go('web', flagged.concat(edges).join(' \u00b7 ') || 'nothing flagged',
-        keyCount ? 'bad' : flagged.length ? 'warn' : 'ok')));
+      var said = flagged.concat(edges);
+      var webLink = go('web', said.slice(0, 3).join(' \u00b7 ') + (said.length > 3 ? ' +' + (said.length - 3) : '') ||
+        'nothing flagged', keyCount ? 'bad' : flagged.length ? 'warn' : 'ok');
+      box.appendChild(hint(row('Web & TLS', webLink), said.join('\n')));
     }
     if (host.dns_security) {
       var dnsInfo = host.dns_security;
       var weak = (dnsInfo.checks || []).filter(function (c) { return c.status === 'bad' || c.status === 'warn'; })
         .map(function (c) { return c.name; });
-      box.appendChild(row('DNS & Mail', go('dns', 'grade ' + (dnsInfo.grade || '?') +
-        (weak.length ? ' \u00b7 check ' + weak.join(', ') : ''), gradeKind(dnsInfo.grade))));
+      box.appendChild(hint(row('DNS & Mail', go('dns', 'grade ' + (dnsInfo.grade || '?') +
+        (weak.length ? ' \u00b7 ' + weak.length + ' to fix' : ''), gradeKind(dnsInfo.grade))), weak.join(', ')));
     }
     var newest = '';
     made.facts.forEach(function (fact) {
@@ -2166,8 +2162,7 @@
     var data = selectedNodeData();
     if (!data) {
       byId('detail-title').textContent = 'Selected';
-      detail.appendChild(el('p', 'note', 'Click a node on the map, or a host in the list below, to see what is ' +
-        'known about it.'));
+      detail.appendChild(el('p', 'note', 'Click a node or host for details.'));
       var wsExport = detail.appendChild(el('div', 'actions'));
       var expAll = wsExport.appendChild(el('button', null, 'Export report (.md)'));
       expAll.addEventListener('click', function () {
@@ -2261,13 +2256,13 @@
         (iface.addresses || []).forEach(function (address) { detail.appendChild(row('This machine', address)); });
       });
       if (data.hidden_neighbours) {
-        detail.appendChild(el('p', 'note', data.hidden_neighbours + ' more devices in the neighbour table are not drawn.'));
+        detail.appendChild(el('p', 'note', '+' + data.hidden_neighbours + ' more not drawn'));
       }
     } else if (data.kind === 'neighbour') {
       detail.appendChild(row('Address', data.label || ''));
       detail.appendChild(row('Hardware address', data.mac || ''));
       detail.appendChild(row('Seen on', data.interface || ''));
-      detail.appendChild(el('p', 'note', 'It becomes a host once a scan, an imported file or the terminal output mentions it.'));
+
     } else if (data.kind === 'egress') {
       byId('detail-title').textContent = data.vpn ? 'VPN Exit' : 'Public WAN Egress';
       if (data.vpn) {
@@ -2278,7 +2273,7 @@
         detail.appendChild(row('ISP / Network', data.isp || 'not known'));
         detail.appendChild(row('OPSEC status', marked('no VPN (direct WAN egress)', 'warn')));
       }
-      detail.appendChild(el('p', 'note', 'This is the public egress point that remote targets see when meow connects to them.'));
+
     } else if (data.kind === 'internet') {
       byId('detail-title').textContent = 'Internet Transit';
       var netHops = data.trace_hops || [];
@@ -2291,7 +2286,7 @@
       if (netHops.length) {
         appendTracerouteSection(detail, netHops, true);
       } else {
-        detail.appendChild(el('p', 'note', 'Run `recon <target>` to measure intermediate traceroute hops and round-trip latency across the Internet.'));
+        detail.appendChild(el('p', 'note', 'Run `recon <target>` for hops.'));
       }
     } else if (data.kind === 'hop' && data.hop) {
       appendHopDetail(detail, data.hop);
@@ -2299,12 +2294,12 @@
       byId('detail-title').textContent = 'WAF / CDN Edge';
       detail.appendChild(row('Provider', marked(data.waf || 'WAF / CDN', 'info')));
       if (data.target) { detail.appendChild(row('Protected origin', data.target)); }
-      detail.appendChild(el('p', 'note', 'Detected before directory scanning (`dirs`) runs so meow avoids wasting requests or getting your egress IP blocked by a strict WAF.'));
+
     } else if (data.kind === 'asn') {
       byId('detail-title').textContent = 'Cloud / ASN Group';
       detail.appendChild(row('ASN / Provider', data.asn || data.label || ''));
       if (data.bgp_prefix) { detail.appendChild(row('BGP prefix', data.bgp_prefix)); }
-      detail.appendChild(el('p', 'note', 'Sibling targets hosted in the same autonomous system are grouped together on the map.'));
+
     } else {
       detail.appendChild(row('Name', data.label || data.id || ''));
     }
@@ -2367,7 +2362,8 @@
       go.addEventListener('click', function () { select('host:' + hop.address); });
     }
     if (hop.location) {
-      detail.appendChild(el('p', 'note', 'Location from the offline DB-IP Lite database: city-level and approximate; routers are often registered where their network is, not where they stand.'));
+      detail.title = 'Location from the offline DB-IP Lite database: city-level and approximate; ' +
+        'routers are often registered where their network is, not where they stand.';
     }
   }
 

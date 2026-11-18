@@ -691,7 +691,7 @@ fn machine_lines(report: &MachineReport) -> Vec<Line<'static>> {
     if let Some(time) = report.observed_utc.get(11..19) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!("Read from this machine at {time} UTC. Nothing was sent to find this out."),
+            format!("Read at {time} UTC (nothing sent)"),
             DIM,
         ));
     }
@@ -944,7 +944,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, model: &Model) {
     let help = if model.note.is_some() {
         " Enter save   Esc cancel"
     } else {
-        " Up/Down select  Tab panel  n note  c confirm  f false positive  u reopen  L/C/R ask AI  a AI view  m this machine  1/2/3 mode  PgUp/PgDn scroll  q quit"
+        " ↑↓ select  Tab panel  n note  c/f/u confirm/false/reopen  L/C/R AI  a answer  m machine  1-3 mode  PgUp/Dn  q quit"
     };
     frame.render_widget(Paragraph::new(Line::styled(help, DIM)), help_area);
 }
@@ -1025,10 +1025,8 @@ pub fn draw(frame: &mut Frame, model: &Model) {
     let [machine, right] =
         Layout::vertical([Constraint::Length(wanted), Constraint::Min(0)]).areas(right);
     frame.render_widget(
-        Paragraph::new(machine_lines_top).block(panel(
-            "This machine: address -> type -> OS -> version (m for routes and neighbours)",
-            false,
-        )),
+        Paragraph::new(machine_lines_top)
+            .block(panel("This machine (m: routes, neighbours)", false)),
         machine,
     );
     let [inspector, advisories] =
@@ -1051,7 +1049,7 @@ pub fn draw(frame: &mut Frame, model: &Model) {
         let lines = match model.selected_host() {
             Some(host) => inspector_lines(&snapshot.graph, host),
             None => vec![Line::styled(
-                "No hosts yet. Import a scan with `meow add <file>`, or work in the session shell.",
+                "No hosts yet: `meow add <file>` or work in the shell.",
                 DIM,
             )],
         };
@@ -1331,8 +1329,8 @@ mod tests {
             "recon 10.10.10.0/23 ports:done services:running crawl:pending dirs:pending",
             "Notices",
             "09:41:00 not running as root: -sS replaced with -sT (connect scan)",
-            "n note  c confirm  f false positive",
-            "L/C/R ask AI",
+            "n note  c/f/u confirm/false/reopen",
+            "L/C/R AI",
             "| cloud $0.25 of $1.00, 3 of 20 calls today",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -1750,7 +1748,7 @@ mod tests {
         // Nothing read yet: the box says so instead of showing nothing.
         let text = screen(&model(), 160, 50);
         for expected in [
-            "This machine: address -> type -> OS -> version",
+            "This machine (m: routes, neighbours)",
             "no address -> computer -> OS not known -> version not known   no VPN",
             "Open ports  none listening",
             "Interfaces  unknown: the network tables could not be read",
@@ -1767,7 +1765,7 @@ mod tests {
             "10.44.8.20 -> MacBook Pro -> macOS -> 15.1   no VPN",
             "Open ports  this machine only: 631/tcp",
             "Interfaces  en0 10.44.8.20/22 gateway 10.44.8.1",
-            "m this machine",
+            "m machine",
             // The selected host gets the same one-line answer.
             "10.10.10.5 -> Server -> OS not known -> version not known",
             "Open ports  22/tcp svc, 80/tcp svc",
@@ -1793,10 +1791,7 @@ mod tests {
         model.on_key(key(KeyCode::PageDown));
         let scrolled = screen(&model, 160, 50);
         assert!(scrolled.contains("All interfaces (2)"), "{scrolled}");
-        assert!(
-            scrolled.contains("Read from this machine at 09:40:00 UTC"),
-            "{scrolled}"
-        );
+        assert!(scrolled.contains("Read at 09:40:00 UTC"), "{scrolled}");
         model.on_key(key(KeyCode::Char('m')));
         assert!(screen(&model, 160, 50).contains("Inspector: node, ports and sub-paths"));
 
@@ -1825,7 +1820,7 @@ mod tests {
         assert!(screen(&empty, 80, 24).contains("waiting for the session"));
         empty.apply_message(&state_message(&Graph::default()));
         let text = screen(&empty, 80, 24);
-        assert!(text.contains("No hosts yet."), "{text}");
+        assert!(text.contains("No hosts yet"), "{text}");
         for (width, height) in [(20, 5), (1, 1), (200, 60)] {
             screen(&model(), width, height);
         }
