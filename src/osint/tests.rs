@@ -1,0 +1,528 @@
+use super::*;
+
+#[test]
+fn internal_names_and_private_reverse_names_stay_off_public_services() {
+    assert_eq!(
+        reverse_name_address("5.0.0.10.in-addr.arpa"),
+        Some("10.0.0.5".parse().unwrap())
+    );
+    let v6: IpAddr = "2001:db8::567:89ab".parse().unwrap();
+    assert_eq!(reverse_name_address(&reverse_dns_name(v6)), Some(v6));
+    assert_eq!(reverse_name_address("1.2.in-addr.arpa"), None);
+    for private in [
+        reverse_dns_name("10.0.0.5".parse().unwrap()),
+        reverse_dns_name("192.168.1.1".parse().unwrap()),
+        reverse_dns_name("fd00::1".parse().unwrap()),
+        "db.acme.corp".to_owned(),
+        "printer.local".to_owned(),
+        "nas.home.arpa".to_owned(),
+        "app.internal".to_owned(),
+        "fileserver".to_owned(),
+    ] {
+        assert!(!may_ask_public_services(&private), "{private}");
+    }
+    for public in [
+        reverse_dns_name("45.33.32.156".parse().unwrap()),
+        "scanme.nmap.org".to_owned(),
+        "example.com".to_owned(),
+    ] {
+        assert!(may_ask_public_services(&public), "{public}");
+    }
+}
+
+#[tokio::test]
+async fn crt_sh_is_not_asked_about_an_internal_name() {
+    for (domain, address) in [
+        ("db.acme.corp", "10.0.0.5"),
+        ("portal.client.com", "10.0.0.7"),
+    ] {
+        let error = format!("{:#}", run_subdomains(domain, address).await.unwrap_err());
+        assert!(error.contains("not sent to crt.sh"), "{domain}: {error}");
+    }
+}
+
+#[test]
+fn a_reverse_record_is_a_claim_and_takes_no_name_from_another_host() {
+    use crate::graph::Graph;
+    let mut graph = Graph::default();
+    let rec = EvidenceRecord::observed(Source::NmapXml, Confidence::High, "scan");
+    graph.apply(Observation::Port {
+        address: "portal.example".into(),
+        port: 443,
+        protocol: "tcp".into(),
+        state: "open".into(),
+        service: None,
+        product: None,
+        version: None,
+        extra_info: None,
+        cpes: vec![],
+        record: rec,
+    });
+    graph.apply(Observation::Note {
+        address: Some("portal.example".into()),
+        text: "in scope".into(),
+        record: EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, "x"),
+    });
+    let before = graph.hosts["portal.example"].clone();
+    // What the dns stage records for a PTR answer.
+    graph.apply(Observation::Hostname {
+        address: "10.0.0.66".into(),
+        hostname: "portal.example".into(),
+        record: EvidenceRecord::observed(
+            Source::Dns,
+            Confidence::Medium,
+            "66.0.0.10.in-addr.arpa IN PTR portal.example",
+        ),
+    });
+    assert_eq!(graph.hosts["portal.example"], before);
+    assert_eq!(
+        graph.host("portal.example").unwrap().address,
+        "portal.example"
+    );
+}
+
+fn build_kexinit_fixture(kex: &str, hostkeys: &str, ciphers: &str, macs: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(20u8); // SSH_MSG_KEXINIT
+    payload.extend_from_slice(&[0x42u8; 16]); // 16-byte cookie
+    let lists = [
+        kex,
+        hostkeys,
+        ciphers,
+        ciphers,
+        macs,
+        macs,
+        "none,zlib@openssh.com",
+        "none,zlib@openssh.com",
+        "",
+        "",
+    ];
+    for list in lists {
+        payload.extend_from_slice(&(list.len() as u32).to_be_bytes());
+        payload.extend_from_slice(list.as_bytes());
+    }
+    payload.push(0); // first_kex_packet_follows = FALSE
+    payload.extend_from_slice(&0u32.to_be_bytes()); // reserved = 0
+
+    let pad_len = 8usize;
+    let pkt_len = 1 + payload.len() + pad_len;
+    let mut framed = Vec::with_capacity(4 + pkt_len);
+    framed.extend_from_slice(&(pkt_len as u32).to_be_bytes());
+    framed.push(pad_len as u8);
+    framed.extend_from_slice(&payload);
+    framed.extend_from_slice(&vec![0u8; pad_len]);
+    framed
+}
+
+#[test]
+fn ssh_msg_kexinit_parser_extracts_algorithms_and_flags_weak_ones() {
+    let fixture = build_kexinit_fixture(
+        "curve25519-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
+        "rsa-sha2-512,ssh-rsa,ssh-dss",
+        "chacha20-poly1305@openssh.com,aes128-ctr,3des-cbc,arcfour",
+        "umac-128-etm@openssh.com,hmac-sha1,hmac-md5",
+    );
+
+    let parsed = parse_ssh_kexinit(&fixture).expect("valid SSH_MSG_KEXINIT fixture");
+    assert_eq!(
+        parsed.kex_algorithms,
+        [
+            "curve25519-sha256",
+            "diffie-hellman-group14-sha1",
+            "diffie-hellman-group1-sha1"
+        ]
+    );
+    assert_eq!(
+        parsed.server_host_key_algorithms,
+        ["rsa-sha2-512", "ssh-rsa", "ssh-dss"]
+    );
+    assert_eq!(
+        parsed.encryption_algorithms_c2s,
+        [
+            "chacha20-poly1305@openssh.com",
+            "aes128-ctr",
+            "3des-cbc",
+            "arcfour"
+        ]
+    );
+    assert_eq!(
+        parsed.mac_algorithms_c2s,
+        ["umac-128-etm@openssh.com", "hmac-sha1", "hmac-md5"]
+    );
+
+    let weak = parsed.weak_algorithms();
+    assert!(weak.contains(&"kex:diffie-hellman-group14-sha1".to_owned()));
+    assert!(weak.contains(&"kex:diffie-hellman-group1-sha1".to_owned()));
+    assert!(weak.contains(&"hostkey:ssh-rsa".to_owned()));
+    assert!(weak.contains(&"hostkey:ssh-dss".to_owned()));
+    assert!(weak.contains(&"cipher:3des-cbc".to_owned()));
+    assert!(weak.contains(&"cipher:arcfour".to_owned()));
+    assert!(weak.contains(&"mac:hmac-sha1".to_owned()));
+    assert!(weak.contains(&"mac:hmac-md5".to_owned()));
+
+    // Modern hardened config produces zero weak algorithms.
+    let modern = build_kexinit_fixture(
+        "curve25519-sha256,diffie-hellman-group16-sha512",
+        "ssh-ed25519,rsa-sha2-512",
+        "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com",
+        "hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com",
+    );
+    let parsed_modern = parse_ssh_kexinit(&modern).unwrap();
+    assert!(parsed_modern.weak_algorithms().is_empty());
+
+    // Rejects truncated or non-KEXINIT packets.
+    assert!(parse_ssh_kexinit(&[0, 0, 0, 5, 0, 21]).is_err());
+    assert!(parse_ssh_kexinit(&fixture[..20]).is_err());
+}
+
+#[test]
+fn team_cymru_and_rdap_parsers_extract_asn_prefix_org_and_country() {
+    let origin = "63949 | 45.33.32.0/24 | US | arin | 2010-02-02";
+    assert_eq!(
+        parse_cymru_origin(origin),
+        Some((
+            63949,
+            Some("45.33.32.0/24".to_owned()),
+            Some("US".to_owned())
+        ))
+    );
+    let desc = "63949 | US | arin | 2012-07-20 | LINO-1 - Akamai Connected Cloud, US";
+    assert_eq!(
+        parse_cymru_asn(desc),
+        Some("LINO-1 - Akamai Connected Cloud, US".to_owned())
+    );
+
+    let rdap_json: Value = serde_json::json!({
+        "handle": "NET-45-33-32-0-1",
+        "name": "LINODE-US",
+        "country": "US",
+        "arin_originas0_originautnums": [63949],
+        "cidr0_cidrs": [
+            { "v4prefix": "45.33.32.0", "length": 24 }
+        ],
+        "entities": [
+            {
+                "handle": "LINO-1",
+                "vcardArray": [
+                    "vcard",
+                    [
+                        ["version", {}, "text", "4.0"],
+                        ["fn", {}, "text", "Akamai Connected Cloud"]
+                    ]
+                ]
+            }
+        ]
+    });
+    let (asn, org, prefix, country) = parse_rdap_response(&rdap_json).unwrap();
+    assert_eq!(asn, Some(63949));
+    assert_eq!(org.as_deref(), Some("Akamai Connected Cloud (LINODE-US)"));
+    assert_eq!(prefix.as_deref(), Some("45.33.32.0/24"));
+    assert_eq!(country.as_deref(), Some("US"));
+}
+
+#[test]
+fn http_header_waf_favicon_and_crtsh_parsers_handle_real_fixtures() {
+    let headers = vec![
+        ("Server".to_owned(), "Apache/2.4.7 (Ubuntu)".to_owned()),
+        ("X-Powered-By".to_owned(), "PHP/8.1.2".to_owned()),
+        ("X-Frame-Options".to_owned(), "SAMEORIGIN".to_owned()),
+        ("CF-Ray".to_owned(), "84a1b2c3d4e5-SJC".to_owned()),
+    ];
+    let analysis = analyze_http_headers(&headers);
+    assert_eq!(analysis.server.as_deref(), Some("Apache/2.4.7 (Ubuntu)"));
+    assert_eq!(analysis.powered_by.as_deref(), Some("PHP/8.1.2"));
+    assert_eq!(analysis.waf.as_deref(), Some("Cloudflare"));
+    assert_eq!(
+        analysis
+            .present_security
+            .get("X-Frame-Options")
+            .map(String::as_str),
+        Some("SAMEORIGIN")
+    );
+    assert_eq!(
+        analysis.missing_security,
+        [
+            "Strict-Transport-Security",
+            "Content-Security-Policy",
+            "X-Content-Type-Options"
+        ]
+    );
+
+    let crtsh_fixture = r#"[
+        {"name_value": "*.scanme.org\nscanme.org\nchat.scanme.org", "common_name": "scanme.org"},
+        {"name_value": "SCANME.ORG\napi.scanme.org\nevil-scanme.org"},
+        {"name_value": "sub.api.scanme.org\nnot-a-domain/path"}
+    ]"#;
+    let subs = parse_crtsh_json(crtsh_fixture, "scanme.org", 50).unwrap();
+    assert_eq!(
+        subs,
+        [
+            "scanme.org",
+            "chat.scanme.org",
+            "api.scanme.org",
+            "sub.api.scanme.org"
+        ]
+    );
+
+    // MurmurHash3 deterministic check and framework lookup.
+    assert_eq!(murmur3_32(b"hello", 0), 613153351);
+    assert_eq!(lookup_favicon_framework(116323821), Some("Spring Boot"));
+    assert_eq!(lookup_favicon_framework(81586312), Some("Jenkins"));
+    assert!(distro_backport_note("OpenSSH 6.6.1p1 Ubuntu 2ubuntu2.13").is_some());
+}
+
+#[tokio::test]
+async fn scripts_are_read_from_the_site_and_html_answers_are_skipped() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = std::sync::Arc::clone(&asked);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let path = request.split_whitespace().nth(1).unwrap_or("").to_owned();
+            log.lock().unwrap().push(path.clone());
+            let (kind, body) = match path.as_str() {
+                "/app.js" => ("application/javascript", "fetch('/api/v2/orders')"),
+                "/spa.js" => ("text/html", "<!doctype html><html></html>"),
+                _ => ("text/plain", "not found"),
+            };
+            let status = if path == "/missing.js" {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(reply.as_bytes()).await;
+        }
+    });
+    let paths: Vec<String> = [
+        "/app.js",
+        "/spa.js",
+        "/missing.js",
+        "//elsewhere.test/x.js",
+        "relative.js",
+    ]
+    .iter()
+    .map(|p| (*p).to_owned())
+    .collect();
+    let got = fetch_scripts("127.0.0.1", None, port, false, &paths, 1024)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, "/app.js");
+    assert!(got[0].1.contains("/api/v2/orders"));
+    // Paths that leave the site are never asked for.
+    let asked = asked.lock().unwrap();
+    assert!(
+        !asked
+            .iter()
+            .any(|p| p.contains("elsewhere") || p.contains("relative")),
+        "{asked:?}"
+    );
+}
+
+#[test]
+fn cookie_values_are_left_out_of_header_evidence() {
+    assert_eq!(
+        redact_cookie_value("Set-Cookie", "sid=abc123; Path=/; HttpOnly"),
+        "sid=<value left out>; Path=/; HttpOnly"
+    );
+    assert_eq!(
+        redact_cookie_value("set-cookie", "a=b"),
+        "a=<value left out>"
+    );
+    assert_eq!(redact_cookie_value("Server", "nginx"), "nginx");
+}
+
+#[test]
+fn srv_caa_ds_and_dnskey_answers_are_read_and_queries_carry_edns0() {
+    // A response to `example.test` with one answer of `qtype`.
+    fn answer(qtype: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut packet = build_dns_query(0x1234, "example.test", qtype).unwrap();
+        packet[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&300u32.to_be_bytes());
+        packet.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        packet.extend_from_slice(rdata);
+        packet
+    }
+    let mut srv = vec![0, 0, 0, 5, 0x01, 0x85];
+    for label in ["dc1", "example", "test"] {
+        srv.push(label.len() as u8);
+        srv.extend_from_slice(label.as_bytes());
+    }
+    srv.push(0);
+    assert_eq!(
+        parse_dns_wire_response(&answer(33, &srv), 0x1234, 33),
+        ["0 5 389 dc1.example.test"]
+    );
+    let mut caa = vec![0, 5];
+    caa.extend_from_slice(b"issueletsencrypt.org");
+    assert_eq!(
+        parse_dns_wire_response(&answer(257, &caa), 0x1234, 257),
+        ["0 issue \"letsencrypt.org\""]
+    );
+    assert_eq!(
+        parse_dns_wire_response(&answer(43, &[0x09, 0x43, 13, 2, 0xAB, 0xCD]), 0x1234, 43),
+        ["2371 13 2"]
+    );
+    assert_eq!(
+        parse_dns_wire_response(&answer(48, &[0x01, 0x01, 3, 13, 0x99]), 0x1234, 48),
+        ["257 3 13"]
+    );
+    // A CAA tag longer than the record is refused, not read past the end.
+    assert!(parse_dns_wire_response(&answer(257, &[0, 40, b'i']), 0x1234, 257).is_empty());
+
+    let plain = build_dns_query(7, "example.test", 48).unwrap();
+    let extended = with_edns0(plain.clone());
+    assert_eq!(&extended[10..12], &[0, 1]);
+    assert_eq!(extended.len(), plain.len() + 11);
+    assert_eq!(
+        &extended[plain.len()..plain.len() + 5],
+        &[0, 0, 41, 0x04, 0xD0]
+    );
+    assert_eq!(dns_rcode(&[0, 7, 0x81, 0x81]), Some(1));
+}
+
+#[test]
+fn dns_doh_and_wire_parsers_extract_records_and_filter_txt() {
+    let doh = serde_json::json!({
+        "Status": 0,
+        "Answer": [
+            {"name": "scanme.nmap.org.", "type": 1, "TTL": 3600, "data": "45.33.32.156"},
+            {"name": "scanme.nmap.org.", "type": 28, "TTL": 3600, "data": "2600:3c01::f03c:91ff:fe18:bb2f"}
+        ]
+    });
+    assert_eq!(parse_doh_records(&doh, 1), ["45.33.32.156"]);
+    assert_eq!(
+        parse_doh_records(&doh, 28),
+        ["2600:3c01::f03c:91ff:fe18:bb2f"]
+    );
+    assert!(is_notable_txt("v=spf1 include:_spf.google.com ~all"));
+    assert!(is_notable_txt("v=DMARC1; p=reject;"));
+    assert!(is_notable_txt("google-site-verification=abc123xyz"));
+    assert!(!is_notable_txt("hello world random note"));
+    assert_eq!(
+        reverse_dns_name(IpAddr::V4(Ipv4Addr::new(45, 33, 32, 156))),
+        "156.32.33.45.in-addr.arpa"
+    );
+}
+
+#[test]
+fn traceroute_detailed_parser_extracts_hops_labels_filtered_stars_and_rtt() {
+    let sample = "\
+traceroute to 45.33.32.156 (45.33.32.156), 15 hops max, 60 byte packets
+ 1  192.168.0.1  1.8 ms
+ 2  96.120.1.1  9.4 ms
+ 3  be-202-seattle.comcast.net (68.86.1.1)  12.1 ms
+ 4  * * *
+ 5  173.230.159.1 (Linode Edge - Fremont, CA)  22.6 ms
+ 6  45.33.32.156  23.1 ms
+";
+    let hops = parse_traceroute_detailed(
+        sample,
+        "45.33.32.156",
+        Some("192.168.0.1"),
+        Some("scanme.nmap.org"),
+    );
+    assert_eq!(hops.len(), 6);
+    assert_eq!(hops[0].hop, 1);
+    assert_eq!(hops[0].address, "192.168.0.1");
+    assert_eq!(hops[0].label.as_deref(), Some("Local Router"));
+    assert_eq!(hops[0].rtt_ms, Some(1.8));
+    assert!(hops[0].formatted().contains("Hop 1: 192.168.0.1"));
+    assert!(hops[0].formatted().contains("(Local Router)"));
+    assert!(hops[0].formatted().contains("1.8 ms"));
+
+    assert_eq!(hops[1].hop, 2);
+    assert_eq!(hops[1].address, "96.120.1.1");
+    assert_eq!(hops[1].label.as_deref(), Some("ISP Regional Node"));
+    assert_eq!(hops[1].rtt_ms, Some(9.4));
+
+    assert_eq!(hops[3].hop, 4);
+    assert_eq!(hops[3].address, "* * *");
+    assert_eq!(
+        hops[3].label.as_deref(),
+        Some("isp-transit / ICMP filtered")
+    );
+    assert_eq!(hops[3].rtt_ms, None);
+    assert!(hops[3].formatted().ends_with('—'));
+
+    assert_eq!(hops[4].hop, 5);
+    assert_eq!(hops[4].address, "173.230.159.1");
+    assert_eq!(hops[4].label.as_deref(), Some("Linode Edge - Fremont, CA"));
+    assert_eq!(hops[4].rtt_ms, Some(22.6));
+
+    assert_eq!(hops[5].hop, 6);
+    assert_eq!(hops[5].address, "45.33.32.156");
+    assert_eq!(hops[5].label.as_deref(), Some("scanme.nmap.org"));
+    assert_eq!(hops[5].rtt_ms, Some(23.1));
+
+    // Round-trip parsing of formatted Hop lines.
+    let formatted: String = hops
+        .iter()
+        .map(TraceHop::formatted)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reparsed = parse_traceroute_detailed(
+        &formatted,
+        "45.33.32.156",
+        Some("192.168.0.1"),
+        Some("scanme.nmap.org"),
+    );
+    assert_eq!(reparsed, hops);
+}
+
+#[tokio::test]
+async fn resolved_ip_policy_blocks_loopback_and_imds_for_external_domains() {
+    assert!(is_allowed_resolved_ip_for_name(
+        "app.lab.local",
+        "10.0.0.5".parse().unwrap()
+    ));
+    assert!(is_allowed_resolved_ip_for_name(
+        "localhost",
+        "127.0.0.1".parse().unwrap()
+    ));
+    assert!(is_allowed_resolved_ip_for_name(
+        "localhost.",
+        "::1".parse().unwrap()
+    ));
+    for blocked in [
+        "100.100.100.200",
+        "fd00:ec2::254",
+        "127.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+        "169.254.169.254",
+        "fe80::1",
+        "0.0.0.0",
+        "::",
+        "255.255.255.255",
+        "224.0.0.1",
+    ] {
+        assert!(
+            !is_allowed_resolved_ip_for_name("evil.example", blocked.parse().unwrap()),
+            "{blocked} should be rejected for evil.example"
+        );
+    }
+    assert!(
+        inspect_web_endpoint("169.254.169.254", Some("evil.example"), 80, false)
+            .await
+            .is_err()
+    );
+    assert!(
+        inspect_web_endpoint("127.0.0.1", Some("evil.example"), 80, false)
+            .await
+            .is_err()
+    );
+}

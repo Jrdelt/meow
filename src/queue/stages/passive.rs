@@ -1,0 +1,235 @@
+//! Stages that read this machine or ask public services: `lan`, `dns`, `asn`,
+//! `subdomains`, `mail-dns` and `trace`.
+
+use super::*;
+
+pub(crate) async fn lan(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let targets = state.graph().target_ips();
+    let local = tokio::task::spawn_blocking(move || crate::observer::observe(&targets))
+        .await
+        .context("local ARP/NDP sweep failed")?;
+    let neighbors = local.neighbors.len();
+    let routes = local.routes.len();
+    let changed = {
+        let mut graph = state.graph();
+        let before = graph.local.neighbors.len() + graph.local.routes.len();
+        let diff = graph.local.neighbors != local.neighbors
+            || graph.local.routes != local.routes
+            || graph.local.interfaces != local.interfaces;
+        graph.local = local;
+        if diff {
+            (neighbors + routes).saturating_sub(before).max(1)
+        } else {
+            0
+        }
+    };
+    if changed > 0 {
+        state.mark_dirty();
+    }
+    Ok(StageEnd::Done(format!(
+        "{neighbors} neighbours, {routes} routes in ARP/NDP cache ({changed} new facts)"
+    )))
+}
+
+pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let task = cx.task;
+    let target = cx.target;
+    let stage = cx.stage;
+    let same_mode = || cx.same_mode();
+    if let Target::Network(net) = target {
+        return Ok(StageEnd::Skipped(format!(
+            "network range {net} does not have a single DNS target"
+        )));
+    }
+    let (observations, ips, summary) = match crate::osint::run_dns(target).await {
+        Ok(res) => res,
+        Err(err) => return Ok(StageEnd::Skipped(format!("DNS lookup unavailable: {err}"))),
+    };
+    if !same_mode() {
+        return Ok(StageEnd::ModeChanged);
+    }
+    let mut cnames = Vec::new();
+    for obs in &observations {
+        if let Observation::Fact { claim, .. } = obs {
+            if let Some(cname) = claim.strip_prefix("CNAME record: ") {
+                cnames.push(cname.to_owned());
+            }
+        }
+    }
+    let found = Found {
+        ips,
+        cnames,
+        ..Found::default()
+    }
+    .checked(target);
+    found.save(&state.db_lock(), task.id, stage)?;
+    let (changed, _) = record(state, observations, None);
+    Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+}
+
+pub(crate) async fn asn(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let task = cx.task;
+    let target = cx.target;
+    let same_mode = || cx.same_mode();
+    let ips = resolve_target_ips(state, task.id, target).await;
+    if !same_mode() {
+        return Ok(StageEnd::ModeChanged);
+    }
+    if ips.is_empty() {
+        return Ok(StageEnd::Skipped(
+            "no resolved IP address to query ASN".to_owned(),
+        ));
+    }
+    if ips.iter().all(|ip| crate::osint::is_non_public_ip(*ip)) {
+        return Ok(StageEnd::Skipped(
+            "private, loopback, or reserved IP range has no public ASN".to_owned(),
+        ));
+    }
+    let ip_strings: Vec<String> = ips.iter().map(ToString::to_string).collect();
+    let (observations, summary) =
+        match crate::osint::run_asn(&ip_strings, Some(state.geo_db())).await {
+            Ok(res) => res,
+            Err(err) => {
+                return Ok(StageEnd::Skipped(format!(
+                    "ASN/RDAP lookup unavailable: {err}"
+                )))
+            }
+        };
+    if observations.is_empty() {
+        return Ok(StageEnd::Skipped(summary));
+    }
+    let (changed, _) = record(state, observations, None);
+    Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+}
+
+pub(crate) async fn subdomains(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let task = cx.task;
+    let target = cx.target;
+    let same_mode = || cx.same_mode();
+    let Target::Host(HostAddr::Name(domain)) = target else {
+        return Ok(StageEnd::Skipped(
+            "target is an IP or CIDR, not a domain name".to_owned(),
+        ));
+    };
+    let dns_found = Found::load(&state.db_lock(), task.id, Stage::Dns, target);
+    let primary_address = dns_found
+        .ips
+        .first()
+        .cloned()
+        .unwrap_or_else(|| domain.clone());
+    let (observations, summary) = match crate::osint::run_subdomains(domain, &primary_address).await
+    {
+        Ok(res) => res,
+        Err(err) => {
+            return Ok(StageEnd::Skipped(format!(
+                "crt.sh query unavailable: {err}"
+            )))
+        }
+    };
+    if !same_mode() {
+        return Ok(StageEnd::ModeChanged);
+    }
+    let (changed, _) = record(state, observations, None);
+    Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+}
+
+pub(crate) async fn mail_dns(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let task = cx.task;
+    let target = cx.target;
+    let same_mode = || cx.same_mode();
+    let Target::Host(HostAddr::Name(domain)) = target else {
+        return Ok(StageEnd::Skipped(
+            "target is an IP or CIDR, not a domain name".to_owned(),
+        ));
+    };
+    let dns_found = Found::load(&state.db_lock(), task.id, Stage::Dns, target);
+    let primary_address = dns_found
+        .ips
+        .first()
+        .cloned()
+        .unwrap_or_else(|| domain.clone());
+    // The names the certificate logs gave, to see which really resolve.
+    let ct_names: Vec<String> = state
+        .graph()
+        .hosts
+        .values()
+        .filter(|host| {
+            host.facts
+                .iter()
+                .any(|fact| fact.record.source == crate::evidence::Source::CtLog)
+        })
+        .map(|host| host.address.clone())
+        .collect();
+    let ran = while_same_mode(
+        &same_mode,
+        crate::maildns::run(domain, &primary_address, &ct_names),
+    )
+    .await;
+    let (observations, summary) = match ran {
+        None => return Ok(StageEnd::ModeChanged),
+        Some(Ok(res)) => res,
+        Some(Err(err)) => return Ok(StageEnd::Skipped(format!("DNS lookups unavailable: {err}"))),
+    };
+    let (changed, _) = record(state, observations, None);
+    Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+}
+
+pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let task = cx.task;
+    let target = cx.target;
+    let same_mode = || cx.same_mode();
+    let Some(resolved_ip) = resolve_target_ips(state, task.id, target)
+        .await
+        .into_iter()
+        .next()
+    else {
+        return Ok(StageEnd::Skipped(
+            "no target IP resolved for traceroute".to_owned(),
+        ));
+    };
+    if !same_mode() {
+        return Ok(StageEnd::ModeChanged);
+    }
+    let local_gateway = state
+        .graph()
+        .local
+        .routes
+        .iter()
+        .filter_map(|r| {
+            if r.destination == "default" || r.destination == "0.0.0.0/0" || r.destination == "::/0"
+            {
+                r.gateway.as_ref()
+            } else {
+                None
+            }
+        })
+        .find(|gw| {
+            gw.parse::<std::net::IpAddr>()
+                .is_ok_and(|g| g.is_ipv4() == resolved_ip.is_ipv4())
+        })
+        .cloned();
+    let ip_str = resolved_ip.to_string();
+    let traced = while_same_mode(
+        &same_mode,
+        crate::osint::run_trace(&ip_str, local_gateway.as_deref()),
+    )
+    .await;
+    let (observations, summary) = match traced {
+        None => return Ok(StageEnd::ModeChanged),
+        Some(Ok(res)) => res,
+        Some(Err(err)) => return Ok(StageEnd::Skipped(format!("traceroute unavailable: {err}"))),
+    };
+    if observations.is_empty() {
+        return Ok(StageEnd::Skipped(
+            "no intermediate traceroute hops observed".to_owned(),
+        ));
+    }
+    let (changed, _) = record(state, observations, None);
+    Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+}
