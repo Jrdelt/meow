@@ -63,14 +63,16 @@ pub(crate) async fn waf_cdn(cx: &Ctx<'_>) -> Result<StageEnd> {
     let task = cx.task;
     let target = cx.target;
     let stage = cx.stage;
-    let (dns_found, headers_found, probed) = {
+    let (dns_found, headers_found) = {
         let db = state.db_lock();
         (
             Found::load(&db, task.id, Stage::Dns, target),
             Found::load(&db, task.id, Stage::Headers, target),
-            load_probed(state, task.id, target),
         )
     };
+    // Outside the block above: it takes the database lock itself, and that
+    // lock is not re-entrant.
+    let probed = load_probed(state, task.id, target);
     let mut target_hosts: BTreeSet<String> = probed.hosts.keys().cloned().collect();
     for ip in &dns_found.ips {
         target_hosts.insert(ip.clone());

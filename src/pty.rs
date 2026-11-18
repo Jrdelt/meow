@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -24,15 +24,27 @@ use ratatui::crossterm::terminal;
 
 use crate::tap::{TapFilter, TapStats};
 
-/// Written to `stdout` when the session ends or panics: leave the alternate
-/// screen, stop mouse tracking, stop bracketed paste, show the cursor.
-pub const TERMINAL_RESET: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?2004l\x1b[?25h";
+/// Written to `stdout` when the session ends or panics: stop mouse
+/// tracking, stop bracketed paste, show the cursor.
+pub const TERMINAL_RESET: &[u8] = b"\x1b[?1000l\x1b[?2004l\x1b[?25h";
+/// Leaves the alternate screen; written before [`TERMINAL_RESET`] only when
+/// the session left it on. On the normal screen, xterm-like terminals take
+/// it as "move the cursor back to where the last full-screen program
+/// started", and what follows would be drawn over older lines.
+pub const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
 
 const READ_CHUNK: usize = 4096;
 /// Chunks the tap may queue before new ones are dropped (about 1 MiB).
 const TAP_QUEUE: usize = 256;
 /// How long to keep draining output after the shell has exited.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// Once the shell has exited, how long the tap and the resize watcher get
+/// to finish before they are left behind.
+const THREAD_GRACE: Duration = Duration::from_secs(1);
+/// After `SIGTERM` or `SIGHUP`, how long the shell gets to end on the
+/// hang-up it is sent before it is killed.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
@@ -86,6 +98,8 @@ pub fn resolve_shell(configured: Option<&str>, env_shell: Option<&str>) -> Strin
 // ---------------------------------------------------------------------------
 
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether the session's output left the terminal on the alternate screen.
+static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 /// The thread that runs the session and owns the terminal.
 static SESSION_THREAD: std::sync::OnceLock<thread::ThreadId> = std::sync::OnceLock::new();
@@ -213,8 +227,56 @@ fn restore_terminal() {
     console::restore_modes();
     let mut stdout = io::stdout();
     if stdout.is_terminal() {
-        let _ = stdout.write_all(TERMINAL_RESET);
+        let _ = stdout.write_all(&reset_sequence(ALT_SCREEN.swap(false, Ordering::SeqCst)));
         let _ = stdout.flush();
+    }
+}
+
+fn reset_sequence(alt_screen: bool) -> Vec<u8> {
+    let leave = if alt_screen { LEAVE_ALT_SCREEN } else { b"" };
+    [leave, TERMINAL_RESET].concat()
+}
+
+/// Follows whether the display is on the alternate screen, from the private
+/// modes that full-screen programs set and reset (1049, 1047 and 47) and the
+/// full reset (`ESC c`) that `reset` sends, which goes back to the normal one.
+#[derive(Default)]
+struct AltScreen {
+    /// The end of what was seen: a sequence may be split across writes.
+    seen: Vec<u8>,
+}
+
+impl AltScreen {
+    const LONGEST: usize = b"\x1b[?1049h".len();
+
+    /// Returns which screen `bytes` leave the display on, if they switch.
+    fn feed(&mut self, bytes: &[u8]) -> Option<bool> {
+        self.seen.extend_from_slice(bytes);
+        let seen = &self.seen;
+        // The last switch wins. One kept from the previous call is found
+        // again only when nothing came after it, and then changes nothing.
+        let last = (0..seen.len())
+            .rev()
+            .filter(|&at| seen[at] == 0x1b)
+            .find_map(|at| Self::switch(&seen[at..]));
+        let keep_from = seen.len().saturating_sub(Self::LONGEST - 1);
+        self.seen.drain(..keep_from);
+        last
+    }
+
+    fn switch(sequence: &[u8]) -> Option<bool> {
+        if sequence.starts_with(b"\x1bc") {
+            return Some(false);
+        }
+        let mode = sequence.strip_prefix(b"\x1b[?")?;
+        let rest = [&b"1049"[..], b"1047", b"47"]
+            .iter()
+            .find_map(|number| mode.strip_prefix(*number))?;
+        match rest.first()? {
+            b'h' => Some(true),
+            b'l' => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -397,12 +459,31 @@ fn signal_end_of_input(pty: &mut dyn Write, session_over: &AtomicBool) {
 }
 
 /// Runs the C filter off the display path and hands clean lines to `sink`.
-fn spawn_tap_worker(chunks: Receiver<Vec<u8>>, mut sink: LineSink) -> JoinHandle<TapStats> {
+/// Ends when every sender is gone, or at the first chunk (an empty one
+/// wakes it) after `open` goes false.
+fn spawn_tap_worker(
+    chunks: Receiver<Vec<u8>>,
+    open: Arc<AtomicBool>,
+    mut sink: LineSink,
+) -> JoinHandle<TapStats> {
     spawn_pty(move || {
         let mut filter = TapFilter::new();
-        for chunk in chunks {
-            for line in filter.feed(&chunk) {
-                sink(&line);
+        while let Ok(chunk) = chunks.recv() {
+            let last = !open.load(Ordering::Acquire);
+            // The session is over, though a background job may still hold
+            // the PTY and the pump its sender: what is queued is all.
+            let queued: Vec<Vec<u8>> = if last {
+                chunks.try_iter().collect()
+            } else {
+                Vec::new()
+            };
+            for chunk in std::iter::once(chunk).chain(queued) {
+                for line in filter.feed(&chunk) {
+                    sink(&line);
+                }
+            }
+            if last {
+                break;
             }
         }
         if let Some(line) = filter.flush() {
@@ -410,6 +491,19 @@ fn spawn_tap_worker(chunks: Receiver<Vec<u8>>, mut sink: LineSink) -> JoinHandle
         }
         filter.stats()
     })
+}
+
+/// Joins `thread` if it ends within `limit`, and otherwise leaves it
+/// running: leaving the session must not wait on a stuck thread.
+fn join_within<T>(thread: JoinHandle<T>, limit: Duration) -> Option<T> {
+    let deadline = Instant::now() + limit;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread.join().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -427,10 +521,14 @@ struct Watcher {
 }
 
 impl Watcher {
+    /// `shell` is the shell's process ID, and `over` is set once the shell
+    /// has been waited for (after which that ID may belong to another).
     #[cfg(unix)]
     fn start(
         master: SharedMaster,
         mut killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        shell: Option<u32>,
+        over: Arc<AtomicBool>,
     ) -> Result<Self> {
         use signal_hook::consts::{SIGHUP, SIGTERM, SIGWINCH};
         use signal_hook::iterator::Signals;
@@ -439,13 +537,27 @@ impl Watcher {
             Signals::new([SIGWINCH, SIGTERM, SIGHUP]).context("cannot install signal handlers")?;
         let handle = signals.handle();
         let thread = spawn_pty(move || {
+            let mut shell = shell.and_then(|pid| libc::pid_t::try_from(pid).ok());
             for signal in signals.forever() {
                 if signal == SIGWINCH {
                     sync_size(&master);
-                } else {
-                    // Ending the shell ends the session through the normal
-                    // path, so the terminal is restored.
-                    let _ = killer.kill();
+                    continue;
+                }
+                // Ending the shell ends the session through the normal
+                // path, so the terminal is restored.
+                let _ = killer.kill();
+                // A shell stuck in its own exit (on a locked history file,
+                // say) ignores the hang-up: it is killed if still there.
+                if let Some(pid) = shell.take() {
+                    let over = Arc::clone(&over);
+                    spawn_pty(move || {
+                        thread::sleep(KILL_GRACE);
+                        if !over.load(Ordering::SeqCst) {
+                            // SAFETY: a signal to the shell, which has not
+                            // been waited for, so the ID is still its own.
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                        }
+                    });
                 }
             }
         });
@@ -460,6 +572,8 @@ impl Watcher {
     fn start(
         master: SharedMaster,
         _killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        _shell: Option<u32>,
+        _over: Arc<AtomicBool>,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
@@ -488,8 +602,11 @@ impl Drop for Watcher {
         #[cfg(not(unix))]
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let _ = join_within(thread, THREAD_GRACE);
         }
+        // signal-hook's handler stays installed, so SIGTERM and SIGHUP are
+        // ignored from here on. That is wanted: the coordinator's cleanup,
+        // which stops running scans, is bounded and must not be cut short.
     }
 }
 
@@ -515,8 +632,56 @@ fn resolve_shell_executable(program: &str) -> Result<PathBuf> {
     })
 }
 
+/// Where the session's input comes from and its output goes.
+struct Terminal {
+    input: Box<dyn Read + Send>,
+    output: Box<dyn Write + Send>,
+    /// The user's own terminal: raw mode, resizes and termination signals.
+    real: bool,
+}
+
+/// The display: shut once the session is over, and watched for the
+/// alternate screen.
+struct Display {
+    open: Arc<AtomicBool>,
+    output: Box<dyn Write + Send>,
+    alt_screen: AltScreen,
+}
+
+impl Write for Display {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.open.load(Ordering::Acquire) {
+            return Ok(buf.len());
+        }
+        let written = self.output.write(buf)?;
+        if let Some(on) = self.alt_screen.feed(&buf[..written]) {
+            ALT_SCREEN.store(on, Ordering::SeqCst);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.open.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.output.flush()
+    }
+}
+
 /// Runs the shell described by `spec` until it exits. Blocks the caller.
 pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome> {
+    let terminal = Terminal {
+        input: Box::new(io::stdin()),
+        output: Box::new(io::stdout()),
+        real: true,
+    };
+    host_session(spec, sink, terminal)
+}
+
+/// [`run_session`] on any input and output. Once the shell has exited this
+/// returns within about [`DRAIN_GRACE`] plus [`THREAD_GRACE`], whatever
+/// still holds the PTY, and gives the terminal back first.
+fn host_session(spec: &SessionSpec, sink: LineSink, terminal: Terminal) -> Result<SessionOutcome> {
     let executable = resolve_shell_executable(&spec.program)?;
     let pair = native_pty_system()
         .openpty(terminal_size())
@@ -553,44 +718,48 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
         }
     };
     let master: SharedMaster = Arc::new(Mutex::new(pair.master));
+    let session_over = Arc::new(AtomicBool::new(false));
 
-    let guard = match TerminalGuard::enter() {
-        Ok(guard) => guard,
-        Err(error) => {
-            let _ = child.kill();
-            return Err(error);
-        }
+    let (guard, watcher) = if terminal.real {
+        let guard = match TerminalGuard::enter() {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
+        // The window may have changed size between openpty and raw mode.
+        sync_size(&master);
+        let watcher = Watcher::start(
+            Arc::clone(&master),
+            child.clone_killer(),
+            child.process_id(),
+            Arc::clone(&session_over),
+        )
+        .ok();
+        (guard, watcher)
+    } else {
+        (None, None)
     };
-    // The window may have changed size between openpty and raw mode.
-    sync_size(&master);
-    let watcher = Watcher::start(Arc::clone(&master), child.clone_killer());
 
+    let display_open = Arc::new(AtomicBool::new(true));
     let (tap_tx, tap_rx) = mpsc::sync_channel::<Vec<u8>>(TAP_QUEUE);
-    let tap_worker = spawn_tap_worker(tap_rx, sink);
+    // Kept to wake the tap once the session is over.
+    let tap_wake = tap_tx.clone();
+    let tap_worker = spawn_tap_worker(tap_rx, Arc::clone(&display_open), sink);
     let dropped = Arc::new(AtomicU64::new(0));
     let (drained_tx, drained_rx) = mpsc::channel::<()>();
     let output_dropped = Arc::clone(&dropped);
-    let display_open = Arc::new(AtomicBool::new(true));
+    let display = Display {
+        open: Arc::clone(&display_open),
+        output: terminal.output,
+        alt_screen: AltScreen::default(),
+    };
     let pump_display_open = Arc::clone(&display_open);
-    struct GatedStdout(Arc<AtomicBool>);
-    impl Write for GatedStdout {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if !self.0.load(Ordering::Acquire) {
-                return Ok(buf.len());
-            }
-            io::stdout().write(buf)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            if !self.0.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            io::stdout().flush()
-        }
-    }
     spawn_pty(move || {
         pump_output_while(
             reader,
-            GatedStdout(Arc::clone(&pump_display_open)),
+            display,
             Some(tap_tx),
             &output_dropped,
             &pump_display_open,
@@ -599,30 +768,29 @@ pub fn run_session(spec: &SessionSpec, sink: LineSink) -> Result<SessionOutcome>
     });
     // Blocks in `read` on stdin; if the session ends first, the thread ends
     // with the process.
-    let session_over = Arc::new(AtomicBool::new(false));
     let input_over = Arc::clone(&session_over);
     let mut writer = writer;
+    let input = terminal.input;
     spawn_pty(move || {
-        pump_input(io::stdin().lock(), &mut *writer);
+        pump_input(input, &mut *writer);
         signal_end_of_input(&mut *writer, &input_over);
     });
 
     let status = child.wait();
-    session_over.store(true, Ordering::Relaxed);
+    session_over.store(true, Ordering::SeqCst);
 
     // The shell is gone. Give the output pump a moment to reach EOF; a
     // background job that still holds the PTY must not keep the session open.
-    let drained = drained_rx.recv_timeout(DRAIN_GRACE).is_ok();
+    let _ = drained_rx.recv_timeout(DRAIN_GRACE);
     display_open.store(false, Ordering::Release);
+    // The terminal goes back to the user before anything below may wait.
+    drop(guard);
+    // What the tap has queued is all it gets now.
+    let _ = tap_wake.try_send(Vec::new());
+    drop(tap_wake);
     drop(watcher);
     drop(master);
-    drop(guard);
-
-    let tap = if drained {
-        tap_worker.join().unwrap_or_default()
-    } else {
-        TapStats::default()
-    };
+    let tap = join_within(tap_worker, THREAD_GRACE).unwrap_or_default();
     let status = status.context("cannot wait for the shell")?;
     Ok(SessionOutcome {
         exit_code: status.exit_code(),
@@ -701,9 +869,183 @@ mod tests {
     #[test]
     fn reset_sequence_matches_the_spec() {
         assert_eq!(
-            TERMINAL_RESET,
+            reset_sequence(true),
             b"\x1b[?1049l\x1b[?1000l\x1b[?2004l\x1b[?25h"
         );
+        // Not on the alternate screen: no 1049l, which would move the
+        // cursor back over older output.
+        assert_eq!(reset_sequence(false), b"\x1b[?1000l\x1b[?2004l\x1b[?25h");
+    }
+
+    #[test]
+    fn the_alternate_screen_is_followed_across_writes() {
+        let mut alt = AltScreen::default();
+        assert_eq!(alt.feed(b"plain text\r\n\x1b[1;32mgreen\x1b[0m"), None);
+        assert_eq!(alt.feed(b"\x1b[?1049h\x1b[22;0;0t less"), Some(true));
+        assert_eq!(alt.feed(b"page two"), None);
+        assert_eq!(alt.feed(b"\x1b[?1049l$ "), Some(false));
+        // The last switch in a write wins.
+        assert_eq!(alt.feed(b"\x1b[?1047h vim \x1b[?1047l"), Some(false));
+        assert_eq!(alt.feed(b"\x1b7\x1b[?47h"), Some(true));
+        // A sequence split across writes, at every point.
+        let sequence = b"\x1b[?1049l";
+        for split in 1..sequence.len() {
+            let mut alt = AltScreen::default();
+            assert_eq!(alt.feed(b"\x1b[?1049h"), Some(true));
+            assert_eq!(alt.feed(&sequence[..split]), None, "{split}");
+            assert_eq!(alt.feed(&sequence[split..]), Some(false), "{split}");
+        }
+        // `reset` after a full-screen program was killed: the full reset
+        // goes back to the normal screen, even when split.
+        let mut alt = AltScreen::default();
+        assert_eq!(alt.feed(b"\x1b[?1049h"), Some(true));
+        assert_eq!(alt.feed(b"\x1bc\x1b]104\x07"), Some(false));
+        assert_eq!(alt.feed(b"\x1b[?1049h\x1b"), Some(true));
+        assert_eq!(alt.feed(b"c$ "), Some(false));
+        // Other modes, and incomplete or non-private ones, are not switches.
+        let mut alt = AltScreen::default();
+        for other in [
+            &b"\x1b[?1000h"[..],
+            b"\x1b[?2004l",
+            b"\x1b[1049h",
+            b"\x1b[?470h",
+            b"\x1b[?104",
+            b"\x1b[c",
+            b"\x1b[0c",
+        ] {
+            assert_eq!(alt.feed(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_tap_ends_with_the_session_even_if_the_pty_stays_open() {
+        let (tx, rx) = mpsc::sync_channel(TAP_QUEUE);
+        let open = Arc::new(AtomicBool::new(true));
+        let (sink, lines) = collecting_sink();
+        let worker = spawn_tap_worker(rx, Arc::clone(&open), sink);
+        tx.send(b"last line\r\n".to_vec()).unwrap();
+        tx.send(b"no newline".to_vec()).unwrap();
+        // `tx` stays alive, as the pump's sender does while a background
+        // job holds the PTY.
+        open.store(false, Ordering::Release);
+        tx.send(Vec::new()).unwrap();
+        let stats =
+            join_within(worker, Duration::from_secs(3)).expect("the tap thread never ended");
+        assert_eq!(*lines.lock().unwrap(), ["last line", "no newline"]);
+        assert_eq!(stats.lines_emitted, 2);
+        drop(tx);
+    }
+
+    #[test]
+    fn a_stuck_thread_is_left_behind() {
+        let (release, wait) = mpsc::channel::<()>();
+        let stuck = thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let started = Instant::now();
+        assert!(join_within(stuck, Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(release);
+        assert_eq!(
+            join_within(thread::spawn(|| 7), Duration::from_secs(3)),
+            Some(7)
+        );
+    }
+
+    /// After the session, a late hang-up must not kill meow while the
+    /// coordinator is still stopping the scans it started.
+    #[cfg(unix)]
+    #[test]
+    fn hang_ups_stay_caught_after_the_session() {
+        #[derive(Debug)]
+        struct NoShell;
+        impl portable_pty::ChildKiller for NoShell {
+            fn kill(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(NoShell)
+            }
+        }
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let master: SharedMaster = Arc::new(Mutex::new(pair.master));
+        let over = Arc::new(AtomicBool::new(true));
+        drop(Watcher::start(master, Box::new(NoShell), None, over).unwrap());
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: reads the current action only.
+            let action = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(signal, std::ptr::null(), &mut action), 0);
+                action
+            };
+            assert_ne!(action.sa_sigaction, libc::SIG_DFL, "{signal}");
+        }
+    }
+
+    /// The shell has exited but a background job still holds the PTY: the
+    /// session ends anyway, and its tap lets go of the sink (which holds the
+    /// coordinator's last sender) instead of waiting for the job.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_holding_the_pty_does_not_hold_up_the_end_of_the_session() {
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Dropped(mpsc::Sender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let spec = SessionSpec {
+            program: "/bin/sh".to_owned(),
+            // The job ignores the hang-up the shell's exit sends, and keeps
+            // the PTY open for 5 s without writing to it.
+            args: vec![
+                "-c".to_owned(),
+                "trap '' HUP; sleep 5 & echo \"job $! started\"; exit 7".to_owned(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+        };
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let held = Dropped(dropped_tx);
+        let sink: LineSink = Box::new(move |_line| {
+            std::hint::black_box(&held);
+        });
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let terminal = Terminal {
+            input: Box::new(io::empty()),
+            output: Box::new(Shared(Arc::clone(&shown))),
+            real: false,
+        };
+
+        let started = Instant::now();
+        let outcome = host_session(&spec, sink, terminal).unwrap();
+        let took = started.elapsed();
+        let gone = dropped_rx.recv_timeout(Duration::from_millis(500));
+
+        let shown = String::from_utf8_lossy(&shown.lock().unwrap()).into_owned();
+        let job = shown
+            .split("job ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+        if let Some(pid) = job {
+            // SAFETY: ends the test's own background job.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert_eq!(outcome.exit_code, 7, "{shown:?}");
+        assert!(took < DRAIN_GRACE + THREAD_GRACE, "{took:?}");
+        assert!(gone.is_ok(), "the tap still holds the sink: {shown:?}");
     }
 
     #[test]
@@ -717,7 +1059,7 @@ mod tests {
 
         let (tx, rx) = mpsc::sync_channel(TAP_QUEUE);
         let (sink, lines) = collecting_sink();
-        let worker = spawn_tap_worker(rx, sink);
+        let worker = spawn_tap_worker(rx, Arc::new(AtomicBool::new(true)), sink);
         let dropped = AtomicU64::new(0);
         let mut display = Vec::new();
         pump_output(Cursor::new(raw.clone()), &mut display, &tx, &dropped);
@@ -825,7 +1167,7 @@ mod tests {
     fn post_session_output_is_drained_without_feeding_tap() {
         let (tx, rx) = mpsc::sync_channel(TAP_QUEUE);
         let (sink, lines) = collecting_sink();
-        let worker = spawn_tap_worker(rx, sink);
+        let worker = spawn_tap_worker(rx, Arc::new(AtomicBool::new(true)), sink);
         let dropped = AtomicU64::new(0);
         let active = AtomicBool::new(false);
         let mut display = Vec::new();

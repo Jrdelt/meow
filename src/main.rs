@@ -570,7 +570,10 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
 
     let sink = tee_sink(coordinator.tap_sink(), debug_tap_log()?);
     let outcome = pty::run_session(&spec, sink);
-    coordinator.shutdown();
+    let skipped = coordinator.shutdown();
+    if !skipped.is_empty() {
+        println!("[!] Skipped on exit (stuck): {}", skipped.join(", "));
+    }
     let outcome = outcome?;
 
     println!(

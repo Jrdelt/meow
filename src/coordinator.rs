@@ -17,8 +17,8 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -80,6 +80,12 @@ const LOCATE_EVERY: Duration = Duration::from_secs(30);
 const LOCATE_RETRY: Duration = Duration::from_secs(15 * 60);
 const WS_MIN_INTERVAL: Duration = Duration::from_millis(400);
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
+/// Leaving a session waits at most this long for the tap's last lines, for
+/// the background tasks to stop, and for a lock the final save needs.
+const STOP_STEP: Duration = Duration::from_secs(1);
+/// ... and at most this long for the whole cleanup: a stuck task must never
+/// keep the user from their own shell.
+const STOP_LIMIT: Duration = Duration::from_secs(5);
 
 /// Contents of `runtime.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +331,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// [`lock`] for leaving the session: gives up at `deadline`, since a task
+/// the runtime had to leave behind may hold the lock for good.
+fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Option<MutexGuard<'_, T>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
 impl State {
     pub fn graph(&self) -> MutexGuard<'_, Graph> {
         lock(&self.graph)
@@ -396,12 +417,17 @@ impl State {
     }
 
     fn save_if_dirty(&self) {
-        if !self.dirty.swap(false, Ordering::SeqCst) {
+        if !self.dirty.load(Ordering::SeqCst) {
             return;
         }
         let path = self.graph_path();
         let (result, full) = {
             let mut graph = self.graph();
+            // Cleared only with the graph in hand: a save still waiting for
+            // it has saved nothing yet.
+            if !self.dirty.swap(false, Ordering::SeqCst) {
+                return;
+            }
             (graph.save(&path), graph.is_full())
         };
         if let Err(error) = result {
@@ -416,6 +442,22 @@ impl State {
                     .to_owned(),
             );
         }
+    }
+
+    /// The final save when the session ends. Returns false when the graph
+    /// was still locked at `deadline`, and the save was skipped.
+    fn save_on_exit(&self, path: &Path, deadline: Instant) -> bool {
+        if !self.dirty.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Some(mut graph) = lock_until(&self.graph, deadline) else {
+            return false;
+        };
+        if self.dirty.swap(false, Ordering::SeqCst) {
+            // Nobody would see a notice now; what was saved before is kept.
+            let _ = graph.save(path);
+        }
+        true
     }
 
     pub fn geo_db(&self) -> &GeoDb {
@@ -1636,8 +1678,13 @@ async fn grounding_loop(state: Shared, mut queue: mpsc::UnboundedReceiver<String
 pub struct Coordinator {
     state: Shared,
     runtime: Option<tokio::runtime::Runtime>,
-    tap: Option<mpsc::Sender<String>>,
+    /// The only strong reference: tap sinks hold weak ones, so that the tap
+    /// task ends once this is dropped, whoever still has a sink.
+    tap: Option<Arc<mpsc::Sender<String>>>,
     tap_task: Option<tokio::task::JoinHandle<()>>,
+    /// Kept from the start: the workspace lock may be held when it ends.
+    graph_path: PathBuf,
+    tmp_dir: PathBuf,
     _runtime_file: RuntimeFile,
 }
 
@@ -1723,8 +1770,10 @@ impl Coordinator {
             None
         };
 
-        let _ = std::fs::remove_file(workspace.tmp_dir().join(webui::OPENER_FILE));
-        let _ = std::fs::remove_file(workspace.tmp_dir().join("map-open.html"));
+        let graph_path = workspace.graph_path();
+        let tmp_dir = workspace.tmp_dir();
+        let _ = std::fs::remove_file(tmp_dir.join(webui::OPENER_FILE));
+        let _ = std::fs::remove_file(tmp_dir.join("map-open.html"));
         let runtime_path = workspace.runtime_path();
         let info = RuntimeInfo {
             pid: std::process::id(),
@@ -1821,8 +1870,10 @@ impl Coordinator {
         Ok(Self {
             state,
             runtime: Some(runtime),
-            tap: Some(tap),
+            tap: Some(Arc::new(tap)),
             tap_task: Some(tap_task),
+            graph_path,
+            tmp_dir,
             _runtime_file: runtime_file,
         })
     }
@@ -1840,40 +1891,78 @@ impl Coordinator {
     }
 
     /// A sink for the PTY analysis tap. Lines are dropped, never queued
-    /// without bound, if the coordinator falls behind.
+    /// without bound, if the coordinator falls behind, and once it stops.
     pub fn tap_sink(&self) -> LineSink {
-        match self.tap.clone() {
-            Some(tap) => Box::new(move |line| {
-                let _ = tap.try_send(line.to_owned());
-            }),
+        match &self.tap {
+            Some(tap) => {
+                let tap = Arc::downgrade(tap);
+                Box::new(move |line| {
+                    if let Some(tap) = tap.upgrade() {
+                        let _ = tap.try_send(line.to_owned());
+                    }
+                })
+            }
             None => Box::new(|_line| {}),
         }
     }
 
-    /// Stops the background tasks and writes the final `graph.json`.
-    pub fn shutdown(mut self) {
-        self.stop();
+    /// Stops the background tasks and writes the final `graph.json`, in at
+    /// most [`STOP_LIMIT`]. Returns what had to be skipped because it was
+    /// stuck.
+    pub fn shutdown(mut self) -> Vec<&'static str> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // On a thread of its own, so that not even a file write that never
+        // returns keeps the user from their shell.
+        let cleanup = std::thread::Builder::new()
+            .name("meow-shutdown".to_owned())
+            .spawn(move || {
+                let skipped = self.stop();
+                // Removes runtime.json before saying it is done.
+                drop(self);
+                let _ = done_tx.send(skipped);
+            });
+        if cleanup.is_err() {
+            // The coordinator went with the closure: its drop stopped it.
+            return Vec::new();
+        }
+        done_rx
+            .recv_timeout(STOP_LIMIT)
+            .unwrap_or_else(|_| vec!["the rest of the cleanup"])
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Vec<&'static str> {
+        let mut skipped = Vec::new();
         let Some(runtime) = self.runtime.take() else {
-            return;
+            return skipped;
         };
-        // Let the tap finish the lines it already has: once every sender is
-        // gone the task ends by itself.
+        // Let the tap finish the lines it already has: with the last sender
+        // gone the task ends by itself. Waited for on a std channel, as the
+        // runtime's own timers stop if both its workers are stuck.
         self.tap.take();
         if let Some(task) = self.tap_task.take() {
-            let _ = runtime
-                .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await });
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            runtime.spawn(async move {
+                let _ = task.await;
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(STOP_STEP);
         }
-        runtime.shutdown_timeout(Duration::from_secs(2));
-        self.state.save_if_dirty();
+        // Returns in time even if a task is stuck, but leaves that task
+        // behind with any lock it holds: hence the deadline below.
+        runtime.shutdown_timeout(STOP_STEP);
+        let deadline = Instant::now() + STOP_STEP;
+        if !self.state.save_on_exit(&self.graph_path, deadline) {
+            skipped.push("saving graph.json");
+        }
         // A tool that was running has just been killed with the runtime.
-        let _ = queue::mark_running_interrupted(&self.state.db_lock());
+        // If the database is stuck, the next session does this as it starts.
+        if let Some(db) = lock_until(&self.state.db, deadline) {
+            let _ = queue::mark_running_interrupted(&db);
+        }
         // Clean up any browser bootstrap file containing the session token.
-        let tmp_dir = lock(&self.state.workspace).tmp_dir();
-        let _ = std::fs::remove_file(tmp_dir.join(webui::OPENER_FILE));
-        let _ = std::fs::remove_file(tmp_dir.join("map-open.html"));
+        let _ = std::fs::remove_file(self.tmp_dir.join(webui::OPENER_FILE));
+        let _ = std::fs::remove_file(self.tmp_dir.join("map-open.html"));
+        skipped
     }
 }
 
@@ -2959,6 +3048,64 @@ mod tests {
             host.ports["22/tcp"].facts[0].record.source,
             Source::PtyRegex
         );
+    }
+
+    /// Shuts the coordinator down on another thread; `None` if that took
+    /// longer than `limit`.
+    fn shutdown_within(
+        coordinator: Coordinator,
+        limit: Duration,
+    ) -> Option<(Vec<&'static str>, Duration)> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let skipped = coordinator.shutdown();
+            let _ = done_tx.send((skipped, started.elapsed()));
+        });
+        done_rx.recv_timeout(limit).ok()
+    }
+
+    /// A task the runtime had to leave behind (as the waf-cdn deadlock did)
+    /// can hold the database and the graph for good: leaving the session
+    /// still ends in time, saying what it skipped.
+    #[test]
+    fn leaving_does_not_wait_for_ever_on_a_lock_a_stuck_task_holds() {
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        state.mark_dirty();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _db = holder.db_lock();
+            let _graph = holder.graph();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+
+        let (skipped, took) = shutdown_within(fx.coordinator, STOP_LIMIT + Duration::from_secs(2))
+            .expect("leaving the session waited for ever on a stuck lock");
+        assert_eq!(skipped, ["saving graph.json"]);
+        assert!(took < STOP_LIMIT, "{took:?}");
+        // The session's runtime record is gone all the same.
+        assert!(!fx.workspace.runtime_path().exists());
+        drop(release_tx);
+    }
+
+    /// A tap sink that outlives the session (the PTY's tap thread when a
+    /// background job still holds the terminal) no longer delays leaving.
+    #[test]
+    fn a_tap_sink_left_alive_does_not_delay_leaving() {
+        let fx = fixture();
+        let mut sink = fx.coordinator.tap_sink();
+        sink("22/tcp   open  ssh     OpenSSH 8.2p1");
+        let (skipped, took) =
+            shutdown_within(fx.coordinator, STOP_LIMIT).expect("leaving the session took too long");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(took < STOP_STEP, "{took:?}");
+        // Lines after that go nowhere, without an error.
+        sink("80/tcp   open  http    nginx 1.18.0");
     }
 
     /// A stand-in for a local OpenAI-compatible server, on its own thread.

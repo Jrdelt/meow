@@ -1144,3 +1144,57 @@ fn mail_dns_puts_every_name_of_a_long_record_into_the_vault() {
     assert!(!masked.contains("acme-holding"), "{masked}");
     assert!(!masked.contains("acme-corp"), "{masked}");
 }
+
+/// The waf-cdn stage once took the database lock while already holding it:
+/// the queue stopped there, and so did leaving the session.
+#[test]
+fn the_waf_cdn_stage_does_not_deadlock_on_the_database() {
+    use crate::coordinator::Coordinator;
+    use crate::workspace::{Config, MeowHome, Workspace};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+    let (workspace, _) =
+        Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+    let mut config = Config::default();
+    config.cve.enabled = false;
+    let coordinator = Coordinator::start(workspace, config).unwrap();
+    let state = coordinator.state();
+
+    let address = "192.0.2.10".to_owned();
+    let id = enqueue(&state.db_lock(), &address, Mode::Mild, &[]).unwrap();
+    let ports = Found {
+        up: 1,
+        hosts: BTreeMap::from([(address.clone(), vec![80])]),
+        web: vec![(address.clone(), 80, false)],
+        ..Found::default()
+    };
+    ports.save(&state.db_lock(), id, Stage::Ports).unwrap();
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+
+    // On its own thread: a deadlock blocks the thread, so no async timeout
+    // could fire.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let end = runtime.block_on(async {
+            let target = Target::parse(&address).unwrap();
+            let cx = stages::Ctx::new(&runner, &task, &target, Stage::WafCdn)?;
+            stages::waf_cdn(&cx).await
+        });
+        let _ = done_tx.send(end.map(|end| match end {
+            StageEnd::Done(detail) | StageEnd::Skipped(detail) => detail,
+            StageEnd::ModeChanged => "mode changed".to_owned(),
+        }));
+    });
+    let detail = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the waf-cdn stage hung")
+        .unwrap();
+    assert!(detail.contains("no blocking WAF/CDN detected"), "{detail}");
+    coordinator.shutdown();
+}
