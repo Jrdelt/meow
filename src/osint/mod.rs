@@ -246,9 +246,9 @@ pub use web::*;
 pub fn distro_backport_note(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
     if lower.contains("ubuntu") {
-        Some("Ubuntu banner detected: Ubuntu backports security fixes without bumping the upstream version; verify installed package revision locally (`dpkg -l` / `apt-cache policy`) before confirming")
+        Some("Ubuntu backports security fixes without changing the upstream version: the installed package (`dpkg -l`) may already have the fix")
     } else if lower.contains("debian") || lower.contains("+deb") {
-        Some("Debian banner detected: Debian backports security fixes without bumping the upstream version; verify installed package revision locally (`dpkg -l` / `apt-cache policy`) before confirming")
+        Some("Debian backports security fixes without changing the upstream version: the installed package (`dpkg -l`) may already have the fix")
     } else if lower.contains("redhat")
         || lower.contains("rhel")
         || lower.contains("centos")
@@ -256,11 +256,11 @@ pub fn distro_backport_note(text: &str) -> Option<&'static str> {
         || lower.contains(".el8")
         || lower.contains(".el9")
     {
-        Some("RHEL/CentOS banner detected: Enterprise Linux backports security fixes; verify installed RPM revision locally (`rpm -q --changelog`) before confirming")
+        Some("Enterprise Linux backports security fixes without changing the upstream version: the installed package (`rpm -q --changelog`) may already have the fix")
     } else if lower.contains("amzn") || lower.contains("amazon") {
-        Some("Amazon Linux banner detected: verify installed RPM revision locally (`rpm -q`) before confirming")
+        Some("Amazon Linux backports security fixes: the installed package (`rpm -q`) may already have the fix")
     } else if lower.contains("suse") || lower.contains("sles") {
-        Some("SUSE banner detected: verify installed package revision locally (`rpm -q`) before confirming")
+        Some("SUSE backports security fixes: the installed package (`rpm -q`) may already have the fix")
     } else {
         None
     }

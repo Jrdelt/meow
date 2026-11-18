@@ -6,7 +6,7 @@
   > ^ <
 ```
 
-`meow` wraps your normal interactive shell (`zsh`, `bash`, `fish`, or `pwsh`), passively observes authorized reconnaissance and command output, grounds discovered services against public vulnerability feeds, maps your OPSEC transit path and target topology on a live local canvas, and compiles a verified Markdown or printable PDF audit report.
+`meow` wraps your normal interactive shell (`zsh`, `bash`, `fish`, or `pwsh`), passively observes authorized reconnaissance and command output, grounds discovered services against public vulnerability feeds, maps your OPSEC transit path and target topology on a live local canvas, and compiles a Markdown or printable PDF audit report.
 
 Everything stays on your machine in a private workspace (`~/.meow/workspaces/<name>/` or `./.meow/`). When you ask a cloud AI model for triage notes, `meow` masks IP addresses, hostnames, domains, emails, MAC addresses, and credentials into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine, and restores the real values locally when the reply returns.
 
@@ -233,9 +233,9 @@ Good to know:
 
 - **Path** — You → gateway → WAN or VPN exit → Internet (click for each hop's location, network and latency) → WAF/CDN → provider → target hosts.
 - **Location** — a small satellite map floats top right; **−** folds it. **Expand** fills the window; **Esc** goes back.
-- **Host tabs** — Overview, Ports, Web & TLS, DNS & Mail, Advisories, Evidence, and Notes & AI. Use ←/→ or `1`–`7`. Hover a row for details.
+- **Host tabs** — Overview, Ports, Web & TLS, DNS & Mail, CVEs, and Notes & AI. Use ←/→ or `1`–`6`. Hover a row for details.
 - **Check now** — one connection to each of a host's known open ports, to see if it is up (mild and aggressive mode).
-- **Advisories** — every CVE match starts as a hypothesis to verify; confirm or dismiss it and the map and `REPORT.md` follow.
+- **CVEs** — found by software version and listed per software, known exploited first, with the release that fixes them.
 - **AI triage** — `[L]` local, `[C]` cloud, `[R]` research. Answers come as a **Red Team** plan (authorized testing, no exploit code) and a **Blue Team** plan (defense). Private addresses, names and secrets are masked before anything leaves your machine.
 - **Export** — **Export report (.md)** or **Print / PDF**, for the whole workspace or one host.
 

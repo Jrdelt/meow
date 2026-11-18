@@ -1,8 +1,9 @@
-//! The workspace topology and evidence store (`graph.json`).
+//! The workspace topology and fact store (`graph.json`).
 //!
 //! Parsers never touch the graph directly: they produce [`Observation`]s,
 //! and [`Graph::apply`] is the single place that normalises hosts, merges
-//! duplicates and attaches the five-field [`EvidenceRecord`] to each fact.
+//! duplicates and attaches an [`EvidenceRecord`] (where it came from) to
+//! each fact.
 //! The file is replaced atomically (temp file in the same directory,
 //! `fsync`, rename).
 
@@ -13,10 +14,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{path_segments, web_origin, HostAddr};
-use crate::evidence::{
-    sanitize, sanitize_url, sanitize_words, Confidence, EvidenceRecord, IllegalTransition, Source,
-    VerificationStatus,
-};
+use crate::evidence::{sanitize, sanitize_url, sanitize_words, Confidence, EvidenceRecord, Source};
 use crate::timeutil::now_rfc3339;
 use crate::workspace::write_private_atomic;
 
@@ -57,8 +55,8 @@ pub struct Fact {
     pub record: EvidenceRecord,
 }
 
-/// A possible vulnerability matched to a host. Always starts as
-/// `UnverifiedHypothesis`; only the operator can turn it into a verdict.
+/// A known vulnerability (CVE, GHSA, ...) found for a host from the version
+/// of its software.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Advisory {
     /// `CVE-2024-1234`, `GHSA-...`
@@ -1180,12 +1178,69 @@ fn clean_reference(url: &str) -> Option<String> {
     Some(cleaned)
 }
 
-fn sanitize_advisory(mut advisory: Advisory, is_new: bool) -> Option<Advisory> {
+/// The distribution notes meow 0.2.2 wrote into a port fact
+/// (`Distro backporting note: ...`) and after the title of each CVE found
+/// on that port (` [...]`), each with a word naming the distribution.
+const NOTES_0_2_2: [(&str, &str); 5] = [
+    (
+        "Ubuntu banner detected: Ubuntu backports security fixes without bumping the upstream version; verify installed package revision locally (`dpkg -l` / `apt-cache policy`) before confirming",
+        "ubuntu",
+    ),
+    (
+        "Debian banner detected: Debian backports security fixes without bumping the upstream version; verify installed package revision locally (`dpkg -l` / `apt-cache policy`) before confirming",
+        "debian",
+    ),
+    (
+        "RHEL/CentOS banner detected: Enterprise Linux backports security fixes; verify installed RPM revision locally (`rpm -q --changelog`) before confirming",
+        "rhel",
+    ),
+    (
+        "Amazon Linux banner detected: verify installed RPM revision locally (`rpm -q`) before confirming",
+        "amazon",
+    ),
+    (
+        "SUSE banner detected: verify installed package revision locally (`rpm -q`) before confirming",
+        "suse",
+    ),
+];
+
+const BACKPORT_CLAIM: &str = "Distro backporting note: ";
+
+/// A distribution note in meow 0.2.2's words, in today's.
+fn reword_old_note(claim: &mut String) {
+    let Some(note) = claim.strip_prefix(BACKPORT_CLAIM) else {
+        return;
+    };
+    let today = NOTES_0_2_2
+        .iter()
+        .find(|(old, _)| *old == note)
+        .and_then(|(_, distro)| crate::osint::distro_backport_note(distro));
+    if let Some(today) = today {
+        *claim = format!("{BACKPORT_CLAIM}{today}");
+    }
+}
+
+/// A CVE title without the distribution note meow 0.2.2 put after it,
+/// whole or cut short with the title.
+fn without_old_note(title: &str) -> &str {
+    for (at, _) in title.match_indices(" [") {
+        let rest = &title[at + 2..];
+        let old_note = NOTES_0_2_2
+            .iter()
+            .any(|(note, _)| note.starts_with(rest) || rest.strip_suffix(']') == Some(note));
+        if !rest.is_empty() && old_note {
+            return title[..at].trim_end();
+        }
+    }
+    title
+}
+
+fn sanitize_advisory(mut advisory: Advisory) -> Option<Advisory> {
     advisory.id = sanitize(&advisory.id, 64);
     if advisory.id.is_empty() {
         return None;
     }
-    advisory.title = clean(&advisory.title);
+    advisory.title = without_old_note(&clean(&advisory.title)).to_owned();
     advisory.severity = advisory
         .severity
         .map(|s| sanitize(&s, 32))
@@ -1209,17 +1264,13 @@ fn sanitize_advisory(mut advisory: Advisory, is_new: bool) -> Option<Advisory> {
         }
     }
     advisory.references = refs;
-    if is_new {
-        advisory.record.normalize_new_advisory();
-    } else {
-        advisory.record.normalize_loaded_advisory();
-    }
+    advisory.record.sanitize_fields();
     Some(advisory)
 }
 
 fn sanitize_path_node(node: &mut PathNode, budget: &mut usize) {
     if let Some(record) = &mut node.record {
-        record.normalize_observed();
+        record.sanitize_fields();
     }
     node.total_nodes = 0;
     let children = std::mem::take(&mut node.children);
@@ -1307,7 +1358,8 @@ fn sanitize_local_net(local: &mut LocalNet) {
 
 fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
     fact.claim = sanitize(&fact.claim, crate::evidence::EVIDENCE_MAX);
-    fact.record.normalize_observed();
+    reword_old_note(&mut fact.claim);
+    fact.record.sanitize_fields();
     let duplicate = facts
         .iter()
         .any(|f| f.claim == fact.claim && f.record.source == fact.record.source);
@@ -1643,7 +1695,7 @@ impl Graph {
     }
 
     /// True once the graph holds as much as it can keep: new observations
-    /// are no longer recorded (verdicts and notes already there stay).
+    /// are no longer recorded (what is already there stays).
     pub fn is_full(&self) -> bool {
         self.tally.full
     }
@@ -1740,7 +1792,7 @@ impl Graph {
                 if advisories.len() >= MAX_ADVISORIES_PER_HOST {
                     break;
                 }
-                if let Some(clean_adv) = sanitize_advisory(advisory, false) {
+                if let Some(clean_adv) = sanitize_advisory(advisory) {
                     if !advisories.iter().any(|a| a.id == clean_adv.id) {
                         advisories.push(clean_adv);
                     }
@@ -1898,8 +1950,8 @@ impl Graph {
     /// text, a certificate, a reverse DNS record), which whoever runs the
     /// machine at `address` can make say what they like. An untrusted claim
     /// never takes a name another host has, and never takes over a host the
-    /// operator has worked on: its advisories, with their verdicts, and its
-    /// notes stay where they are. A trusted one moves the name to this host.
+    /// operator has worked on: its CVEs and its notes stay where they are.
+    /// A trusted one moves the name to this host.
     fn add_hostname(&mut self, address: &str, name: &str, trusted: bool) -> bool {
         let Some(HostAddr::Name(name)) = HostAddr::parse(name) else {
             return false;
@@ -2259,7 +2311,7 @@ impl Graph {
                     return false;
                 }
                 let mut budget = MAX_PATH_NODES.saturating_sub(entry.paths.count());
-                record.normalize_observed();
+                record.sanitize_fields();
                 insert_path(&mut entry.paths, &segments, &mut budget, status, record)
                     .unwrap_or(false)
             }
@@ -2453,10 +2505,10 @@ impl Graph {
             .count()
     }
 
-    /// Attaches an advisory to a host. An advisory already present keeps its
-    /// verification status; only its descriptive fields are refreshed.
+    /// Attaches a CVE to a host. One already there is kept; only its
+    /// descriptive fields are refreshed.
     pub fn add_advisory(&mut self, address: &str, advisory: Advisory) -> bool {
-        let Some(advisory) = sanitize_advisory(advisory, true) else {
+        let Some(advisory) = sanitize_advisory(advisory) else {
             return false;
         };
         let weight = advisory_weight(&advisory);
@@ -2508,7 +2560,7 @@ impl Graph {
 
     /// Removes database matches that a complete new lookup no longer
     /// returns: the software was updated, or the match was a wrong one.
-    /// Anything the operator has ruled on stays.
+    /// CVEs from anywhere else (a note, an import) stay.
     pub fn drop_stale_advisories(&mut self, address: &str, current: &BTreeSet<String>) -> usize {
         let Some(host) = self.host_mut(address) else {
             return 0;
@@ -2517,7 +2569,6 @@ impl Graph {
         let mut freed = 0usize;
         host.advisories.retain(|advisory| {
             let keep = current.contains(&advisory.id)
-                || advisory.record.verification_status != VerificationStatus::UnverifiedHypothesis
                 || !matches!(advisory.record.source, Source::NvdApi | Source::OsvApi);
             if !keep {
                 freed += advisory_weight(advisory);
@@ -2546,28 +2597,6 @@ impl Graph {
             self.tally.weight += weight;
         }
         added
-    }
-
-    /// Operator verdict on an advisory (`Confirmed`, `FalsePositive`, or
-    /// back to `UnverifiedHypothesis`).
-    pub fn set_advisory_status(
-        &mut self,
-        address: &str,
-        advisory_id: &str,
-        status: VerificationStatus,
-    ) -> Result<()> {
-        let host = self
-            .host_mut(address)
-            .with_context(|| format!("no advisory {advisory_id} on {address}"))?;
-        let advisory = host
-            .advisories
-            .iter_mut()
-            .find(|a| a.id.eq_ignore_ascii_case(advisory_id))
-            .with_context(|| format!("no advisory '{advisory_id}' on {address}"))?;
-        advisory
-            .record
-            .transition(status)
-            .map_err(|e: IllegalTransition| anyhow::anyhow!(e))
     }
 
     /// IP addresses of all known hosts (name-only hosts are left out).
@@ -2662,7 +2691,7 @@ mod tests {
             matched: "cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*".into(),
             port: Some("80/tcp".into()),
             references: vec![],
-            record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
+            record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
         }
     }
 
@@ -2727,10 +2756,6 @@ mod tests {
         assert_eq!(p.product.as_deref(), Some("nginx"));
         assert_eq!(p.label(), "80/tcp http nginx");
         assert_eq!(p.facts.len(), 2);
-        assert!(p
-            .facts
-            .iter()
-            .all(|f| f.record.verification_status == VerificationStatus::Observed));
     }
 
     #[test]
@@ -2845,18 +2870,11 @@ mod tests {
 
     #[test]
     fn a_claimed_name_takes_nothing_from_the_host_that_has_it() {
-        // The operator has worked on portal.example: a confirmed finding
-        // and a note of their own.
+        // The operator has worked on portal.example: a CVE found there and
+        // a note of their own.
         let mut graph = Graph::default();
         graph.apply(port("portal.example", 443, "https", Some("nginx")));
         graph.add_advisory("portal.example", advisory("CVE-2021-23017"));
-        graph
-            .set_advisory_status(
-                "portal.example",
-                "CVE-2021-23017",
-                VerificationStatus::Confirmed,
-            )
-            .unwrap();
         graph.apply(Observation::Note {
             address: Some("portal.example".into()),
             text: "admin panel, in scope".into(),
@@ -2906,7 +2924,7 @@ mod tests {
             .contains("portal.example"));
 
         // The scanner resolving the name the user asked for does merge the
-        // hosts, verdict and note included.
+        // hosts, CVE and note included.
         graph.apply(hostname(
             "203.0.113.50",
             "portal.example",
@@ -2916,10 +2934,7 @@ mod tests {
         assert!(!graph.hosts.contains_key("portal.example"));
         let real = graph.host("portal.example").unwrap();
         assert_eq!(real.address, "203.0.113.50");
-        assert_eq!(
-            real.advisories[0].record.verification_status,
-            VerificationStatus::Confirmed
-        );
+        assert_eq!(real.advisories[0].id, "CVE-2021-23017");
         assert!(real
             .facts
             .iter()
@@ -3034,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn advisories_start_as_hypotheses_and_need_an_explicit_verdict() {
+    fn a_cve_found_twice_is_kept_once_with_what_both_said() {
         let mut graph = Graph::default();
         graph.apply(port("10.0.0.5", 80, "http", Some("nginx")));
         assert!(graph.add_advisory("10.0.0.5", advisory("CVE-2021-23017")));
@@ -3045,22 +3060,9 @@ mod tests {
         assert_eq!(graph.advisory_count(), 1);
         assert!(graph.hosts["10.0.0.5"].advisories[0].kev);
 
-        let status = |g: &Graph| g.hosts["10.0.0.5"].advisories[0].record.verification_status;
-        assert_eq!(status(&graph), VerificationStatus::UnverifiedHypothesis);
-        graph
-            .set_advisory_status("10.0.0.5", "cve-2021-23017", VerificationStatus::Confirmed)
-            .unwrap();
-        assert_eq!(status(&graph), VerificationStatus::Confirmed);
-        // Re-matching the same CVE must not reset the operator's verdict.
+        // Matching it again keeps what the first match knew.
         graph.add_advisory("10.0.0.5", advisory("CVE-2021-23017"));
-        assert_eq!(status(&graph), VerificationStatus::Confirmed);
-
-        assert!(graph
-            .set_advisory_status("10.0.0.5", "CVE-2021-23017", VerificationStatus::Observed)
-            .is_err());
-        assert!(graph
-            .set_advisory_status("10.0.0.5", "CVE-0000-0000", VerificationStatus::Confirmed)
-            .is_err());
+        assert!(graph.hosts["10.0.0.5"].advisories[0].kev);
     }
 
     #[test]
@@ -3354,21 +3356,17 @@ mod tests {
             .collect();
         assert_eq!(names, ["graph.json"]);
 
-        // Every stored fact carries the five evidence fields.
+        // Every stored fact says where it came from.
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         let fact = &json["hosts"]["10.0.0.5"]["ports"]["80/tcp"]["facts"][0];
-        for field in [
-            "source",
-            "timestamp_utc",
-            "confidence",
-            "evidence",
-            "verification_status",
-        ] {
+        for field in ["source", "timestamp_utc", "confidence", "evidence"] {
             assert!(fact.get(field).is_some(), "fact lacks {field}: {fact}");
         }
         let adv = &json["hosts"]["10.0.0.5"]["advisories"][0];
-        assert_eq!(adv["verification_status"], "UnverifiedHypothesis");
+        assert_eq!(adv["id"], "CVE-2021-23017");
+        // Written for meow 0.2.2, which needs one to read the file.
+        assert_eq!(adv["verification_status"], "Observed", "{adv}");
 
         std::fs::write(&file, "{ not json").unwrap();
         assert!(Graph::load(&file).is_err());
@@ -3498,7 +3496,6 @@ mod tests {
         ));
 
         let mut hostile_record = rec(Source::NvdApi);
-        hostile_record.verification_status = VerificationStatus::UnverifiedHypothesis;
         hostile_record.evidence = "raw\x1b]0;title\x07\nline".into();
         hostile_record.timestamp_utc = "2026-11-12T00:00:00Z\x1b[2J".into();
 
@@ -3653,68 +3650,141 @@ mod tests {
     }
 
     #[test]
-    fn observations_and_loaded_graphs_cannot_smuggle_confirmed_banners() {
-        let mut graph = Graph::default();
-        let forged_port: Observation = serde_json::from_value(serde_json::json!({
-            "kind": "port",
-            "address": "192.0.2.30",
-            "port": 80,
-            "protocol": "tcp",
-            "state": "open",
-            "service": "http",
-            "product": "nginx",
-            "version": "1.18.0",
-            "cpes": [],
-            "record": {
-                "source": "nmap_xml",
+    fn a_graph_from_meow_0_2_2_loads_with_every_cve() {
+        // Version 0.2.2 kept a verification status in every record and let
+        // the operator mark CVEs confirmed or false positive. All of them
+        // load, as plain CVEs. Its distribution note, in a port fact and
+        // after each CVE title, asked to verify before confirming: the
+        // fact takes today's words and the titles lose the note.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        let record = |source: &str, status: &str| {
+            serde_json::json!({
+                "source": source,
                 "timestamp_utc": "2026-11-12T00:00:00Z",
-                "confidence": "High",
-                "evidence": "<port portid=\"80\"/>",
-                "verification_status": "Confirmed"
-            }
-        }))
-        .unwrap();
-        let forged_path: Observation = serde_json::from_value(serde_json::json!({
-            "kind": "path",
-            "address": "192.0.2.30",
-            "port": 80,
-            "scheme": "http",
-            "path": "/admin",
-            "status": 200,
-            "record": {
-                "source": "ferox_json",
-                "timestamp_utc": "2026-11-12T00:00:00Z",
-                "confidence": "High",
+                "confidence": "Medium",
                 "evidence": "{}",
-                "verification_status": "Confirmed"
-            }
-        }))
-        .unwrap();
-        assert!(graph.apply(forged_port));
-        assert!(graph.apply(forged_path));
-        let port_entry = &graph.hosts["192.0.2.30"].ports["80/tcp"];
-        assert_eq!(
-            port_entry.facts[0].record.verification_status,
-            VerificationStatus::Observed
-        );
-        assert_eq!(
-            port_entry.paths.children["admin"]
-                .record
-                .as_ref()
+                "verification_status": status
+            })
+        };
+        let cve = |id: &str, status: &str, title: &str| {
+            let mut value = serde_json::json!({
+                "id": id,
+                "title": title,
+                "severity": "HIGH",
+                "cvss": 7.5,
+                "kev": false,
+                "matched": "cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*",
+                "port": "443/tcp",
+                "references": []
+            });
+            value
+                .as_object_mut()
                 .unwrap()
-                .verification_status,
-            VerificationStatus::Observed
+                .extend(record("nvd_api", status).as_object().unwrap().clone());
+            value
+        };
+        let debian = NOTES_0_2_2[1].0;
+        // Cut short with the title, at 200 bytes, between two words.
+        let long_title = sanitize_words(
+            &format!("Username enumeration in a server that answers in a way that tells valid from invalid names [{debian}]"),
+            MAX_FIELD,
+        );
+        assert!(
+            long_title.contains(" [Debian") && !long_title.ends_with(']'),
+            "{long_title}"
+        );
+        let old = serde_json::json!({
+            "version": 2,
+            "updated_utc": "2026-11-12T00:00:00Z",
+            "hosts": {
+                "192.0.2.30": {
+                    "address": "192.0.2.30",
+                    "ports": {
+                        "443/tcp": {
+                            "number": 443,
+                            "protocol": "tcp",
+                            "state": "open",
+                            "product": "nginx",
+                            "version": "1.18.0",
+                            "facts": [{
+                                "claim": "443/tcp open https nginx 1.18.0",
+                                "source": "nmap_xml",
+                                "timestamp_utc": "2026-11-12T00:00:00Z",
+                                "confidence": "High",
+                                "evidence": "<port portid=\"443\"/>",
+                                "verification_status": "Observed"
+                            }, {
+                                "claim": format!("Distro backporting note: {debian}"),
+                                "source": "nmap_xml",
+                                "timestamp_utc": "2026-11-12T00:00:00Z",
+                                "confidence": "High",
+                                "evidence": "nginx 1.18.0 Debian",
+                                "verification_status": "Observed"
+                            }]
+                        }
+                    },
+                    "advisories": [
+                        cve("CVE-2021-23017", "Confirmed", &format!("Off-by-one in the resolver [{debian}]")),
+                        cve("CVE-2021-3618", "FalsePositive", &long_title),
+                        cve("CVE-2019-20372", "UnverifiedHypothesis", "Request smuggling [see vendor notes]")
+                    ]
+                }
+            }
+        });
+        std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let mut graph = Graph::load(&file).unwrap();
+        let host = &graph.hosts["192.0.2.30"];
+        let ids: Vec<&str> = host.advisories.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["CVE-2021-23017", "CVE-2021-3618", "CVE-2019-20372"]);
+        let titles: Vec<&str> = host.advisories.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Off-by-one in the resolver",
+                long_title.split(" [").next().unwrap(),
+                "Request smuggling [see vendor notes]"
+            ]
+        );
+        let facts: Vec<&str> = host.ports["443/tcp"]
+            .facts
+            .iter()
+            .map(|f| f.claim.as_str())
+            .collect();
+        let today = crate::osint::distro_backport_note("debian").unwrap();
+        assert_eq!(
+            facts,
+            [
+                "443/tcp open https nginx 1.18.0".to_owned(),
+                format!("Distro backporting note: {today}")
+            ]
         );
 
-        let mut forged_adv = advisory("CVE-2024-3333");
-        forged_adv.record.verification_status = VerificationStatus::Confirmed;
-        assert!(graph.add_advisory("192.0.2.30", forged_adv));
-        assert_eq!(
-            graph.hosts["192.0.2.30"].advisories[0]
-                .record
-                .verification_status,
-            VerificationStatus::UnverifiedHypothesis
-        );
+        graph.save(&file).unwrap();
+        let saved = std::fs::read_to_string(&file).unwrap();
+        for gone in [
+            "Confirmed",
+            "FalsePositive",
+            "UnverifiedHypothesis",
+            "confirming",
+            "verify installed",
+            "banner detected",
+        ] {
+            assert!(!saved.contains(gone), "{gone}: {saved}");
+        }
+        assert_eq!(Graph::load(&file).unwrap(), graph);
+
+        // The same note from a scan of this version is not added twice.
+        let mut again = graph.clone();
+        assert!(!again.apply(Observation::Fact {
+            address: "192.0.2.30".into(),
+            port: Some(443),
+            protocol: "tcp".into(),
+            claim: format!("Distro backporting note: {today}"),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        }));
+        assert_eq!(again, graph);
     }
 
     #[test]
@@ -3741,15 +3811,6 @@ mod tests {
             graph.drop_stale_advisories("198.51.100.99", &BTreeSet::new()),
             0
         );
-        let err = graph
-            .set_advisory_status(
-                "198.51.100.99",
-                "CVE-2024-0001",
-                VerificationStatus::Confirmed,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no advisory"), "{err}");
         assert!(graph.hosts.is_empty());
 
         // Folding a name-keyed host into an IP host preserves os, mac, and not_open.

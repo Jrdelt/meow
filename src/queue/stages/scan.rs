@@ -242,7 +242,7 @@ pub(crate) async fn cves(cx: &Ctx<'_>) -> Result<StageEnd> {
                     if port.state != "open" {
                         continue;
                     }
-                    if let Some(note) = crate::checklist::backport_note_for(host, Some(port_key)) {
+                    if let Some(note) = crate::cve::backport_note_for(host, Some(port_key)) {
                         backport_obs.push(Observation::Fact {
                             address: addr.clone(),
                             port: Some(port.number),
@@ -281,23 +281,15 @@ pub(crate) async fn cves(cx: &Ctx<'_>) -> Result<StageEnd> {
             changed += merged.added;
         }
     }
-    let to_verify: usize = {
+    let total: usize = {
         let graph = state.graph();
         versioned_hosts
             .iter()
             .filter_map(|addr| graph.hosts.get(addr))
-            .map(|h| {
-                h.advisories
-                    .iter()
-                    .filter(|a| {
-                        a.record.verification_status
-                            == crate::evidence::VerificationStatus::UnverifiedHypothesis
-                    })
-                    .count()
-            })
+            .map(|h| h.advisories.len())
             .sum()
     };
     Ok(StageEnd::Done(format!(
-        "{added_total} new advisories, {to_verify} hypotheses to verify ({changed} new facts)"
+        "{added_total} new CVEs, {total} in all ({changed} new facts)"
     )))
 }

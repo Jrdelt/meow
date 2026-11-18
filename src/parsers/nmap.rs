@@ -722,12 +722,10 @@ mod tests {
             "{:?}",
             port.facts
         );
-        assert!(
-            port.facts
-                .iter()
-                .all(|f| f.record.verification_status
-                    == crate::evidence::VerificationStatus::Observed)
-        );
+        assert!(port
+            .facts
+            .iter()
+            .all(|f| f.record.source == crate::evidence::Source::NmapXml));
     }
 
     #[test]

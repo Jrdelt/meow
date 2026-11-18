@@ -580,8 +580,8 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
     Ok(ExitCode::from(u8::try_from(outcome.exit_code).unwrap_or(1)))
 }
 
-/// Looks up CVEs for every host with versioned software and merges the
-/// matches into the graph as unverified hypotheses.
+/// Looks up CVEs for every host with versioned software and adds them to
+/// the graph.
 fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) -> Result<()> {
     let lookups: Vec<cve::Lookup> = graph.hosts.values().flat_map(cve::plan).collect();
     if lookups.is_empty() {
@@ -612,19 +612,23 @@ fn ground_cves(workspace: &Workspace, graph: &mut Graph, settings: CveSettings) 
         );
     }
     println!(
-        "[+] CVE lookups: {} new possible {} ({} known exploited), matched by version number only and not verified; {} in total",
+        "[+] CVE lookups: {} new {} ({} known exploited), found by software version; {} in total",
         summary.new_advisories,
-        if summary.new_advisories == 1 { "advisory" } else { "advisories" },
+        if summary.new_advisories == 1 {
+            "CVE"
+        } else {
+            "CVEs"
+        },
         summary.kev,
         graph.advisory_count()
     );
     for host in graph.hosts.values() {
         for fix in cve::fix_plan(host) {
             println!(
-                "[+] {}: {} (answers {})",
+                "[+] {}: {} (fixes {})",
                 sanitize_terminal_line(&host.address, 128),
                 sanitize_terminal_line(&fix.action, 240),
-                fix.advisories
+                fix.counts()
             );
         }
     }
@@ -661,10 +665,7 @@ fn accept_foreign_workspace(
     );
     for (file, what) in [
         ("state.db", "queued scans and cached lookups"),
-        (
-            "graph.json",
-            "hosts, findings and verdicts someone else recorded",
-        ),
+        ("graph.json", "hosts and findings someone else recorded"),
         ("replay.sh", "a log of commands"),
         ("last_cwd", "the directory its shell starts in"),
     ] {
@@ -676,10 +677,7 @@ fn accept_foreign_workspace(
         }
     }
     println!(
-        "    Queued scans would run against targets its author chose once you leave light mode,"
-    );
-    println!(
-        "    and its findings may be marked confirmed without anyone here having checked them."
+        "    Queued scans would run against targets its author chose once you leave light mode."
     );
     if !std::io::stdin().is_terminal() {
         bail!(

@@ -1,11 +1,10 @@
 //! `meow hud`: the companion terminal panel.
 //!
 //! It attaches to a live session over the coordinator WebSocket and shows
-//! the host list, a node and sub-path inspector, the evidence-versus-
-//! hypothesis checklist for each advisory, the CVE feed, the background
-//! queue and the notice log. A catch-up box takes operator notes, and
-//! verdict keys confirm or dismiss hypotheses. When no session is running
-//! it opens the workspace files read-only.
+//! the host list, a node and sub-path inspector, the CVEs found on each
+//! host by software version, the background queue and the notice log. A
+//! catch-up box takes operator notes. When no session is running it opens
+//! the workspace files read-only.
 //!
 //! This is a separate process from the PTY host, so reading terminal events
 //! with crossterm is fine here.
@@ -31,11 +30,10 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::ai::{Budget, Tier};
-use crate::checklist;
 use crate::coordinator::{AiStatus, Command, Notice};
 use crate::cve;
 use crate::db::Db;
-use crate::evidence::{sanitize, VerificationStatus};
+use crate::evidence::sanitize;
 use crate::graph::{Advisory, Graph, Host, PathNode};
 use crate::mode::Mode;
 use crate::observer::{machine_report, MachineReport};
@@ -115,11 +113,6 @@ pub struct Model {
     pub show_machine: bool,
 }
 
-fn advisory_rank(advisory: &Advisory) -> (bool, i64) {
-    // Known-exploited first, then by severity score, highest first.
-    (!advisory.kev, -(advisory.cvss.unwrap_or(0.0) * 10.0) as i64)
-}
-
 impl Model {
     pub fn new(live: bool) -> Self {
         Self {
@@ -152,13 +145,14 @@ impl Model {
         self.hosts().get(self.host_index).copied()
     }
 
-    /// The selected host's advisories, most urgent first.
+    /// The selected host's CVEs, most urgent first: known exploited, then
+    /// by score.
     pub fn advisories(&self) -> Vec<&Advisory> {
         let mut list: Vec<&Advisory> = self
             .selected_host()
             .map(|h| h.advisories.iter().collect())
             .unwrap_or_default();
-        list.sort_by_key(|a| advisory_rank(a));
+        list.sort_by(|a, b| cve::cmp_urgency(a, b));
         list
     }
 
@@ -180,9 +174,9 @@ impl Model {
         };
         match message.get("type").and_then(Value::as_str) {
             Some("state") => {
-                // Keep the selection on the same host and the same advisory
+                // Keep the selection on the same host and the same CVE
                 // across updates: a new match that ranks higher must not put
-                // another one under the cursor just before a verdict key.
+                // another one under the cursor.
                 let selected = self.selected_host().map(|h| h.address.clone());
                 let advisory = self.selected_advisory().map(|a| a.id.clone());
                 match serde_json::from_value::<Snapshot>(message["state"].clone()) {
@@ -257,18 +251,6 @@ impl Model {
         }
     }
 
-    fn verdict(&mut self, status: VerificationStatus) -> Action {
-        let (Some(host), Some(advisory)) = (self.selected_host(), self.selected_advisory()) else {
-            self.status = "select a host and an advisory first".to_owned();
-            return Action::None;
-        };
-        Action::Send(Command::Verdict {
-            address: host.address.clone(),
-            advisory: advisory.id.clone(),
-            status,
-        })
-    }
-
     fn ask_ai(&mut self, tier: Tier) -> Action {
         let Some(host) = self.selected_host() else {
             self.status = "select a host first".to_owned();
@@ -287,7 +269,7 @@ impl Model {
 
     /// Handles text pasted into the terminal. It is text for the catch-up
     /// box and nothing else: a line break in it does not send the note, and
-    /// what follows does not run as keys (a mode, a verdict, an AI request).
+    /// what follows does not run as keys (a mode, an AI request).
     /// With the box closed a paste does nothing.
     pub fn on_paste(&mut self, text: &str) -> Action {
         if let Some(note) = &mut self.note {
@@ -394,9 +376,6 @@ impl Model {
                 self.note = Some(String::new());
                 Action::None
             }
-            KeyCode::Char('c') => self.verdict(VerificationStatus::Confirmed),
-            KeyCode::Char('f') => self.verdict(VerificationStatus::FalsePositive),
-            KeyCode::Char('u') => self.verdict(VerificationStatus::UnverifiedHypothesis),
             KeyCode::Char('L') => self.ask_ai(Tier::Local),
             KeyCode::Char('C') => self.ask_ai(Tier::Cloud),
             KeyCode::Char('R') => self.ask_ai(Tier::Research),
@@ -436,15 +415,6 @@ const GOOD: Style = Style::new().fg(Color::Green);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const BAD: Style = Style::new().fg(Color::Red);
 const TITLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-
-fn status_style(status: VerificationStatus) -> Style {
-    match status {
-        VerificationStatus::Confirmed => BAD,
-        VerificationStatus::FalsePositive => GOOD,
-        VerificationStatus::UnverifiedHypothesis => WARN,
-        VerificationStatus::Observed => DIM,
-    }
-}
 
 /// Breaks `text` into lines of at most `width` characters at spaces; a word
 /// longer than a line is split.
@@ -511,25 +481,14 @@ fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
             Span::raw(sanitize(&names.join(", "), 300)),
         ]));
     }
-    // What to do about the advisories: one update per piece of software.
+    // What to do about the CVEs: one update per piece of software.
     let fixes = cve::fix_plan(host);
     if !fixes.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled("What to update", TITLE));
         for fix in fixes.iter().take(5) {
-            let known = if fix.kev > 0 {
-                format!(", {} known exploited", fix.kev)
-            } else {
-                String::new()
-            };
             lines.push(Line::raw(format!("  {}", sanitize(&fix.action, 300))));
-            lines.push(Line::styled(
-                format!(
-                    "      answers {} matched by version only{known}",
-                    fix.advisories
-                ),
-                DIM,
-            ));
+            lines.push(Line::styled(format!("      fixes {}", fix.counts()), DIM));
         }
     }
     lines.push(Line::raw(""));
@@ -562,7 +521,7 @@ fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
         lines.push(Line::styled("  none seen", DIM));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("Evidence (Observed)", TITLE));
+    lines.push(Line::styled("Observations", TITLE));
     let facts = host
         .facts
         .iter()
@@ -584,25 +543,34 @@ fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
     lines
 }
 
-fn advisory_detail(snapshot: &Snapshot, host: &Host, advisory: &Advisory) -> Vec<Line<'static>> {
-    let list = checklist::for_advisory(&snapshot.graph, host, advisory);
-    let (done, total) = list.progress();
+fn advisory_detail(host: &Host, advisory: &Advisory) -> Vec<Line<'static>> {
+    let style = if cve::is_serious(advisory) { BAD } else { WARN };
+    let mut head = vec![
+        Span::styled(advisory.id.clone(), TITLE),
+        Span::raw("  "),
+        Span::styled(cve::severity_label(advisory), style),
+    ];
+    if advisory.kev {
+        head.push(Span::styled("  known exploited", BAD));
+    }
+    // The software and version it was found from.
+    let found_from = cve::by_software(host)
+        .into_iter()
+        .find(|group| group.cves.iter().any(|a| a.id == advisory.id))
+        .map(|group| group.software);
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(advisory.id.clone(), TITLE),
-            Span::raw("  "),
-            Span::styled(
-                advisory.record.verification_status.to_string(),
-                status_style(advisory.record.verification_status),
-            ),
-        ]),
+        Line::from(head),
         Line::raw(advisory.title.clone()),
         Line::styled(
-            format!(
-                "{}  {}",
-                advisory.port.as_deref().unwrap_or("-"),
-                advisory.matched
-            ),
+            [
+                found_from.unwrap_or_else(|| advisory.matched.clone()),
+                advisory.port.clone().unwrap_or_default(),
+            ]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("  "),
             DIM,
         ),
     ];
@@ -612,31 +580,10 @@ fn advisory_detail(snapshot: &Snapshot, host: &Host, advisory: &Advisory) -> Vec
         (None, None) => None,
     };
     lines.extend(fix.map(|text| Line::styled(sanitize(&text, 120), GOOD)));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!("Verification checklist ({done}/{total})"),
-        TITLE,
-    ));
-    for item in &list.items {
-        let (mark, style) = if item.done {
-            ("[x]", GOOD)
-        } else {
-            ("[ ]", DIM)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark} {}", item.label), style),
-            Span::styled(format!("  {}", item.detail), DIM),
-        ]));
-    }
-    if list.research_ready()
-        && advisory.record.verification_status == VerificationStatus::UnverifiedHypothesis
-    {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "[R] Deep Research Ready",
-            GOOD.add_modifier(Modifier::BOLD),
-        ));
-    }
+    lines.extend(
+        cve::backport_note_for(host, advisory.port.as_deref())
+            .map(|note| Line::styled(format!("{note}."), DIM)),
+    );
     lines
 }
 
@@ -735,7 +682,7 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
                 String::new()
             };
             format!(
-                " | {seen} hosts{mentioned} | {} advisories | ",
+                " | {seen} hosts{mentioned} | {} CVEs | ",
                 snapshot.graph.advisory_count()
             )
         }),
@@ -758,18 +705,11 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model) {
     let items: Vec<ListItem> = model
         .hosts()
         .iter()
         .map(|host| {
-            let open = host
-                .advisories
-                .iter()
-                .filter(|a| {
-                    a.record.verification_status == VerificationStatus::UnverifiedHypothesis
-                })
-                .count();
             if only_mentioned(host) {
                 // A name from a URL in the terminal, not a machine seen.
                 return ListItem::new(Line::styled(format!("{}  mentioned", host.label()), DIM));
@@ -779,14 +719,18 @@ fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot)
                 format!("  p:{}", host.open_ports().count()),
                 DIM,
             ));
-            if open > 0 {
-                spans.push(Span::styled(format!(" h:{open}"), WARN));
+            // CVEs: red when one is known exploited, critical or high.
+            let cves = host.advisories.len();
+            if cves > 0 {
+                let style = if host.advisories.iter().any(cve::is_serious) {
+                    BAD
+                } else {
+                    WARN
+                };
+                spans.push(Span::styled(format!(" cve:{cves}"), style));
             }
             if host.advisories.iter().any(|a| a.kev) {
                 spans.push(Span::styled(" KEV", BAD));
-            }
-            if checklist::host_research_ready(&snapshot.graph, host) {
-                spans.push(Span::styled(" [R]", GOOD));
             }
             ListItem::new(Line::from(spans))
         })
@@ -798,29 +742,25 @@ fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot)
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model) {
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
     let advisories = model.advisories();
     let items: Vec<ListItem> = advisories
         .iter()
         .map(|advisory| {
-            let score = advisory
-                .cvss
-                .map(|s| format!(" {s:.1}"))
-                .unwrap_or_default();
-            let mut spans = vec![Span::raw(format!("{}{score}", advisory.id))];
+            let style = if cve::is_serious(advisory) { BAD } else { WARN };
+            let mut spans = vec![
+                Span::raw(advisory.id.clone()),
+                Span::styled(format!(" {}", cve::severity_label(advisory)), style),
+            ];
             if advisory.kev {
                 spans.push(Span::styled(" KEV", BAD));
             }
-            spans.push(Span::styled(
-                format!(" {}", advisory.record.verification_status),
-                status_style(advisory.record.verification_status),
-            ));
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = format!("CVE feed: hypotheses and findings ({})", advisories.len());
+    let title = format!("CVEs ({})", advisories.len());
     let list = List::new(items)
         .block(panel(&title, model.focus == Focus::Advisories))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -829,16 +769,13 @@ fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snap
     frame.render_stateful_widget(list, list_area, &mut state);
 
     let detail = match (model.selected_host(), model.selected_advisory()) {
-        (Some(host), Some(advisory)) => advisory_detail(snapshot, host, advisory),
-        _ => vec![Line::styled(
-            "No advisories matched for this host yet.",
-            DIM,
-        )],
+        (Some(host), Some(advisory)) => advisory_detail(host, advisory),
+        _ => vec![Line::styled("No CVEs found for this host yet.", DIM)],
     };
     frame.render_widget(
         Paragraph::new(detail)
             .wrap(Wrap { trim: false })
-            .block(panel("Evidence vs. hypothesis", false)),
+            .block(panel("CVE", false)),
         detail_area,
     );
 }
@@ -944,7 +881,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, model: &Model) {
     let help = if model.note.is_some() {
         " Enter save   Esc cancel"
     } else {
-        " ↑↓ select  Tab panel  n note  c/f/u confirm/false/reopen  L/C/R AI  a answer  m machine  1-3 mode  PgUp/Dn  q quit"
+        " ↑↓ select  Tab panel  n note  L/C/R AI  a answer  m machine  1-3 mode  PgUp/Dn  q quit"
     };
     frame.render_widget(Paragraph::new(Line::styled(help, DIM)), help_area);
 }
@@ -1031,7 +968,7 @@ pub fn draw(frame: &mut Frame, model: &Model) {
     );
     let [inspector, advisories] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
-    draw_hosts(frame, hosts, model, snapshot);
+    draw_hosts(frame, hosts, model);
     if model.show_ai {
         draw_ai(frame, inspector, model, snapshot);
     } else if model.show_machine {
@@ -1061,7 +998,7 @@ pub fn draw(frame: &mut Frame, model: &Model) {
             inspector,
         );
     }
-    draw_advisories(frame, advisories, model, snapshot);
+    draw_advisories(frame, advisories, model);
     draw_activity(frame, activity, snapshot);
 }
 
@@ -1251,7 +1188,7 @@ mod tests {
                     matched: "cpe:2.3:a:nginx:nginx:1.18.0".into(),
                     port: Some("80/tcp".into()),
                     references: vec![],
-                    record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
+                    record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
                 },
             );
         }
@@ -1270,7 +1207,7 @@ mod tests {
                         { "stage": "crawl", "status": "pending", "detail": "" },
                         { "stage": "dirs", "status": "pending", "detail": "" } ] } ],
                 "notices": [ { "at": "2026-11-12T09:41:00Z", "text": "not running as root: -sS replaced with -sT (connect scan)" } ],
-                "checklists": {}, "topology": {},
+                "cves": {}, "topology": {},
                 "budget": { "spent_usd": 0.25, "calls": 3, "max_usd": 1.0, "max_calls": 20, "has_key": true }
             }
         })
@@ -1307,30 +1244,28 @@ mod tests {
         let text = screen(&model, 160, 64);
         for expected in [
             "meow hud",
-            "| acme | mode mild | 2 hosts | 3 advisories | live",
+            "| acme | mode mild | 2 hosts | 3 CVEs | live",
             "Hosts",
-            "10.10.10.5  p:2 h:3 KEV [R]",
+            "10.10.10.5  p:2 cve:3 KEV",
             "10.10.10.9  p:1",
             "Inspector: node, ports and sub-paths",
             "80/tcp svc nginx 1.18.0 open",
             "/portal/",
             "/config  200",
             "/login.php  200",
-            "Evidence (Observed)",
+            "Observations",
             "[nmap_xml / High]",
-            "CVE feed: hypotheses and findings (3)",
-            "Evidence vs. hypothesis",
-            "Verification checklist (4/6)",
-            "[x] Service identified",
-            "[x] Route to the host  via 10.10.14.1 on tun0",
-            "[ ] Operator verdict",
-            "[R] Deep Research Ready",
+            "CVEs (3)",
+            "CVE-2020-0002 High 4.0 KEV",
+            "CVE-2021-23017 High 7.7",
+            "CVE-2020-0002  High 4.0  known exploited",
+            "title of CVE-2020-0002",
+            "cpe:2.3:a:nginx:nginx:1.18.0  80/tcp",
             "Background queue",
             "recon 10.10.10.0/23 ports:done services:running crawl:pending dirs:pending",
             "Notices",
             "09:41:00 not running as root: -sS replaced with -sT (connect scan)",
-            "n note  c/f/u confirm/false/reopen",
-            "L/C/R AI",
+            "n note  L/C/R AI",
             "| cloud $0.25 of $1.00, 3 of 20 calls today",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -1346,8 +1281,9 @@ mod tests {
         let mut message: serde_json::Value = serde_json::from_str(&state_message(&graph)).unwrap();
         message["state"]["notices"] = json!([ {
             "at": "2026-11-12T09:41:00Z",
-            "text": "3 possible advisories for 10.10.10.5 (1 known exploited), matched by version \
-                     number only and not verified. Most come from one place: Update nginx to 1.20.1 or later."
+            "text": "3 new CVEs for 10.10.10.5 (1 known exploited), found by software version. \
+                     Most come from one place: Update nginx 1.18.0 to 1.20.1 or later, or close \
+                     80/tcp if the service is not needed."
         } ]);
         let mut model = Model::new(true);
         model.apply_message(&message.to_string());
@@ -1356,7 +1292,7 @@ mod tests {
         for expected in [
             "What to update",
             "Update cpe:2.3:a:nginx:nginx:1.18.0 to 1.20.1 or later, or close 80/tcp if the service",
-            "answers 3 matched by version only, 1 known exploited",
+            "fixes 3 CVEs, 1 known exploited",
             "Fixed in 1.20.1",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -1364,7 +1300,10 @@ mod tests {
 
         // On a narrow screen the notice continues under its own text.
         let narrow = screen(&model, 100, 30);
-        for expected in ["09:41:00 3 possible advisories", "         or later."] {
+        for expected in [
+            "09:41:00 3 new CVEs for",
+            "         80/tcp if the service is not needed.",
+        ] {
             assert!(
                 narrow.contains(expected),
                 "missing {expected:?} in:\n{narrow}"
@@ -1410,7 +1349,7 @@ mod tests {
         let mut model = model();
         let before = (model.host_index, model.advisory_index);
         // With the box closed a paste does nothing: not `3` (aggressive),
-        // not `c` (confirm), not `C` (a cloud request), not `q`.
+        // not `C` (a cloud request), not `q`.
         assert_eq!(model.on_paste("3cCRq\nf"), Action::None);
         assert_eq!((model.host_index, model.advisory_index), before);
         assert_eq!(model.note, None);
@@ -1444,7 +1383,7 @@ mod tests {
         model.on_key(key(KeyCode::Char('j')));
         let chosen = model.selected_advisory().unwrap().id.clone();
         assert_eq!(chosen, "CVE-2021-23017");
-        // A new match that ranks first arrives just before a verdict key.
+        // A new match that ranks first arrives.
         let mut graph = graph();
         graph.add_advisory(
             "10.10.10.5",
@@ -1459,15 +1398,11 @@ mod tests {
                 fixed_in: None,
                 last_affected: None,
                 references: vec![],
-                record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
+                record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
             },
         );
         model.apply_message(&state_message(&graph));
         assert_eq!(model.selected_advisory().unwrap().id, chosen);
-        match model.on_key(key(KeyCode::Char('c'))) {
-            Action::Send(Command::Verdict { advisory, .. }) => assert_eq!(advisory, chosen),
-            other => panic!("{other:?}"),
-        }
     }
 
     #[test]
@@ -1481,29 +1416,16 @@ mod tests {
             "stays on the last host"
         );
         assert_eq!(model.selected_host().unwrap().address, "10.10.10.9");
-        // No advisory on this host: a verdict key explains instead of sending.
-        assert_eq!(model.on_key(key(KeyCode::Char('c'))), Action::None);
-        assert!(model.status.contains("select a host and an advisory"));
 
         model.on_key(key(KeyCode::Up));
         model.on_key(key(KeyCode::Tab));
         assert_eq!(model.focus, Focus::Advisories);
         model.on_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            model.on_key(key(KeyCode::Char('c'))),
-            Action::Send(Command::Verdict {
-                address: "10.10.10.5".into(),
-                advisory: "CVE-2021-23017".into(),
-                status: VerificationStatus::Confirmed,
-            })
-        );
-        assert!(matches!(
-            model.on_key(key(KeyCode::Char('f'))),
-            Action::Send(Command::Verdict {
-                status: VerificationStatus::FalsePositive,
-                ..
-            })
-        ));
+        assert_eq!(model.selected_advisory().unwrap().id, "CVE-2021-23017");
+        // The verdict keys of 0.2.2 do nothing now.
+        for old in ['c', 'f', 'u'] {
+            assert_eq!(model.on_key(key(KeyCode::Char(old))), Action::None);
+        }
         assert_eq!(
             model.on_key(key(KeyCode::Char('2'))),
             Action::Send(Command::SetMode { mode: Mode::Mild })
@@ -1518,7 +1440,7 @@ mod tests {
     #[test]
     fn ai_keys_ask_for_the_selected_host_and_show_the_reply() {
         let mut model = model();
-        // Lower-case c is "confirm"; the AI tiers are the capital letters.
+        // The AI tiers are the capital letters.
         for (key_char, tier) in [
             ('L', Tier::Local),
             ('C', Tier::Cloud),
@@ -1706,7 +1628,7 @@ mod tests {
         );
 
         model.on_key(key(KeyCode::Tab));
-        assert_eq!(model.on_key(key(KeyCode::Char('c'))), Action::None);
+        assert_eq!(model.on_key(key(KeyCode::Char('2'))), Action::None);
         assert!(model.status.starts_with("read-only"));
         model.on_key(key(KeyCode::Char('n')));
         model.on_key(key(KeyCode::Char('x')));

@@ -9,7 +9,7 @@
 //!
 //! Requests carry only public software identifiers (CPE names, product and
 //! package names, versions), never hosts or paths. Every match is stored as
-//! an `UnverifiedHypothesis`. Connecting has a 5 s timeout, so an offline
+//! a CVE of the host it was found on. Connecting has a 5 s timeout, so an offline
 //! machine fails fast, while a reply may take as long as it keeps arriving;
 //! NVD requests are paced to respect its rate limit.
 
@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::cpe;
 use crate::db::Db;
-use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
+use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::graph::{Advisory, Fact, Host};
 
 pub const NVD_URL: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
@@ -1502,11 +1502,7 @@ impl CveClient {
                 else {
                     continue;
                 };
-                let backport = crate::checklist::backport_note_for(host, Some(port));
-                let title = match backport {
-                    Some(note) => format!("{} [{note}]", cve.description),
-                    None => cve.description,
-                };
+                let backport = backport_note_for(host, Some(port));
                 let evidence = json!({
                     "query": query,
                     "id": cve.id,
@@ -1520,7 +1516,7 @@ impl CveClient {
                     Advisory {
                         kev: cve.kev || kev.contains(&cve.id),
                         id: cve.id,
-                        title,
+                        title: cve.description,
                         severity: cve.severity,
                         cvss: cve.cvss,
                         matched: query.clone(),
@@ -1528,7 +1524,7 @@ impl CveClient {
                         references: cve.references,
                         fixed_in: relevance.fixed_in,
                         last_affected: relevance.last_affected,
-                        record: EvidenceRecord::hypothesis(
+                        record: EvidenceRecord::observed(
                             Source::NvdApi,
                             relevance.confidence,
                             &evidence,
@@ -1600,7 +1596,7 @@ impl CveClient {
                                         .filter_map(|r| text_field(r, "url"))
                                         .take(MAX_REFERENCES)
                                         .collect(),
-                                    record: EvidenceRecord::hypothesis(
+                                    record: EvidenceRecord::observed(
                                         Source::OsvApi,
                                         confidence,
                                         &evidence,
@@ -1649,7 +1645,7 @@ pub struct Merged {
 }
 
 /// Merges one host's grounding into the graph. After a lookup that reached
-/// every source without truncation, unverified matches it did not return are
+/// every source without truncation, earlier matches it did not return are
 /// removed.
 pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Grounding) -> Merged {
     let mut merged = Merged::default();
@@ -1674,7 +1670,7 @@ pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Groundi
     merged
 }
 
-/// One piece of software on a host and what to do about its advisories.
+/// One piece of software on a host and what to do about its CVEs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FixItem {
     /// `Apache httpd 2.4.34`
@@ -1688,73 +1684,237 @@ pub struct FixItem {
     pub action: String,
 }
 
-/// Groups a host's advisories by the software they were matched on: one
-/// update usually answers all of them. False positives are left out.
-pub fn fix_plan(host: &Host) -> Vec<FixItem> {
-    struct Group<'a> {
-        software: String,
-        port: Option<String>,
-        advisories: Vec<&'a Advisory>,
-    }
-    let mut groups: Vec<Group> = Vec::new();
-    for advisory in &host.advisories {
-        if advisory.record.verification_status == VerificationStatus::FalsePositive {
-            continue;
+impl FixItem {
+    /// What the update answers: `3 CVEs, 1 known exploited`.
+    pub fn counts(&self) -> String {
+        let noun = if self.advisories == 1 { "CVE" } else { "CVEs" };
+        match self.kev {
+            0 => format!("{} {noun}", self.advisories),
+            kev => format!("{} {noun}, {kev} known exploited", self.advisories),
         }
-        let seen = advisory
-            .port
-            .as_ref()
-            .and_then(|key| host.ports.get(key))
-            .and_then(|port| {
-                let product = port.product.as_deref()?;
-                Some(match port.version.as_deref() {
-                    Some(version) => format!("{product} {version}"),
-                    None => product.to_owned(),
-                })
-            });
-        let software = if let Some(cpe) = advisory.matched.strip_prefix("cpeName=") {
-            seen.or_else(|| {
-                let parts = cpe::parts(cpe)?;
-                Some(format!("{} {}", parts.product, parts.version?).replace('_', " "))
-            })
-            .unwrap_or_else(|| cpe.to_owned())
-        } else if let Some(words) = advisory.matched.strip_prefix("keywordSearch=") {
-            seen.unwrap_or_else(|| words.to_owned())
-        } else {
-            advisory.matched.clone()
+    }
+}
+
+/// The rating of a CVE as a word (`Critical`, `High`, `Medium`, `Low`):
+/// the database's own, or else the one its CVSS score falls in.
+pub fn severity_word(advisory: &Advisory) -> Option<String> {
+    let named = advisory
+        .severity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(word) = named {
+        let known = match word.to_ascii_uppercase().as_str() {
+            "CRITICAL" => "Critical",
+            "HIGH" => "High",
+            "MEDIUM" | "MODERATE" => "Medium",
+            "LOW" => "Low",
+            "NONE" => "None",
+            _ => return Some(word.to_owned()),
         };
+        return Some(known.to_owned());
+    }
+    let score = advisory.cvss?;
+    Some(
+        match score {
+            s if s >= 9.0 => "Critical",
+            s if s >= 7.0 => "High",
+            s if s >= 4.0 => "Medium",
+            s if s > 0.0 => "Low",
+            _ => "None",
+        }
+        .to_owned(),
+    )
+}
+
+/// `High 7.7`, `Critical`, `5.3`: the rating and the CVSS score, or
+/// `unrated`.
+pub fn severity_label(advisory: &Advisory) -> String {
+    match (severity_word(advisory), advisory.cvss) {
+        (Some(word), Some(score)) => format!("{word} {score:.1}"),
+        (Some(word), None) => word,
+        (None, Some(score)) => format!("{score:.1}"),
+        (None, None) => "unrated".to_owned(),
+    }
+}
+
+/// The CVSS score, or one that stands for the rating word when there is none.
+fn score(advisory: &Advisory) -> f64 {
+    advisory
+        .cvss
+        .unwrap_or_else(|| match severity_word(advisory).as_deref() {
+            Some("Critical") => 9.0,
+            Some("High") => 7.0,
+            Some("Medium") => 4.0,
+            Some("Low") => 0.1,
+            _ => 0.0,
+        })
+}
+
+/// Known exploited, or rated critical or high: drawn red on the map.
+pub fn is_serious(advisory: &Advisory) -> bool {
+    advisory.kev
+        || matches!(
+            severity_word(advisory).as_deref(),
+            Some("Critical" | "High")
+        )
+}
+
+/// Most urgent first: known exploited, then by score, then by ID.
+pub fn cmp_urgency(a: &Advisory, b: &Advisory) -> Ordering {
+    b.kev
+        .cmp(&a.kev)
+        .then(score(b).total_cmp(&score(a)))
+        .then(a.id.cmp(&b.id))
+}
+
+/// Why the version of a service on this host may say little: its
+/// distribution backports security fixes without changing the version.
+pub fn backport_note_for(host: &Host, port_key: Option<&str>) -> Option<&'static str> {
+    if let Some(p) = port_key.and_then(|key| host.ports.get(key)) {
+        for field in [
+            p.version.as_deref(),
+            p.extra_info.as_deref(),
+            p.http.as_ref().and_then(|h| h.server.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(note) = crate::osint::distro_backport_note(field) {
+                return Some(note);
+            }
+        }
+    }
+    host.os
+        .as_deref()
+        .and_then(crate::osint::distro_backport_note)
+}
+
+/// The CVEs found from one piece of software on a host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CveGroup<'a> {
+    /// `nginx 1.18.0`, `jquery@3.4.1 (npm)`
+    pub software: String,
+    /// The port the software was seen on, if any.
+    pub port: Option<String>,
+    /// Most urgent first.
+    pub cves: Vec<&'a Advisory>,
+}
+
+impl CveGroup<'_> {
+    fn newest(&self, pick: fn(&Advisory) -> &Option<String>) -> Option<String> {
+        self.cves
+            .iter()
+            .filter_map(|a| pick(a).clone())
+            .max_by(|a, b| cmp_versions(a, b))
+    }
+
+    /// The first release that has none of them: `fixed in 1.20.1`, or
+    /// `affected up to 1.21.0` when no fix past that is named.
+    pub fn fix(&self) -> Option<String> {
+        match (
+            self.newest(|a| &a.fixed_in),
+            self.newest(|a| &a.last_affected),
+        ) {
+            (Some(fixed), Some(last)) if cmp_versions(&last, &fixed) != Ordering::Less => {
+                Some(format!("affected up to {last}"))
+            }
+            (Some(fixed), _) => Some(format!("fixed in {fixed}")),
+            (None, Some(last)) => Some(format!("affected up to {last}")),
+            (None, None) => None,
+        }
+    }
+
+    /// What to update to: `1.20.1 or later`.
+    pub fn target(&self) -> String {
+        match (
+            self.newest(|a| &a.fixed_in),
+            self.newest(|a| &a.last_affected),
+        ) {
+            (Some(fixed), Some(last)) if cmp_versions(&last, &fixed) != Ordering::Less => {
+                format!("a release newer than {last}")
+            }
+            (Some(fixed), _) => format!("{fixed} or later"),
+            (None, Some(last)) => format!("a release newer than {last}"),
+            (None, None) => "its newest release".to_owned(),
+        }
+    }
+
+    pub fn kev(&self) -> usize {
+        self.cves.iter().filter(|a| a.kev).count()
+    }
+
+    /// `nginx 1.18.0 · 443/tcp · fixed in 1.20.1`
+    pub fn heading(&self) -> String {
+        let mut parts = vec![self.software.clone()];
+        parts.extend(self.port.clone());
+        parts.extend(self.fix());
+        parts.join(" \u{b7} ")
+    }
+}
+
+/// The name and version of the software a CVE was found from.
+fn software_of(host: &Host, advisory: &Advisory) -> String {
+    let seen = advisory
+        .port
+        .as_ref()
+        .and_then(|key| host.ports.get(key))
+        .and_then(|port| {
+            let product = port.product.as_deref()?;
+            Some(match port.version.as_deref() {
+                Some(version) => format!("{product} {version}"),
+                None => product.to_owned(),
+            })
+        });
+    if let Some(cpe) = advisory.matched.strip_prefix("cpeName=") {
+        seen.or_else(|| {
+            let parts = cpe::parts(cpe)?;
+            Some(format!("{} {}", parts.product, parts.version?).replace('_', " "))
+        })
+        .unwrap_or_else(|| cpe.to_owned())
+    } else if let Some(words) = advisory.matched.strip_prefix("keywordSearch=") {
+        seen.unwrap_or_else(|| words.to_owned())
+    } else {
+        advisory.matched.clone()
+    }
+}
+
+/// A host's CVEs grouped by the software and version they were found
+/// from, the most urgent group first and the most urgent CVE first in each.
+pub fn by_software(host: &Host) -> Vec<CveGroup<'_>> {
+    let mut groups: Vec<CveGroup> = Vec::new();
+    for advisory in &host.advisories {
+        let software = software_of(host, advisory);
         match groups
             .iter_mut()
             .find(|g| g.software == software && g.port == advisory.port)
         {
-            Some(group) => group.advisories.push(advisory),
-            None => groups.push(Group {
+            Some(group) => group.cves.push(advisory),
+            None => groups.push(CveGroup {
                 software,
                 port: advisory.port.clone(),
-                advisories: vec![advisory],
+                cves: vec![advisory],
             }),
         }
     }
-    let mut plan: Vec<FixItem> = groups
+    for group in &mut groups {
+        group.cves.sort_by(|a, b| cmp_urgency(a, b));
+    }
+    groups.sort_by(|a, b| {
+        cmp_urgency(a.cves[0], b.cves[0])
+            .then(b.cves.len().cmp(&a.cves.len()))
+            .then(a.software.cmp(&b.software))
+    });
+    groups
+}
+
+/// Groups a host's CVEs by the software they were found from: one update
+/// usually answers all of them. In the order of [`by_software`].
+pub fn fix_plan(host: &Host) -> Vec<FixItem> {
+    by_software(host)
         .into_iter()
         .map(|group| {
-            let newest = |pick: fn(&Advisory) -> &Option<String>| {
-                group
-                    .advisories
-                    .iter()
-                    .filter_map(|a| pick(a).clone())
-                    .max_by(|a, b| cmp_versions(a, b))
-            };
-            let fixed = newest(|a| &a.fixed_in);
-            let last = newest(|a| &a.last_affected);
-            let target = match (fixed, last) {
-                (Some(fixed), Some(last)) if cmp_versions(&last, &fixed) != Ordering::Less => {
-                    format!("a release newer than {last}")
-                }
-                (Some(fixed), _) => format!("{fixed} or later"),
-                (None, Some(last)) => format!("a release newer than {last}"),
-                (None, None) => "its newest release".to_owned(),
-            };
+            let target = group.target();
             let close = group
                 .port
                 .as_ref()
@@ -1762,21 +1922,14 @@ pub fn fix_plan(host: &Host) -> Vec<FixItem> {
                 .unwrap_or_default();
             FixItem {
                 action: format!("Update {} to {target}{close}.", group.software),
+                advisories: group.cves.len(),
+                kev: group.kev(),
                 software: group.software,
                 port: group.port,
-                advisories: group.advisories.len(),
-                kev: group.advisories.iter().filter(|a| a.kev).count(),
                 target,
             }
         })
-        .collect();
-    plan.sort_by(|a, b| {
-        b.kev
-            .cmp(&a.kev)
-            .then(b.advisories.cmp(&a.advisories))
-            .then(a.software.cmp(&b.software))
-    });
-    plan
+        .collect()
 }
 
 /// Grounds every host that has something to look up and merges the results
@@ -1829,7 +1982,6 @@ fn push_advisory(grounding: &mut Grounding, advisory: Advisory) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evidence::VerificationStatus;
     use crate::graph::{Graph, Observation};
     use axum::extract::{Path, Query, State};
     use axum::routing::{get, post};
@@ -2228,7 +2380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grounding_attaches_only_unverified_hypotheses() {
+    async fn grounding_finds_cves_from_versions_and_packages() {
         let (base, mock) = mock_server().await;
         let client = client(&base, Some("secret-key"));
         let host = sample_host();
@@ -2251,12 +2403,6 @@ mod tests {
             ],
             "cpeName results are trusted as matched by NVD; keyword results add nothing new here"
         );
-        for advisory in &grounding.advisories {
-            assert_eq!(
-                advisory.record.verification_status,
-                VerificationStatus::UnverifiedHypothesis
-            );
-        }
         let by_id = |id: &str| grounding.advisories.iter().find(|a| a.id == id).unwrap();
         assert!(by_id("CVE-2021-23017").kev, "flagged by NVD itself");
         assert!(
@@ -2447,7 +2593,7 @@ mod tests {
             references: Vec::new(),
             fixed_in: fixed_in.map(Into::into),
             last_affected: last_affected.map(Into::into),
-            record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "x"),
+            record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "x"),
         }
     }
 
@@ -2461,13 +2607,11 @@ mod tests {
             matched("CVE-2026-5004", false, None, None),
         ];
         host.advisories[3].matched = "jquery@3.4.1 (npm)".into();
-        host.advisories[1].record.verification_status = VerificationStatus::FalsePositive;
         let plan = fix_plan(&host);
         assert_eq!(plan.len(), 2);
         assert_eq!(
             (plan[0].software.as_str(), plan[0].advisories, plan[0].kev),
-            ("nginx 1.18.0", 2, 1),
-            "the false positive is not counted"
+            ("nginx 1.18.0", 3, 1)
         );
         assert_eq!(
             plan[0].action,
@@ -2476,9 +2620,88 @@ mod tests {
         assert_eq!(plan[1].software, "jquery@3.4.1 (npm)");
         assert_eq!(plan[1].target, "its newest release");
 
+        assert_eq!(plan[0].counts(), "3 CVEs, 1 known exploited");
+        assert_eq!(plan[1].counts(), "1 CVE");
+
         // No release is named as fixed past the last affected one.
         host.advisories[2].last_affected = Some("1.21.0".into());
         assert_eq!(fix_plan(&host)[0].target, "a release newer than 1.21.0");
+    }
+
+    #[test]
+    fn what_to_update_follows_the_order_of_the_cve_groups() {
+        // nginx has more CVEs, but Jetty has the most urgent one: both
+        // lists put Jetty first.
+        let mut host = sample_host();
+        let jetty = Advisory {
+            matched: "keywordSearch=jetty 9.4.31".into(),
+            port: Some("8080/tcp".into()),
+            cvss: Some(9.8),
+            ..matched("CVE-2026-7001", true, Some("9.4.41"), None)
+        };
+        host.advisories = vec![
+            Advisory {
+                cvss: Some(7.7),
+                ..matched("CVE-2026-5001", true, Some("1.20.1"), None)
+            },
+            matched("CVE-2026-5002", false, Some("1.19.4"), None),
+            matched("CVE-2026-5003", false, None, None),
+            jetty,
+        ];
+        let groups: Vec<String> = by_software(&host)
+            .into_iter()
+            .map(|group| group.software)
+            .collect();
+        let plan: Vec<String> = fix_plan(&host)
+            .into_iter()
+            .map(|fix| fix.software)
+            .collect();
+        assert_eq!(groups, ["Jetty 9.4.31.v20200723 (extra)", "nginx 1.18.0"]);
+        assert_eq!(plan, groups);
+    }
+
+    #[test]
+    fn cves_are_grouped_by_software_and_known_exploited_come_first() {
+        let mut host = sample_host();
+        let scored = |id: &str, kev: bool, severity: Option<&str>, cvss: Option<f64>| Advisory {
+            severity: severity.map(Into::into),
+            cvss,
+            ..matched(id, kev, None, None)
+        };
+        host.advisories = vec![
+            scored("CVE-2026-6001", false, Some("CRITICAL"), Some(9.8)),
+            Advisory {
+                fixed_in: Some("1.20.1".into()),
+                ..scored("CVE-2021-23017", true, Some("HIGH"), Some(7.7))
+            },
+            scored("CVE-2026-6002", false, Some("MODERATE"), None),
+            Advisory {
+                matched: "jquery@3.4.1 (npm)".into(),
+                port: None,
+                ..scored("GHSA-0001", false, None, Some(4.2))
+            },
+        ];
+        let groups = by_software(&host);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].heading(),
+            "nginx 1.18.0 \u{b7} 80/tcp \u{b7} fixed in 1.20.1"
+        );
+        let ids: Vec<&str> = groups[0].cves.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["CVE-2021-23017", "CVE-2026-6001", "CVE-2026-6002"]);
+        assert_eq!(groups[0].kev(), 1);
+        assert_eq!(groups[1].heading(), "jquery@3.4.1 (npm)");
+
+        let labels: Vec<String> = groups[0].cves.iter().map(|a| severity_label(a)).collect();
+        assert_eq!(labels, ["High 7.7", "Critical 9.8", "Medium"]);
+        assert_eq!(severity_label(groups[1].cves[0]), "Medium 4.2");
+        assert_eq!(
+            severity_label(&matched("CVE-1", false, None, None)),
+            "unrated"
+        );
+        let serious: Vec<bool> = groups[0].cves.iter().map(|a| is_serious(a)).collect();
+        assert_eq!(serious, [true, true, false]);
+        assert!(!is_serious(groups[1].cves[0]));
     }
 
     #[test]
@@ -2488,9 +2711,6 @@ mod tests {
         for id in ["CVE-2026-5001", "CVE-2026-5002", "CVE-2026-5003"] {
             graph.add_advisory("10.0.0.5", matched(id, false, None, None));
         }
-        graph
-            .set_advisory_status("10.0.0.5", "CVE-2026-5002", VerificationStatus::Confirmed)
-            .unwrap();
         let mut grounding = Grounding {
             advisories: vec![
                 matched("CVE-2026-5001", false, Some("1.20.1"), None),
@@ -2512,16 +2732,12 @@ mod tests {
             Merged {
                 added: 1,
                 kev: 1,
-                dropped: 1
+                dropped: 2
             }
         );
         let host = &graph.hosts["10.0.0.5"];
         let ids: Vec<&str> = host.advisories.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["CVE-2026-5001", "CVE-2026-5002", "CVE-2026-5009"],
-            "the operator's confirmed finding stays; the unverified leftover goes"
-        );
+        assert_eq!(ids, ["CVE-2026-5001", "CVE-2026-5009"]);
         assert_eq!(
             host.advisories[0].fixed_in.as_deref(),
             Some("1.20.1"),

@@ -33,11 +33,10 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
 use crate::ai::{self, AiEngine, Tier};
-use crate::checklist;
 use crate::cve::{self, CveClient};
 use crate::db::Db;
 use crate::endpoint::Target;
-use crate::evidence::{Confidence, EvidenceRecord, Source, VerificationStatus};
+use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::geoip::{self, GeoDb};
 use crate::graph::{Graph, Host, LocalNet, Observation};
 use crate::location::Place;
@@ -171,12 +170,6 @@ pub enum Command {
         items: Vec<Observation>,
         /// Run CVE lookups for the affected hosts afterwards.
         ground: bool,
-    },
-    /// Operator verdict on an advisory.
-    Verdict {
-        address: String,
-        advisory: String,
-        status: VerificationStatus,
     },
     /// Queues an authorized asset and service inventory (`meow recon`).
     Recon {
@@ -433,7 +426,7 @@ impl State {
         self.cve.is_some()
     }
 
-    /// Runs CVE grounding for `address` immediately and merges hypotheses into the graph.
+    /// Runs CVE grounding for `address` immediately and adds the CVEs found to the graph.
     pub async fn ground_host(&self, address: &str) -> Option<(cve::Merged, usize, Vec<String>)> {
         let client = self.cve.as_ref()?;
         let host = self.graph().hosts.get(address).cloned()?;
@@ -473,14 +466,9 @@ impl State {
             let fix = first_fix
                 .map(|fix| format!(" Most come from one place: {}", fix.action))
                 .unwrap_or_default();
-            let noun = if merged.added == 1 {
-                "advisory"
-            } else {
-                "advisories"
-            };
+            let noun = if merged.added == 1 { "CVE" } else { "CVEs" };
             self.notice(format!(
-                "{} possible {noun} for {address} ({} known exploited), matched by version \
-                 number only and not verified.{fix}",
+                "{} new {noun} for {address} ({} known exploited), found by software version.{fix}",
                 merged.added, merged.kev
             ));
         }
@@ -529,25 +517,39 @@ impl State {
         let raw_target = lock(&self.target).clone();
         let budget = self.ai.budget();
 
-        let mut checklists = serde_json::Map::new();
-        for host in graph.hosts.values() {
-            let mut per_host = serde_json::Map::new();
-            for advisory in &host.advisories {
-                let list = checklist::for_advisory(&graph, host, advisory);
-                let items: Vec<Value> = list
-                    .items
+        // Each host's CVEs by the software and version they were found
+        // from, the most urgent first: the map lists them so.
+        let cves: serde_json::Map<String, Value> = graph
+            .hosts
+            .values()
+            .filter(|host| !host.advisories.is_empty())
+            .map(|host| {
+                let groups: Vec<Value> = cve::by_software(host)
                     .iter()
-                    .map(|c| json!({ "label": c.label, "done": c.done, "detail": c.detail, "required": c.required }))
+                    .map(|group| {
+                        json!({
+                            "software": group.software,
+                            "port": group.port,
+                            "fix": group.fix(),
+                            "kev": group.kev(),
+                            // Its distribution may have the fix under the
+                            // same version number.
+                            "note": cve::backport_note_for(host, group.port.as_deref()),
+                            "cves": group
+                                .cves
+                                .iter()
+                                .map(|a| json!({
+                                    "id": a.id,
+                                    "severity": cve::severity_label(a),
+                                    "serious": cve::is_serious(a),
+                                }))
+                                .collect::<Vec<_>>(),
+                        })
+                    })
                     .collect();
-                per_host.insert(
-                    advisory.id.clone(),
-                    json!({ "items": items, "research_ready": list.research_ready() }),
-                );
-            }
-            if !per_host.is_empty() {
-                checklists.insert(host.address.clone(), Value::Object(per_host));
-            }
-        }
+                (host.address.clone(), Value::Array(groups))
+            })
+            .collect();
         let fixes: serde_json::Map<String, Value> = graph
             .hosts
             .values()
@@ -580,7 +582,8 @@ impl State {
             "port": self.port,
             "revision": revision,
             "graph": shown,
-            "checklists": checklists,
+            "cves": cves,
+            "cve_lookups": self.cve.is_some(),
             "fixes": fixes,
             "topology": Topology::build(&graph).cytoscape_with_geo(&graph, Some(&self.geo)),
             "machine": observer::machine_report(&graph.local),
@@ -665,17 +668,6 @@ impl State {
                 Ok(
                     json!({ "parsed": total, "changed": changed, "hosts": hosts, "grounding": grounding }),
                 )
-            }
-            Command::Verdict {
-                address,
-                advisory,
-                status,
-            } => {
-                self.graph()
-                    .set_advisory_status(&address, &advisory, status)?;
-                self.mark_dirty();
-                self.notice(format!("{advisory} on {address} marked {status}"));
-                Ok(json!({ "status": status }))
             }
             Command::Recon { target, flags } => {
                 let mode = self.mode();
@@ -797,10 +789,9 @@ impl State {
                         .with_context(|| format!("unknown host '{address}'"))?;
                     (graph.clone(), host)
                 };
-                if tier == Tier::Research && !checklist::host_research_ready(&graph, &host) {
+                if tier == Tier::Research && host.advisories.is_empty() {
                     bail!(
-                        "[R] is not ready for {}: the stack and route evidence is incomplete \
-                         (see the verification checklist)",
+                        "[R] needs a CVE to research: none found for {} yet",
                         host.address
                     );
                 }
@@ -2617,6 +2608,24 @@ mod tests {
             Some(json!({ "cmd": "state" })),
         );
         assert_eq!(status, 200);
+
+        // A command meow does not know is refused: the verdict of 0.2.2
+        // among them.
+        for unknown in [
+            json!({ "cmd": "verdict", "address": "192.0.2.5", "advisory": "CVE-2021-23017",
+                    "status": "Confirmed" }),
+            json!({ "cmd": "no_such_command" }),
+        ] {
+            let (status, _) = request(
+                &info,
+                "POST",
+                "/api/command",
+                &[("Authorization", &auth)],
+                Some(unknown.clone()),
+            );
+            assert!((400..500).contains(&status), "{unknown}: {status}");
+            assert!(serde_json::from_value::<Command>(unknown).is_err());
+        }
     }
 
     #[test]
@@ -2769,14 +2778,13 @@ mod tests {
         // Errors from the coordinator come back as errors, not as "offline".
         let error = ipc::send(
             &fx.workspace,
-            &Command::Verdict {
+            &Command::Ai {
+                tier: Tier::Local,
                 address: "10.0.0.5".into(),
-                advisory: "CVE-0000-0000".into(),
-                status: VerificationStatus::Confirmed,
             },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("no advisory"), "{error:#}");
+        assert!(format!("{error:#}").contains("unknown host"), "{error:#}");
 
         let workspace = fx.workspace.clone();
         fx.coordinator.shutdown();
@@ -2793,7 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_observations_and_verdicts_reach_the_graph_file() {
+    fn imported_observations_and_cves_reach_the_map_and_the_graph_file() {
         let fx = fixture();
         let state = fx.coordinator.state();
         let items = crate::parsers::nmap::parse(crate::parsers::nmap::SAMPLE).unwrap();
@@ -2810,45 +2818,77 @@ mod tests {
         );
         assert!(result["changed"].as_u64().unwrap() > 5);
 
-        state.graph().add_advisory(
-            "10.0.0.5",
-            crate::graph::Advisory {
-                fixed_in: None,
-                last_affected: None,
-                id: "CVE-2021-23017".into(),
-                title: "t".into(),
-                severity: None,
-                cvss: None,
-                kev: false,
-                matched: "m".into(),
-                port: Some("443/tcp".into()),
-                references: vec![],
-                record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
-            },
-        );
-        // Observed -> Confirmed is impossible; a hypothesis can be confirmed.
-        assert!(state
-            .execute(Command::Verdict {
-                address: "10.0.0.5".into(),
-                advisory: "CVE-2021-23017".into(),
-                status: VerificationStatus::Observed,
-            })
-            .is_err());
+        let cve = |id: &str, kev: bool, cvss: f64, fixed_in: Option<&str>| crate::graph::Advisory {
+            fixed_in: fixed_in.map(Into::into),
+            last_affected: None,
+            id: id.into(),
+            title: format!("about {id}"),
+            severity: None,
+            cvss: Some(cvss),
+            kev,
+            matched: "cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*".into(),
+            port: Some("443/tcp".into()),
+            references: vec![],
+            record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
+        };
         state
-            .execute(Command::Verdict {
-                address: "10.0.0.5".into(),
-                advisory: "CVE-2021-23017".into(),
-                status: VerificationStatus::Confirmed,
-            })
-            .unwrap();
+            .graph()
+            .add_advisory("10.0.0.5", cve("CVE-2021-3618", false, 7.4, Some("1.21.0")));
+        state
+            .graph()
+            .add_advisory("10.0.0.5", cve("CVE-2021-23017", true, 7.7, Some("1.20.1")));
+        state
+            .graph()
+            .add_advisory("10.0.0.5", cve("CVE-2009-3896", false, 5.0, None));
 
+        // The map gets them by software and version, the most urgent first.
         let snapshot = state.snapshot();
-        let checklist = &snapshot["checklists"]["10.0.0.5"]["CVE-2021-23017"];
-        assert_eq!(checklist["items"].as_array().unwrap().len(), 6);
-        assert!(snapshot["notices"].as_array().unwrap().len() >= 2);
+        assert!(snapshot.get("checklists").is_none());
+        let groups = snapshot["cves"]["10.0.0.5"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["software"], "nginx 1.18.0");
+        assert_eq!(groups[0]["port"], "443/tcp");
+        assert_eq!(groups[0]["fix"], "fixed in 1.21.0");
+        assert_eq!(groups[0]["kev"], 1);
+        // The nginx banner names Ubuntu, which may have the fix already.
+        assert_eq!(
+            groups[0]["note"],
+            crate::osint::distro_backport_note("ubuntu").unwrap()
+        );
+        assert_eq!(snapshot["cve_lookups"], false);
+        let listed: Vec<(&str, &str, bool)> = groups[0]["cves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["id"].as_str().unwrap(),
+                    c["severity"].as_str().unwrap(),
+                    c["serious"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("CVE-2021-23017", "High 7.7", true),
+                ("CVE-2021-3618", "High 7.4", true),
+                ("CVE-2009-3896", "Medium 5.0", false),
+            ]
+        );
+        assert!(snapshot["cves"].get("10.0.0.9").is_none());
+        let node = snapshot["topology"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["data"]["id"] == "host:10.0.0.5")
+            .unwrap();
+        assert_eq!(node["data"]["cves"], 3);
+        assert_eq!(node["data"]["serious_cves"], 2);
+        assert_eq!(node["data"]["kev"], 1);
 
-        // Deserialized IPC Observations cannot smuggle Confirmed banners.
-        let forged_cmd: Command = serde_json::from_value(json!({
+        // Records sent over IPC by meow 0.2.2 still parse.
+        let old_cmd: Command = serde_json::from_value(json!({
             "cmd": "observations",
             "ground": false,
             "items": [{
@@ -2868,23 +2908,18 @@ mod tests {
             }]
         }))
         .unwrap();
-        state.execute(forged_cmd).unwrap();
+        state.execute(old_cmd).unwrap();
         assert_eq!(
             state.graph().hosts["192.0.2.44"].ports["8080/tcp"].facts[0]
                 .record
-                .verification_status,
-            VerificationStatus::Observed
+                .source,
+            Source::HttpHeader
         );
 
         let path = fx.workspace.graph_path();
         fx.coordinator.shutdown();
         let saved = Graph::load(&path).unwrap();
-        assert_eq!(
-            saved.hosts["10.0.0.5"].advisories[0]
-                .record
-                .verification_status,
-            VerificationStatus::Confirmed
-        );
+        assert_eq!(saved.hosts["10.0.0.5"].advisories.len(), 3);
     }
 
     #[test]
@@ -2923,10 +2958,6 @@ mod tests {
         assert_eq!(
             host.ports["22/tcp"].facts[0].record.source,
             Source::PtyRegex
-        );
-        assert_eq!(
-            host.ports["22/tcp"].facts[0].record.verification_status,
-            VerificationStatus::Observed
         );
     }
 
@@ -2983,10 +3014,10 @@ mod tests {
                 ground: false,
             })
             .unwrap();
-        // Deep research needs stack and route evidence first.
+        // Deep research needs a CVE to research, and nothing more.
         let refused = ask(Tier::Research, "10.0.0.5").unwrap_err().to_string();
         assert!(
-            refused.contains("[R] is not ready for 10.0.0.5"),
+            refused.contains("[R] needs a CVE to research: none found for 10.0.0.5"),
             "{refused}"
         );
 
@@ -3024,6 +3055,33 @@ mod tests {
         assert!(snapshot["notices"]
             .to_string()
             .contains("[L] for 10.0.0.5 answered by local"));
+
+        // With a CVE found, [R] starts. No key is set here, so it ends
+        // without asking anyone.
+        if std::env::var(crate::ai::API_KEY_ENV).is_err() {
+            state.graph().add_advisory(
+                "10.0.0.5",
+                crate::graph::Advisory {
+                    fixed_in: None,
+                    last_affected: None,
+                    id: "CVE-2021-23017".into(),
+                    title: "t".into(),
+                    severity: None,
+                    cvss: None,
+                    kev: false,
+                    matched: "cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*".into(),
+                    port: Some("443/tcp".into()),
+                    references: vec![],
+                    record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
+                },
+            );
+            assert_eq!(ask(Tier::Research, "10.0.0.5").unwrap()["started"], true);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while state.snapshot()["ai"]["running"] == true {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

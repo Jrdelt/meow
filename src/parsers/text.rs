@@ -401,14 +401,10 @@ version 1.2.3.4:5 is not an endpoint? it is treated as one
     }
 
     #[test]
-    fn nothing_is_ever_marked_beyond_observed() {
-        use crate::evidence::VerificationStatus;
+    fn every_observation_says_where_it_came_from() {
         for observation in TextParser::parse(Source::LogRegex, TERMINAL) {
             let json = serde_json::to_value(&observation).unwrap();
-            assert_eq!(
-                json["record"]["verification_status"],
-                serde_json::to_value(VerificationStatus::Observed).unwrap()
-            );
+            assert_eq!(json["record"]["source"], "log_regex");
         }
     }
 

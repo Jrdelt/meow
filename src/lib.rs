@@ -2,7 +2,6 @@
 
 pub mod ai;
 pub mod anthropic;
-pub mod checklist;
 pub mod cli;
 pub mod coordinator;
 pub mod cpe;

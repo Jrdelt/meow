@@ -21,8 +21,6 @@ use petgraph::graph::{Graph as PetGraph, NodeIndex};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::checklist;
-use crate::evidence::VerificationStatus;
 use crate::graph::{Graph, Host};
 use crate::observer::{
     has_routable_address, is_default_route, primary_address, routable_address, route_for,
@@ -960,12 +958,6 @@ impl Topology {
                     .strip_prefix("host:")
                     .and_then(|address| graph.hosts.get(address));
                 if let Some(host) = host {
-                    let open = |status: VerificationStatus| {
-                        host.advisories
-                            .iter()
-                            .filter(|a| a.record.verification_status == status)
-                            .count()
-                    };
                     data["address"] = json!(crate::evidence::sanitize(&host.address, 200));
                     data["headline"] =
                         json!(crate::evidence::sanitize(&host_headline(graph, host), 240));
@@ -987,10 +979,14 @@ impl Topology {
                         data["associated_hosts"] = json!(assoc_hosts);
                     }
                     data["open_ports"] = json!(host.open_ports().count());
-                    data["hypotheses"] = json!(open(VerificationStatus::UnverifiedHypothesis));
-                    data["confirmed"] = json!(open(VerificationStatus::Confirmed));
-                    data["kev"] = json!(host.advisories.iter().any(|a| a.kev));
-                    data["ready"] = json!(checklist::host_research_ready(graph, host));
+                    // CVEs, and how many are known exploited, critical or high.
+                    data["cves"] = json!(host.advisories.len());
+                    data["serious_cves"] = json!(host
+                        .advisories
+                        .iter()
+                        .filter(|a| crate::cve::is_serious(a))
+                        .count());
+                    data["kev"] = json!(host.advisories.iter().filter(|a| a.kev).count());
                     data["reachable"] = json!(self.reachable(&host.address));
                     // Known by name only: no address, so no route to derive.
                     data["by_name"] = json!(parse_host_ip(&host.address).is_none());
@@ -1351,7 +1347,7 @@ mod tests {
                 matched: "m".into(),
                 port: Some("80/tcp".into()),
                 references: vec![],
-                record: EvidenceRecord::hypothesis(Source::NvdApi, Confidence::Medium, "{}"),
+                record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
             },
         );
         graph
@@ -1481,10 +1477,9 @@ mod tests {
         assert_eq!(web["data"]["kind"], "host");
         assert_eq!(web["data"]["address"], "10.10.10.5");
         assert_eq!(web["data"]["open_ports"], 1);
-        assert_eq!(web["data"]["hypotheses"], 1);
-        assert_eq!(web["data"]["confirmed"], 0);
-        assert_eq!(web["data"]["kev"], true);
-        assert_eq!(web["data"]["ready"], true);
+        assert_eq!(web["data"]["cves"], 1);
+        assert_eq!(web["data"]["serious_cves"], 1);
+        assert_eq!(web["data"]["kev"], 1);
         assert_eq!(web["data"]["reachable"], true);
         assert_eq!(web["data"]["by_name"], false);
         let named = nodes

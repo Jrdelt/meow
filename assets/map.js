@@ -295,18 +295,14 @@
     // One line of status, like a finished lookup: what there is, what to do.
     var hostsMap = (state.graph && state.graph.hosts) || {};
     var hosts = Object.keys(hostsMap);
-    var confirmed = 0, open = 0;
+    var total = { total: 0, kev: 0 };
     hosts.forEach(function (key) {
-      var host = own(hostsMap, key);
-      if (!host) { return; }
-      (host.advisories || []).forEach(function (advisory) {
-        if (advisory.verification_status === 'Confirmed') { confirmed += 1; }
-        if (advisory.verification_status === 'UnverifiedHypothesis') { open += 1; }
-      });
+      var counts = cveCounts(key);
+      total.total += counts.total;
+      total.kev += counts.kev;
     });
     var parts = [hosts.length + (hosts.length === 1 ? ' host' : ' hosts')];
-    parts.push(open + ' to verify');
-    parts.push(confirmed + ' confirmed');
+    parts.push(cveWords(total) || 'no CVEs');
     byId('counts').textContent = parts.join(' · ');
     document.title = 'meow: ' + sessionName;
   }
@@ -319,10 +315,11 @@
   }
 
   // Turns the session's nodes and links into the illustration.
+  // Red: a CVE that is known exploited, critical or high. Yellow: other CVEs.
   function status(d) {
     if (!d || d.kind !== 'host') { return 'none'; }
-    if (d.confirmed) { return 'bad'; }
-    if (d.hypotheses) { return 'warn'; }
+    if (d.serious_cves) { return 'bad'; }
+    if (d.cves) { return 'warn'; }
     return 'ok';
   }
   var SEVERITY = { bad: 0, warn: 1, ok: 2, none: 3 };
@@ -399,7 +396,7 @@
       } else if (d.kind === 'egress' || d.kind === 'hop' || d.kind === 'waf' || d.kind === 'asn') {
         parts.push(d.label || id);
       } else if (d.kind === 'host') {
-        var dot = d.confirmed ? ' \ud83d\udd34' : (d.hypotheses ? ' \ud83d\udfe1' : (d.open_ports ? ' \ud83d\udfe2' : ''));
+        var dot = d.serious_cves ? ' \ud83d\udd34' : (d.cves ? ' \ud83d\udfe1' : (d.open_ports ? ' \ud83d\udfe2' : ''));
         var primary = (d.primary_hostname && d.primary_hostname !== d.address)
           ? (d.primary_hostname + ' (' + d.address + ')')
           : (d.address || d.label);
@@ -412,10 +409,7 @@
         }
         if (d.city) { sub.push(d.city); }
         if (sub.length) { parts.push(sub.join(' · ')); }
-        var counts = [];
-        if (d.confirmed) { counts.push(d.confirmed + ' confirmed'); }
-        if (d.hypotheses) { counts.push(d.hypotheses + ' to verify'); }
-        if (counts.length) { parts.push(counts.join(' · ')); }
+        if (d.cves) { parts.push(cveWords({ total: d.cves, kev: d.kev || 0 })); }
       } else if (d.kind === 'gateway') {
         parts.push('Gateway · ' + (d.label || id.replace(/^gw:/, '')));
       } else if (d.kind === 'interface') {
@@ -1072,7 +1066,7 @@
 
   function renderLegend() {
     var legend = byId('legend');
-    [['warn', 'to verify'], ['bad', 'confirmed']].forEach(function (key) {
+    [['warn', 'CVEs'], ['bad', 'critical, high or exploited']].forEach(function (key) {
       var item = legend.appendChild(el('span', 'item'));
       item.appendChild(el('span', 'glow ' + key[0]));
       item.appendChild(el('span', null, key[1]));
@@ -1199,7 +1193,7 @@
     }
     renderDetail();
     renderHosts();
-    renderAdvisory();
+    renderCves();
     renderWhere();
     renderAiPanel();
   }
@@ -1304,8 +1298,10 @@
         if (entry.label !== data.address) { facts.push(data.address); }
         facts.push(data.open_ports + (data.open_ports === 1 ? ' port' : ' ports'));
         var kind = 'ok';
-        if (data.hypotheses) { facts.push(data.hypotheses + ' to verify'); kind = 'warn'; }
-        if (data.confirmed) { facts.push(data.confirmed + ' confirmed'); kind = 'bad'; }
+        if (data.cves) {
+          facts.push(data.cves + (data.cves === 1 ? ' CVE' : ' CVEs'));
+          kind = data.serious_cves ? 'bad' : 'warn';
+        }
         var line = list.appendChild(row(name, marked(facts.join(' · '), kind)));
         if (data.id === selected) { line.className += ' current'; }
       });
@@ -1340,7 +1336,7 @@
   function renderSide() {
     renderMachine();
     renderHosts();
-    renderAdvisory();
+    renderCves();
 
     // The newest run of each target in full; earlier runs of the same
     // target (all kept in the workspace) fold away under it.
@@ -1412,77 +1408,134 @@
     return list;
   }
 
-  // One advisory: a line that unfolds into its checklist and the verdict.
-  function advisoryItem(address, advisory, kind, withHost) {
-    var item = fold('advisory:' + address + ':' + advisory.id, 'item', false);
+  // How many CVEs a host has, how many are known exploited, and how many
+  // are known exploited, critical or high (drawn red).
+  function cveCounts(address) {
+    var counts = { total: 0, kev: 0, serious: 0 };
+    (own(state.cves || {}, address) || []).forEach(function (group) {
+      counts.kev += group.kev || 0;
+      (group.cves || []).forEach(function (entry) {
+        counts.total += 1;
+        if (entry.serious) { counts.serious += 1; }
+      });
+    });
+    return counts;
+  }
+
+  // "3 CVEs (1 known exploited)"
+  function cveWords(counts) {
+    if (!counts.total) { return ''; }
+    return counts.total + (counts.total === 1 ? ' CVE' : ' CVEs') +
+      (counts.kev ? ' (' + counts.kev + ' known exploited)' : '');
+  }
+
+  // One CVE: its ID, rating and title on a line that unfolds into the
+  // release that fixes it.
+  function cveItem(address, advisory, entry, withHost) {
+    var kind = entry.serious ? 'bad' : 'warn';
+    var item = fold('cve:' + address + ':' + advisory.id, 'item', false);
     var summary = item.appendChild(el('summary'));
     summary.appendChild(mark(kind));
-    var text = summary.appendChild(el('span', 'what'));
-    var title = text.appendChild(el('span', 'title', advisory.id + '  ' + advisory.title));
+    var line = summary.appendChild(el('span', 'what'));
+    line.appendChild(el('span', 'cve-id', advisory.id));
+    line.appendChild(el('span', 'sev ' + kind + '-text', entry.severity || 'unrated'));
+    if (advisory.kev) { line.appendChild(el('span', 'kev', 'known exploited')); }
+    var title = line.appendChild(el('span', 'title', advisory.title));
     title.title = advisory.title;
-    var where = [];
-    if (withHost) { where.push(address); }
-    if (advisory.port) { where.push(advisory.port); }
-    if (advisory.severity) { where.push(advisory.severity + (advisory.cvss ? ' ' + advisory.cvss : '')); }
-    if (advisory.kev) { where.push('in the CISA known-exploited catalog'); }
-    if (advisory.fixed_in) { where.push('fixed in ' + advisory.fixed_in); }
-    else if (advisory.last_affected) { where.push('affected up to ' + advisory.last_affected); }
-    where.push(advisory.matched);
-    text.appendChild(el('span', 'dim', where.join(' · ')));
-
-    var status = advisory.verification_status;
-    var checks = own(own(state.checklists, address), advisory.id) || {};
-    (checks.items || []).forEach(function (check) {
-      var label = el('span', 'label', check.label);
-      item.appendChild(row(label, marked(check.detail, check.done ? 'ok' : 'warn')));
-    });
-    if (checks.research_ready && status === 'UnverifiedHypothesis') {
-      item.appendChild(el('div', 'badge ok', '[R] Deep Research Ready'));
+    if (advisory.fixed_in) {
+      item.appendChild(row('Fixed in', advisory.fixed_in));
+    } else if (advisory.last_affected) {
+      item.appendChild(row('Affected up to', advisory.last_affected));
     }
-    var actions = item.appendChild(el('div', 'actions'));
-    function verdict(label, value) {
-      var button = actions.appendChild(el('button', null, label));
-      button.addEventListener('click', function () {
-        send({ cmd: 'verdict', address: address, advisory: advisory.id, status: value });
-      });
+    // The group heading names the software and version; a match on the
+    // name alone is less sure, so it is said.
+    var words = /^keywordSearch=(.*)$/.exec(String(advisory.matched || ''));
+    if (words) { item.appendChild(row('Matched on', 'name search: ' + words[1])); }
+    if (withHost) {
+      var look = item.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Show host'));
+      look.addEventListener('click', function () { select('host:' + address); });
     }
-    if (status === 'UnverifiedHypothesis') {
-      verdict('Confirm', 'Confirmed');
-      verdict('False positive', 'FalsePositive');
-    } else {
-      verdict('Reopen', 'UnverifiedHypothesis');
-    }
-    var look = actions.appendChild(el('button', null, 'Show host'));
-    look.addEventListener('click', function () { select('host:' + address); });
     return item;
   }
 
-  // The Advisory card: everything that needs a decision, most urgent first.
-  // For the selected host, or for every host when none is selected.
-  function renderAdvisory() {
-    var box = clear(byId('advisory'));
+  // The CVEs found from one piece of software: "nginx 1.18.0 · 443/tcp ·
+  // fixed in 1.20.1", then each CVE, the most urgent first. At most
+  // `budget.left` of them: the rest are counted.
+  function cveGroup(address, host, group, open, withHost, budget) {
+    var entries = group.cves || [];
+    var serious = entries.some(function (entry) { return entry.serious; });
+    var key = 'cves:' + address + ':' + group.software + ':' + (group.port || '');
+    var section = fold(key, 'group ' + (serious ? 'bad' : 'warn'), open);
+    var summary = section.appendChild(el('summary'));
+    var parts = [group.software];
+    if (group.port) { parts.push(group.port); }
+    if (group.fix) { parts.push(group.fix); }
+    summary.appendChild(el('span', 'name', parts.join(' · ')));
+    summary.appendChild(el('span', 'dim', ' ' + cveWords({ total: entries.length, kev: group.kev || 0 })));
+    // Said once on the host's own list, not again for each host of the overview.
+    if (group.note && !withHost) { section.appendChild(el('p', 'note', group.note.replace(/`/g, '') + '.')); }
+    var known = table();
+    (host.advisories || []).forEach(function (advisory) { known[advisory.id] = advisory; });
+    var shown = entries.slice(0, Math.max(0, budget.left));
+    budget.left -= shown.length;
+    shown.forEach(function (entry) {
+      var advisory = own(known, entry.id);
+      if (advisory) { section.appendChild(cveItem(address, advisory, entry, withHost)); }
+    });
+    if (entries.length > shown.length) {
+      section.appendChild(el('p', 'note', '+' + (entries.length - shown.length) +
+        (withHost ? ' more: select the host to see them' : ' more in the report')));
+    }
+    return section;
+  }
+
+  // How much the CVEs card draws: every state push rebuilds it.
+  var CVES_PER_HOST = 200;
+  var CVES_IN_OVERVIEW = 80;
+  var HOSTS_IN_OVERVIEW = 20;
+  var FIXES_IN_OVERVIEW = 20;
+
+  // Whether CVEs could be looked up for a host: a version seen on a port.
+  function hasVersions(host) {
+    return Object.keys((host && host.ports) || {}).some(function (key) {
+      var port = own(host.ports, key);
+      return port && port.state === 'open' &&
+        ((port.product && port.version) || (port.cpes || []).length > 0);
+    });
+  }
+
+  // The CVEs card: what to update first, then the CVEs of each host by
+  // the software and version they were found from. For the selected host,
+  // or for every host when none is selected.
+  function renderCves() {
+    var box = clear(byId('cves'));
     var selData = selectedNodeData();
     var only = selData && selData.address ? selData.address : null;
-    byId('advisory-title').textContent = only ? 'Advisory for ' + only : 'Advisory';
-    var groups = [
-      { name: 'Confirmed', kind: 'bad', open: true, items: [] },
-      { name: 'Known exploited, to verify', kind: 'issue', open: true, items: [] },
-      { name: 'To verify', kind: 'warn', open: false, items: [] },
-      { name: 'Informational', kind: 'info', open: false, items: [] },
-      { name: 'False positives', kind: 'ok', open: false, items: [] }
-    ];
+    byId('cves-title').textContent = only ? 'CVEs for ' + only : 'CVEs';
     // What to do comes first: one line per piece of software, since one
-    // update usually answers every advisory matched on it.
+    // update usually fixes every CVE found from it.
+    var hostsMap = (state.graph && state.graph.hosts) || {};
+    var byHost = state.cves || {};
+    var addresses = Object.keys(byHost).filter(function (address) {
+      return (!only || address === only) && own(hostsMap, address);
+    });
+    // The host with the most known exploited, then the most serious, CVEs first.
+    addresses.sort(function (a, b) {
+      var ca = cveCounts(a), cb = cveCounts(b);
+      return (cb.kev - ca.kev) || (cb.serious - ca.serious) || (cb.total - ca.total) || (a < b ? -1 : a > b ? 1 : 0);
+    });
     var fixes = state.fixes || {};
     var mine = table();
     ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
       (iface.addresses || []).forEach(function (cidr) { mine[cidr.split('/')[0]] = true; });
     });
+    // In the order of the CVEs below it.
     var plan = [];
-    Object.keys(fixes).forEach(function (address) {
-      if (only && address !== only) { return; }
+    addresses.forEach(function (address) {
       (own(fixes, address) || []).forEach(function (fix) { plan.push({ address: address, fix: fix }); });
     });
+    var planLeft = only ? 0 : Math.max(0, plan.length - FIXES_IN_OVERVIEW);
+    if (planLeft) { plan = plan.slice(0, FIXES_IN_OVERVIEW); }
     if (plan.length) {
       var todo = box.appendChild(el('div', 'todo'));
       todo.appendChild(el('h3', null, 'What to update'));
@@ -1491,63 +1544,48 @@
         var fix = entry.fix;
         var here = !!mine[entry.address];
         elsewhere = elsewhere || !here;
-        var count = fix.advisories + (fix.advisories === 1 ? ' advisory' : ' advisories') +
-          (fix.kev ? ', ' + fix.kev + ' known exploited' : '');
         var line = todo.appendChild(el('div', 'fix'));
         line.appendChild(el('div', null, fix.action));
         line.appendChild(el('div', 'dim', 'On ' + entry.address + (here ? ' (this machine)' : ' (another machine, not this one)') +
-          ' · answers ' + count));
+          ' · fixes ' + cveWords({ total: fix.advisories, kev: fix.kev })));
       });
-      todo.appendChild(hint(el('p', 'note', 'Matched by version only, not proof. Rescan after updating.'),
+      if (planLeft) { todo.appendChild(el('p', 'note', '+' + planLeft + ' more: select a host to see its own')); }
+      todo.appendChild(hint(el('p', 'note', 'Found by version number. Rescan after updating.'),
         (elsewhere ? 'An update has to be made on the machine named, by whoever looks after it. ' : '') +
         'A system that takes security updates from its vendor often has the fix under the same version number.'));
     }
-    var hostsMap = (state.graph && state.graph.hosts) || {};
-    Object.keys(hostsMap).forEach(function (address) {
-      if (only && address !== only) { return; }
+    // Every host's CVEs would be thousands of rows on a large network:
+    // the overview shows the first ones, a selected host its own.
+    var budget = { left: only ? CVES_PER_HOST : CVES_IN_OVERVIEW };
+    var hostsLeft = only ? 0 : Math.max(0, addresses.length - HOSTS_IN_OVERVIEW);
+    addresses.slice(0, only ? 1 : HOSTS_IN_OVERVIEW).forEach(function (address) {
       var host = own(hostsMap, address);
-      if (!host) { return; }
-      // Known-exploited first, then by severity score.
-      var ordered = (host.advisories || []).slice().sort(function (a, b) {
-        return (b.kev ? 1 : 0) - (a.kev ? 1 : 0) || (b.cvss || 0) - (a.cvss || 0);
-      });
-      ordered.forEach(function (advisory) {
-        var status = advisory.verification_status;
-        var group = status === 'Confirmed' ? 0 : (status === 'FalsePositive' ? 4 : (advisory.kev ? 1 : 2));
-        groups[group].items.push({ address: address, advisory: advisory });
+      if (!only) {
+        var head = box.appendChild(el('h3', 'cve-host'));
+        var names = host.hostnames || [];
+        var link = head.appendChild(el('button', 'link', names.length ? names[0] + ' (' + address + ')' : address));
+        link.type = 'button';
+        link.addEventListener('click', function () { select('host:' + address); });
+        head.appendChild(el('span', 'dim', ' ' + cveWords(cveCounts(address))));
+      }
+      (own(byHost, address) || []).forEach(function (group, index) {
+        var serious = (group.cves || []).some(function (entry) { return entry.serious; });
+        box.appendChild(cveGroup(address, host, group, (index === 0 || serious) && budget.left > 0, !only, budget));
       });
     });
-    var localNet = (state.graph && state.graph.local) || {};
-    var notes = (localNet.warnings || []).concat(localNet.notes || []);
-    var shown = 0;
-    groups.forEach(function (group) {
-      var count = group.name === 'Informational' ? notes.length : group.items.length;
-      if (!count) { return; }
-      // The most urgent group that has anything in it starts unfolded.
-      var open = group.open || shown === 0;
-      shown += count;
-      var section = box.appendChild(fold('group:' + group.name, 'group ' + group.kind, open));
-      var summary = section.appendChild(el('summary'));
-      summary.appendChild(el('span', 'name', group.name));
-      summary.appendChild(el('span', 'dim', ' (' + count + ')'));
-      if (group.name === 'Informational') {
-        notes.forEach(function (text) {
-          var line = section.appendChild(el('div', 'plain'));
-          line.appendChild(mark('info'));
-          line.appendChild(el('span', null, text));
-        });
-        return;
+    if (hostsLeft) {
+      box.appendChild(el('p', 'note', '+' + hostsLeft + (hostsLeft === 1 ? ' more host' : ' more hosts') +
+        ' with CVEs: select one to see them, or see the report'));
+    }
+    if (!addresses.length) {
+      var empty = only ? 'No CVEs found for this host.' : 'No CVEs found yet.';
+      if (state.cve_lookups === false) {
+        empty = 'CVE lookups are off.';
+      } else if (only && !hasVersions(own(hostsMap, only))) {
+        empty = 'No software version seen yet.';
       }
-      group.items.slice(0, 80).forEach(function (entry) {
-        section.appendChild(advisoryItem(entry.address, entry.advisory, group.kind === 'issue' ? 'bad' : group.kind, !only));
-      });
-      if (group.items.length > 80) {
-        section.appendChild(el('p', 'note', '+' + (group.items.length - 80) + ' more in the report'));
-      }
-    });
-    if (!shown) {
-      box.appendChild(hint(el('p', 'note', only ? 'No matches for this host.' : 'Nothing to decide yet.'),
-        'Software that matches a known vulnerability appears here as a hypothesis to verify.'));
+      box.appendChild(hint(el('p', 'note', empty),
+        'CVEs are looked up from the software and version seen on each port.'));
     }
   }
 
@@ -1781,17 +1819,13 @@
     });
 
     var ai = card('Ask AI');
-    var lists = own(state.checklists, host.address) || {};
-    var ready = Object.keys(lists).some(function (id) {
-      var list = own(lists, id);
-      return !!(list && list.research_ready);
-    });
+    var hasCves = (host.advisories || []).length > 0;
     var ask = ai.appendChild(el('div', 'actions'));
     [['local', '[L] Local'], ['cloud', '[C] Cloud triage'], ['research', '[R] Deep research']].forEach(function (tier) {
       var button = ask.appendChild(el('button', null, tier[1]));
-      if (tier[0] === 'research' && !ready) {
+      if (tier[0] === 'research' && !hasCves) {
         button.disabled = true;
-        button.title = 'Needs stack and route evidence first (see the checklist).';
+        button.title = 'No CVEs found for this host yet.';
       }
       button.addEventListener('click', function () {
         pendingAiScroll = true;
@@ -1807,20 +1841,6 @@
         '[C] answers with the local model and [R] is unavailable until a key is added. ' +
         'It applies to this session at once.'));
     }
-
-    var evidence = card('Evidence');
-    var facts = (host.facts || []).slice();
-    Object.keys(hostPorts).forEach(function (key) {
-      var port = own(hostPorts, key);
-      if (!port) { return; }
-      (port.facts || []).forEach(function (fact) { facts.push(fact); });
-    });
-    facts.forEach(function (fact) {
-      var line = evidence.appendChild(el('div', 'fact'));
-      line.appendChild(el('div', null, fact.claim));
-      line.appendChild(el('div', 'dim', fact.source + ' · ' + fact.confidence + ' · ' + fact.verification_status));
-    });
-    if (!facts.length) { evidence.appendChild(el('p', 'note', 'Nothing recorded yet.')); }
 
     var note = card('Add a note');
     var box = note.appendChild(el('textarea'));
@@ -1844,14 +1864,14 @@
       }
     });
     return { status: statusCard(host), ports: ports, web: web.childNodes.length > 1 ? web : null,
-      ai: ai, evidence: evidence, note: note, facts: facts };
+      ai: ai, note: note };
   }
 
-  // The selected host's cards sit in tabs under its name. The Advisory
-  // card and the AI answer move into their tab while that host is selected,
+  // The selected host's cards sit in tabs under its name. The CVEs card
+  // and the AI answer move into their tab while that host is selected,
   // and back to their own place on the page otherwise.
   var HOST_TABS = [['overview', 'Overview'], ['ports', 'Ports'], ['web', 'Web & TLS'], ['dns', 'DNS & Mail'],
-    ['advisories', 'Advisories'], ['evidence', 'Evidence'], ['notes', 'Notes & AI']];
+    ['cves', 'CVEs'], ['notes', 'Notes & AI']];
 
   // A to F: green, amber or red.
   function gradeKind(grade) {
@@ -1894,7 +1914,7 @@
   var hostTab = 'overview';
   try { hostTab = sessionStorage.getItem('meow-map-tab') || 'overview'; } catch (_) {}
   var movable = table();
-  ['card-advisory', 'card-ai'].forEach(function (id) {
+  ['card-cves', 'card-ai'].forEach(function (id) {
     var node = byId(id);
     var home = document.createComment(' ' + id + ' ');
     node.parentNode.insertBefore(home, node);
@@ -1910,20 +1930,8 @@
     });
   }
 
-  function advisoryCounts(host) {
-    var counts = { confirmed: 0, open: 0, kev: 0 };
-    (host.advisories || []).forEach(function (advisory) {
-      var status = advisory.verification_status;
-      if (status === 'Confirmed') { counts.confirmed += 1; return; }
-      if (status === 'FalsePositive') { return; }
-      counts.open += 1;
-      if (advisory.kev) { counts.kev += 1; }
-    });
-    return counts;
-  }
-
   // Overview: one line per tab, each a link to it.
-  function glanceCard(host, made, adv) {
+  function glanceCard(host, made, cves) {
     var box = card('At a Glance');
     box.className += ' glance';
     function go(key, text, kind) {
@@ -1944,11 +1952,8 @@
     }).join(', ') + (open.length > 10 ? ', +' + (open.length - 10) + ' more' : '');
     box.appendChild(row('Open ports', go('ports', open.length ? list : 'none seen yet')));
 
-    var words = [];
-    if (adv.confirmed) { words.push(adv.confirmed + ' confirmed'); }
-    if (adv.open) { words.push(adv.open + ' to verify' + (adv.kev ? ' (' + adv.kev + ' known exploited)' : '')); }
-    box.appendChild(row('Advisories', go('advisories', words.join(' \u00b7 ') || 'none matched',
-      adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : 'ok')));
+    box.appendChild(row('CVEs', go('cves', cveWords(cves) || 'none found',
+      cves.serious ? 'bad' : cves.total ? 'warn' : 'ok')));
     if (made.web) {
       // One short phrase per kind of problem, with the ports it was seen on.
       var oldTls = [], weak = [], missing = [], edges = [], oldLibs = [], keyCount = 0, worstGrade = '';
@@ -1987,14 +1992,6 @@
       box.appendChild(hint(row('DNS & Mail', go('dns', 'grade ' + (dnsInfo.grade || '?') +
         (weak.length ? ' \u00b7 ' + weak.length + ' to fix' : ''), gradeKind(dnsInfo.grade))), weak.join(', ')));
     }
-    var newest = '';
-    made.facts.forEach(function (fact) {
-      var at = String((fact.record || fact).timestamp_utc || '');
-      if (at > newest) { newest = at; }
-    });
-    var count = made.facts.length;
-    box.appendChild(row('Evidence', go('evidence', count + (count === 1 ? ' fact' : ' facts') +
-      (newest ? ', newest ' + sinceText(newest) : ''))));
     return box;
   }
 
@@ -2023,7 +2020,7 @@
 
   function buildHostTabs(host, data, refocus) {
     var made = hostCards(host, data);
-    var adv = advisoryCounts(host);
+    var cves = cveCounts(host.address);
     var reply = state.ai || {};
     var aiHere = reply.address === host.address && !!(reply.running || reply.text || reply.error);
     var openPorts = Object.keys(host.ports || {}).filter(function (key) {
@@ -2031,12 +2028,11 @@
       return port && port.state === 'open';
     }).length;
     var content = {
-      overview: [made.status, glanceCard(host, made, adv)],
+      overview: [made.status, glanceCard(host, made, cves)],
       ports: [made.ports],
       web: made.web ? [made.web] : null,
       dns: host.dns_security ? [dnsCard(host.dns_security)] : null,
-      advisories: [movable['card-advisory'].node],
-      evidence: [made.evidence],
+      cves: [movable['card-cves'].node],
       notes: aiHere ? [made.ai, made.note, movable['card-ai'].node] : [made.ai, made.note]
     };
     var badge = {
@@ -2044,8 +2040,7 @@
       web: exposedKeys(host) ? [exposedKeys(host) + (exposedKeys(host) === 1 ? ' key' : ' keys'), 'bad'] : null,
       dns: host.dns_security ? [host.dns_security.grade || '?',
         { ok: '', warn: 'warn', bad: 'bad', info: '' }[gradeKind(host.dns_security.grade)]] : null,
-      advisories: [String(adv.confirmed + adv.open), adv.confirmed || adv.kev ? 'bad' : adv.open ? 'warn' : ''],
-      evidence: [String(made.facts.length), ''],
+      cves: cves.total ? [String(cves.total), cves.serious ? 'bad' : 'warn'] : null,
       notes: aiHere ? [reply.running ? 'AI\u2026' : 'AI', reply.error ? 'bad' : 'info'] : null
     };
     var names = associatedNamesFor(host, data);
@@ -2077,7 +2072,7 @@
     showTab(hostTab, refocus, true);
   }
 
-  // Arrow keys, Home and End move between tabs; 1 to 7 open one directly.
+  // Arrow keys, Home and End move between tabs; 1 to 6 open one directly.
   byId('host-tabs').addEventListener('keydown', function (event) {
     var tabs = Array.prototype.slice.call(this.querySelectorAll('[role="tab"]'));
     var at = tabs.indexOf(document.activeElement);

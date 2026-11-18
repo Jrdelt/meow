@@ -1,10 +1,9 @@
 //! `meow report`: compiles the workspace into `REPORT.md`.
 //!
 //! No AI and no network are involved: the report is assembled from
-//! `graph.json`, `state.db`, `replay.sh` and `chats/*.md`. Evidence and
-//! conclusions stay apart: only advisories the operator marked `Confirmed`
-//! are listed as findings; everything matched automatically is listed as an
-//! unverified hypothesis.
+//! `graph.json`, `state.db`, `replay.sh` and `chats/*.md`. The CVEs found
+//! on each host are listed by the software and version they were found
+//! from.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -12,10 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use crate::checklist;
 use crate::cve;
 use crate::db::Db;
-use crate::evidence::{inert_markdown, Source, VerificationStatus};
+use crate::evidence::{inert_markdown, Source};
 use crate::graph::{Advisory, DnsSecurity, Fact, Graph, Host, HttpInfo};
 use crate::mode::Mode;
 use crate::queue::{self, TaskRow};
@@ -350,44 +348,49 @@ fn render_chat_markdown(out: &mut String, text: &str) {
     }
 }
 
-fn status_of(advisory: &Advisory) -> VerificationStatus {
-    advisory.record.verification_status
-}
-
-fn advisories_with(graph: &Graph, status: VerificationStatus) -> Vec<(&Host, &Advisory)> {
-    let mut found: Vec<(&Host, &Advisory)> = graph
-        .hosts
-        .values()
-        .flat_map(|host| host.advisories.iter().map(move |advisory| (host, advisory)))
-        .filter(|(_, advisory)| status_of(advisory) == status)
-        .collect();
-    // Known-exploited first, then by severity score.
-    found.sort_by(|a, b| {
-        let rank =
-            |advisory: &Advisory| (!advisory.kev, -(advisory.cvss.unwrap_or(0.0) * 10.0) as i64);
-        rank(a.1)
-            .cmp(&rank(b.1))
-            .then(a.0.address.cmp(&b.0.address))
-    });
-    found
-}
-
-fn severity(advisory: &Advisory) -> String {
-    match (&advisory.severity, advisory.cvss) {
-        (Some(severity), Some(score)) => format!("{severity} {score:.1}"),
-        (Some(severity), None) => severity.clone(),
-        (None, Some(score)) => format!("{score:.1}"),
+/// The release that fixes one CVE: `1.20.1`, `newer than 1.19.9`, or `-`.
+fn fixed_cell(advisory: &Advisory) -> String {
+    match (&advisory.fixed_in, &advisory.last_affected) {
+        (Some(fixed), _) => md(fixed),
+        (None, Some(last)) => format!("newer than {}", md(last)),
         (None, None) => "-".to_owned(),
+    }
+}
+
+/// One host's CVEs, by the software and version they were found from.
+fn render_cves(out: &mut String, host: &Host) {
+    let _ = writeln!(out, "### {}\n", md(&host.label()));
+    for group in cve::by_software(host) {
+        let _ = writeln!(out, "#### {}\n", md(&group.heading()));
+        // One of meow's own sentences, not scanned text: its commands stay
+        // code spans.
+        if let Some(note) = cve::backport_note_for(host, group.port.as_deref()) {
+            let _ = writeln!(out, "{note}.\n");
+        }
+        out.push_str(
+            "| CVE | Severity | Known exploited | Fixed in | Summary |\n|---|---|---|---|---|\n",
+        );
+        for advisory in &group.cves {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                md_cell(&advisory.id),
+                md_cell(&cve::severity_label(advisory)),
+                if advisory.kev { "yes" } else { "-" },
+                fixed_cell(advisory),
+                md_cell(&advisory.title)
+            );
+        }
+        out.push('\n');
     }
 }
 
 fn fact_line(fact: &Fact) -> String {
     format!(
-        "- {} _({}, {:?}, {}, {})_",
+        "- {} _({}, {:?}, {})_",
         md(&fact.claim),
         fact.record.source.as_str(),
         fact.record.confidence,
-        fact.record.verification_status,
         md(&fact.record.timestamp_utc)
     )
 }
@@ -720,7 +723,7 @@ fn render_host(out: &mut String, host: &Host) {
         .into_iter()
         .partition(|f| f.record.source == Source::ManualNote);
     if !observed.is_empty() {
-        out.push_str("Observed evidence:\n\n");
+        out.push_str("Observations:\n\n");
         for fact in observed.iter().take(MAX_FACTS_PER_HOST) {
             let _ = writeln!(out, "{}", fact_line(fact));
         }
@@ -750,9 +753,12 @@ fn render_host(out: &mut String, host: &Host) {
 /// Renders the report. Pure: the same inputs give the same text.
 pub fn render(inputs: &Inputs) -> String {
     let graph = &inputs.graph;
-    let confirmed = advisories_with(graph, VerificationStatus::Confirmed);
-    let hypotheses = advisories_with(graph, VerificationStatus::UnverifiedHypothesis);
-    let dismissed = advisories_with(graph, VerificationStatus::FalsePositive);
+    let kev = graph
+        .hosts
+        .values()
+        .flat_map(|host| &host.advisories)
+        .filter(|advisory| advisory.kev)
+        .count();
     let mut out = String::new();
 
     let _ = writeln!(out, "# Audit report: {}\n", md(&inputs.session));
@@ -765,12 +771,10 @@ pub fn render(inputs: &Inputs) -> String {
     );
     let _ = writeln!(
         out,
-        "| Hosts | Confirmed findings | Unverified hypotheses | False positives | Secrets to rotate |\n\
-         |---|---|---|---|---|\n| {} | {} | {} | {} | {} |\n",
+        "| Hosts | CVEs | Known exploited | Secrets to rotate |\n\
+         |---|---|---|---|\n| {} | {} | {kev} | {} |\n",
         graph.hosts.len(),
-        confirmed.len(),
-        hypotheses.len(),
-        dismissed.len(),
+        graph.advisory_count(),
         inputs.secrets.len()
     );
     out.push_str(
@@ -789,8 +793,8 @@ pub fn render(inputs: &Inputs) -> String {
         out.push('\n');
     }
 
-    // What to do, before the lists of what was matched: one update per
-    // piece of software usually answers every advisory matched on it.
+    // What to do, before the lists of what was found: one update per
+    // piece of software usually fixes every CVE found from it.
     let fixes: Vec<(&Host, cve::FixItem)> = graph
         .hosts
         .values()
@@ -799,105 +803,41 @@ pub fn render(inputs: &Inputs) -> String {
     if !fixes.is_empty() {
         out.push_str("## What to update\n\n");
         out.push_str(
-            "One line per piece of software. The advisories behind each line were matched by \
-             version number only; a system that takes security updates from its vendor may \
-             already carry the fix under the same version number.\n\n",
+            "One line per piece of software. CVEs are found by version number: a system that \
+             takes security updates from its vendor may already have the fix under the same \
+             version number.\n\n",
         );
         for (host, fix) in &fixes {
-            let known = if fix.kev > 0 {
-                format!(", {} known exploited", fix.kev)
-            } else {
-                String::new()
-            };
             let _ = writeln!(
                 out,
-                "- {}: {} (answers {}{known})",
+                "- {}: {} ({})",
                 md(&host.label()),
                 md(&fix.action),
-                fix.advisories
+                fix.counts()
             );
         }
         out.push('\n');
     }
 
-    out.push_str("## Confirmed findings\n\n");
-    if confirmed.is_empty() {
-        out.push_str("None. No hypothesis has been confirmed by the operator yet.\n\n");
+    out.push_str("## CVEs\n\n");
+    // The host with the most urgent CVE first.
+    let mut affected: Vec<(&Host, &Advisory)> = graph
+        .hosts
+        .values()
+        .filter_map(|host| {
+            let worst = host
+                .advisories
+                .iter()
+                .min_by(|a, b| cve::cmp_urgency(a, b))?;
+            Some((host, worst))
+        })
+        .collect();
+    if affected.is_empty() {
+        out.push_str("None found.\n\n");
     }
-    for (host, advisory) in &confirmed {
-        let _ = writeln!(out, "### {} on {}\n", md(&advisory.id), md(&host.label()));
-        // Fixed words first: a title cannot start the line as a list
-        // item, a quote or a heading of its own.
-        let _ = writeln!(out, "Summary: {}\n", md(&advisory.title));
-        let _ = writeln!(out, "- Severity: {}", md(&severity(advisory)));
-        if advisory.kev {
-            out.push_str("- Listed in the CISA Known Exploited Vulnerabilities catalog\n");
-        }
-        let _ = writeln!(
-            out,
-            "- Port: {}",
-            md(advisory.port.as_deref().unwrap_or("-"))
-        );
-        let _ = writeln!(out, "- Matched on: {}", code(&advisory.matched));
-        if let Some(fixed) = &advisory.fixed_in {
-            let _ = writeln!(out, "- Fixed in: {}", md(fixed));
-        } else if let Some(last) = &advisory.last_affected {
-            let _ = writeln!(out, "- Affected up to: {}", md(last));
-        }
-        let _ = writeln!(
-            out,
-            "- Source: {} ({:?} confidence), matched {}",
-            advisory.record.source.as_str(),
-            advisory.record.confidence,
-            md(&advisory.record.timestamp_utc)
-        );
-        let _ = writeln!(out, "- Evidence: {}", code(&advisory.record.evidence));
-        for reference in &advisory.references {
-            let _ = writeln!(out, "- Reference: {}", md(reference));
-        }
-        out.push('\n');
-    }
-
-    out.push_str("## Unverified hypotheses\n\n");
-    if hypotheses.is_empty() {
-        out.push_str("None.\n\n");
-    } else {
-        out.push_str(
-            "Matched automatically from vulnerability databases. Each needs verification before it \
-             counts as a finding.\n\n\
-             | Host | Advisory | Severity | KEV | Port | Checklist | Deep research ready | Summary |\n\
-             |---|---|---|---|---|---|---|---|\n",
-        );
-        for (host, advisory) in &hypotheses {
-            let list = checklist::for_advisory(graph, host, advisory);
-            let (done, total) = list.progress();
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} | {} | {} | {done}/{total} | {} | {} |",
-                md(&host.address),
-                md(&advisory.id),
-                md(&severity(advisory)),
-                if advisory.kev { "yes" } else { "-" },
-                md(advisory.port.as_deref().unwrap_or("-")),
-                if list.research_ready() { "yes" } else { "no" },
-                md(&advisory.title)
-            );
-        }
-        out.push('\n');
-    }
-
-    if !dismissed.is_empty() {
-        out.push_str("## Dismissed as false positives\n\n");
-        for (host, advisory) in &dismissed {
-            let _ = writeln!(
-                out,
-                "- {} on {}: {}",
-                md(&advisory.id),
-                md(&host.address),
-                md(&advisory.title)
-            );
-        }
-        out.push('\n');
+    affected.sort_by(|a, b| cve::cmp_urgency(a.1, b.1).then(a.0.address.cmp(&b.0.address)));
+    for (host, _) in affected {
+        render_cves(&mut out, host);
     }
 
     out.push_str("## Hosts\n\n");
@@ -1015,9 +955,9 @@ pub fn render(inputs: &Inputs) -> String {
     out
 }
 
-/// Renders a single-host engagement report containing that host's Evidence,
-/// confirmed Advisories, unverified hypotheses, operator notes, the keys
-/// found in its scripts, and AI remediation chat (`chats/<address>.md`).
+/// Renders a single-host engagement report containing that host's CVEs,
+/// what was seen on it, operator notes, the keys found in its scripts, and
+/// AI remediation chat (`chats/<address>.md`).
 pub fn render_host_report(inputs: &Inputs, address: &str) -> Option<String> {
     let host = inputs.graph.host(address)?.clone();
     let canonical = host.address.clone();
@@ -1174,11 +1114,7 @@ mod tests {
             matched: "cpeName=cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*".into(),
             port: Some("443/tcp".into()),
             references: vec!["https://nvd.nist.gov/vuln/detail/CVE-2021-23017".into()],
-            record: EvidenceRecord::hypothesis(
-                Source::NvdApi,
-                Confidence::Medium,
-                "{\"id\":\"x\"}",
-            ),
+            record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{\"id\":\"x\"}"),
         }
     }
 
@@ -1255,24 +1191,29 @@ mod tests {
             .local
             .warnings
             .push("Listener tcp/192.168.1.5:8000 is bound to eth0".into());
-        graph.add_advisory("10.10.10.5", advisory("CVE-2021-23017", 7.7, true));
+        graph.add_advisory(
+            "10.10.10.5",
+            Advisory {
+                fixed_in: Some("1.20.1".into()),
+                ..advisory("CVE-2021-23017", 7.7, true)
+            },
+        );
         graph.add_advisory("10.10.10.5", advisory("CVE-2019-0001", 9.8, false));
-        graph.add_advisory("10.10.10.5", advisory("CVE-2018-0002", 5.0, false));
-        graph.add_advisory("10.10.10.9", advisory("CVE-2020-0003", 6.0, false));
-        graph
-            .set_advisory_status(
-                "10.10.10.5",
-                "CVE-2021-23017",
-                VerificationStatus::Confirmed,
-            )
-            .unwrap();
-        graph
-            .set_advisory_status(
-                "10.10.10.5",
-                "CVE-2018-0002",
-                VerificationStatus::FalsePositive,
-            )
-            .unwrap();
+        graph.add_advisory(
+            "10.10.10.5",
+            Advisory {
+                severity: Some("MEDIUM".into()),
+                last_affected: Some("1.19.9".into()),
+                ..advisory("CVE-2018-0002", 5.0, false)
+            },
+        );
+        graph.add_advisory(
+            "10.10.10.9",
+            Advisory {
+                severity: Some("MEDIUM".into()),
+                ..advisory("CVE-2020-0003", 6.0, false)
+            },
+        );
 
         let stage = |stage, status: &str, detail: &str| StageRow {
             stage,
@@ -1311,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_findings_and_hypotheses_are_kept_apart() {
+    fn cves_are_listed_by_software_and_version() {
         let text = render(&inputs());
         let section = |title: &str| -> &str {
             let start = text
@@ -1321,44 +1262,175 @@ mod tests {
             let end = rest.find("\n## ").map_or(rest.len(), |i| i + 1);
             &rest[..end]
         };
-
-        let confirmed = section("Confirmed findings");
-        assert!(
-            confirmed.contains("### CVE-2021-23017 on 10.10.10.5"),
-            "{confirmed}"
-        );
-        assert!(confirmed.contains("Listed in the CISA Known Exploited Vulnerabilities catalog"));
-        assert!(confirmed.contains("- Severity: HIGH 7.7"));
-        assert!(confirmed.contains("- Evidence: `{\"id\":\"x\"}`"));
-        for other in ["CVE-2019-0001", "CVE-2018-0002", "CVE-2020-0003"] {
-            assert!(
-                !confirmed.contains(other),
-                "{other} is not confirmed but is listed as a finding"
-            );
+        let cves = section("CVEs");
+        // Known exploited first, then by score; the fix for the whole group
+        // in its heading, each CVE's own in its row.
+        let expected = [
+            "### 10.10.10.5\n",
+            "#### nginx 1.18.0 \u{b7} 443/tcp \u{b7} fixed in 1.20.1\n",
+            "| CVE | Severity | Known exploited | Fixed in | Summary |",
+            "| CVE-2021-23017 | High 7.7 | yes | 1.20.1 | CVE-2021-23017 summary with \
+             &lt;b&gt;markup&lt;/b&gt; \\| pipe |",
+            "| CVE-2019-0001 | High 9.8 | - | - | ",
+            "| CVE-2018-0002 | Medium 5.0 | - | newer than 1.19.9 | ",
+            "### 10.10.10.9\n",
+            "#### nginx 1.18.0 \u{b7} 443/tcp\n",
+            "| CVE-2020-0003 | Medium 6.0 | - | - | ",
+        ];
+        let mut from = 0;
+        for line in expected {
+            match cves[from..].find(line) {
+                Some(at) => from += at + line.len(),
+                None => panic!("missing or out of order: {line:?}\n{cves}"),
+            }
         }
-
-        let hypotheses = section("Unverified hypotheses");
-        assert!(!hypotheses.contains("CVE-2021-23017"));
-        assert!(!hypotheses.contains("CVE-2018-0002"));
-        // Highest score first; checklist progress and readiness per row.
-        let first = hypotheses.find("CVE-2019-0001").unwrap();
-        let second = hypotheses.find("CVE-2020-0003").unwrap();
-        assert!(first < second);
+        for gone in [
+            "hypothes",
+            "Hypothes",
+            "verif",
+            "Verif",
+            "onfirmed",
+            "alse positive",
+            "Checklist",
+            "research ready",
+            "Evidence",
+        ] {
+            assert!(!text.contains(gone), "{gone} in:\n{text}");
+        }
+        assert!(text.contains("| Hosts | CVEs | Known exploited | Secrets to rotate |"));
+        assert!(text.contains("| 2 | 4 | 1 | 1 |"));
         assert!(
-            hypotheses
-                .contains("| 10.10.10.5 | CVE-2019-0001 | HIGH 9.8 | - | 443/tcp | 5/6 | yes |"),
-            "{hypotheses}"
+            section("What to update").contains(
+                "- 10.10.10.5: Update nginx 1.18.0 to 1.20.1 or later, or close 443/tcp if \
+                 the service is not needed. (3 CVEs, 1 known exploited)"
+            ),
+            "{text}"
         );
-        assert!(
-            hypotheses
-                .contains("| 10.10.10.9 | CVE-2020-0003 | HIGH 6.0 | - | 443/tcp | 1/6 | no |"),
-            "{hypotheses}"
-        );
+        assert_tables_keep_their_columns(&text);
+    }
 
-        let dismissed = section("Dismissed as false positives");
-        assert!(dismissed.contains("- CVE-2018-0002 on 10.10.10.5"));
-        assert!(text.contains("| Hosts | Confirmed findings | Unverified hypotheses | False positives | Secrets to rotate |"));
-        assert!(text.contains("| 2 | 1 | 2 | 1 | 1 |"));
+    #[test]
+    fn a_workspace_from_meow_0_2_2_still_renders() {
+        // Version 0.2.2 marked CVEs confirmed or false positive. Both are
+        // listed as the CVEs they are, and nothing speaks of a verdict.
+        // Its distribution note asked to verify before confirming; it is
+        // in today's words, once per software, and gone from the titles.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        let old_note = "Debian banner detected: Debian backports security fixes without bumping \
+                        the upstream version; verify installed package revision locally \
+                        (`dpkg -l` / `apt-cache policy`) before confirming";
+        let cut_title = "Username enumeration [Debian banner detected: Debian backports security \
+                         fixes without bumping the upstream version; verify installed package \
+                         revision locally (`dpkg -l` / `apt-cache policy`) before";
+        let cve = |id: &str, kev: bool, status: &str| {
+            serde_json::json!({
+                "id": id,
+                "title": if id == "CVE-2018-15473" {
+                    cut_title.to_owned()
+                } else {
+                    format!("about {id} [{old_note}]")
+                },
+                "severity": "HIGH",
+                "cvss": 7.5,
+                "kev": kev,
+                "matched": "cpeName=cpe:2.3:a:openbsd:openssh:7.4:*:*:*:*:*:*:*",
+                "port": "22/tcp",
+                "references": [],
+                "fixed_in": "7.6",
+                "source": "nvd_api",
+                "timestamp_utc": "2026-11-12T00:00:00Z",
+                "confidence": "Medium",
+                "evidence": "{}",
+                "verification_status": status
+            })
+        };
+        let old = serde_json::json!({
+            "version": 2,
+            "updated_utc": "2026-11-12T00:00:00Z",
+            "hosts": {
+                "198.51.100.7": {
+                    "address": "198.51.100.7",
+                    "ports": {
+                        "22/tcp": {
+                            "number": 22,
+                            "protocol": "tcp",
+                            "state": "open",
+                            "service": "ssh",
+                            "product": "OpenSSH",
+                            "version": "7.4",
+                            "extra_info": "Debian 10+deb9u7",
+                            "facts": [{
+                                "claim": "22/tcp open ssh OpenSSH 7.4",
+                                "source": "nmap_xml",
+                                "timestamp_utc": "2026-11-12T00:00:00Z",
+                                "confidence": "High",
+                                "evidence": "<port/>",
+                                "verification_status": "Observed"
+                            }, {
+                                "claim": format!("Distro backporting note: {old_note}"),
+                                "source": "nmap_xml",
+                                "timestamp_utc": "2026-11-12T00:00:00Z",
+                                "confidence": "High",
+                                "evidence": "OpenSSH 7.4 Debian 10+deb9u7",
+                                "verification_status": "Observed"
+                            }]
+                        }
+                    },
+                    "advisories": [
+                        cve("CVE-2018-15473", false, "FalsePositive"),
+                        cve("CVE-2023-38408", true, "Confirmed"),
+                        cve("CVE-2017-15906", false, "UnverifiedHypothesis")
+                    ]
+                }
+            }
+        });
+        std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+        let data = Inputs {
+            graph: Graph::load(&file).unwrap(),
+            secrets: Vec::new(),
+            ..inputs()
+        };
+        for text in [
+            render(&data),
+            render_host_report(&data, "198.51.100.7").unwrap(),
+        ] {
+            let at = text
+                .find("#### OpenSSH 7.4 \u{b7} 22/tcp \u{b7} fixed in 7.6")
+                .unwrap_or_else(|| panic!("{text}"));
+            let rows = &text[at..];
+            let order: Vec<usize> = ["CVE-2023-38408", "CVE-2017-15906", "CVE-2018-15473"]
+                .iter()
+                .map(|id| rows.find(&format!("| {id} | High 7.5 |")).unwrap())
+                .collect();
+            assert!(order.windows(2).all(|w| w[0] < w[1]), "{rows}");
+            assert!(rows.contains("| CVE-2023-38408 | High 7.5 | yes | 7.6 |"));
+            for gone in [
+                "onfirmed",
+                "alse positive",
+                "hypothes",
+                "Verification",
+                "verify installed",
+                "banner detected",
+            ] {
+                assert!(!text.contains(gone), "{gone} in:\n{text}");
+            }
+            assert!(text.contains("| 1 | 3 | 1 | 0 |"), "{text}");
+            assert!(
+                rows.contains("| CVE-2018-15473 | High 7.5 | - | 7.6 | Username enumeration |"),
+                "{rows}"
+            );
+            assert!(rows.contains("| about CVE-2023-38408 |"), "{rows}");
+            // Under the software heading, once for its three CVEs.
+            let group = &rows[..rows[1..].find("\n#").map_or(rows.len(), |end| end + 1)];
+            let note = "Debian backports security fixes without changing the upstream version";
+            assert_eq!(group.matches(note).count(), 1, "{group}");
+        }
+        let full = render(&data);
+        assert!(
+            full.contains("- Distro backporting note: Debian backports security fixes"),
+            "{full}"
+        );
     }
 
     #[test]
@@ -1373,17 +1445,19 @@ mod tests {
             "-->|routed|",
             "Route warnings:",
             "## What to update",
-            "## Confirmed findings",
-            "## Unverified hypotheses",
-            "## Dismissed as false positives",
+            "## CVEs",
+            "### 10.10.10.5",
+            "#### nginx 1.18.0 \u{b7} 443/tcp \u{b7} fixed in 1.20.1",
+            "### 10.10.10.9",
+            "#### nginx 1.18.0 \u{b7} 443/tcp",
             "## Hosts",
             "### 10.10.10.5",
             "| 443/tcp | open | ssl/http | nginx | 1.18.0 |",
             "Paths on 443/tcp:",
             "- `/admin/`",
             "- `/admin/login.php` (200)",
-            "Observed evidence:",
-            "_(nmap_xml, High, Observed, ",
+            "Observations:",
+            "_(nmap_xml, High, 2026-",
             "Operator notes:",
             "- default creds rejected",
             "### 10.10.10.9",
@@ -1475,7 +1549,7 @@ mod tests {
             ),
         ];
         let rendered = render(&custom);
-        assert!(rendered.contains("| 443/tcp \\| &lt;img src=x&gt; |"));
+        assert!(rendered.contains("#### nginx 1.18.0 \u{b7} 443/tcp \\| &lt;img src=x&gt;\n"));
         // No tag opens anywhere, in or out of code: what counts as code
         // differs between Markdown dialects.
         assert!(rendered.contains("#### Heading &lt;script>alert(1)&lt;/script>"));
@@ -1510,10 +1584,9 @@ mod tests {
             );
             port.version = Some("1.18.0 [vendor fix](https://e.example/fix.sh)".into());
             port.tls_sans.insert("![c](https://e.example/b.png)".into());
-            // A confirmed finding whose title starts like a list item and
-            // opens a code block.
+            // A CVE whose title starts like a list item and opens a code
+            // block.
             host.advisories[0].title = "- Status: fixed ``` swallow the rest".into();
-            host.advisories[0].record.verification_status = VerificationStatus::Confirmed;
         }
         custom.secrets = vec![crate::vault::ExposedSecret {
             token: "<<SEC_01>>".into(),
@@ -1552,9 +1625,9 @@ mod tests {
             .unwrap();
         assert_eq!(cells, header.matches('|').count(), "{row}");
         // The title neither opens a code block nor starts a list item, and
-        // what follows the finding is still there, outside any block.
+        // what follows the CVE is still there, outside any block.
         assert!(
-            rendered.contains("Summary: - Status: fixed \\`\\`\\` swallow the rest"),
+            rendered.contains("| - Status: fixed \\`\\`\\` swallow the rest |"),
             "{rendered}"
         );
         assert!(rendered.contains("\n## Hosts\n"));
@@ -1595,11 +1668,14 @@ mod tests {
         }
     }
 
-    /// The section of one host in a report: from its heading to the next.
+    /// The section of one host under "Hosts" in a report: from its heading
+    /// to the next.
     fn host_section<'a>(text: &'a str, heading: &str) -> &'a str {
-        let start = text
-            .find(&format!("{heading}\n"))
-            .unwrap_or_else(|| panic!("no {heading}"));
+        let hosts = text.find("\n## Hosts\n").expect("a Hosts section");
+        let start = hosts
+            + text[hosts..]
+                .find(&format!("{heading}\n"))
+                .unwrap_or_else(|| panic!("no {heading}"));
         let rest = &text[start + heading.len()..];
         let end = ["\n### ", "\n## "]
             .iter()
@@ -1748,7 +1824,7 @@ mod tests {
             "| www.example.test | resolves | 203.0.113.10 |",
             "| old.example.test | wildcard only (may not exist) | 203.0.113.50 |",
             "| gone.example.test | no record | - |",
-            "Observed evidence:",
+            "Observations:",
         ];
         let check_order = |text: &str| {
             let mut from = 0;
@@ -1786,7 +1862,7 @@ mod tests {
         // the web stage's hint.
         let single = render_host_report(&data, "10.10.10.5").unwrap();
         check_order(host_section(&single, "### 10.10.10.5"));
-        assert!(single.contains("| 1 | 1 | 1 | 1 | 1 |"), "{single}");
+        assert!(single.contains("| 1 | 3 | 1 | 1 |"), "{single}");
         assert!(
             single.contains(&format!(
                 "| `<<SEC_02>>` | `{hint}` | 2026-11-12T09:10:00Z |"
@@ -1842,7 +1918,7 @@ mod tests {
             single.contains("| `<<SEC_03>>` | `21 chars` | 2026-11-12T09:20:00Z |"),
             "{single}"
         );
-        assert!(single.contains("| 1 | 1 | 1 | 1 | 2 |"), "{single}");
+        assert!(single.contains("| 1 | 3 | 1 | 2 |"), "{single}");
         assert!(!single.contains(&value[..4]), "{single}");
         assert_tables_keep_their_columns(&single);
     }
@@ -2069,10 +2145,9 @@ mod tests {
             chats: vec![],
         });
         for expected in [
-            "| 0 | 0 | 0 | 0 | 0 |",
+            "| 0 | 0 | 0 | 0 |",
             "graph LR\n    n0([\"this machine\"])\n```",
-            "None. No hypothesis has been confirmed by the operator yet.",
-            "## Unverified hypotheses\n\nNone.",
+            "## CVEs\n\nNone found.",
             "No hosts recorded.",
             "No secret has been seen",
             "No recon task was queued.",
@@ -2081,7 +2156,7 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?}\n{text}");
         }
-        assert!(!text.contains("Dismissed as false positives"));
+        assert!(!text.contains("What to update"));
     }
 
     #[test]
@@ -2125,7 +2200,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# Audit report: acme\n"));
         assert!(text.contains("Mode: mild."));
-        assert!(text.contains("### CVE-2021-23017 on 10.10.10.5"));
+        assert!(text.contains("| CVE-2021-23017 | High 7.7 | yes | 1.20.1 |"));
         assert!(text.contains("| 1 | 10.10.10.0/23 | mild | ports | pending |"));
         assert!(text.contains("| `<<SEC_01>>` | `hunt... (15 chars)` |"));
         assert!(
@@ -2204,7 +2279,6 @@ mod tests {
                 timestamp_utc: "2026-11-12T09:41:00Z".into(),
                 confidence: Confidence::High,
                 evidence: "@@ -1 +1 @@\n-``\u{200b}`\n+<script>alert(1)</script>".into(),
-                verification_status: VerificationStatus::Observed,
             },
         });
         let rendered = render(&custom);

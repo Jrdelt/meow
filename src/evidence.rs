@@ -1,10 +1,8 @@
-//! The mandatory five-field evidence schema.
+//! Where each recorded fact came from.
 //!
-//! Every parsed fact, advisory or note carries an [`EvidenceRecord`]. Raw
-//! observations are never promoted straight to confirmed findings: the only
-//! way to `Confirmed` is through `UnverifiedHypothesis`.
-
-use std::fmt;
+//! Every parsed fact, CVE match or note carries an [`EvidenceRecord`]: the
+//! source, when it was recorded, how sure the parser was, and the raw
+//! snippet it was read from.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,15 +80,6 @@ impl Source {
             Source::JsScan => "js_scan",
         }
     }
-
-    /// Sources that can originate vulnerability advisories rather than raw
-    /// network/banner/log observations.
-    pub fn is_advisory_source(self) -> bool {
-        matches!(
-            self,
-            Source::NvdApi | Source::OsvApi | Source::CisaKev | Source::ManualNote
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -100,63 +89,10 @@ pub enum Confidence {
     High,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum VerificationStatus {
-    Observed,
-    UnverifiedHypothesis,
-    Confirmed,
-    FalsePositive,
-}
-
-impl VerificationStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VerificationStatus::Observed => "Observed",
-            VerificationStatus::UnverifiedHypothesis => "UnverifiedHypothesis",
-            VerificationStatus::Confirmed => "Confirmed",
-            VerificationStatus::FalsePositive => "FalsePositive",
-        }
-    }
-
-    /// `Observed -> UnverifiedHypothesis -> Confirmed | FalsePositive`.
-    /// A verdict can be reopened (back to `UnverifiedHypothesis`), but
-    /// `Observed` can never jump straight to a verdict.
-    pub fn can_become(self, next: VerificationStatus) -> bool {
-        use VerificationStatus::*;
-        matches!(
-            (self, next),
-            (Observed, UnverifiedHypothesis)
-                | (UnverifiedHypothesis, Confirmed | FalsePositive)
-                | (Confirmed | FalsePositive, UnverifiedHypothesis)
-        )
-    }
-}
-
-impl fmt::Display for VerificationStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IllegalTransition {
-    pub from: VerificationStatus,
-    pub to: VerificationStatus,
-}
-
-impl fmt::Display for IllegalTransition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "cannot change verification status from {} to {}",
-            self.from, self.to
-        )
-    }
-}
-
-impl std::error::Error for IllegalTransition {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where one fact came from. Each record is also written with a
+/// `verification_status` for meow 0.2.2 (see its `Serialize`); the one in
+/// a file is ignored when read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EvidenceRecord {
     pub source: Source,
     /// RFC 3339, UTC.
@@ -164,57 +100,41 @@ pub struct EvidenceRecord {
     pub confidence: Confidence,
     /// Exact raw snippet, XML/JSON attribute or diff block.
     pub evidence: String,
-    pub verification_status: VerificationStatus,
+}
+
+/// meow 0.2.2 cannot read a record without a `verification_status`, so a
+/// fixed one is still written: a workspace stays readable by a teammate on
+/// that version, or after going back to it. Nothing here reads it.
+impl Serialize for EvidenceRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("EvidenceRecord", 5)?;
+        out.serialize_field("source", &self.source)?;
+        out.serialize_field("timestamp_utc", &self.timestamp_utc)?;
+        out.serialize_field("confidence", &self.confidence)?;
+        out.serialize_field("evidence", &self.evidence)?;
+        out.serialize_field("verification_status", "Observed")?;
+        out.end()
+    }
 }
 
 impl EvidenceRecord {
-    fn new(
-        source: Source,
-        confidence: Confidence,
-        evidence: &str,
-        status: VerificationStatus,
-    ) -> Self {
+    /// A record of something seen now.
+    pub fn observed(source: Source, confidence: Confidence, evidence: &str) -> Self {
         Self {
             source,
             timestamp_utc: now_rfc3339(),
             confidence,
             evidence: sanitize(evidence, EVIDENCE_MAX),
-            verification_status: status,
         }
     }
 
-    /// A raw observation.
-    pub fn observed(source: Source, confidence: Confidence, evidence: &str) -> Self {
-        Self::new(source, confidence, evidence, VerificationStatus::Observed)
-    }
-
-    /// A possible issue derived from observations (for example a CVE match).
-    pub fn hypothesis(source: Source, confidence: Confidence, evidence: &str) -> Self {
-        Self::new(
-            source,
-            confidence,
-            evidence,
-            VerificationStatus::UnverifiedHypothesis,
-        )
-    }
-
-    /// An observation whose evidence keeps its line breaks.
+    /// A record whose raw snippet keeps its line breaks.
     pub fn observed_block(source: Source, confidence: Confidence, evidence: &str) -> Self {
         Self {
             evidence: sanitize_block(evidence, EVIDENCE_MAX),
             ..Self::observed(source, confidence, "")
         }
-    }
-
-    pub fn transition(&mut self, to: VerificationStatus) -> Result<(), IllegalTransition> {
-        if !self.verification_status.can_become(to) {
-            return Err(IllegalTransition {
-                from: self.verification_status,
-                to,
-            });
-        }
-        self.verification_status = to;
-        Ok(())
     }
 
     /// Strips terminal control sequences and bounds field lengths on a record
@@ -225,32 +145,6 @@ impl EvidenceRecord {
             Source::GitDiff => sanitize_block(&self.evidence, EVIDENCE_MAX),
             _ => sanitize(&self.evidence, EVIDENCE_MAX),
         };
-    }
-
-    /// Enforces the observation invariant: raw observations and facts are
-    /// always `Observed` and carry sanitized, bounded fields.
-    pub fn normalize_observed(&mut self) {
-        self.sanitize_fields();
-        self.verification_status = VerificationStatus::Observed;
-    }
-
-    /// Enforces the new-advisory invariant: newly matched advisories always
-    /// enter as `UnverifiedHypothesis` until an operator verdict transitions them.
-    pub fn normalize_new_advisory(&mut self) {
-        self.sanitize_fields();
-        self.verification_status = VerificationStatus::UnverifiedHypothesis;
-    }
-
-    /// Enforces advisory state-machine bounds when loading `graph.json` or
-    /// snapshots: advisories are never `Observed`, and automated banner/scan
-    /// sources cannot hold a verdict (`Confirmed` or `FalsePositive`).
-    pub fn normalize_loaded_advisory(&mut self) {
-        self.sanitize_fields();
-        if self.verification_status == VerificationStatus::Observed
-            || !self.source.is_advisory_source()
-        {
-            self.verification_status = VerificationStatus::UnverifiedHypothesis;
-        }
     }
 }
 
@@ -588,10 +482,9 @@ mod tests {
         }
     }
     use crate::timeutil::parse_rfc3339;
-    use VerificationStatus::*;
 
     #[test]
-    fn record_serializes_to_exactly_five_fields() {
+    fn record_serializes_to_the_five_fields_meow_0_2_2_reads() {
         let record =
             EvidenceRecord::observed(Source::NmapXml, Confidence::High, "<port portid=\"22\"/>");
         let json = serde_json::to_value(&record).unwrap();
@@ -608,9 +501,21 @@ mod tests {
                 "verification_status"
             ]
         );
+        // The one value meow 0.2.2 accepts for any record: it reads facts
+        // as they are and CVE matches as new.
+        assert_eq!(json["verification_status"], "Observed");
+        #[derive(Deserialize)]
+        enum OldStatus {
+            Observed,
+        }
+        #[derive(Deserialize)]
+        struct OldRecord {
+            verification_status: OldStatus,
+        }
+        let old: OldRecord = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(old.verification_status, OldStatus::Observed));
         assert_eq!(json["source"], "nmap_xml");
         assert_eq!(json["confidence"], "High");
-        assert_eq!(json["verification_status"], "Observed");
         assert!(parse_rfc3339(json["timestamp_utc"].as_str().unwrap()).is_some());
         assert_eq!(
             serde_json::from_value::<EvidenceRecord>(json).unwrap(),
@@ -647,41 +552,6 @@ mod tests {
         ] {
             let wire = serde_json::to_string(&source).unwrap();
             assert_eq!(wire, format!("\"{}\"", source.as_str()));
-        }
-    }
-
-    #[test]
-    fn observed_can_never_jump_to_a_verdict() {
-        let mut record =
-            EvidenceRecord::observed(Source::HttpHeader, Confidence::Medium, "Server: nginx");
-        for verdict in [Confirmed, FalsePositive] {
-            let error = record.transition(verdict).unwrap_err();
-            assert_eq!(error.from, Observed);
-            assert_eq!(record.verification_status, Observed);
-        }
-        record.transition(UnverifiedHypothesis).unwrap();
-        record.transition(Confirmed).unwrap();
-        assert_eq!(record.verification_status, Confirmed);
-    }
-
-    #[test]
-    fn transition_table_is_exact() {
-        let all = [Observed, UnverifiedHypothesis, Confirmed, FalsePositive];
-        let allowed = [
-            (Observed, UnverifiedHypothesis),
-            (UnverifiedHypothesis, Confirmed),
-            (UnverifiedHypothesis, FalsePositive),
-            (Confirmed, UnverifiedHypothesis),
-            (FalsePositive, UnverifiedHypothesis),
-        ];
-        for from in all {
-            for to in all {
-                assert_eq!(
-                    from.can_become(to),
-                    allowed.contains(&(from, to)),
-                    "{from} -> {to}"
-                );
-            }
         }
     }
 
@@ -728,36 +598,27 @@ mod tests {
     }
 
     #[test]
-    fn deserialized_records_cannot_bypass_state_machine_bounds() {
-        let mut forged_obs: EvidenceRecord = serde_json::from_value(serde_json::json!({
-            "source": "nmap_xml",
-            "timestamp_utc": "2026-11-12T00:00:00Z",
-            "confidence": "High",
-            "evidence": "<port portid=\"80\"/>",
-            "verification_status": "Confirmed"
-        }))
-        .unwrap();
-        forged_obs.normalize_observed();
-        assert_eq!(forged_obs.verification_status, Observed);
-
-        let mut forged_new_adv = forged_obs.clone();
-        forged_new_adv.source = Source::NvdApi;
-        forged_new_adv.verification_status = Confirmed;
-        forged_new_adv.normalize_new_advisory();
-        assert_eq!(forged_new_adv.verification_status, UnverifiedHypothesis);
-
-        // Loaded advisories keep legitimate operator verdicts on advisory sources,
-        // but clamp Observed or banner/scanner sources back to UnverifiedHypothesis.
-        let mut legitimate_verdict =
-            EvidenceRecord::hypothesis(Source::NvdApi, Confidence::High, "{}");
-        legitimate_verdict.transition(Confirmed).unwrap();
-        legitimate_verdict.normalize_loaded_advisory();
-        assert_eq!(legitimate_verdict.verification_status, Confirmed);
-
-        let mut banner_verdict = forged_obs;
-        banner_verdict.verification_status = Confirmed;
-        banner_verdict.normalize_loaded_advisory();
-        assert_eq!(banner_verdict.verification_status, UnverifiedHypothesis);
+    fn records_from_meow_0_2_2_still_load() {
+        // Every record of an older file carries a verification status,
+        // advisories included ("Confirmed", "FalsePositive"). It is ignored.
+        for status in [
+            "Observed",
+            "UnverifiedHypothesis",
+            "Confirmed",
+            "FalsePositive",
+        ] {
+            let record: EvidenceRecord = serde_json::from_value(serde_json::json!({
+                "source": "nvd_api",
+                "timestamp_utc": "2026-11-12T00:00:00Z",
+                "confidence": "High",
+                "evidence": "{}",
+                "verification_status": status
+            }))
+            .unwrap();
+            assert_eq!(record.source, Source::NvdApi);
+            let saved = serde_json::to_value(&record).unwrap();
+            assert_eq!(saved["verification_status"], "Observed", "{saved}");
+        }
     }
 
     #[test]
