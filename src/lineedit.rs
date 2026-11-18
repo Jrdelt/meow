@@ -764,13 +764,17 @@ mod tests {
         }
     }
 
+    /// The terminal's local modes, without PENDIN and FLUSHO: those are
+    /// state the kernel keeps, not settings. macOS (like every BSD) sets
+    /// PENDIN by itself when a terminal goes back to line mode, so pending
+    /// input is typed again.
     #[cfg(unix)]
     fn local_flags(fd: libc::c_int) -> libc::tcflag_t {
         // SAFETY: `termios` is plain C data that `tcgetattr` fills.
         unsafe {
             let mut termios: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(fd, &mut termios), 0);
-            termios.c_lflag
+            termios.c_lflag & !(libc::PENDIN | libc::FLUSHO)
         }
     }
 
