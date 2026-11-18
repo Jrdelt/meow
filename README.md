@@ -195,42 +195,49 @@ meow mode aggressive
 
 ## What `meow recon` Does (17 Stages)
 
-`meow recon <target>` runs one stage at a time in the background so you can keep using your shell. Follow progress in `meow hud` or on the live browser map.
+`meow recon <target>` runs these one at a time in the background (mild and aggressive mode). Follow along in `meow hud` or on the map.
 
-1. **`lan`** — Reads your local ARP/NDP neighbour cache and routing table to identify your local gateway and LAN neighbours without sending broadcast traffic.
-2. **`dns`** — Resolves `A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT` (SPF/DMARC/verification), and reverse `PTR` records through your own resolvers first, with DNS-over-HTTPS as a fallback only for public names. Internal names (`.local`, `.corp`, `.internal`, ...) and the reverse names of private addresses never go to a public resolver, and a reverse record never takes a name another host has.
-3. **`asn`** — Queries Team Cymru DNS and RDAP to identify the target's Autonomous System Number (ASN), BGP prefix, cloud/ISP organization, and country, plus offline GeoIP city coordinates.
-4. **`subdomains`** — Queries Certificate Transparency logs (`crt.sh`) for public domain targets to discover associated hostnames and subdomains passively; an internal name, or one that resolves to a private address, is not sent.
-5. **`mail-dns`** — For domain targets, grades mail and DNS protection A–F: SPF (its `-all`/`~all` ending and the 10-lookup limit), DMARC (policy, coverage, reports), DKIM (24 common selectors, key length), CAA (which certificate authorities may issue) and DNSSEC (DS at the parent, DNSKEY in the zone), and names the mail provider. It lists services the domain publishes in SRV records and well-known names (`_ldap`, `_kerberos`, `_gc`, `_sip`, `_autodiscover`, `autodiscover`, `lyncdiscover`, `enterpriseenrollment`), which often reveal Active Directory or Microsoft 365, and checks for wildcard DNS: two made-up names are looked up, and each certificate-log name is marked as resolving, answering only through the wildcard (so it may not exist), or gone. Only DNS questions are asked, the same way as `dns`; nothing is sent to the target's servers. Results appear in the host's **DNS & Mail** tab on the map.
-6. **`trace`** — Runs a bounded traceroute (`traceroute`, `tracepath`, or `tracert`) to map intermediate network hops and round-trip latency between your gateway and the target.
-7. **`ports`** — Runs `nmap` to discover open TCP ports on the target.
-8. **`udp`** — Aggressive mode only, and only as root (UDP scanning sends raw packets and is slow): runs `nmap -sU -sV` on a named list of security-relevant UDP services (DNS 53, DHCP 67, TFTP 69, Kerberos 88, RPC 111, NTP 123, NetBIOS 137, SNMP 161, CLDAP 389, IKE 500/4500, syslog 514, RIP 520, IPMI 623, OpenVPN 1194, SQL Server Browser 1434, SSDP 1900, NFS 2049, SIP 5060, mDNS 5353, CoAP 5683, memcached 11211, WireGuard 51820). Each service that answers gets a note on what it means (for example SNMP's clear-text community strings, IPMI's pre-login password hashes). In mild mode, or without root, it is skipped with the command to run yourself.
-9. **`services`** — Runs `nmap -sV` strictly on the open ports found in `ports` to fingerprint service banners, versions, and CPEs.
-10. **`headers`** — Inspects HTTP/HTTPS endpoints for server headers, security headers (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`), HTML `<title>`, `/robots.txt`, `/.well-known/security.txt`, and `/favicon.ico` framework hashes. It also fingerprints the software stack from response headers, cookie names, the HTML (generator tag, CMS and framework signs) and script file names (flagging outdated libraries such as jQuery before 3.5.0 or AngularJS 1.x), checks each cookie's `Secure`, `HttpOnly` and `SameSite` flags (never keeping its value), and grades the security headers A–F (HSTS, CSP, frame protection, `nosniff`, `Referrer-Policy`, `Permissions-Policy`, and what `Server`/`X-Powered-By` give away).
-11. **`waf-cdn`** — Detects edge WAF/CDN providers (Cloudflare, AWS CloudFront, Akamai, Fastly, Imperva, Sucuri, Azure Front Door, Google Cloud CDN) from HTTP headers and CNAME chains.
-12. **`tls-audit`** — Inspects TLS certificates (Subject, Issuer, validity dates, Subject Alternative Names) and checks supported TLS protocol versions (`TLSv1.0`–`TLSv1.3`), flagging deprecated protocols or expiring certificates.
-13. **`ssh-audit`** — Performs a zero-authentication RFC 4253 `SSH_MSG_KEXINIT` handshake on open SSH ports to inventory key-exchange, host-key, cipher, and MAC algorithms and flag weak cryptography (`ssh-rsa`, `ssh-dss`, `diffie-hellman-group1-sha1`, CBC/RC4 ciphers, MD5/SHA-1 MACs).
-14. **`cves`** — Grounds discovered product/version CPEs against OSV.dev, NVD, and the CISA Known Exploited Vulnerabilities (KEV) catalog, noting when Linux distribution banners (Ubuntu, Debian, RHEL) indicate backported security patches.
-15. **`crawl`** — Crawls discovered HTTP/HTTPS services with `katana` to inventory linked endpoints.
-16. **`js`** — Reads the site's own JavaScript files (from the page's script tags and the crawl; up to 15 in mild mode, 40 in aggressive, never another site's) and pulls out API paths and URLs they name, and exposed keys (AWS, Google, GitHub, Slack, Stripe, SendGrid, Twilio, Mailgun, npm, JWTs, private keys, and keys or passwords assigned in the code). A key goes straight into the Privacy Vault: the map, the evidence and the report show only its placeholder (`<<SEC_03>>`), its kind and a short hint, and the report lists it under secrets to rotate.
-17. **`dirs`** — Runs `feroxbuster` with the SecLists `common.txt` wordlist against discovered web services to find unlinked directories and files.
+| # | Stage | What it finds |
+|---|---|---|
+| 1 | `lan` | Gateway and LAN neighbours from your ARP/NDP cache and routes (sends nothing) |
+| 2 | `dns` | A, AAAA, CNAME, MX, NS, TXT and PTR records |
+| 3 | `asn` | ASN, BGP prefix, provider and country |
+| 4 | `subdomains` | Subdomains from Certificate Transparency logs (`crt.sh`) |
+| 5 | `mail-dns` | A–F grade for SPF, DMARC, DKIM, CAA and DNSSEC; published services (AD, Microsoft 365); wildcard DNS |
+| 6 | `trace` | Route hops and latency |
+| 7 | `ports` | Open TCP ports (`nmap`) |
+| 8 | `udp` | Key UDP services such as SNMP, IPMI, NTP and DNS (aggressive mode, as root) |
+| 9 | `services` | Service versions and CPEs on the open ports (`nmap -sV`) |
+| 10 | `headers` | Web stack, cookie flags, security-header grade, title, `robots.txt`, `security.txt` |
+| 11 | `waf-cdn` | WAF or CDN in front of the site |
+| 12 | `tls-audit` | Certificate details and TLS versions |
+| 13 | `ssh-audit` | SSH algorithms, weak ones flagged |
+| 14 | `cves` | Known vulnerabilities for the versions found (OSV, NVD, CISA KEV) |
+| 15 | `crawl` | Linked pages (`katana`) |
+| 16 | `js` | API endpoints and exposed keys in the site's own scripts |
+| 17 | `dirs` | Unlinked files and folders (`feroxbuster`) |
 
-If an external tool (`nmap`, `katana`, `feroxbuster`, `traceroute`, `openssl`) is not installed, `meow` marks that stage `skipped` with a clear reason and continues the remaining stages.
+Good to know:
+
+- A missing tool skips its stage with the reason; the rest still run. `meow tools` installs them.
+- DNS questions go to your own resolvers first. DNS-over-HTTPS and `crt.sh` are used only for public names, never for internal ones or private addresses.
+- `mail-dns` only asks DNS questions; nothing is sent to the target's servers.
+- `js` reads only the target site's scripts (15 in mild, 40 in aggressive). A key it finds goes straight into the Privacy Vault: you only ever see a placeholder like `<<SEC_03>>`, and the report lists it to rotate.
+- Cookie values are never stored. `dirs` skips sites behind a WAF in mild mode.
 
 ---
 
 ## Live Topology Map & Report Export
 
-Run `meow map` to open the local topology view in your browser (`127.0.0.1:<port>`, protected by a per-session token).
+`meow map` opens the map in your browser (`127.0.0.1`, protected by a per-session token).
 
-The drawing fills the whole card, which fills the window. Your rough location (a small satellite map) floats over its top-right corner: fold it into a pill with **−**, and it folds itself when it would hide a device. **Expand** fills the entire browser window with the map and the side panel; press **Esc** to go back.
-
-- **Vertical OPSEC & transit path** — Traces your traffic from **You (Operator)** → **Local Gateway** → **WAN Egress / VPN Exit** (highlighting whether a VPN tunnel such as `utun`/`wg`/`tun` is active or direct ISP egress is exposed) → **Internet** (click to expand hop-by-hop traceroute latency; click a hop for its city, region and country from the offline location database, its network/ASN, address type, reverse DNS and the latency it adds) → **WAF / CDN Edge** → **ASN / Cloud Provider** compound group → **Target Hosts**.
-- **Host tabs** — Click a host and its details open under the map in tabs: **Overview** (Server Status and an *At a Glance* summary that links to each tab), **Ports**, **Web & TLS**, **Advisories**, **Evidence**, and **Notes & AI**. Counts on the tabs show open ports, open advisories (red when one is confirmed or known exploited) and facts. The tab you pick stays open across live updates and when you switch hosts; arrow keys move between tabs and `1`–`6` open one directly. Print / PDF includes every tab.
-- **Host inspector & Associated Hosts** — Click any host node to see its **Server Status** (up or not as the scans last saw it, how long ago, and a **Check now** button that makes one connection to each of up to six of its known open ports, in mild and aggressive mode only), its ports (one line each: port, open/closed/filtered, service and version), HTTP security headers, TLS certificate details, SSH algorithm inventories, discovered web paths, traceroute hops, and CVE hypotheses. Subdomains and TLS SANs discovered via passive OSINT appear in the **Associated Hosts** drawer with a one-click **Queue Recon** button.
-- **Hypothesis verification** — Every CVE match starts as an **Unverified Hypothesis** with a verification checklist. Confirming or dismissing a hypothesis updates both the map badge and `REPORT.md`.
-- **AI Triage (`[L]` Local / `[C]` Cloud / `[R]` Research)** — Ask a local or cloud AI model to prioritize findings for the selected host. A triage answer comes in two panels side by side: **Red Team** (authorized penetration test: attack-surface priorities, non-destructive verification steps, evidence to collect; never exploit code) and **Blue Team** (SOC defense: hardening and patches, a detection rule, monitoring and response). All private addresses, names, and secrets are masked into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine.
-- **One-click Report Export** — Use **Export report (.md)** or **Print / PDF** in the side panel for the full workspace report, or inside any host drawer for a single-host report.
+- **Path** — You → gateway → WAN or VPN exit → Internet (click for each hop's location, network and latency) → WAF/CDN → provider → target hosts.
+- **Location** — a small satellite map floats top right; **−** folds it. **Expand** fills the window; **Esc** goes back.
+- **Host tabs** — Overview, Ports, Web & TLS, DNS & Mail, Advisories, Evidence, and Notes & AI. Use ←/→ or `1`–`7`. Hover a row for details.
+- **Check now** — one connection to each of a host's known open ports, to see if it is up (mild and aggressive mode).
+- **Advisories** — every CVE match starts as a hypothesis to verify; confirm or dismiss it and the map and `REPORT.md` follow.
+- **AI triage** — `[L]` local, `[C]` cloud, `[R]` research. Answers come as a **Red Team** plan (authorized testing, no exploit code) and a **Blue Team** plan (defense). Private addresses, names and secrets are masked before anything leaves your machine.
+- **Export** — **Export report (.md)** or **Print / PDF**, for the whole workspace or one host.
 
 ---
 
@@ -324,6 +331,15 @@ Run `meow tools` at any time to check which companion tools and data files are i
 
 ```sh
 meow tools
+```
+
+### The `udp` stage is skipped
+
+It runs only in aggressive mode and as root, because UDP scanning sends raw packets and is slow. To run it yourself and add the result:
+
+```sh
+sudo nmap -sU -sV -p U:53,67,69,88,111,123,137,161,389,500,514,520,623,1194,1434,1900,2049,4500,5060,5353,5683,11211,51820 <target> -oX udp.xml
+meow add udp.xml
 ```
 
 ### `meow map` does not open a browser tab (or you are on SSH / headless Linux)
