@@ -29,7 +29,7 @@ use crate::anthropic;
 use crate::checklist;
 use crate::db::Db;
 use crate::evidence::{sanitize, Source, VerificationStatus};
-use crate::graph::{Graph, Host};
+use crate::graph::{DnsSecurity, Graph, Host, HttpInfo};
 use crate::timeutil::{now_rfc3339, today_utc};
 use crate::vault::Vault;
 use crate::workspace::{private_open_options, read_private_bounded, refuse_file_symlink};
@@ -45,6 +45,21 @@ const MAX_HYPOTHESES: usize = 25;
 const MAX_PORTS: usize = 64;
 const MAX_NAMES_PER_PORT: usize = 16;
 const MAX_CPES_PER_PORT: usize = 8;
+/// The web findings beyond the basics (stack, cookies, header grade, script
+/// endpoints and keys) go for this many ports: a host rarely serves more
+/// sites than this, and a tarpit claiming hundreds would otherwise make a
+/// request of megabytes.
+const MAX_WEB_DETAIL_PORTS: usize = 4;
+const MAX_TECH_PER_PORT: usize = 12;
+const MAX_HEADER_NOTES: usize = 6;
+const MAX_COOKIES_PER_PORT: usize = 8;
+const MAX_ISSUES_PER_COOKIE: usize = 4;
+const MAX_ENDPOINTS_PER_PORT: usize = 25;
+const MAX_KEYS_PER_PORT: usize = 10;
+const MAX_DNS_CHECKS: usize = 12;
+const MAX_DNS_SERVICES: usize = 16;
+const MAX_DNS_WILDCARD: usize = 8;
+const MAX_SUBDOMAINS: usize = 15;
 const MAX_REPLY: usize = 200_000;
 const MAX_PROMPT_CACHE_ROWS: i64 = 5_000;
 const MAX_AI_TOML_BYTES: u64 = 256 * 1024;
@@ -430,7 +445,11 @@ Base every statement on the evidence in the document. Factor in the ASN / hostin
 `ssh_kex`, `http_header`, and `tls_cert` reflect ground-truth runtime configurations (unaffected by \
 distro package backporting). Entries under `hypotheses` are unverified CVE/OSV matches from \
 vulnerability databases: account for Linux distribution backported patches (`distro_backport_note`) \
-before treating one as real. Be concise and specific to this host.
+before treating one as real. Be concise and specific to this host. Use these in both the Red Team \
+and the Blue Team part where present: the DNS & mail grade (`dns_security`), the software stack with \
+its outdated libraries (`tech`), cookie flags (`cookies`), the header grade (`header_grade`, \
+`header_notes`), API endpoints named in the site's scripts (`js_endpoints`) and keys exposed in them \
+(`exposed_keys`, by placeholder only).
 
 The red-team part is for verification within the authorized scope: what to test next and how to \
 confirm or rule out each weakness with safe, non-destructive checks (version and configuration \
@@ -482,12 +501,170 @@ fn clean(text: &str) -> String {
     sanitize(text, 400)
 }
 
+fn clean_list(items: &[String], max: usize) -> Vec<String> {
+    items.iter().take(max).map(|item| clean(item)).collect()
+}
+
+/// A vault placeholder for a secret (`<<SEC_03>>`) and nothing else. The
+/// graph keeps only these for a key found in a script; checked again here
+/// because a key must never reach a prompt, whatever built the host.
+fn is_secret_placeholder(text: &str) -> bool {
+    text.strip_prefix("<<SEC_")
+        .and_then(|rest| rest.strip_suffix(">>"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What the web stages found on one port beyond the basics, with only the
+/// fields that hold something.
+fn web_detail(http: &HttpInfo) -> serde_json::Map<String, Value> {
+    let mut detail = serde_json::Map::new();
+    if !http.tech.is_empty() {
+        detail.insert(
+            "tech".to_owned(),
+            json!(clean_list(&http.tech, MAX_TECH_PER_PORT)),
+        );
+    }
+    if let Some(grade) = &http.header_grade {
+        detail.insert("header_grade".to_owned(), json!(sanitize(grade, 2)));
+    }
+    if !http.header_notes.is_empty() {
+        detail.insert(
+            "header_notes".to_owned(),
+            json!(clean_list(&http.header_notes, MAX_HEADER_NOTES)),
+        );
+    }
+    if !http.cookies.is_empty() {
+        let cookies: Vec<Value> = http
+            .cookies
+            .iter()
+            .take(MAX_COOKIES_PER_PORT)
+            .map(|cookie| {
+                let mut entry = json!({
+                    "name": sanitize(&cookie.name, 64),
+                    "flags": sanitize(&cookie.flags, 120),
+                });
+                if !cookie.issues.is_empty() {
+                    entry["issues"] = json!(clean_list(&cookie.issues, MAX_ISSUES_PER_COOKIE));
+                }
+                entry
+            })
+            .collect();
+        detail.insert("cookies".to_owned(), Value::Array(cookies));
+    }
+    if !http.js_endpoints.is_empty() {
+        detail.insert(
+            "js_endpoints".to_owned(),
+            json!(clean_list(&http.js_endpoints, MAX_ENDPOINTS_PER_PORT)),
+        );
+        let left_out = http
+            .js_endpoints
+            .len()
+            .saturating_sub(MAX_ENDPOINTS_PER_PORT);
+        if left_out > 0 {
+            detail.insert("js_endpoints_left_out".to_owned(), json!(left_out));
+        }
+    }
+    // A key goes by its placeholder only: the preview shows its first
+    // characters, which is more than the model needs to say "rotate it".
+    let keys: Vec<&crate::graph::JsSecret> = http
+        .js_secrets
+        .iter()
+        .filter(|secret| is_secret_placeholder(&secret.token))
+        .collect();
+    if !keys.is_empty() {
+        let shown: Vec<Value> = keys
+            .iter()
+            .take(MAX_KEYS_PER_PORT)
+            .map(|secret| {
+                json!({
+                    "kind": clean(&secret.kind),
+                    "token": secret.token,
+                    "file": clean(&secret.file),
+                })
+            })
+            .collect();
+        detail.insert("exposed_keys".to_owned(), Value::Array(shown));
+        let left_out = keys.len().saturating_sub(MAX_KEYS_PER_PORT);
+        if left_out > 0 {
+            detail.insert("exposed_keys_left_out".to_owned(), json!(left_out));
+        }
+    }
+    detail
+}
+
+/// How well the host's domain protects its mail and DNS, size-capped.
+fn dns_detail(dns: &DnsSecurity) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("domain".to_owned(), json!(clean(&dns.domain)));
+    out.insert("grade".to_owned(), json!(sanitize(&dns.grade, 2)));
+    if !dns.checks.is_empty() {
+        let checks: Vec<Value> = dns
+            .checks
+            .iter()
+            .take(MAX_DNS_CHECKS)
+            .map(|check| {
+                let mut entry = json!({
+                    "name": clean(&check.name),
+                    "status": clean(&check.status),
+                    "value": clean(&check.value),
+                });
+                if !check.advice.is_empty() {
+                    entry["advice"] = json!(clean(&check.advice));
+                }
+                entry
+            })
+            .collect();
+        out.insert("checks".to_owned(), Value::Array(checks));
+    }
+    if !dns.services.is_empty() {
+        let services: Vec<Value> = dns
+            .services
+            .iter()
+            .take(MAX_DNS_SERVICES)
+            .map(|service| {
+                json!({
+                    "record": clean(&service.record),
+                    "target": clean(&service.target),
+                    "meaning": clean(&service.meaning),
+                })
+            })
+            .collect();
+        out.insert("services".to_owned(), Value::Array(services));
+        let left_out = dns.services.len().saturating_sub(MAX_DNS_SERVICES);
+        if left_out > 0 {
+            out.insert("services_left_out".to_owned(), json!(left_out));
+        }
+    }
+    if !dns.wildcard.is_empty() {
+        out.insert(
+            "wildcard".to_owned(),
+            json!(clean_list(&dns.wildcard, MAX_DNS_WILDCARD)),
+        );
+    }
+    if !dns.subdomains.is_empty() {
+        let subdomains: Vec<Value> = dns
+            .subdomains
+            .iter()
+            .take(MAX_SUBDOMAINS)
+            .map(|sub| json!({ "name": clean(&sub.name), "status": clean(&sub.status) }))
+            .collect();
+        out.insert("subdomains".to_owned(), Value::Array(subdomains));
+        let left_out = dns.subdomains.len().saturating_sub(MAX_SUBDOMAINS);
+        if left_out > 0 {
+            out.insert("subdomains_left_out".to_owned(), json!(left_out));
+        }
+    }
+    Value::Object(out)
+}
+
 /// The compact, size-capped view of one host that the triage tiers see.
 fn compact_host(graph: &Graph, host: &Host) -> Value {
     // Open ports first: they are what a triage is about.
     let mut listed: Vec<&crate::graph::Port> = host.ports.values().collect();
     listed.sort_by_key(|port| port.state != "open");
     let ports_left_out = listed.len().saturating_sub(MAX_PORTS);
+    let mut web_detail_ports = 0usize;
+    let mut web_detail_left_out = 0usize;
     let ports: Vec<Value> = listed
         .into_iter()
         .take(MAX_PORTS)
@@ -502,7 +679,7 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
                     None => clean(&path),
                 })
                 .collect();
-            json!({
+            let mut entry = json!({
                 "port": port.key(),
                 "state": port.state,
                 "service": port.service,
@@ -522,7 +699,19 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
                 "tls_names": port.tls_sans.iter().take(MAX_NAMES_PER_PORT).collect::<Vec<_>>(),
                 "tls_names_left_out": port.tls_sans.len().saturating_sub(MAX_NAMES_PER_PORT),
                 "paths": paths,
-            })
+            });
+            let detail = port.http.as_ref().map(web_detail).unwrap_or_default();
+            if !detail.is_empty() {
+                if web_detail_ports < MAX_WEB_DETAIL_PORTS {
+                    web_detail_ports += 1;
+                    if let Some(object) = entry.as_object_mut() {
+                        object.extend(detail);
+                    }
+                } else {
+                    web_detail_left_out += 1;
+                }
+            }
+            entry
         })
         .collect();
 
@@ -587,7 +776,7 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
         })
         .collect();
 
-    json!({
+    let mut document = json!({
         "address": host.address,
         "hostnames": host.hostnames,
         "operating_system": host.os,
@@ -602,7 +791,14 @@ fn compact_host(graph: &Graph, host: &Host) -> Value {
         "observed_facts": observed,
         "hypotheses": hypotheses,
         "operator_notes": notes.iter().map(|n| clean(&n.claim)).collect::<Vec<_>>(),
-    })
+    });
+    if web_detail_left_out > 0 {
+        document["web_detail_ports_left_out"] = json!(web_detail_left_out);
+    }
+    if let Some(dns) = &host.dns_security {
+        document["dns_security"] = dns_detail(dns);
+    }
+    document
 }
 
 /// Triage prompt for `[L]` and `[C]`.
@@ -1826,7 +2022,9 @@ pub fn append_chat(chats_dir: &Path, host: &Host, outcome: &Outcome) -> Result<P
 mod tests {
     use super::*;
     use crate::evidence::{Confidence, EvidenceRecord};
-    use crate::graph::{Advisory, Observation, Route};
+    use crate::graph::{
+        Advisory, CookieCheck, DnsCheck, DnsService, JsSecret, Observation, Route, SubdomainCheck,
+    };
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::response::IntoResponse;
@@ -1950,6 +2148,343 @@ mod tests {
         let started = std::time::Instant::now();
         mask_prompt(&vault, &graph, &triage_prompt(&graph, host), false).unwrap();
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_host_filled_to_every_new_cap_still_makes_a_bounded_request() {
+        // Strings as long as the graph keeps them, every list as long as
+        // the graph allows, on more web ports than a request can list.
+        let long = |what: &str, n: usize| format!("{what} {n} {}", "word ".repeat(36));
+        let mut graph = Graph::default();
+        for port in 8000..8070u16 {
+            graph.apply(Observation::Port {
+                address: "10.10.10.9".into(),
+                port,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("http".into()),
+                product: None,
+                version: None,
+                extra_info: None,
+                cpes: (0..20).map(|n| format!("cpe:2.3:a:v:p{n}:1.0")).collect(),
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+            let http = HttpInfo {
+                scheme: "https".into(),
+                tech: (0..30).map(|n| long("tech", n)).collect(),
+                cookies: (0..30)
+                    .map(|n| CookieCheck {
+                        name: format!("cookie{n}{}", "c".repeat(60)),
+                        flags: "Secure HttpOnly SameSite=strict ".repeat(4),
+                        issues: (0..8).map(|i| long("issue", i)).collect(),
+                    })
+                    .collect(),
+                header_grade: Some("F".into()),
+                header_notes: (0..20).map(|n| long("note", n)).collect(),
+                scripts: (0..50).map(|n| format!("/static/{n}.js")).collect(),
+                js_endpoints: (0..200)
+                    .map(|n| format!("/api/v1/{n}/{}", "items/".repeat(30)))
+                    .collect(),
+                js_secrets: (1..=40)
+                    .map(|n| JsSecret {
+                        kind: long("kind", n),
+                        token: format!("<<SEC_{n:02}>>"),
+                        preview: format!("{n} chars"),
+                        file: format!("/static/{n}/{}", "bundle/".repeat(26)),
+                    })
+                    .collect(),
+                ..HttpInfo::default()
+            };
+            graph.apply(Observation::WebMeta {
+                address: "10.10.10.9".into(),
+                port,
+                http: Box::new(http),
+                record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+            });
+        }
+        graph.apply(Observation::DnsSecurity {
+            address: "10.10.10.9".into(),
+            info: Box::new(DnsSecurity {
+                domain: "tarpit.example".into(),
+                grade: "F".into(),
+                checks: (0..20)
+                    .map(|n| DnsCheck {
+                        name: format!("Check{n}"),
+                        status: "bad".into(),
+                        value: long("value", n),
+                        advice: long("advice", n),
+                    })
+                    .collect(),
+                services: (0..40)
+                    .map(|n| DnsService {
+                        record: format!("_s{n}._tcp.tarpit.example"),
+                        target: format!("h{n}.tarpit.example:389"),
+                        meaning: long("meaning", n),
+                    })
+                    .collect(),
+                wildcard: (0..20).map(|n| format!("10.0.0.{n}")).collect(),
+                subdomains: (0..40)
+                    .map(|n| SubdomainCheck {
+                        name: format!("n{n}.tarpit.example"),
+                        status: "resolves".into(),
+                        addresses: (0..10).map(|a| format!("10.1.{n}.{a}")).collect(),
+                    })
+                    .collect(),
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+        });
+
+        let host = &graph.hosts["10.10.10.9"];
+        let data = &triage_prompt(&graph, host).user["untrusted_scan_data"];
+        let ports = data["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), MAX_PORTS);
+        let first = &ports[0];
+        assert_eq!(first["tech"].as_array().unwrap().len(), MAX_TECH_PER_PORT);
+        assert_eq!(first["header_grade"], "F");
+        assert_eq!(
+            first["header_notes"].as_array().unwrap().len(),
+            MAX_HEADER_NOTES
+        );
+        let cookies = first["cookies"].as_array().unwrap();
+        assert_eq!(cookies.len(), MAX_COOKIES_PER_PORT);
+        assert_eq!(
+            cookies[0]["issues"].as_array().unwrap().len(),
+            MAX_ISSUES_PER_COOKIE
+        );
+        assert_eq!(
+            first["js_endpoints"].as_array().unwrap().len(),
+            MAX_ENDPOINTS_PER_PORT
+        );
+        // The graph keeps 150 endpoints and 32 keys a port.
+        assert_eq!(first["js_endpoints_left_out"], 150 - MAX_ENDPOINTS_PER_PORT);
+        assert_eq!(
+            first["exposed_keys"].as_array().unwrap().len(),
+            MAX_KEYS_PER_PORT
+        );
+        assert_eq!(first["exposed_keys_left_out"], 32 - MAX_KEYS_PER_PORT);
+        // Past the first few web ports only the basics go, and the model
+        // is told how many ports had more.
+        assert!(ports[MAX_WEB_DETAIL_PORTS].get("tech").is_none());
+        assert!(ports[MAX_WEB_DETAIL_PORTS].get("js_endpoints").is_none());
+        assert_eq!(
+            data["web_detail_ports_left_out"],
+            MAX_PORTS - MAX_WEB_DETAIL_PORTS
+        );
+        let dns = &data["dns_security"];
+        assert_eq!(dns["grade"], "F");
+        assert_eq!(dns["checks"].as_array().unwrap().len(), MAX_DNS_CHECKS);
+        assert_eq!(dns["services"].as_array().unwrap().len(), MAX_DNS_SERVICES);
+        assert_eq!(dns["services_left_out"], 32 - MAX_DNS_SERVICES);
+        assert_eq!(dns["wildcard"].as_array().unwrap().len(), MAX_DNS_WILDCARD);
+        assert_eq!(dns["subdomains"].as_array().unwrap().len(), MAX_SUBDOMAINS);
+        assert_eq!(dns["subdomains_left_out"], 32 - MAX_SUBDOMAINS);
+        assert!(dns["subdomains"][0].get("addresses").is_none());
+        let size = data.to_string().len();
+        assert!(size < 200_000, "{size} bytes");
+
+        let vault = Mutex::new(Vault::ephemeral());
+        let started = std::time::Instant::now();
+        mask_prompt(&vault, &graph, &triage_prompt(&graph, host), false).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// The lab host with what the web and mail-DNS stages find, named the
+    /// way an internal network names things.
+    fn lab_with_web_and_dns() -> Graph {
+        let mut graph = lab();
+        graph.apply(Observation::WebMeta {
+            address: "10.10.10.5".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                tech: vec![
+                    "nginx 1.18.0".into(),
+                    "jQuery 1.12.4 (older than 3.5.0: XSS fixes)".into(),
+                ],
+                cookies: vec![CookieCheck {
+                    name: "PHPSESSID".into(),
+                    flags: "HttpOnly SameSite=lax".into(),
+                    issues: vec!["no Secure flag: it is also sent over plain HTTP".into()],
+                }],
+                header_grade: Some("D".into()),
+                header_notes: vec!["no Content-Security-Policy".into()],
+                scripts: vec!["/static/app.js".into()],
+                js_endpoints: vec![
+                    "https://api.internal.example.test/v1/x".into(),
+                    "/api/v1/users".into(),
+                ],
+                js_secrets: vec![JsSecret {
+                    kind: "AWS access key ID".into(),
+                    token: "<<SEC_01>>".into(),
+                    // Built here: no key-shaped text in the source.
+                    preview: format!("{}{}\u{2026} (20 chars)", "AK", "IA"),
+                    file: "/static/app.js".into(),
+                }],
+                ..HttpInfo::default()
+            }),
+            record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+        });
+        graph.apply(Observation::DnsSecurity {
+            address: "10.10.10.5".into(),
+            info: Box::new(DnsSecurity {
+                domain: "corp.example.test".into(),
+                grade: "C".into(),
+                checks: vec![DnsCheck {
+                    name: "SPF".into(),
+                    status: "warn".into(),
+                    value: "v=spf1 ip4:10.20.30.0/24 ~all".into(),
+                    advice: "End the record with -all.".into(),
+                }],
+                services: vec![DnsService {
+                    record: "_ldap._tcp.corp.example.test".into(),
+                    target: "dc01.corp.example.test:389".into(),
+                    meaning: "LDAP directory (Active Directory)".into(),
+                }],
+                wildcard: vec!["10.9.8.7".into()],
+                subdomains: vec![SubdomainCheck {
+                    name: "old.corp.example.test".into(),
+                    status: "resolves".into(),
+                    addresses: vec!["10.20.30.40".into()],
+                }],
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+        });
+        graph
+    }
+
+    #[test]
+    fn web_and_dns_findings_reach_the_cloud_masked_only() {
+        let graph = lab_with_web_and_dns();
+        let host = &graph.hosts["10.10.10.5"];
+        let prompt = triage_prompt(&graph, host);
+        assert!(prompt.system.contains("`dns_security`"));
+        assert!(prompt
+            .system
+            .contains("`exposed_keys`, by placeholder only"));
+        // Even unmasked (the local tier), a key goes by its placeholder.
+        let data = &prompt.user["untrusted_scan_data"];
+        assert_eq!(
+            data["ports"][0]["exposed_keys"],
+            json!([{ "kind": "AWS access key ID", "token": "<<SEC_01>>", "file": "/static/app.js" }])
+        );
+        assert!(!prompt.user.to_string().contains("(20 chars)"));
+
+        // The key itself is in the vault, as the web stage left it.
+        let fake_key = format!("{}{}{}", "AK", "IA", "Q".repeat(16));
+        let vault = Mutex::new(Vault::ephemeral());
+        assert_eq!(
+            vault
+                .lock()
+                .unwrap()
+                .register(crate::vault::Kind::Sec, &fake_key),
+            "<<SEC_01>>"
+        );
+        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        for private in [
+            "10.10.10.5",
+            "corp.example.test",
+            "dc01",
+            "old.corp",
+            "10.20.30.40",
+            "10.20.30.0",
+            "10.9.8.7",
+            "api.internal.example.test",
+            "internal.example",
+            fake_key.as_str(),
+            "(20 chars)",
+        ] {
+            assert!(
+                !masked.contains(private),
+                "{private} would reach the cloud:\n{masked}"
+            );
+        }
+        let vault = vault.lock().unwrap();
+        let sent: Value = serde_json::from_str(&masked).unwrap();
+        assert!(vault.leaks_json(&sent).is_empty(), "{masked}");
+        assert!(vault.leaks(&masked).is_empty(), "{masked}");
+
+        // What is not private still reaches the model as it is.
+        let data = &sent["untrusted_scan_data"];
+        let port = &data["ports"][0];
+        assert_eq!(port["tech"][0], "nginx 1.18.0");
+        assert_eq!(port["header_grade"], "D");
+        assert_eq!(port["header_notes"][0], "no Content-Security-Policy");
+        assert_eq!(port["cookies"][0]["name"], "PHPSESSID");
+        assert_eq!(port["cookies"][0]["flags"], "HttpOnly SameSite=lax");
+        assert_eq!(port["js_endpoints"][1], "/api/v1/users");
+        let api = port["js_endpoints"][0].as_str().unwrap();
+        assert!(
+            api.starts_with("https://<<DOM_") && api.ends_with(">>/v1/x"),
+            "{api}"
+        );
+        assert_eq!(port["exposed_keys"][0]["kind"], "AWS access key ID");
+        assert_eq!(port["exposed_keys"][0]["file"], "/static/app.js");
+        assert!(port["exposed_keys"][0].get("preview").is_none());
+        // The key's placeholder is masked like any placeholder-shaped text;
+        // the reply gets back the one the map and the report show.
+        let token = port["exposed_keys"][0]["token"].as_str().unwrap();
+        assert_eq!(vault.unmask(token), "<<SEC_01>>");
+        let dns = &data["dns_security"];
+        assert_eq!(dns["grade"], "C");
+        assert_eq!(dns["checks"][0]["name"], "SPF");
+        assert_eq!(dns["checks"][0]["status"], "warn");
+        assert_eq!(
+            dns["services"][0]["meaning"],
+            "LDAP directory (Active Directory)"
+        );
+        let target = dns["services"][0]["target"].as_str().unwrap();
+        assert!(
+            target.starts_with("<<DOM_") && target.ends_with(">>:389"),
+            "{target}"
+        );
+        assert_eq!(dns["subdomains"][0]["status"], "resolves");
+        assert!(dns["wildcard"][0].as_str().unwrap().starts_with("<<HOST_"));
+    }
+
+    #[tokio::test]
+    async fn a_dmarc_report_mailbox_does_not_stop_the_request() {
+        // Record types by their DNS numbers.
+        const MX: u16 = 15;
+        const TXT: u16 = 16;
+        let resolver = |name: String, rrtype: u16| async move {
+            let answer: &[&str] = match (name.as_str(), rrtype) {
+                ("shop.example.com", TXT) => &["v=spf1 include:_spf.acme-group.ad mx -all"],
+                ("shop.example.com", MX) => &["10 mx1.shop.example.com"],
+                ("_dmarc.shop.example.com", TXT) => {
+                    &["v=DMARC1; p=quarantine; rua=mailto:dmarc@shop.example.com"]
+                }
+                _ => &[],
+            };
+            answer
+                .iter()
+                .map(|a| (*a).to_owned())
+                .collect::<Vec<String>>()
+        };
+        let (observations, _) =
+            crate::maildns::run_with("shop.example.com", "203.0.113.10", &[], resolver)
+                .await
+                .unwrap();
+        let mut graph = Graph::default();
+        for observation in observations {
+            graph.apply(observation);
+        }
+        let host = &graph.hosts["203.0.113.10"];
+        let prompt = triage_prompt(&graph, host);
+
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        for private in ["shop.example", "acme-group", "203.0.113.10"] {
+            assert!(
+                !masked.contains(private),
+                "{private} would reach the cloud:\n{masked}"
+            );
+        }
+        // The check keeps its name, and the role mailbox stays as it is.
+        let sent: Value = serde_json::from_str(&masked).unwrap();
+        let checks = &sent["untrusted_scan_data"]["dns_security"]["checks"];
+        assert_eq!(checks[1]["name"], "DMARC");
+        let value = checks[1]["value"].as_str().unwrap();
+        assert!(value.contains("rua=mailto:dmarc@<<DOM_"), "{value}");
     }
 
     #[test]

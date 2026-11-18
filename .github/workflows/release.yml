@@ -3,8 +3,15 @@
 # workflow) for the version in Cargo.toml: GitHub then makes the tag itself
 # when it publishes. The files go on that version's GitHub Release: a .pkg
 # installer for macOS, plus .tar.gz / .zip archives that `meow update`
-# fetches, each with a .sha256 file. Only the pinned checkout action is
-# used; uploads go through the gh CLI the runners carry.
+# fetches, each with a .sha256 file.
+#
+# The build jobs compile third-party crates, whose build scripts can run any
+# code, so they get a read-only token and no GH_TOKEN: they hand their files
+# to the publish job as workflow artifacts, one per build, which it checks
+# build by build, so a build can hand over only its own files. Only the
+# draft and publish jobs, which compile nothing, can write to the release,
+# through the gh CLI the runners carry. Actions are pinned to a commit:
+# checkout, upload-artifact and download-artifact.
 name: release
 
 on:
@@ -88,8 +95,10 @@ jobs:
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Read-only: this job runs crate build scripts, so it must not hold a
+    # token that can change the repository or the release.
     permissions:
-      contents: write
+      contents: read
     defaults:
       run:
         shell: bash
@@ -112,34 +121,29 @@ jobs:
           MATRIX_TARGET: ${{ matrix.target }}
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: cargo build --release --locked --target "$MATRIX_TARGET"
-      - name: Package and upload
+      - name: Package
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.draft.outputs.tag }}
           MATRIX_NAME: ${{ matrix.name }}
           MATRIX_TARGET: ${{ matrix.target }}
           COPYFILE_DISABLE: "1"
         run: |
-          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
-            echo "Refusing to clobber already-published release $TAG." >&2
-            exit 1
-          fi
           version=${TAG#v}
           name="meow-$version-$MATRIX_NAME"
           out="target/$MATRIX_TARGET/release"
-          mkdir -p stage
+          mkdir -p stage dist
           cp LICENSE stage/LICENSE
           cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
           case "$MATRIX_NAME" in
           windows-*)
             cp "$out/meow.exe" stage/meow.exe
-            ARCHIVE_NAME="$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
+            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
             cp "$out/meow" stage/meow
             chmod 0755 stage/meow
-            tar -czf "$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
+            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
@@ -152,19 +156,30 @@ jobs:
             chmod 0755 pkgroot/usr/local/bin/meow
             pkgbuild --root pkgroot --ownership recommended \
               --identifier io.github.jrdelt.meow \
-              --version "$version" --install-location / "$name.pkg"
+              --version "$version" --install-location / "dist/$name.pkg"
             files="$files $name.pkg"
             ;;
           esac
+          # From inside dist/, so each .sha256 names the bare file, as
+          # `meow update` and `sha256sum -c` next to a download expect.
+          cd dist || exit 1
           for file in $files; do
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum -- "$file" >"$file.sha256"
             else
               shasum -a 256 -- "$file" >"$file.sha256"
             fi
-            gh release upload "$TAG" "$file" "$file.sha256" \
-              --repo "$GITHUB_REPOSITORY" --clobber
           done
+      - name: Hand the files to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: meow-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of this job replaces what an earlier attempt kept,
+          # instead of failing on the name.
+          overwrite: true
 
   publish:
     name: publish the release
@@ -173,7 +188,93 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Fetch the builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: meow-*
+          # Not merged: each build's files land in dist/meow-<build>/, so
+          # the check below knows which build handed over which file. In
+          # one merged folder a build could put its own copy of another
+          # build's archive and .sha256 in place of the real ones.
+          path: dist
+      - name: Check the builds and add them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
+        run: |
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "Invalid release tag: $TAG" >&2; exit 1 ;;
+          esac
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "Refusing to clobber already-published release $TAG." >&2
+            exit 1
+          fi
+          # The builds, as the build matrix names them. This list must
+          # match the matrix; a test in src/release.rs checks that it does.
+          builds="macos-arm64 macos-x86_64 linux-x86_64 linux-arm64 windows-x86_64"
+          version=${TAG#v}
+          cd dist || exit 1
+          # diff marks every line, so a file name cannot pass for a
+          # workflow command in the log.
+          show_diff() {
+            diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") | cat -v >&2 || true
+          }
+          # One folder per build artifact and nothing else. With a single
+          # artifact download-artifact unpacks it straight into dist/, so
+          # that fails here too.
+          expected=$(for build in $builds; do printf 'meow-%s\n' "$build"; done | LC_ALL=C sort)
+          found=$(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | LC_ALL=C sort)
+          if [ "$found" != "$expected" ] || [ -n "$(find . -mindepth 1 -maxdepth 1 ! -type d -print -quit)" ]; then
+            echo "The build artifacts are not the expected folders (< expected, > found):" >&2
+            show_diff "$expected" "$found"
+            exit 1
+          fi
+          uploads=""
+          for build in $builds; do
+            # The files the build job's Package step makes, named the same
+            # way.
+            dir="meow-$build"
+            name="meow-$version-$build"
+            case "$build" in
+            windows-*) files="$name.zip" ;;
+            *) files="$name.tar.gz" ;;
+            esac
+            case "$build" in
+            macos-*) files="$files $name.pkg" ;;
+            esac
+            # Exactly this build's files and their .sha256 files, and
+            # nothing else: a build cannot add, drop or rename a release
+            # file, or hand over another build's. Only names from the
+            # list above reach gh below.
+            expected=$(for file in $files; do printf '%s\n%s.sha256\n' "$file" "$file"; done | LC_ALL=C sort)
+            found=$(find "$dir" -mindepth 1 -printf '%P\n' | LC_ALL=C sort)
+            if [ "$found" != "$expected" ] || [ -n "$(find "$dir" -mindepth 1 ! -type f -print -quit)" ]; then
+              echo "$dir does not hold the expected files (< expected, > found):" >&2
+              show_diff "$expected" "$found"
+              exit 1
+            fi
+            for file in $files; do
+              # One checksum line that names this file, so `sha256sum -c`
+              # checks this file and no other.
+              if ! awk -v want="$file" '{ sub(/\r$/, "") } NF == 2 && length($1) == 64 && $1 ~ /^[0-9a-f]+$/ && ($2 == want || $2 == "*" want) { ok++ } END { exit !(ok == 1 && NR == 1) }' "$dir/$file.sha256"; then
+                echo "$dir/$file.sha256 is not one checksum line for $file." >&2
+                exit 1
+              fi
+              # From inside the build's folder, as the .sha256 names the
+              # bare file.
+              (cd "$dir" && sha256sum --check --strict -- "$file.sha256") || exit 1
+              # gh names each release file by its base name, so the
+              # folder does not show in the release.
+              uploads="$uploads $dir/$file $dir/$file.sha256"
+            done
+          done
+          # shellcheck disable=SC2086 # the names hold no spaces or patterns
+          gh release upload "$TAG" $uploads --repo "$GITHUB_REPOSITORY" --clobber
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

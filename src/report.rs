@@ -16,7 +16,7 @@ use crate::checklist;
 use crate::cve;
 use crate::db::Db;
 use crate::evidence::{inert_markdown, Source, VerificationStatus};
-use crate::graph::{Advisory, Fact, Graph, Host};
+use crate::graph::{Advisory, DnsSecurity, Fact, Graph, Host, HttpInfo};
 use crate::mode::Mode;
 use crate::queue::{self, TaskRow};
 use crate::timeutil::now_rfc3339;
@@ -27,6 +27,8 @@ use crate::workspace::{write_private_atomic, Workspace};
 const MAX_REPLAY_LINES: usize = 600;
 const MAX_PATHS_PER_PORT: usize = 80;
 const MAX_FACTS_PER_HOST: usize = 80;
+const MAX_ENDPOINTS_PER_PORT: usize = 40;
+const MAX_SCRIPTS_PER_PORT: usize = 20;
 const MAX_REPORT_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Everything the report is built from.
@@ -95,6 +97,34 @@ fn code(text: &str) -> String {
 /// not, and a `\` before `|` must not produce `\\|`.
 fn code_cell(text: &str) -> String {
     code(&text.replace('\\', "/"))
+}
+
+/// [`md`] for text that starts a list item: a value such as `- x`, `+ x`
+/// or `1. x` would otherwise open a list of its own inside the item, and
+/// leading spaces could turn it into a code block.
+fn md_item(text: &str) -> String {
+    let escaped = md(text);
+    let escaped = escaped.trim_start();
+    let bytes = escaped.as_bytes();
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    // `1.` opens a list only before a space or the end: `10.0.0.1` does not.
+    let marker_ends = matches!(bytes.get(digits + 1), None | Some(b' '));
+    match bytes.get(digits) {
+        Some(b'-' | b'+') if digits == 0 => format!("\\{escaped}"),
+        Some(b'.' | b')') if digits > 0 && marker_ends => {
+            format!("{}\\{}", &escaped[..digits], &escaped[digits..])
+        }
+        _ => escaped.to_owned(),
+    }
+}
+
+/// Whether `text` is a vault placeholder (`<<SEC_03>>`). The graph keeps
+/// nothing else for a key, but a hand-edited `graph.json` could: then the
+/// text may be the key itself, and it is not printed.
+fn is_placeholder(text: &str) -> bool {
+    text.strip_prefix("<<SEC_")
+        .and_then(|rest| rest.strip_suffix(">>"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn clean_chat_line(line: &str) -> String {
@@ -362,6 +392,218 @@ fn fact_line(fact: &Fact) -> String {
     )
 }
 
+/// [`md`] for a table cell, with `-` for nothing so that no cell is blank.
+fn md_cell(text: &str) -> String {
+    let escaped = md(text);
+    if escaped.trim().is_empty() {
+        "-".to_owned()
+    } else {
+        escaped
+    }
+}
+
+/// A stack entry the web fingerprint marked as outdated, split into the
+/// software and why it is a concern: `jQuery 1.12.4 (older than 3.5.0: ...)`.
+fn outdated(tech: &str) -> Option<(&str, &str)> {
+    if !tech.contains("(older than") && !tech.contains("end of life") {
+        return None;
+    }
+    Some(match tech.find(" (") {
+        Some(at) => {
+            let why = &tech[at + 2..];
+            (&tech[..at], why.strip_suffix(')').unwrap_or(why))
+        }
+        None => (tech, ""),
+    })
+}
+
+/// What the web fingerprint and the site's own scripts showed on one port:
+/// the software stack, the security-header grade, cookies, exposed keys,
+/// the endpoints the scripts name and the scripts themselves. `port` is
+/// already escaped. A port with none of these gets nothing, not an empty
+/// heading.
+fn render_web_details(out: &mut String, port: &str, http: &HttpInfo) {
+    if !http.tech.is_empty() {
+        let _ = writeln!(out, "Software stack on {port}:\n");
+        out.push_str("| Software | Note |\n|---|---|\n");
+        for tech in &http.tech {
+            let (name, note) = match outdated(tech) {
+                Some((name, "")) => (md_cell(name), "outdated".to_owned()),
+                Some((name, why)) => (md_cell(name), format!("outdated: {}", md(why))),
+                None => (md_cell(tech), "-".to_owned()),
+            };
+            let _ = writeln!(out, "| {name} | {note} |");
+        }
+        out.push('\n');
+    }
+    if http.header_grade.is_some() || !http.header_notes.is_empty() {
+        match &http.header_grade {
+            Some(grade) => {
+                let _ = writeln!(out, "Security headers on {port}: grade {}.\n", md(grade));
+            }
+            None => {
+                let _ = writeln!(out, "Security headers on {port}:\n");
+            }
+        }
+        for note in &http.header_notes {
+            let _ = writeln!(out, "- {}", md_item(note));
+        }
+        if !http.header_notes.is_empty() {
+            out.push('\n');
+        }
+    }
+    if !http.cookies.is_empty() {
+        let _ = writeln!(
+            out,
+            "Cookies set on {port} (names and flags only; values are never kept):\n"
+        );
+        out.push_str("| Cookie | Flags | Issues |\n|---|---|---|\n");
+        for cookie in &http.cookies {
+            let issues: Vec<String> = cookie.issues.iter().map(|issue| md(issue)).collect();
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} |",
+                md_cell(&cookie.name),
+                md_cell(&cookie.flags),
+                if issues.is_empty() {
+                    "none".to_owned()
+                } else {
+                    issues.join("; ")
+                }
+            );
+        }
+        out.push('\n');
+    }
+    if !http.js_secrets.is_empty() {
+        // The rotation list is "Secrets to rotate", from the vault; here is
+        // only where each key was found, under the same placeholder.
+        let _ = writeln!(
+            out,
+            "Keys exposed in the scripts on {port}. The keys stay in the vault, never in this \
+             report; each is listed under Secrets to rotate by the same placeholder.\n"
+        );
+        out.push_str("| Kind | File | Placeholder | Hint |\n|---|---|---|---|\n");
+        for secret in &http.js_secrets {
+            let token = if is_placeholder(&secret.token) {
+                code_cell(&secret.token)
+            } else {
+                "withheld".to_owned()
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {token} | {} |",
+                md_cell(&secret.kind),
+                md_cell(&secret.file),
+                md_cell(&secret.preview)
+            );
+        }
+        out.push('\n');
+    }
+    for (label, list, max) in [
+        (
+            "Endpoints named in the scripts",
+            &http.js_endpoints,
+            MAX_ENDPOINTS_PER_PORT,
+        ),
+        (
+            "Script files of the site",
+            &http.scripts,
+            MAX_SCRIPTS_PER_PORT,
+        ),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "{label} on {port} ({}):\n", list.len());
+        for item in list.iter().take(max) {
+            let _ = writeln!(out, "- {}", md_item(item));
+        }
+        if list.len() > max {
+            let _ = writeln!(out, "- +{} more", list.len() - max);
+        }
+        out.push('\n');
+    }
+}
+
+/// How well the domain a host was found under protects its mail and DNS,
+/// from the `mail-dns` stage.
+fn render_dns(out: &mut String, dns: &DnsSecurity) {
+    let grade = match dns.grade.trim() {
+        "" | "?" => "not graded".to_owned(),
+        grade => format!("grade {}", md(grade)),
+    };
+    if dns.domain.trim().is_empty() {
+        let _ = writeln!(out, "DNS & Mail: {grade}.\n");
+    } else {
+        let _ = writeln!(out, "DNS & Mail for {}: {grade}.\n", md(&dns.domain));
+    }
+    if !dns.checks.is_empty() {
+        out.push_str("| Check | Status | Value | Advice |\n|---|---|---|---|\n");
+        for check in &dns.checks {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                md_cell(&check.name),
+                md_cell(&check.status),
+                md_cell(&check.value),
+                md_cell(&check.advice)
+            );
+        }
+        out.push('\n');
+    }
+    if !dns.services.is_empty() {
+        out.push_str(
+            "Services published in DNS:\n\n| Record | Target | Meaning |\n|---|---|---|\n",
+        );
+        for service in &dns.services {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} |",
+                md_cell(&service.record),
+                md_cell(&service.target),
+                md_cell(&service.meaning)
+            );
+        }
+        out.push('\n');
+    }
+    if dns.wildcard.is_empty() {
+        out.push_str("Wildcard DNS: none.\n\n");
+    } else {
+        let addresses: Vec<String> = dns.wildcard.iter().map(|a| md(a)).collect();
+        let _ = writeln!(
+            out,
+            "Wildcard DNS: made-up names under the domain resolve to {}.\n",
+            addresses.join(", ")
+        );
+    }
+    if !dns.subdomains.is_empty() {
+        out.push_str(
+            "Names from the certificate logs, looked up:\n\n\
+             | Name | Status | Addresses |\n|---|---|---|\n",
+        );
+        for sub in &dns.subdomains {
+            let status = match sub.status.as_str() {
+                "resolves" => "resolves".to_owned(),
+                "wildcard" => "wildcard only (may not exist)".to_owned(),
+                "gone" => "no record".to_owned(),
+                other => md_cell(other),
+            };
+            let addresses: Vec<String> = sub.addresses.iter().map(|a| md(a)).collect();
+            let _ = writeln!(
+                out,
+                "| {} | {status} | {} |",
+                md_cell(&sub.name),
+                if addresses.is_empty() {
+                    "-".to_owned()
+                } else {
+                    addresses.join(", ")
+                }
+            );
+        }
+        out.push('\n');
+    }
+}
+
 fn render_host(out: &mut String, host: &Host) {
     let _ = writeln!(out, "### {}\n", md(&host.label()));
     if let Some(os) = &host.os {
@@ -459,6 +701,14 @@ fn render_host(out: &mut String, host: &Host) {
             );
         }
         out.push('\n');
+    }
+    for port in host.ports.values() {
+        if let Some(http) = &port.http {
+            render_web_details(out, &md(&port.key()), http);
+        }
+    }
+    if let Some(dns) = &host.dns_security {
+        render_dns(out, dns);
     }
 
     let facts: Vec<&Fact> = host
@@ -766,8 +1016,8 @@ pub fn render(inputs: &Inputs) -> String {
 }
 
 /// Renders a single-host engagement report containing that host's Evidence,
-/// confirmed Advisories, unverified hypotheses, operator notes, and AI
-/// remediation chat (`chats/<address>.md`).
+/// confirmed Advisories, unverified hypotheses, operator notes, the keys
+/// found in its scripts, and AI remediation chat (`chats/<address>.md`).
 pub fn render_host_report(inputs: &Inputs, address: &str) -> Option<String> {
     let host = inputs.graph.host(address)?.clone();
     let canonical = host.address.clone();
@@ -792,13 +1042,35 @@ pub fn render_host_report(inputs: &Inputs, address: &str) -> Option<String> {
         .filter(|(name, _)| name == &chat_file || name == &format!("{canonical}.md"))
         .cloned()
         .collect();
+    // The vault does not say where a secret was seen, so only the keys found
+    // in this host's own scripts are listed to rotate here. Each keeps the
+    // web stage's hint, not the vault's: the vault shows the first characters
+    // of every value, and the web stage shows a password-like one only by
+    // its length. This report is the one the map offers for download.
+    let found_here: Vec<_> = host
+        .ports
+        .values()
+        .filter_map(|port| port.http.as_ref())
+        .flat_map(|http| &http.js_secrets)
+        .collect();
+    let secrets = inputs
+        .secrets
+        .iter()
+        .filter_map(|secret| {
+            let found = found_here.iter().find(|js| js.token == secret.token)?;
+            Some(ExposedSecret {
+                preview: found.preview.clone(),
+                ..secret.clone()
+            })
+        })
+        .collect();
     let filtered = Inputs {
         session: format!("{} ({})", inputs.session, host.label()),
         mode: inputs.mode,
         generated_utc: inputs.generated_utc.clone(),
         graph: sub_graph,
         tasks,
-        secrets: Vec::new(),
+        secrets,
         replay: None,
         chats,
     };
@@ -1290,6 +1562,445 @@ mod tests {
             rendered.contains("| `<<SEC_01>>` | `a\\|b... (9 chars)` |"),
             "{rendered}"
         );
+    }
+
+    /// Every table keeps the columns of its header row: no cell text added
+    /// a border or took one away.
+    fn assert_tables_keep_their_columns(text: &str) {
+        let borders = |line: &str| {
+            line.replace("\\\\", "")
+                .replace("\\|", "")
+                .matches('|')
+                .count()
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut columns = None;
+        for (at, line) in lines.iter().enumerate() {
+            if !line.starts_with('|') {
+                columns = None;
+                continue;
+            }
+            match columns {
+                None => {
+                    assert!(
+                        lines
+                            .get(at + 1)
+                            .is_some_and(|next| next.starts_with("|---")),
+                        "a table row without a header: {line}\n{text}"
+                    );
+                    columns = Some(borders(line));
+                }
+                Some(count) => assert_eq!(borders(line), count, "{line}\n{text}"),
+            }
+        }
+    }
+
+    /// The section of one host in a report: from its heading to the next.
+    fn host_section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let start = text
+            .find(&format!("{heading}\n"))
+            .unwrap_or_else(|| panic!("no {heading}"));
+        let rest = &text[start + heading.len()..];
+        let end = ["\n### ", "\n## "]
+            .iter()
+            .filter_map(|next| rest.find(next))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// The fields the web fingerprint, the site's scripts and the mail-dns
+    /// stage fill in, on 10.10.10.5.
+    fn with_web_and_dns_details() -> Inputs {
+        use crate::graph::{CookieCheck, DnsCheck, DnsService, JsSecret, SubdomainCheck};
+        let mut data = inputs();
+        // Built here: no key-shaped text in the source.
+        let hint = format!("{}{}\u{2026} (20 chars)", "AK", "IA");
+        let host = data.graph.hosts.get_mut("10.10.10.5").unwrap();
+        let http = host
+            .ports
+            .get_mut("443/tcp")
+            .unwrap()
+            .http
+            .as_mut()
+            .unwrap();
+        http.tech = vec![
+            "nginx 1.18.0".into(),
+            "jQuery 1.12.4 (older than 3.5.0: known XSS issues (CVE-2020-11022, CVE-2020-11023))"
+                .into(),
+            "AngularJS 1.8.2 (AngularJS 1.x reached end of life in 2021: no more security fixes)"
+                .into(),
+        ];
+        http.header_grade = Some("D".into());
+        http.header_notes = vec![
+            "missing Content-Security-Policy, X-Frame-Options".into(),
+            "Strict-Transport-Security max-age is under six months".into(),
+        ];
+        http.cookies = vec![
+            CookieCheck {
+                name: "PHPSESSID".into(),
+                flags: "HttpOnly".into(),
+                issues: vec![
+                    "no Secure flag: it is also sent over plain HTTP".into(),
+                    "no SameSite: browsers default to Lax".into(),
+                ],
+            },
+            CookieCheck {
+                name: "lang".into(),
+                flags: "Secure HttpOnly SameSite=Lax".into(),
+                issues: vec![],
+            },
+        ];
+        http.scripts = vec!["/static/app.js".into(), "/static/vendor.js".into()];
+        http.js_endpoints = (0..50).map(|i| format!("/api/v1/item{i}")).collect();
+        http.js_endpoints[1] = "https://api.partner.example/v2/orders".into();
+        http.js_secrets = vec![JsSecret {
+            kind: "AWS access key ID".into(),
+            token: "<<SEC_02>>".into(),
+            preview: hint.clone(),
+            file: "/static/app.js".into(),
+        }];
+        host.dns_security = Some(DnsSecurity {
+            domain: "example.test".into(),
+            grade: "C".into(),
+            checks: vec![
+                DnsCheck {
+                    name: "SPF".into(),
+                    status: "ok".into(),
+                    value: "v=spf1 -all".into(),
+                    advice: String::new(),
+                },
+                DnsCheck {
+                    name: "DMARC".into(),
+                    status: "warn".into(),
+                    value: "p=none".into(),
+                    advice: "move to p=quarantine once the reports look clean".into(),
+                },
+            ],
+            services: vec![DnsService {
+                record: "_ldap._tcp.example.test".into(),
+                target: "dc01.corp.example.test:389".into(),
+                meaning: "LDAP directory (often Active Directory domain controllers)".into(),
+            }],
+            wildcard: vec!["203.0.113.50".into()],
+            subdomains: vec![
+                SubdomainCheck {
+                    name: "www.example.test".into(),
+                    status: "resolves".into(),
+                    addresses: vec!["203.0.113.10".into()],
+                },
+                SubdomainCheck {
+                    name: "old.example.test".into(),
+                    status: "wildcard".into(),
+                    addresses: vec!["203.0.113.50".into()],
+                },
+                SubdomainCheck {
+                    name: "gone.example.test".into(),
+                    status: "gone".into(),
+                    addresses: vec![],
+                },
+            ],
+        });
+        data.secrets.push(ExposedSecret {
+            token: "<<SEC_02>>".into(),
+            preview: format!("{}{}... (20 chars)", "AK", "IA"),
+            first_seen_utc: "2026-11-12T09:10:00Z".into(),
+        });
+        data
+    }
+
+    #[test]
+    fn web_and_dns_details_have_their_own_sections() {
+        let data = with_web_and_dns_details();
+        let hint = format!("{}{}\u{2026} (20 chars)", "AK", "IA");
+        let expected_host = [
+            "| 443/tcp | open | ssl/http | nginx | 1.18.0 |",
+            "Paths on 443/tcp:",
+            "Software stack on 443/tcp:\n\n| Software | Note |\n|---|---|\n",
+            "| nginx 1.18.0 | - |",
+            "| jQuery 1.12.4 | outdated: older than 3.5.0: known XSS issues \
+             (CVE-2020-11022, CVE-2020-11023) |",
+            "| AngularJS 1.8.2 | outdated: AngularJS 1.x reached end of life in 2021: \
+             no more security fixes |",
+            "Security headers on 443/tcp: grade D.\n\n\
+             - missing Content-Security-Policy, X-Frame-Options\n\
+             - Strict-Transport-Security max-age is under six months\n",
+            "Cookies set on 443/tcp (names and flags only; values are never kept):",
+            "| PHPSESSID | HttpOnly | no Secure flag: it is also sent over plain HTTP; \
+             no SameSite: browsers default to Lax |",
+            "| lang | Secure HttpOnly SameSite=Lax | none |",
+            "Keys exposed in the scripts on 443/tcp.",
+            "listed under Secrets to rotate by the same placeholder.",
+            "| Kind | File | Placeholder | Hint |",
+            &format!("| AWS access key ID | /static/app.js | `<<SEC_02>>` | {hint} |"),
+            "Endpoints named in the scripts on 443/tcp (50):\n\n- /api/v1/item0\n\
+             - https://api.partner.example/v2/orders\n",
+            "- /api/v1/item39\n- +10 more\n",
+            "Script files of the site on 443/tcp (2):\n\n- /static/app.js\n- /static/vendor.js\n",
+            "DNS & Mail for example.test: grade C.\n\n| Check | Status | Value | Advice |",
+            "| SPF | ok | v=spf1 -all | - |",
+            "| DMARC | warn | p=none | move to p=quarantine once the reports look clean |",
+            "Services published in DNS:\n\n| Record | Target | Meaning |",
+            "| \\_ldap.\\_tcp.example.test | dc01.corp.example.test:389 | \
+             LDAP directory (often Active Directory domain controllers) |",
+            "Wildcard DNS: made-up names under the domain resolve to 203.0.113.50.",
+            "Names from the certificate logs, looked up:",
+            "| www.example.test | resolves | 203.0.113.10 |",
+            "| old.example.test | wildcard only (may not exist) | 203.0.113.50 |",
+            "| gone.example.test | no record | - |",
+            "Observed evidence:",
+        ];
+        let check_order = |text: &str| {
+            let mut from = 0;
+            for expected in expected_host {
+                match text[from..].find(expected) {
+                    Some(at) => from += at + expected.len(),
+                    None => panic!("missing or out of order: {expected:?}\n{text}"),
+                }
+            }
+        };
+
+        let text = render(&data);
+        check_order(host_section(&text, "### 10.10.10.5"));
+        assert!(!text.contains("/api/v1/item40\n"), "{text}");
+        let vault_row = format!("| `<<SEC_02>>` | `{}{}... (20 chars)` |", "AK", "IA");
+        assert!(text.contains(&format!("{vault_row} 2026-11-12T09:10:00Z |")));
+        assert_tables_keep_their_columns(&text);
+        // The other host has none of these: no empty heading for it.
+        let other = host_section(&text, "### 10.10.10.9");
+        for absent in [
+            "Software stack",
+            "Security headers on",
+            "Cookies set",
+            "Keys exposed",
+            "Endpoints named",
+            "Script files",
+            "DNS & Mail",
+            "Wildcard DNS",
+        ] {
+            assert!(!other.contains(absent), "{absent} in:\n{other}");
+        }
+
+        // The single-host report has the same sections, and lists to rotate
+        // the keys found in this host's scripts, not the vault's others, with
+        // the web stage's hint.
+        let single = render_host_report(&data, "10.10.10.5").unwrap();
+        check_order(host_section(&single, "### 10.10.10.5"));
+        assert!(single.contains("| 1 | 1 | 1 | 1 | 1 |"), "{single}");
+        assert!(
+            single.contains(&format!(
+                "| `<<SEC_02>>` | `{hint}` | 2026-11-12T09:10:00Z |"
+            )),
+            "{single}"
+        );
+        assert!(!single.contains(&vault_row), "{single}");
+        assert!(!single.contains("<<SEC_01>>"), "{single}");
+        assert_tables_keep_their_columns(&single);
+        let bare = render_host_report(&data, "10.10.10.9").unwrap();
+        assert!(bare.contains("No secret has been seen"));
+        assert!(!bare.contains("DNS & Mail") && !bare.contains("Software stack"));
+    }
+
+    #[test]
+    fn single_host_report_hides_the_start_of_a_password_like_key() {
+        use crate::graph::JsSecret;
+        let mut data = with_web_and_dns_details();
+        let kind = "possible secret (a key, token or password assigned in the code)";
+        let value = "hunter2".repeat(3);
+        let http = data
+            .graph
+            .hosts
+            .get_mut("10.10.10.5")
+            .unwrap()
+            .ports
+            .get_mut("443/tcp")
+            .unwrap()
+            .http
+            .as_mut()
+            .unwrap();
+        http.js_secrets.push(JsSecret {
+            kind: kind.into(),
+            token: "<<SEC_03>>".into(),
+            preview: crate::webfp::preview(kind, &value),
+            file: "/static/app.js".into(),
+        });
+        // The vault's own hint keeps the first characters of any value.
+        data.secrets.push(ExposedSecret {
+            token: "<<SEC_03>>".into(),
+            preview: format!("{}... (21 chars)", &value[..4]),
+            first_seen_utc: "2026-11-12T09:20:00Z".into(),
+        });
+
+        let single = render_host_report(&data, "10.10.10.5").unwrap();
+        assert!(
+            single.contains(&format!(
+                "| {kind} | /static/app.js | `<<SEC_03>>` | 21 chars |"
+            )),
+            "{single}"
+        );
+        assert!(
+            single.contains("| `<<SEC_03>>` | `21 chars` | 2026-11-12T09:20:00Z |"),
+            "{single}"
+        );
+        assert!(single.contains("| 1 | 1 | 1 | 1 | 2 |"), "{single}");
+        assert!(!single.contains(&value[..4]), "{single}");
+        assert_tables_keep_their_columns(&single);
+    }
+
+    #[test]
+    fn empty_web_and_dns_fields_render_nothing() {
+        let text = render(&inputs());
+        for absent in [
+            "Software stack",
+            "Security headers on",
+            "Cookies set",
+            "Keys exposed",
+            "Endpoints named",
+            "Script files",
+            "DNS & Mail",
+            "Wildcard DNS",
+        ] {
+            assert!(!text.contains(absent), "{absent} in:\n{text}");
+        }
+
+        // A domain with nothing but its grade: no empty tables.
+        let mut data = inputs();
+        data.graph.hosts.get_mut("10.10.10.9").unwrap().dns_security = Some(DnsSecurity {
+            domain: "example.org".into(),
+            grade: "?".into(),
+            ..DnsSecurity::default()
+        });
+        let text = render(&data);
+        let host = host_section(&text, "### 10.10.10.9");
+        assert!(
+            host.contains("DNS & Mail for example.org: not graded.\n\nWildcard DNS: none.\n\n"),
+            "{host}"
+        );
+        for absent in ["| Check |", "Services published", "certificate logs"] {
+            assert!(!host.contains(absent), "{absent} in:\n{host}");
+        }
+    }
+
+    #[test]
+    fn hostile_web_and_dns_values_stay_text() {
+        use crate::graph::{CookieCheck, DnsCheck, DnsService, JsSecret, SubdomainCheck};
+        let evil = "a|b `c` \\| d\n## Injected <script>alert(1)</script> [x](javascript:alert(1))";
+        // A key in the placeholder's place, as a hand-edited graph.json could
+        // have it: built here, so no key-shaped text is in the source.
+        let fake_key = format!("{}{}{}", "AK", "IA", "Z".repeat(16));
+        let mut data = inputs();
+        let host = data.graph.hosts.get_mut("10.10.10.5").unwrap();
+        let http = host
+            .ports
+            .get_mut("443/tcp")
+            .unwrap()
+            .http
+            .as_mut()
+            .unwrap();
+        http.tech = vec![evil.into(), format!("{evil} (older than {evil})")];
+        http.header_grade = Some(evil.into());
+        http.header_notes = vec![evil.into(), "- nested".into()];
+        http.cookies = vec![CookieCheck {
+            name: evil.into(),
+            flags: evil.into(),
+            issues: vec![evil.into(), evil.into()],
+        }];
+        http.scripts = vec![evil.into()];
+        http.js_endpoints = vec![
+            evil.into(),
+            "- nested".into(),
+            "+ nested".into(),
+            "1. ordered".into(),
+            "    indented".into(),
+        ];
+        http.js_secrets = vec![
+            JsSecret {
+                kind: evil.into(),
+                token: "<<SEC_07>>".into(),
+                preview: evil.into(),
+                file: evil.into(),
+            },
+            JsSecret {
+                kind: evil.into(),
+                token: fake_key.clone(),
+                preview: evil.into(),
+                file: evil.into(),
+            },
+        ];
+        host.dns_security = Some(DnsSecurity {
+            domain: evil.into(),
+            grade: evil.into(),
+            checks: vec![DnsCheck {
+                name: evil.into(),
+                status: evil.into(),
+                value: evil.into(),
+                advice: evil.into(),
+            }],
+            services: vec![DnsService {
+                record: evil.into(),
+                target: evil.into(),
+                meaning: evil.into(),
+            }],
+            wildcard: vec![evil.into(), evil.into()],
+            subdomains: vec![SubdomainCheck {
+                name: evil.into(),
+                status: evil.into(),
+                addresses: vec![evil.into(), evil.into()],
+            }],
+        });
+
+        for rendered in [
+            render(&data),
+            render_host_report(&data, "10.10.10.5").unwrap(),
+        ] {
+            let section = host_section(&rendered, "### 10.10.10.5");
+            // Every section is there, so the checks below saw each field.
+            for expected in [
+                "Software stack on 443/tcp:",
+                "Security headers on 443/tcp: grade ",
+                "Cookies set on 443/tcp",
+                "Keys exposed in the scripts on 443/tcp.",
+                "Endpoints named in the scripts on 443/tcp (5):",
+                "Script files of the site on 443/tcp (1):",
+                "DNS & Mail for ",
+                "Services published in DNS:",
+                "Wildcard DNS: made-up names",
+                "Names from the certificate logs",
+            ] {
+                assert!(section.contains(expected), "no {expected:?} in:\n{section}");
+            }
+            assert!(!rendered.contains("<script"), "{rendered}");
+            assert!(!rendered.contains("[x](javascript:"), "{rendered}");
+            assert!(!rendered.contains("`c`"), "{rendered}");
+            assert!(
+                !rendered
+                    .lines()
+                    .any(|line| line.trim_start().starts_with('#') && line.contains("Injected")),
+                "{rendered}"
+            );
+            assert!(section.contains(
+                "a\\|b \\`c\\` \\\\\\| d \\#\\# Injected &lt;script&gt;alert(1)&lt;/script&gt; \
+                 \\[x\\](javascript:alert(1))"
+            ));
+            assert_tables_keep_their_columns(&rendered);
+            // A value cannot open a list or a code block inside a list item.
+            for item in [
+                "- \\- nested\n",
+                "- \\+ nested\n",
+                "- 1\\. ordered\n",
+                "- indented\n",
+            ] {
+                assert!(section.contains(item), "no {item:?} in:\n{section}");
+            }
+            // Only a vault placeholder is printed for a key, never other text.
+            assert!(section.contains(" | `<<SEC_07>>` | "));
+            assert!(section.contains(" | withheld | "), "{section}");
+            assert!(!rendered.contains(&fake_key));
+        }
+        assert_eq!(md_item("  42) x"), "42\\) x");
+        assert_eq!(md_item("7."), "7\\.");
+        assert_eq!(md_item("10.0.0.1/api"), "10.0.0.1/api");
+        assert_eq!(md_item("v1.2 - ok"), "v1.2 - ok");
     }
 
     #[test]

@@ -2006,6 +2006,101 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Owner and access list of a file or folder, every account as a SID so
+    /// the checks hold whatever the system language.
+    #[cfg(windows)]
+    struct AclListing {
+        owner: String,
+        /// True when the list does not inherit from the parent folder.
+        protected: bool,
+        /// Each entry's SID and whether it was inherited.
+        entries: Vec<(String, bool)>,
+    }
+
+    /// Reads `path`'s access list with the same System32 PowerShell the
+    /// module uses. The path goes in by environment, never into the script.
+    #[cfg(windows)]
+    fn acl_listing(path: &Path) -> AclListing {
+        const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$item = Get-Item -LiteralPath $env:MEOW_TEST_ACL_PATH -Force
+$sid = [System.Security.Principal.SecurityIdentifier]
+$acl = $item.GetAccessControl()
+Write-Output ('owner ' + $acl.GetOwner($sid).Value)
+Write-Output ('protected ' + $acl.AreAccessRulesProtected)
+foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
+    Write-Output ('entry ' + $rule.IdentityReference.Value + ' ' + $rule.IsInherited)
+}
+"#;
+        let out = std::process::Command::new(windows_powershell_exe().unwrap())
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                SCRIPT,
+            ])
+            .env("MEOW_TEST_ACL_PATH", path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cannot read the access list of {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut listing = AclListing {
+            owner: String::new(),
+            protected: false,
+            entries: Vec::new(),
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines().map(str::trim) {
+            if let Some(owner) = line.strip_prefix("owner ") {
+                listing.owner = owner.to_owned();
+            } else if let Some(flag) = line.strip_prefix("protected ") {
+                listing.protected = flag.eq_ignore_ascii_case("true");
+            } else if let Some(entry) = line.strip_prefix("entry ") {
+                let (sid, inherited) = entry
+                    .rsplit_once(' ')
+                    .unwrap_or_else(|| panic!("unexpected access entry {entry:?}"));
+                listing
+                    .entries
+                    .push((sid.to_owned(), inherited.eq_ignore_ascii_case("true")));
+            }
+        }
+        assert!(
+            is_valid_windows_sid(&listing.owner),
+            "no owner read for {}",
+            path.display()
+        );
+        listing
+    }
+
+    #[cfg(windows)]
+    fn icacls(path: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(windows_system32_exe("icacls").unwrap())
+            .arg(path)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn icacls_ok(path: &Path, args: &[&str]) {
+        let out = icacls(path, args);
+        assert!(
+            out.status.success(),
+            "icacls {} {args:?} failed: {} {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
     #[test]
     fn workspace_names_are_single_safe_directory_names() {
         for good in ["a", "acme-lab", "client_2026.q4", "HTB.box-01", "7days"] {
@@ -2126,6 +2221,121 @@ mod tests {
         loosen();
         Workspace::load(&ws.dir).unwrap();
         assert_private();
+    }
+
+    /// ISS-032 on a real NTFS folder: a workspace opened up to Everyone is
+    /// taken back to the user, SYSTEM and Administrators when it is opened
+    /// again, and a folder owned by another account is refused.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reopen_takes_back_access_and_refuses_other_owners() {
+        const EVERYONE: &str = "S-1-1-0";
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", false);
+        let nested = ws.tmp_dir().join("shell");
+        fs::create_dir(&nested).unwrap();
+        let stray = nested.join("bashrc");
+        fs::write(&stray, "x").unwrap();
+
+        // Everyone in every way a folder can carry it: the root inherits
+        // again and holds an inheritable entry, which also reaches the
+        // children; the subfolder stops inheriting and keeps its own copy;
+        // the files get entries of their own. The SID form works in any
+        // system language, where the account name would not.
+        icacls_ok(&ws.dir, &["/inheritance:e"]);
+        icacls_ok(&ws.dir, &["/grant", "*S-1-1-0:(OI)(CI)(F)"]);
+        icacls_ok(&nested, &["/inheritance:d"]);
+        icacls_ok(&nested, &["/grant", "*S-1-1-0:(OI)(CI)(M)"]);
+        icacls_ok(&stray, &["/grant", "*S-1-1-0:(R)"]);
+        icacls_ok(&ws.profile_path(), &["/grant", "*S-1-1-0:(R)"]);
+        for path in [&ws.dir, &nested, &stray, &ws.profile_path()] {
+            let listing = acl_listing(path);
+            assert!(
+                listing.entries.iter().any(|(sid, _)| sid == EVERYONE),
+                "the setup did not open {} to Everyone",
+                path.display()
+            );
+        }
+        assert!(!acl_listing(&ws.dir).protected);
+        assert!(acl_listing(&nested).protected);
+
+        // Opening an existing workspace is what re-applies the access lists.
+        let (again, created) = open(&fx, "acme", false);
+        assert!(!created);
+        assert_eq!(again.dir, ws.dir);
+
+        let id = current_windows_identity().unwrap();
+        let trusted = [id.user.as_str(), "S-1-5-18", "S-1-5-32-544"];
+        let check = |path: &Path, root: bool| {
+            let listing = acl_listing(path);
+            assert_eq!(
+                listing.protected,
+                root,
+                "{}: only the workspace folder may stop inheriting",
+                path.display()
+            );
+            assert!(
+                !listing.entries.is_empty(),
+                "{} has no entries",
+                path.display()
+            );
+            for (sid, inherited) in &listing.entries {
+                assert_ne!(sid, EVERYONE, "{} still lets Everyone in", path.display());
+                assert!(
+                    trusted.iter().any(|t| t.eq_ignore_ascii_case(sid)),
+                    "{} lets {sid} in",
+                    path.display()
+                );
+                assert_eq!(
+                    *inherited,
+                    !root,
+                    "{}: {sid} should be {}",
+                    path.display(),
+                    if root { "explicit" } else { "inherited" }
+                );
+            }
+        };
+        check(&ws.dir, true);
+        for path in [
+            ws.tmp_dir(),
+            ws.chats_dir(),
+            nested,
+            stray,
+            ws.profile_path(),
+        ] {
+            check(&path, false);
+        }
+
+        // Giving a folder to another account takes the restore privilege,
+        // which the elevated administrator on a GitHub runner holds, so it
+        // must work there; on a desktop without it this half is skipped.
+        let other = fx.home.workspace_dir("other");
+        fs::create_dir(&other).unwrap();
+        let setowner = icacls(&other, &["/setowner", "*S-1-5-19"]);
+        if !setowner.status.success() {
+            let why = format!(
+                "icacls /setowner failed: {} {}",
+                String::from_utf8_lossy(&setowner.stdout).trim(),
+                String::from_utf8_lossy(&setowner.stderr).trim()
+            );
+            assert!(env::var_os("GITHUB_ACTIONS").is_none(), "{why}");
+            eprintln!("skipping the other-owner check: {why}");
+            return;
+        }
+        assert_eq!(acl_listing(&other).owner, "S-1-5-19");
+        let err = Workspace::open_or_create(&fx.home, &fx.cwd, "other", false, Mode::Light)
+            .expect_err("a folder owned by LOCAL SERVICE was taken into use");
+        let kind = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .map(io::Error::kind);
+        assert_eq!(kind, Some(io::ErrorKind::PermissionDenied), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("belongs to another Windows account"),
+            "{err:#}"
+        );
+        assert!(!other.join(PROFILE_FILE).exists());
+        assert!(!other.join("tmp").exists());
     }
 
     #[cfg(unix)]

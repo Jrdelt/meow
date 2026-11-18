@@ -309,6 +309,7 @@ function Invoke-SafeDownload([string]$Url, [string]$OutFile, [long]$MaxBytes) {
                 [System.IO.FileAccess]::Write,
                 [System.IO.FileShare]::None
             )
+            $Complete = $false
             try {
                 $Buf = New-Object byte[] 65536
                 $Total = 0L
@@ -319,9 +320,16 @@ function Invoke-SafeDownload([string]$Url, [string]$OutFile, [long]$MaxBytes) {
                     }
                     $Out.Write($Buf, 0, $Read)
                 }
+                $Complete = $true
                 return
             } finally {
                 $Out.Dispose()
+                # A body cut short by the size limit or a dropped connection
+                # is not left behind for the caller to clean up. Only a file
+                # this call created is removed.
+                if (-not $Complete) {
+                    Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+                }
             }
         } finally {
             $Resp.Dispose()
@@ -335,9 +343,11 @@ $GeoPart = $null
 
 try {
     $TlsProto = [Net.SecurityProtocolType]::Tls12
-    $Tls13 = [Net.SecurityProtocolType]::Tls12
-    if ([Enum]::TryParse([Net.SecurityProtocolType], 'Tls13', [ref]$Tls13)) {
-        $TlsProto = $TlsProto -bor $Tls13
+    # Looked up by name: Windows PowerShell 5.1 runs on .NET Framework, which
+    # has no Enum.TryParse(Type, string, out object), and older versions of it
+    # have no Tls13 at all.
+    if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+        $TlsProto = $TlsProto -bor [Net.SecurityProtocolType]'Tls13'
     }
     [Net.ServicePointManager]::SecurityProtocol = $TlsProto
 

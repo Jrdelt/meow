@@ -1022,4 +1022,193 @@ mod tests {
         let error = run_with(&url, "linux-riscv64", "0.1.1", &exe, false).unwrap_err();
         assert!(format!("{error:#}").contains("no meow-0.2.0-linux-riscv64.tar.gz"));
     }
+
+    /// Every workflow file, by file name, with Windows line ends undone so
+    /// the checks below read the same on any checkout.
+    fn workflow_files() -> Vec<(String, String)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".github")
+            .join("workflows");
+        let mut files: Vec<(String, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yml" | "yaml")
+                )
+            })
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let text = std::fs::read_to_string(&path).unwrap();
+                (name, text.replace("\r\n", "\n"))
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Each job of a workflow: its id (a key two spaces in under `jobs:`)
+    /// and the lines under it.
+    fn workflow_jobs(workflow: &str) -> Vec<(&str, String)> {
+        let (_, jobs) = workflow.split_once("\njobs:\n").unwrap();
+        let mut found: Vec<(&str, String)> = Vec::new();
+        for line in jobs.lines() {
+            let id = line
+                .strip_prefix("  ")
+                .and_then(|rest| rest.strip_suffix(':'))
+                .filter(|id| {
+                    !id.is_empty()
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                });
+            if let Some(id) = id {
+                found.push((id, String::new()));
+            } else if let Some((_, text)) = found.last_mut() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        found
+    }
+
+    /// The entries of a job's `permissions:` block.
+    fn job_permissions(job: &str) -> Vec<&str> {
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let mut lines = job.lines().skip_while(|line| line.trim() != "permissions:");
+        let header = lines.next().expect("the job has a permissions block");
+        let depth = indent(header);
+        lines
+            .take_while(|line| !line.trim().is_empty() && indent(line) > depth)
+            .map(str::trim)
+            .collect()
+    }
+
+    #[test]
+    fn workflow_actions_are_pinned_to_a_commit_with_its_version() {
+        // A tag can be moved to other code; a commit cannot. The comment
+        // says which release the commit is, for people and for Dependabot.
+        let mut actions = Vec::new();
+        for (file, text) in workflow_files() {
+            for line in text.lines() {
+                let item = line.trim_start();
+                let item = item.strip_prefix("- ").unwrap_or(item).trim_start();
+                let Some(value) = item.strip_prefix("uses:") else {
+                    // A `uses:` written another way (flow style, say) would
+                    // slip past the checks below.
+                    let code = line.split('#').next().unwrap_or_default();
+                    assert!(!code.contains("uses:"), "{file}: odd `uses:` in: {line}");
+                    continue;
+                };
+                let (reference, comment) = value
+                    .split_once(" #")
+                    .unwrap_or_else(|| panic!("{file}: no version comment: {line}"));
+                let reference = reference.trim().trim_matches(|c| c == '"' || c == '\'');
+                let (action, commit) = reference
+                    .rsplit_once('@')
+                    .unwrap_or_else(|| panic!("{file}: not pinned: {line}"));
+                assert!(!action.is_empty(), "{file}: {line}");
+                assert!(
+                    commit.len() == 40
+                        && commit
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{file}: not pinned to a full commit: {line}"
+                );
+                let version = comment
+                    .trim()
+                    .strip_prefix('v')
+                    .unwrap_or_else(|| panic!("{file}: no version comment: {line}"));
+                assert!(
+                    version
+                        .split('.')
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+                    "{file}: odd version comment: {line}"
+                );
+                actions.push(action.to_owned());
+            }
+            // A checkout that keeps its token in .git/config hands it to
+            // every later step, crate build scripts included.
+            assert_eq!(
+                text.matches("uses: actions/checkout@").count(),
+                text.matches("persist-credentials: false").count(),
+                "{file}: a checkout keeps its credentials"
+            );
+        }
+        for action in [
+            "actions/checkout",
+            "actions/upload-artifact",
+            "actions/download-artifact",
+        ] {
+            assert!(actions.iter().any(|seen| seen == action), "{action}");
+        }
+    }
+
+    #[test]
+    fn release_builds_get_a_read_only_token_and_only_publish_writes() {
+        // The build jobs run crate build scripts, which can run any code: a
+        // token there that can write could change the repository or the
+        // release. They hand their files over as artifacts instead.
+        let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+        let (top, _) = workflow.split_once("\njobs:\n").unwrap();
+        assert!(top.contains("\npermissions:\n  contents: read\n"));
+        let jobs = workflow_jobs(&workflow);
+        let ids: Vec<&str> = jobs.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, ["draft", "build", "publish"]);
+        for (id, job) in &jobs {
+            let wanted = if *id == "build" {
+                "contents: read"
+            } else {
+                "contents: write"
+            };
+            assert_eq!(job_permissions(job), [wanted], "{id}");
+        }
+        assert_eq!(workflow.matches("contents: write").count(), 2);
+        assert!(!workflow.contains("write-all"));
+
+        let build = &jobs[1].1;
+        for needle in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "github.token",
+            "secrets.",
+            "gh release",
+            ": write",
+        ] {
+            assert!(!build.contains(needle), "the build job has {needle}");
+        }
+        assert!(build.contains("uses: actions/upload-artifact@"));
+        assert!(build.contains("if-no-files-found: error"));
+
+        let publish = &jobs[2].1;
+        assert!(publish.contains("uses: actions/download-artifact@"));
+        assert!(publish.contains("Refusing to clobber already-published release"));
+        assert!(publish.contains("sha256sum --check --strict"));
+        assert!(publish.contains("--clobber"));
+        // Each build's artifact stays in its own folder, named after the
+        // build, and is checked there. Merged into one folder, a build could
+        // hand over its own copy of another build's file and .sha256.
+        assert!(build.contains("          name: meow-${{ matrix.name }}\n"));
+        assert!(!publish.contains("merge-multiple"));
+        assert!(publish.contains("dir=\"meow-$build\""));
+        assert!(publish.contains("(cd \"$dir\" && sha256sum --check --strict"));
+        assert!(publish.contains("uploads=\"$uploads $dir/$file $dir/$file.sha256\""));
+        // The publish job takes exactly the files of these builds, so its
+        // list has to be the build matrix.
+        let matrix: Vec<&str> = build
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- { name: "))
+            .map(|rest| rest.split(',').next().unwrap().trim())
+            .collect();
+        let listed: Vec<&str> = publish
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("builds=\""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the publish job lists the builds")
+            .split_whitespace()
+            .collect();
+        assert_eq!(matrix.len(), 5);
+        assert_eq!(listed, matrix);
+    }
 }

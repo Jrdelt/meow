@@ -1,7 +1,8 @@
-# Formatting, lint, test, MSRV, Windows cross-lint, and dependency audit gates
-# on every push to main and every pull request. Read-only: pull requests from
-# forks run without secrets and cannot write to the repository. Actions are
-# pinned to an immutable commit SHA.
+# Formatting, lint, test, MSRV, Windows, and dependency audit gates on every
+# push to main and every pull request, and by hand on any branch (Actions ->
+# checks -> Run workflow). Read-only: pull requests from forks run without
+# secrets and cannot write to the repository. Actions are pinned to an
+# immutable commit SHA.
 name: checks
 
 on:
@@ -10,6 +11,7 @@ on:
   pull_request:
   schedule:
     - cron: "17 6 * * 1" # weekly, so new advisories surface without a push
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -80,6 +82,42 @@ jobs:
           rustup default stable
           rustup target add x86_64-pc-windows-gnu
       - run: cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+  # The Windows-only code paths run nowhere else: the workspace access lists
+  # (unit tests, MSVC toolchain) and the installer's downloads under both
+  # Windows PowerShell 5.1 and PowerShell 7. Each step runs even when an
+  # earlier one failed, so one run reports all of them.
+  windows:
+    name: test and installer downloads (Windows)
+    if: github.event_name != 'schedule' || github.repository == 'Jrdelt/meow'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      # Git on the runner checks text out with CRLF; tests compare files
+      # they embed byte for byte, so keep the committed LF endings.
+      - name: Keep committed line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Installer downloads (Windows PowerShell 5.1)
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .github/scripts/install-ps1-checks.ps1
+      - name: Installer downloads (PowerShell 7)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/scripts/install-ps1-checks.ps1
+      - name: Rust toolchain
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Unit tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo test --locked --no-fail-fast --lib
 
   audit:
     name: dependency audit (RustSec)

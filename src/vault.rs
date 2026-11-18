@@ -291,6 +291,39 @@ const COMMON_USERS: &[&str] = &[
     "unknown",
 ];
 
+/// Mailboxes a role has, not a person (RFC 2142, and where DMARC and CAA
+/// records send reports). They tell nothing about the target, and their
+/// names are words: taken for a user name, `dmarc` from
+/// `rua=mailto:dmarc@...` would be masked in every "DMARC" of the request,
+/// `security` in every "Strict-Transport-Security".
+const ROLE_MAILBOXES: &[&str] = &[
+    "postmaster",
+    "hostmaster",
+    "webmaster",
+    "abuse",
+    "security",
+    "noc",
+    "dmarc",
+    "dmarc-reports",
+    "dmarcreports",
+    "reports",
+    "info",
+    "support",
+    "contact",
+    "sales",
+    "noreply",
+    "no-reply",
+    "privacy",
+    "legal",
+    "billing",
+];
+
+/// A login or mailbox name every system or domain has.
+fn is_common_user(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    COMMON_USERS.contains(&lower.as_str()) || ROLE_MAILBOXES.contains(&lower.as_str())
+}
+
 /// Top-level domains under which a name is taken for a real host name and
 /// masked: the generic ones and the country codes. Not the whole registry:
 /// a name under a rarer ending is masked once the graph knows it.
@@ -892,21 +925,140 @@ fn is_single_label_name(name: &str) -> bool {
         && !PLAIN_WORDS.contains(&lower.as_str())
 }
 
-fn extract_redirect_host(location: &str) -> Option<String> {
-    let trimmed = location.trim();
+/// The host of a web or WebSocket URL, absolute or scheme-relative
+/// (`//cdn.example.com/x`): a redirect target, an endpoint named in a
+/// script. A bare path has none.
+fn url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
     let candidate = if let Some(rest) = trimmed.strip_prefix("//") {
         format!("https://{rest}")
     } else {
         trimmed.to_owned()
     };
     let parsed = url::Url::parse(&candidate).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
         return None;
     }
     match parsed.host()? {
         url::Host::Domain(name) => Some(name.to_owned()),
         url::Host::Ipv4(ip) => Some(ip.to_string()),
         url::Host::Ipv6(ip) => Some(ip.to_string()),
+    }
+}
+
+/// A software maker's or advisory database's site, or a name under one.
+/// `name` is in lower case.
+fn is_public_name(name: &str) -> bool {
+    PUBLIC_NAMES
+        .iter()
+        .any(|public| name == *public || name.ends_with(&format!(".{public}")))
+}
+
+/// A name under a real top-level domain that is neither a file name
+/// (`install.sh`) nor a public site's: masked wherever it is not one part
+/// of a path. `name` is in lower case.
+fn is_public_host_name(name: &str) -> bool {
+    let labels: Vec<&str> = name.split('.').collect();
+    let tld = labels.last().copied().unwrap_or("");
+    if !PUBLIC_TLDS.contains(&tld) || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    if labels.len() == 2 && FILE_LIKE_TLDS.contains(&tld) {
+        return false;
+    }
+    !is_public_name(name)
+}
+
+/// A URL as written, cut into the host it names and what follows it (path,
+/// query, fragment). The host is as it stands in the text, without user
+/// and port: the parser rewrites `10.1`, `167772165` and `bücher.example`,
+/// the request does not. A bare path has no host. Neither has an IPv6
+/// literal here: the address pattern finds one however it is written.
+fn split_url(url: &str) -> (Option<&str>, &str) {
+    let url = url.trim();
+    let scheme_end = url.find("://").filter(|at| {
+        *at > 0
+            && url[..*at]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    let after = match (scheme_end, url.strip_prefix("//")) {
+        (Some(at), _) => &url[at + 3..],
+        (None, Some(rest)) => rest,
+        (None, None) => return (None, url),
+    };
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = (!host.starts_with('[')).then(|| without_port(host));
+    (host.filter(|host| !host.is_empty()), &after[end..])
+}
+
+/// The domains a mail policy names: those an SPF record sends lookups to
+/// (`include:`, `a:`, `mx:`, `ptr:`, `exists:`, `redirect=`, `exp=`) and
+/// those a DMARC record sends reports to (the `rua=` and `ruf=` addresses).
+fn mail_policy_domains<'a>(check: &str, value: &'a str) -> Vec<&'a str> {
+    match check {
+        "SPF" => value
+            .split_whitespace()
+            .filter_map(|term| {
+                let term = term.trim_start_matches(['+', '-', '~', '?']);
+                let (mechanism, spec) = term.split_once([':', '='])?;
+                if !matches!(
+                    mechanism.to_ascii_lowercase().as_str(),
+                    "include" | "a" | "mx" | "ptr" | "exists" | "redirect" | "exp"
+                ) {
+                    return None;
+                }
+                // `a:relay.example.com/24`; `exists:%{i}._spf.example.com`
+                // expands macros: what follows the last one is the domain.
+                let spec = spec.split('/').next().unwrap_or("");
+                let spec = spec.rsplit('}').next().unwrap_or(spec);
+                Some(spec.trim_matches('.'))
+            })
+            .filter(|domain| domain.contains('.'))
+            .collect(),
+        "DMARC" => value
+            .split(';')
+            .filter_map(|part| {
+                let (key, list) = part.split_once('=')?;
+                matches!(key.trim().to_ascii_lowercase().as_str(), "rua" | "ruf").then_some(list)
+            })
+            .flat_map(|list| list.split(','))
+            .filter_map(|address| {
+                // mailto:reports@example.com!10m
+                let (_, domain) = address.trim().rsplit_once('@')?;
+                let domain = domain.split('!').next().unwrap_or(domain);
+                Some(domain.trim().trim_end_matches('.'))
+            })
+            .filter(|domain| domain.contains('.'))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `dc01.corp.example.com:389` -> `dc01.corp.example.com`, as an SRV target
+/// is written. An address is left whole: the end of `2001:db8::1` is not a
+/// port.
+fn without_port(target: &str) -> &str {
+    let target = target.trim();
+    if let Some(rest) = target.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    if target.parse::<IpAddr>().is_ok() {
+        return target;
+    }
+    match target.rsplit_once(':') {
+        Some((host, port))
+            if !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => target,
     }
 }
 
@@ -1078,8 +1230,10 @@ impl Vault {
     }
 
     /// Registers everything the graph knows to be private: host addresses,
-    /// names, TLS SANs, redirect hosts, local interface addresses, gateways
-    /// and neighbours.
+    /// names, TLS SANs, redirect hosts, the hosts of URLs in the site's
+    /// scripts and the names in their paths, the domain's DNS records
+    /// (service targets, subdomains, wildcard answers, SPF and DMARC
+    /// domains), local interface addresses, gateways and neighbours.
     pub fn register_graph(&mut self, graph: &Graph) {
         let domain = |vault: &mut Self, name: &str| {
             let name = name.trim_start_matches("*.");
@@ -1106,6 +1260,16 @@ impl Vault {
                 vault.register_domain_suffix(name);
             }
         };
+        // DNS answers and URLs give either one.
+        let name_or_address = |vault: &mut Self, text: &str| {
+            let text = text.trim().trim_end_matches('.');
+            match text.split('%').next().unwrap_or("").parse::<IpAddr>() {
+                Ok(_) => {
+                    vault.register(Kind::Host, text);
+                }
+                Err(_) => domain(vault, text),
+            }
+        };
         for host in graph.hosts.values() {
             match host
                 .address
@@ -1129,22 +1293,91 @@ impl Vault {
                 for san in &port.tls_sans {
                     domain(self, san);
                 }
-                if let Some(host_or_ip) = port
-                    .http
-                    .as_ref()
-                    .and_then(|http| http.location.as_deref())
-                    .and_then(extract_redirect_host)
-                {
-                    match host_or_ip.parse::<IpAddr>() {
-                        Ok(_) => {
-                            self.register(Kind::Host, &host_or_ip);
+                let Some(http) = &port.http else {
+                    continue;
+                };
+                // The host of a redirect, and of a URL a script names (often
+                // an internal API server). Their paths are web paths, which
+                // go as the crawled paths do.
+                let urls = http
+                    .location
+                    .iter()
+                    .chain(&http.js_endpoints)
+                    .chain(&http.scripts)
+                    .chain(http.js_secrets.iter().map(|secret| &secret.file));
+                for url in urls {
+                    let (written, rest) = split_url(url);
+                    if let Some(host_or_ip) = url_host(url) {
+                        // `http://10.1/` is 10.0.0.1 to the parser, but the
+                        // request holds it as written, which no pattern
+                        // finds: that form is registered too.
+                        let written = written.map(str::to_ascii_lowercase);
+                        if let Some(written) = written.filter(|written| {
+                            *written != host_or_ip
+                                && written.parse::<IpAddr>().is_err()
+                                && !is_dotted_quad(written)
+                        }) {
+                            self.register(Kind::Dom, &written);
                         }
-                        Err(_) => domain(self, &host_or_ip),
+                        name_or_address(self, &host_or_ip);
+                    }
+                    // A name in the path is taken for a file where it is
+                    // found (`/cgi-bin/status.pl`). In a URL from a script it
+                    // is more often a host: per-domain API routes
+                    // (`/v3/mg.example.com/messages`) and proxies name one.
+                    for found in HOSTNAME.find_iter(rest) {
+                        let name = found.as_str().to_ascii_lowercase();
+                        let tld = name.rsplit('.').next().unwrap_or("");
+                        if INTERNAL_TLDS.contains(&tld) || is_public_host_name(&name) {
+                            domain(self, &name);
+                        }
                     }
                 }
             }
             if let Some(mac) = &host.mac {
                 self.register(Kind::Host, mac);
+            }
+            if let Some(dns) = &host.dns_security {
+                domain(self, &dns.domain);
+                // The checks also name the registrable domain (DNSSEC, CAA,
+                // DMARC), which is not always the parent of the one checked.
+                if let Some(zone) = crate::osint::root_domain(&dns.domain) {
+                    domain(self, &zone);
+                }
+                // SPF includes and DMARC report addresses name the domain's
+                // mail providers and parent companies, under any ending.
+                // A public site's name stays readable.
+                for check in &dns.checks {
+                    for name in mail_policy_domains(&check.name, &check.value) {
+                        let name = name.to_ascii_lowercase();
+                        if !is_public_name(&name) {
+                            domain(self, &name);
+                        }
+                    }
+                }
+                for service in &dns.services {
+                    // _ldap._tcp.dc._msdcs.corp.example.com: the name after
+                    // the last service label is the domain's own.
+                    let labels: Vec<&str> = service.record.split('.').collect();
+                    let own = labels
+                        .iter()
+                        .rposition(|label| label.starts_with('_'))
+                        .map_or(0, |last| last + 1);
+                    let owner = labels[own..].join(".");
+                    if owner.contains('.') {
+                        domain(self, &owner);
+                    }
+                    name_or_address(self, without_port(&service.target));
+                }
+                for address in &dns.wildcard {
+                    name_or_address(self, address);
+                }
+                for sub in &dns.subdomains {
+                    domain(self, &sub.name);
+                    for address in &sub.addresses {
+                        name_or_address(self, address);
+                    }
+                }
             }
         }
         let local = &graph.local;
@@ -1198,18 +1431,7 @@ impl Vault {
         if self.is_internal_name(&name) {
             return true;
         }
-        let labels: Vec<&str> = name.split('.').collect();
-        let tld = labels.last().copied().unwrap_or("");
-        if !PUBLIC_TLDS.contains(&tld) || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
-            return false;
-        }
-        if labels.len() == 2 && FILE_LIKE_TLDS.contains(&tld) {
-            return false;
-        }
-        if PUBLIC_NAMES
-            .iter()
-            .any(|public| name == *public || name.ends_with(&format!(".{public}")))
-        {
+        if !is_public_host_name(&name) {
             return false;
         }
         // `/cgi-bin/status.pl`: after one slash it is a file in a path;
@@ -1291,7 +1513,12 @@ impl Vault {
             }
         }
         whole(&FS_PATH, Kind::Path, &mut spans);
-        group(&EMAIL_USER, 1, Kind::User, &mut spans);
+        for found in EMAIL_USER.captures_iter(text) {
+            let part = found.get(1).expect("group 1 always participates");
+            if !is_common_user(part.as_str()) {
+                spans.push((part.start(), part.end(), Kind::User));
+            }
+        }
         // Registered values that no pattern above would recognise (single
         // label host names, user names), looked up by the word they begin
         // with at every place a word begins.
@@ -2652,6 +2879,252 @@ mod tests {
             vault.mask_text("target:2001:db8::1 and ::ffff:10.0.0.1"),
             "target:<<HOST_02>> and <<HOST_03>>"
         );
+    }
+
+    #[test]
+    fn dns_records_and_script_urls_are_vaulted() {
+        use crate::graph::{DnsCheck, DnsSecurity, DnsService, HttpInfo, JsSecret, SubdomainCheck};
+        // `.zz` is neither a public nor an internal ending: no pattern masks
+        // these names, only what the graph registers does.
+        let mut graph = Graph::default();
+        graph.apply(Observation::WebMeta {
+            address: "198.51.100.30".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                tech: vec!["nginx 1.18.0".into()],
+                scripts: vec!["//cdn.acme-app.zz/lib.js".into()],
+                js_endpoints: vec![
+                    "https://api.internal-acme.zz:8443/v1/x".into(),
+                    "wss://push.acme-app.zz/socket".into(),
+                    "http://[2001:db8::66]/status".into(),
+                    "/api/v1/users".into(),
+                ],
+                js_secrets: vec![JsSecret {
+                    kind: "Stripe secret key".into(),
+                    token: "<<SEC_01>>".into(),
+                    preview: "21 chars".into(),
+                    file: "https://static.acme-files.zz/app.js".into(),
+                }],
+                ..HttpInfo::default()
+            }),
+            record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+        });
+        graph.apply(Observation::DnsSecurity {
+            address: "198.51.100.30".into(),
+            info: Box::new(DnsSecurity {
+                domain: "mail.eu.acme-corp.zz".into(),
+                grade: "D".into(),
+                checks: vec![
+                    DnsCheck {
+                        name: "DNSSEC".into(),
+                        status: "bad".into(),
+                        value: "acme-corp.zz is not signed".into(),
+                        advice: String::new(),
+                    },
+                    DnsCheck {
+                        name: "SPF".into(),
+                        status: "warn".into(),
+                        value: "v=spf1 include:_spf.acme-group.ad a:relay.acme-holding.zz/24 \
+                                -mx:mx.acme-mx.zz exists:%{i}._spf.acme-exists.zz \
+                                ip4:10.20.30.0/24 include:_spf-a.microsoft.com \
+                                redirect=_spf.acme-redirect.zz ~all"
+                            .into(),
+                        advice: String::new(),
+                    },
+                    DnsCheck {
+                        name: "DMARC".into(),
+                        status: "ok".into(),
+                        value: "v=DMARC1; p=quarantine; \
+                                rua=mailto:dmarc@acme-parent.zz,mailto:x@acme-vendor.zz!10m; \
+                                ruf=mailto:forensic@acme-ruf.zz"
+                            .into(),
+                        advice: String::new(),
+                    },
+                ],
+                services: vec![
+                    DnsService {
+                        record: "_ldap._tcp.dc._msdcs.acme-corp.zz".into(),
+                        target: "dc01.ad.acme-corp.zz:389".into(),
+                        meaning: "LDAP".into(),
+                    },
+                    DnsService {
+                        record: "autodiscover.acme-corp.zz".into(),
+                        target: "mx.hosted-acme.zz".into(),
+                        meaning: "mail client setup".into(),
+                    },
+                    DnsService {
+                        record: "vpn.acme-corp.zz".into(),
+                        target: "2001:db8::44".into(),
+                        meaning: "VPN".into(),
+                    },
+                ],
+                wildcard: vec!["203.0.113.77".into()],
+                subdomains: vec![SubdomainCheck {
+                    name: "old.acme-corp.zz".into(),
+                    status: "resolves".into(),
+                    addresses: vec!["10.20.30.40".into(), "2001:db8::55".into()],
+                }],
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+        });
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+
+        let has = |kind: Kind, value: &str| vault.tokens.contains_key(&(kind, value.to_owned()));
+        for name in [
+            "mail.eu.acme-corp.zz",
+            "acme-corp.zz",
+            "dc01.ad.acme-corp.zz",
+            "mx.hosted-acme.zz",
+            "old.acme-corp.zz",
+            "api.internal-acme.zz",
+            "push.acme-app.zz",
+            "cdn.acme-app.zz",
+            "static.acme-files.zz",
+            "_spf.acme-group.ad",
+            "relay.acme-holding.zz",
+            "mx.acme-mx.zz",
+            "_spf.acme-exists.zz",
+            "_spf.acme-redirect.zz",
+            "acme-parent.zz",
+            "acme-vendor.zz",
+            "acme-ruf.zz",
+        ] {
+            assert!(has(Kind::Dom, name), "{name} is not registered");
+        }
+        // A software maker's own SPF include is not the target's.
+        assert!(!has(Kind::Dom, "_spf-a.microsoft.com"));
+        assert!(!vault.suffixes.contains("microsoft.com"));
+        for address in [
+            "2001:db8::44",
+            "203.0.113.77",
+            "10.20.30.40",
+            "2001:db8::55",
+            "2001:db8::66",
+        ] {
+            assert!(has(Kind::Host, address), "{address} is not registered");
+        }
+        // The service labels and the port are not names.
+        assert!(!has(Kind::Dom, "_ldap._tcp.dc._msdcs.acme-corp.zz"));
+        assert!(!has(Kind::Dom, "dc01.ad.acme-corp.zz:389"));
+        // Web paths are not registered, as the crawled paths are not.
+        assert!(!vault.tokens.keys().any(|(_, value)| value.contains("/api")));
+
+        let text = "_ldap._tcp.dc._msdcs.acme-corp.zz -> dc01.ad.acme-corp.zz:389; \
+                    DNSSEC: acme-corp.zz is not signed; old.acme-corp.zz at 10.20.30.40; \
+                    calls https://api.internal-acme.zz:8443/v1/x and /api/v1/users; \
+                    SPF: v=spf1 include:_spf.acme-group.ad a:relay.acme-holding.zz/24 ~all; \
+                    DMARC: v=DMARC1; p=quarantine; rua=mailto:dmarc@acme-parent.zz; \
+                    nginx 1.18.0, grade D";
+        let masked = vault.mask_text(text);
+        for private in [
+            "acme-corp",
+            "dc01",
+            "internal-acme",
+            "10.20.30.40",
+            "acme-group",
+            "acme-holding",
+            "acme-parent",
+        ] {
+            assert!(!masked.contains(private), "{private} in {masked}");
+        }
+        // A role mailbox is not a user name: "DMARC" stays a word.
+        assert!(masked.contains("DMARC: v=DMARC1;"), "{masked}");
+        assert!(masked.contains("rua=mailto:dmarc@<<DOM_"), "{masked}");
+        assert!(masked.contains(":389;"), "{masked}");
+        assert!(masked.contains("/api/v1/users"), "{masked}");
+        assert!(masked.contains("nginx 1.18.0, grade D"), "{masked}");
+        assert!(vault.leaks(&masked).is_empty(), "{masked}");
+    }
+
+    #[test]
+    fn ports_are_taken_off_service_targets_but_not_off_addresses() {
+        assert_eq!(without_port("dc01.corp.example:389"), "dc01.corp.example");
+        assert_eq!(without_port(" dc01.corp.example "), "dc01.corp.example");
+        assert_eq!(without_port("2001:db8::1"), "2001:db8::1");
+        assert_eq!(without_port("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(without_port("10.0.0.5:88"), "10.0.0.5");
+        assert_eq!(without_port("host:notaport"), "host:notaport");
+        assert_eq!(
+            url_host("wss://Push.Example.zz/s"),
+            Some("push.example.zz".into())
+        );
+        assert_eq!(
+            url_host("//cdn.example.zz/x.js"),
+            Some("cdn.example.zz".into())
+        );
+        assert_eq!(url_host("/api/v1/users"), None);
+        assert_eq!(url_host("ftp://files.example.zz/"), None);
+        assert_eq!(
+            split_url("http://u:p@0x0a141e28:8080/a?b#c"),
+            (Some("0x0a141e28"), "/a?b#c")
+        );
+        assert_eq!(split_url("//10.1/x"), (Some("10.1"), "/x"));
+        assert_eq!(split_url("https://[2001:db8::1]:443/x"), (None, "/x"));
+        assert_eq!(
+            split_url("/go?to=https://a.example.zz/"),
+            (None, "/go?to=https://a.example.zz/")
+        );
+    }
+
+    #[test]
+    fn host_names_in_script_url_paths_and_numeric_hosts_are_vaulted() {
+        use crate::graph::HttpInfo;
+        let endpoints = [
+            "/v3/mg.acme-corp.com/messages",
+            "https://api.mailgun.net/v3/mg.acme-corp.com/messages",
+            "/api/proxy/db01.internal-acme.com/status",
+            "https://gw.acme-shop.zz/route/db02.acme-corp.com/v1",
+            "/api/v1/domains/acme-holding.de",
+            "http://10.1/api/v1/status",
+            "http://167772165/api/v1/health",
+            "http://0x0a.0x14.0x1e.0x28/api/v1/z",
+            "http://0x0a141e28/api/v1/w",
+            // Public names and file names in a path stay readable.
+            "/api/proxy/github.com/repos",
+            "/api/v1/install.sh",
+        ];
+        let mut graph = Graph::default();
+        graph.apply(Observation::WebMeta {
+            address: "198.51.100.31".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                js_endpoints: endpoints.iter().map(|e| (*e).to_owned()).collect(),
+                location: Some("https://login.acme-sso.zz/sso/idp.acme-corp.com/start".into()),
+                ..HttpInfo::default()
+            }),
+            record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+        });
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+
+        let text = format!(
+            "{} redirect https://login.acme-sso.zz/sso/idp.acme-corp.com/start",
+            endpoints.join(" ")
+        );
+        let masked = vault.mask_text(&text);
+        for private in [
+            "acme-corp",
+            "internal-acme",
+            "acme-shop",
+            "acme-holding",
+            "acme-sso",
+            "10.1/",
+            "167772165",
+            "0x0a",
+        ] {
+            assert!(!masked.contains(private), "{private} in {masked}");
+        }
+        // The parsed form of a numeric host is registered as before.
+        assert!(vault
+            .tokens
+            .contains_key(&(Kind::Host, "10.20.30.40".to_owned())));
+        assert!(masked.contains("/messages"), "{masked}");
+        assert!(masked.contains("/api/proxy/github.com/repos"), "{masked}");
+        assert!(masked.contains("/api/v1/install.sh"), "{masked}");
+        assert!(vault.leaks(&masked).is_empty(), "{masked}");
     }
 
     #[test]
