@@ -353,6 +353,55 @@ pub fn sanitize(text: &str, max: usize) -> String {
     out.trim().to_owned()
 }
 
+/// Where a cut splits no word of scan text: a space or a comma. No name,
+/// address, URL or key holds one.
+pub fn is_word_break(c: char) -> bool {
+    c.is_whitespace() || c == ','
+}
+
+/// Where a cut splits no part of a URL that names something: a word break,
+/// or the start of its query, of one of its parameters or of its fragment.
+/// The host and each parameter are then whole or left out. Not a `/`: a
+/// key written in base64 can hold one.
+pub fn is_url_break(c: char) -> bool {
+    is_word_break(c) || matches!(c, '?' | '&' | '#')
+}
+
+/// The start of `text`, at most `max` bytes, cut where it splits nothing:
+/// back to the last character before the limit for which `is_break` holds,
+/// which is left out with any others before it. Text that fits is returned
+/// whole, and one word longer than `max` not at all.
+///
+/// Scan text is masked before it leaves the machine, and the vault knows
+/// names and keys whole: half of one matches no placeholder and no pattern,
+/// and would go out as it is.
+pub fn head_between(text: &str, max: usize, is_break: impl Fn(char) -> bool) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let end = head(text, max).len();
+    // A cut right before a break splits nothing.
+    let cut = if text[end..].starts_with(&is_break) {
+        end
+    } else {
+        text[..end].rfind(&is_break).unwrap_or(0)
+    };
+    text[..cut].trim_end_matches(&is_break)
+}
+
+/// [`sanitize`], cut between words ([`head_between`] at [`is_word_break`]).
+pub fn sanitize_words(text: &str, max: usize) -> String {
+    // Enough to tell whether anything is past the limit.
+    let full = sanitize(text, max.saturating_mul(2));
+    head_between(&full, max, is_word_break).to_owned()
+}
+
+/// [`sanitize`] for a URL, cut between its parts ([`is_url_break`]).
+pub fn sanitize_url(text: &str, max: usize) -> String {
+    let full = sanitize(text, max.saturating_mul(2));
+    head_between(&full, max, is_url_break).to_owned()
+}
+
 /// Text from a model or a web page as Markdown that formats and does
 /// nothing else, in every Markdown dialect: headings, lists, emphasis and
 /// code stay; nothing in it becomes an image, a link, a link definition or
@@ -411,6 +460,33 @@ pub fn inert_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_text_is_cut_between_words_and_a_url_between_its_parts() {
+        assert_eq!(head_between("abc def", 7, is_word_break), "abc def");
+        assert_eq!(head_between("abc defgh", 7, is_word_break), "abc");
+        // A cut right before a break keeps the word before it.
+        assert_eq!(head_between("abc def gh", 7, is_word_break), "abc def");
+        assert_eq!(head_between("a, b,c", 5, is_word_break), "a, b");
+        assert_eq!(head_between("abcdefgh", 7, is_word_break), "");
+        // Not through a character of more than one byte.
+        assert_eq!(
+            head_between("\u{e9}\u{e9} \u{e9}\u{e9}", 6, is_word_break),
+            "\u{e9}\u{e9}"
+        );
+
+        let url = "https://sso.example.test/authorize?client_id=web\
+                   &redirect_uri=https%3A%2F%2Fportal.example.test%2Fcb";
+        assert_eq!(sanitize_url(url, 200), url);
+        assert_eq!(
+            sanitize_url(url, 70),
+            "https://sso.example.test/authorize?client_id=web"
+        );
+        assert_eq!(sanitize_url(url, 40), "https://sso.example.test/authorize");
+        // Prose is cut at spaces and commas only: a key can hold a `/`.
+        assert_eq!(sanitize_words(url, 70), "");
+        assert_eq!(sanitize_words("a b/cd", 5), "a");
+    }
 
     #[test]
     fn only_the_start_of_a_long_text_is_looked_at() {

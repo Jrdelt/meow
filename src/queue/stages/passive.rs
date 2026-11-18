@@ -175,8 +175,21 @@ pub(crate) async fn mail_dns(cx: &Ctx<'_>) -> Result<StageEnd> {
         Some(Ok(res)) => res,
         Some(Err(err)) => return Ok(StageEnd::Skipped(format!("DNS lookups unavailable: {err}"))),
     };
+    register_mail_dns(&mut state.vault(), &observations);
     let (changed, _) = record(state, observations, None);
     Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
+}
+
+/// Puts what the `mail-dns` stage found into the vault, before it goes into
+/// the graph. The facts quote the records whole, but the graph keeps a part
+/// of a long one: the names in them are registered from the record as it
+/// was found, so a fact never names one the vault does not know.
+pub(crate) fn register_mail_dns(vault: &mut crate::vault::Vault, observations: &[Observation]) {
+    for observation in observations {
+        if let Observation::DnsSecurity { info, .. } = observation {
+            vault.register_dns_security(info);
+        }
+    }
 }
 
 pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {

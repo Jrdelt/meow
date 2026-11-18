@@ -419,6 +419,103 @@ fn dns_doh_and_wire_parsers_extract_records_and_filter_txt() {
 }
 
 #[test]
+fn a_txt_record_split_into_strings_is_joined_as_the_wire_parser_joins_it() {
+    // An SPF record over 255 bytes comes as several strings; DNS-over-HTTPS
+    // writes them in presentation form. They are joined without spaces.
+    let doh = serde_json::json!({
+        "Status": 0,
+        "Answer": [
+            {"name": "example.test.", "type": 16, "TTL": 300,
+             "data": "\"v=spf1 include:_spf.acme-a.zz \" \"include:_spf.acme-b.zz -all\""},
+            {"name": "example.test.", "type": 16, "TTL": 300,
+             "data": "\"say \\\"hi\\\"\\059 back\\\\slash\""},
+            {"name": "example.test.", "type": 16, "TTL": 300, "data": "\"v=DMARC1; p=reject\""},
+            {"name": "example.test.", "type": 16, "TTL": 300, "data": "unquoted text as is"}
+        ]
+    });
+    assert_eq!(
+        parse_doh_records(&doh, 16),
+        [
+            "v=spf1 include:_spf.acme-a.zz include:_spf.acme-b.zz -all",
+            "say \"hi\"; back\\slash",
+            "v=DMARC1; p=reject",
+            "unquoted text as is",
+        ]
+    );
+    // The wire parser gives the same record from the same strings.
+    let mut packet = vec![0, 9, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    packet.extend_from_slice(&build_dns_query(9, "example.test", 16).unwrap()[12..]);
+    let strings: [&[u8]; 2] = [
+        b"v=spf1 include:_spf.acme-a.zz ",
+        b"include:_spf.acme-b.zz -all",
+    ];
+    let rdata: Vec<u8> = strings
+        .iter()
+        .flat_map(|s| std::iter::once(s.len() as u8).chain(s.iter().copied()))
+        .collect();
+    packet.extend_from_slice(&[0xC0, 12, 0, 16, 0, 1, 0, 0, 1, 44]);
+    packet.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    packet.extend_from_slice(&rdata);
+    assert_eq!(
+        parse_dns_wire_response(&packet, 9, 16),
+        parse_doh_records(&doh, 16)[..1]
+    );
+}
+
+#[test]
+fn a_long_txt_record_is_kept_whole_and_cut_only_between_terms() {
+    // A TXT answer in both forms, its text in strings of at most 255 bytes.
+    let answers = |record: &str| {
+        let strings: Vec<&str> = record
+            .as_bytes()
+            .chunks(250)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect();
+        let doh = serde_json::json!({
+            "Status": 0,
+            "Answer": [{
+                "name": "example.test.", "type": 16, "TTL": 300,
+                "data": strings.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(" "),
+            }]
+        });
+        let mut packet = vec![0, 9, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        packet.extend_from_slice(&build_dns_query(9, "example.test", 16).unwrap()[12..]);
+        let rdata: Vec<u8> = strings
+            .iter()
+            .flat_map(|s| std::iter::once(s.len() as u8).chain(s.bytes()))
+            .collect();
+        packet.extend_from_slice(&[0xC0, 12, 0, 16, 0, 1, 0, 0, 1, 44]);
+        packet.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&rdata);
+        (
+            parse_doh_records(&doh, 16),
+            parse_dns_wire_response(&packet, 9, 16),
+        )
+    };
+    // 416 bytes: byte 400 falls inside `acmeholdingmail`, which has no dot
+    // to be found by, and the request to the model takes 400 at most.
+    let spf = format!(
+        "v=spf1 {}include:acmeholdingmail.ag -all",
+        "ip4:192.0.2.1 ".repeat(27)
+    );
+    let at = spf.find("acmeholdingmail").unwrap();
+    assert!(at < 400 && at + "acmeholdingmail".len() > 400);
+    let (doh, wire) = answers(&spf);
+    assert_eq!(doh, [spf.as_str()]);
+    assert_eq!(wire, doh);
+    // Longer than is kept: cut after a whole term.
+    let longer = format!("v=spf1 {}-all", "ip4:192.0.2.1 ".repeat(80));
+    let (doh, wire) = answers(&longer);
+    assert!(
+        doh[0].len() <= 1024 && doh[0].len() > 1000,
+        "{}",
+        doh[0].len()
+    );
+    assert!(doh[0].ends_with(" ip4:192.0.2.1"), "{}", doh[0]);
+    assert_eq!(wire, doh);
+}
+
+#[test]
 fn traceroute_detailed_parser_extracts_hops_labels_filtered_stars_and_rtt() {
     let sample = "\
 traceroute to 45.33.32.156 (45.33.32.156), 15 hops max, 60 byte packets

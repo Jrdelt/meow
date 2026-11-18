@@ -75,6 +75,68 @@ pub fn is_notable_txt(txt: &str) -> bool {
         || lower.starts_with("protonmail-verification=")
 }
 
+/// The text of a TXT record as DNS-over-HTTPS gives it: in presentation
+/// form, one or more quoted strings (`"v=spf1 ... " "include:x -all"`). A
+/// record over 255 bytes, such as a long SPF record, comes as several. The
+/// strings are joined without spaces (RFC 7208 3.3), as the wire parser
+/// joins them, and their escapes (`\"`, `\\`, `\059`) undone. Text that
+/// does not start with a quote is taken as it is.
+fn txt_text(data: &str) -> String {
+    let data = data.trim();
+    if !data.starts_with('"') {
+        return data.to_owned();
+    }
+    let bytes = data.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut quoted = false;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => quoted = !quoted,
+            b'\\' => {
+                let digits = bytes
+                    .get(at + 1..at + 4)
+                    .filter(|digits| digits.iter().all(u8::is_ascii_digit))
+                    .map(|d| d.iter().fold(0u32, |n, d| n * 10 + u32::from(d - b'0')));
+                match (digits, bytes.get(at + 1)) {
+                    (Some(value), _) if value <= 255 => {
+                        out.push(value as u8);
+                        at += 3;
+                    }
+                    (_, Some(next)) => {
+                        out.push(*next);
+                        at += 1;
+                    }
+                    (_, None) => {}
+                }
+            }
+            // Between two strings.
+            b if !quoted && b.is_ascii_whitespace() => {}
+            b => out.push(b),
+        }
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The longest TXT record kept, in bytes: an SPF record split into several
+/// strings, or a 4096-bit DKIM key, whole.
+const MAX_TXT: usize = 1024;
+
+/// A record's data as kept. A TXT record is cut between its terms and kept
+/// longer than the requests to the model hold (400 bytes): a cut through a
+/// domain an SPF record names (`include:acmehol`) would leave part of a name
+/// the vault never sees whole, while the request's own cut goes back to a
+/// space.
+fn clean_record(rrtype: u16, data: &str) -> String {
+    let data = data.trim().trim_end_matches('.');
+    if rrtype == 16 {
+        crate::evidence::sanitize_words(data, MAX_TXT)
+    } else {
+        sanitize(data, 400)
+    }
+}
+
 /// Parses a DNS-over-HTTPS (Cloudflare / Google JSON schema) response for
 /// the requested numeric record type (`rrtype`).
 pub fn parse_doh_records(json: &Value, rrtype: u16) -> Vec<String> {
@@ -92,7 +154,12 @@ pub fn parse_doh_records(json: &Value, rrtype: u16) -> Vec<String> {
         let Some(raw) = ans.get("data").and_then(Value::as_str) else {
             continue;
         };
-        let cleaned = sanitize(raw.trim().trim_matches('"').trim_end_matches('.'), 400);
+        let raw = if kind == 16 {
+            txt_text(raw)
+        } else {
+            raw.trim().trim_matches('"').to_owned()
+        };
+        let cleaned = clean_record(rrtype, &raw);
         if !cleaned.is_empty() && !out.contains(&cleaned) {
             out.push(cleaned);
         }
@@ -279,7 +346,7 @@ pub fn parse_dns_wire_response(packet: &[u8], expected_txid: u16, qtype: u16) ->
             _ => None,
         };
         if let Some(val) = parsed {
-            let cleaned = sanitize(val.trim().trim_end_matches('.'), 400);
+            let cleaned = clean_record(rtype, &val);
             if !cleaned.is_empty() && !out.contains(&cleaned) {
                 out.push(cleaned);
             }

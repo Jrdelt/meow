@@ -1180,9 +1180,17 @@ mod tests {
         }
         assert!(build.contains("uses: actions/upload-artifact@"));
         assert!(build.contains("if-no-files-found: error"));
+        // A failed job can be re-run for 30 days; the publish job then
+        // needs the builds' files, and says so when they are gone.
+        assert!(build.contains("retention-days: 30\n"));
+        assert!(!workflow.contains("retention-days: 1\n"));
 
         let publish = &jobs[2].1;
         assert!(publish.contains("uses: actions/download-artifact@"));
+        assert!(publish.contains("the build artifacts may have expired: re-run all jobs"));
+        assert!(
+            publish.find("may have expired").unwrap() < publish.find("cd dist || exit 1").unwrap()
+        );
         assert!(publish.contains("Refusing to clobber already-published release"));
         assert!(publish.contains("sha256sum --check --strict"));
         assert!(publish.contains("--clobber"));

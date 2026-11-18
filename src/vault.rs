@@ -22,7 +22,8 @@ use rusqlite::params;
 use serde_json::Value;
 
 use crate::db::Db;
-use crate::graph::Graph;
+use crate::evidence::Source;
+use crate::graph::{DnsSecurity, Graph};
 use crate::timeutil::now_rfc3339;
 
 /// Longest placeholder the stream unmasker will wait for.
@@ -161,7 +162,9 @@ static COOKIE: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A name that holds a credential, alone or as one part of a longer name:
 /// `password`, `DB_PASSWORD`, `aws_secret_access_key`, `reset-password-token`,
-/// `PHPSESSID`. The name may be quoted; the value may be quoted too.
+/// `PHPSESSID`. The name may be quoted; the value may be quoted too. A quoted
+/// value may run to the end of the text, as it does when a long text was cut
+/// inside it (`password = "Summer 2024 …`).
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*"#,
@@ -170,7 +173,7 @@ static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
         r#"|(?:access|refresh|auth|id|bearer|session|csrf|xsrf)[_-]?token|token|credentials?"#,
         r#"|[a-z]*sess(?:ion)?[_-]?id)"#,
         r#"(?:[_.-][A-Za-z0-9]+)*["']?\s*[:=]\s*"#,
-        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
+        r#"(?:"([^"\r\n]{3,200})(?:"|\z)|'([^'\r\n]{3,200})(?:'|\z)|([^\s"',;&<>]{3,}))"#,
     ))
     .expect("valid regex")
 });
@@ -180,7 +183,7 @@ static KEY_VALUE_CAMEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"[a-z0-9]+(?:Password|Passwd|Passphrase|Pwd|Secret|Token|ApiKey|Credentials?)"#,
         r#"[A-Za-z0-9]*["']?\s*[:=]\s*"#,
-        r#"(?:"([^"\r\n]{3,200})"|'([^'\r\n]{3,200})'|([^\s"',;&<>]{3,}))"#,
+        r#"(?:"([^"\r\n]{3,200})(?:"|\z)|'([^'\r\n]{3,200})(?:'|\z)|([^\s"',;&<>]{3,}))"#,
     ))
     .expect("valid regex")
 });
@@ -655,6 +658,114 @@ const PLAIN_WORDS: &[&str] = &[
     "for",
     "not",
 ];
+/// Names a developer gives a machine for its role or after the software it
+/// runs, as a script or a compose file has them (`http://api:8080/v1`,
+/// `http://redis:6379`). The same word stands in paths, product names and
+/// prose (`/api/v1/users`, `Redis key-value store`), and alone it says
+/// nothing about whose network this is: registered as a name it would be
+/// masked everywhere. A one-word name of a machine's own (`jenkins01`,
+/// `build-srv`) is still registered.
+const GENERIC_HOST_WORDS: &[&str] = &[
+    // What the machine is for.
+    "api",
+    "apis",
+    "app",
+    "apps",
+    "web",
+    "site",
+    "backend",
+    "frontend",
+    "static",
+    "assets",
+    "media",
+    "images",
+    "img",
+    "files",
+    "uploads",
+    "cdn",
+    "auth",
+    "login",
+    "sso",
+    "oauth",
+    "account",
+    "accounts",
+    "gateway",
+    "proxy",
+    "services",
+    "svc",
+    "worker",
+    "workers",
+    "queue",
+    "cache",
+    "db",
+    "database",
+    "search",
+    "graphql",
+    "rest",
+    "rpc",
+    "ws",
+    "socket",
+    "websocket",
+    "events",
+    "stream",
+    "push",
+    "portal",
+    "dashboard",
+    "console",
+    "panel",
+    "docs",
+    "health",
+    "metrics",
+    "monitor",
+    "monitoring",
+    "logs",
+    "storage",
+    "internal",
+    "public",
+    "private",
+    "dev",
+    "stage",
+    "staging",
+    "prod",
+    "production",
+    "demo",
+    "sandbox",
+    "beta",
+    // This machine, by its other usual names.
+    "loopback",
+    "ip6-localhost",
+    "ip6-loopback",
+    // Software that runs under its own name in a container.
+    "redis",
+    "mysql",
+    "mariadb",
+    "postgres",
+    "postgresql",
+    "mongo",
+    "mongodb",
+    "memcached",
+    "elasticsearch",
+    "kibana",
+    "grafana",
+    "prometheus",
+    "rabbitmq",
+    "kafka",
+    "zookeeper",
+    "minio",
+    "keycloak",
+    "jenkins",
+    "gitlab",
+    "traefik",
+    "haproxy",
+    "tomcat",
+];
+
+/// A word of [`PLAIN_WORDS`] or [`GENERIC_HOST_WORDS`], in any case: never
+/// a name worth masking on its own.
+fn is_plain_word(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    PLAIN_WORDS.contains(&lower.as_str()) || GENERIC_HOST_WORDS.contains(&lower.as_str())
+}
 
 /// The IPv6 address in the run `text[from..to]` (hexadecimal digits, colons
 /// and dots with at least two colons), as a span of `text`. The run may hold
@@ -913,16 +1024,15 @@ fn first_word(value: &str) -> String {
 }
 
 /// One label of a host name that is worth masking: letters, digits and
-/// hyphens, and not one of [`PLAIN_WORDS`].
+/// hyphens, and not a plain word (see [`is_plain_word`]).
 fn is_single_label_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
     (2..=63).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         && !name.starts_with('-')
         && !name.ends_with('-')
-        && !PLAIN_WORDS.contains(&lower.as_str())
+        && !is_plain_word(name)
 }
 
 /// The host of a web or WebSocket URL, absolute or scheme-relative
@@ -999,10 +1109,13 @@ fn split_url(url: &str) -> (Option<&str>, &str) {
 /// The domains a mail policy names: those an SPF record sends lookups to
 /// (`include:`, `a:`, `mx:`, `ptr:`, `exists:`, `redirect=`, `exp=`) and
 /// those a DMARC record sends reports to (the `rua=` and `ruf=` addresses).
+/// A record split into strings and not joined (`"v=spf1 ... " "include:x"`)
+/// leaves quotes in it: they part terms here, they are never in a domain.
 fn mail_policy_domains<'a>(check: &str, value: &'a str) -> Vec<&'a str> {
+    let is_quote_or_space = |c: char| c == '"' || c.is_whitespace();
     match check {
         "SPF" => value
-            .split_whitespace()
+            .split(is_quote_or_space)
             .filter_map(|term| {
                 let term = term.trim_start_matches(['+', '-', '~', '?']);
                 let (mechanism, spec) = term.split_once([':', '='])?;
@@ -1024,14 +1137,18 @@ fn mail_policy_domains<'a>(check: &str, value: &'a str) -> Vec<&'a str> {
             .split(';')
             .filter_map(|part| {
                 let (key, list) = part.split_once('=')?;
-                matches!(key.trim().to_ascii_lowercase().as_str(), "rua" | "ruf").then_some(list)
+                let key = key.trim_matches(is_quote_or_space).to_ascii_lowercase();
+                matches!(key.as_str(), "rua" | "ruf").then_some(list)
             })
             .flat_map(|list| list.split(','))
             .filter_map(|address| {
                 // mailto:reports@example.com!10m
                 let (_, domain) = address.trim().rsplit_once('@')?;
-                let domain = domain.split('!').next().unwrap_or(domain);
-                Some(domain.trim().trim_end_matches('.'))
+                let domain = domain
+                    .split(|c: char| c == '!' || is_quote_or_space(c))
+                    .next()
+                    .unwrap_or(domain);
+                Some(domain.trim_end_matches('.'))
             })
             .filter(|domain| domain.contains('.'))
             .collect(),
@@ -1199,6 +1316,10 @@ impl Vault {
 
     fn index(&mut self, kind: Kind, value: &str) {
         let min_len = match kind {
+            // A plain word kept from an earlier version, which registered
+            // `api` for `http://api:8080/`: it still unmasks, but is not
+            // looked for, or that word would be masked everywhere.
+            Kind::Dom if is_plain_word(value) => return,
             Kind::Dom => 2,
             Kind::User => 3,
             _ => return,
@@ -1229,47 +1350,192 @@ impl Vault {
         }
     }
 
+    /// Registers a host name the graph or a scan gives, and the base domain
+    /// it is under. One word is a machine name, unless it is a word every
+    /// scan and every request holds (a certificate can name anything).
+    fn register_name(&mut self, name: &str) {
+        let name = name.trim_start_matches("*.");
+        if name.parse::<IpAddr>().is_ok() || !name.contains('.') {
+            if name.parse::<IpAddr>().is_err() && is_single_label_name(name) {
+                self.register(Kind::Dom, name);
+            }
+            return;
+        }
+        self.register(Kind::Dom, name);
+        // app.lab.local -> every *.lab.local name is internal too.
+        // corp.co.uk -> parent is public suffix co.uk, so corp.co.uk itself is the root.
+        let labels: Vec<&str> = name.split('.').collect();
+        if labels.len() >= 3 {
+            let parent = labels[1..].join(".");
+            if is_public_multi_label_suffix(&parent) {
+                self.register_domain_suffix(name);
+            } else {
+                self.register_domain_suffix(&parent);
+            }
+        } else if labels.len() == 2 {
+            self.register_domain_suffix(name);
+        }
+    }
+
+    /// A DNS answer or the host of a URL, which give either a name or an
+    /// address.
+    fn register_name_or_address(&mut self, text: &str) {
+        let text = text.trim().trim_end_matches('.');
+        match text.split('%').next().unwrap_or("").parse::<IpAddr>() {
+            Ok(_) => {
+                self.register(Kind::Host, text);
+            }
+            Err(_) => self.register_name(text),
+        }
+    }
+
+    /// Registers what a URL names: its host (often an internal API server
+    /// in a script), as written and as parsed, and the host names in its
+    /// path. The path itself is a web path, which goes as the crawled
+    /// paths do. A software maker's site (`https://www.apache.org/licenses/`)
+    /// says what software this is and is nobody's private name: it is left
+    /// alone, or its domain would be masked for good.
+    ///
+    /// [`Vault::register_graph`] does this for the URLs the graph keeps;
+    /// the `js` stage does it for every endpoint it finds, since its facts
+    /// name endpoints past what the graph keeps.
+    pub fn register_url(&mut self, url: &str) {
+        let (written, rest) = split_url(url);
+        if let Some(parsed) = url_host(url) {
+            // `www.apache.org.` is `www.apache.org`.
+            let parsed = parsed.trim_end_matches('.');
+            if !is_public_name(parsed) {
+                self.register_name_or_address(parsed);
+            }
+            // `http://10.1/` is 10.0.0.1 to the parser, but the request
+            // holds it as written, which no pattern finds: that form is
+            // registered too. Whether it is a public site's is asked of it
+            // alone, since the parser can read another host than the one
+            // written (`http://www.apache.org\@intranet.example/` is a path
+            // on www.apache.org).
+            let written = written.map(|written| written.trim_end_matches('.').to_ascii_lowercase());
+            if let Some(written) = written.filter(|written| {
+                written.as_str() != parsed
+                    && !is_public_name(written)
+                    && written.parse::<IpAddr>().is_err()
+                    && !is_dotted_quad(written)
+            }) {
+                self.register(Kind::Dom, &written);
+            }
+        }
+        // A name in the path is taken for a file where it is found
+        // (`/cgi-bin/status.pl`). In a URL from a script it is more often a
+        // host: per-domain API routes (`/v3/mg.example.com/messages`) and
+        // proxies name one.
+        for found in HOSTNAME.find_iter(rest) {
+            let name = found.as_str().to_ascii_lowercase();
+            let tld = name.rsplit('.').next().unwrap_or("");
+            if INTERNAL_TLDS.contains(&tld) || is_public_host_name(&name) {
+                self.register_name(&name);
+            }
+        }
+    }
+
+    /// Registers the names in a record the `dns` stage found, as its fact
+    /// gives the record (`MX record: 10 mx1.example.com`): the domain's mail
+    /// and name servers, what it is an alias of, what its address calls
+    /// itself, and the domains its SPF record names. They are often a
+    /// provider's or a parent company's, under any ending, and the fact goes
+    /// to the model as it is, whether or not the `mail-dns` stage ran. A
+    /// software maker's site stays readable.
+    fn register_dns_fact(&mut self, claim: &str) {
+        let Some((kind, data)) = claim.split_once(" record: ") else {
+            return;
+        };
+        let names = match kind {
+            // The preference, then the server.
+            "MX" => data.split_whitespace().skip(1).take(1).collect(),
+            "NS" | "CNAME" | "PTR" => vec![data.trim()],
+            "TXT" => {
+                let lower = data.trim_start().to_ascii_lowercase();
+                if lower.starts_with("v=spf1") || lower.starts_with("spf2.") {
+                    mail_policy_domains("SPF", data)
+                } else if lower.starts_with("v=dmarc1") {
+                    mail_policy_domains("DMARC", data)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
+        for name in names {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            if !is_public_name(&name) {
+                self.register_name_or_address(&name);
+            }
+        }
+    }
+
+    /// Registers what the `mail-dns` stage found for a domain: the domain
+    /// and its registrable domain, the domains its SPF and DMARC records
+    /// name, its service targets, wildcard answers and subdomains.
+    ///
+    /// [`Vault::register_graph`] does this for the record the graph keeps;
+    /// the stage does it first for the record as it was found, whole, since
+    /// its facts quote the records past what the graph keeps of them.
+    pub fn register_dns_security(&mut self, dns: &DnsSecurity) {
+        self.register_name(&dns.domain);
+        // The checks also name the registrable domain (DNSSEC, CAA,
+        // DMARC), which is not always the parent of the one checked.
+        if let Some(zone) = crate::osint::root_domain(&dns.domain) {
+            self.register_name(&zone);
+        }
+        // SPF includes and DMARC report addresses name the domain's mail
+        // providers and parent companies, under any ending. A public site's
+        // name stays readable.
+        for check in &dns.checks {
+            for name in mail_policy_domains(&check.name, &check.value) {
+                let name = name.to_ascii_lowercase();
+                if !is_public_name(&name) {
+                    self.register_name(&name);
+                }
+            }
+        }
+        for service in &dns.services {
+            // _ldap._tcp.dc._msdcs.corp.example.com: the name after the
+            // last service label is the domain's own.
+            let labels: Vec<&str> = service.record.split('.').collect();
+            let own = labels
+                .iter()
+                .rposition(|label| label.starts_with('_'))
+                .map_or(0, |last| last + 1);
+            let owner = labels[own..].join(".");
+            if owner.contains('.') {
+                self.register_name(&owner);
+            }
+            // A hosted service (device enrollment under
+            // manage.microsoft.com) points at its maker's site, which is
+            // nobody's private name.
+            let target = without_port(&service.target)
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if !is_public_name(&target) {
+                self.register_name_or_address(&target);
+            }
+        }
+        for address in &dns.wildcard {
+            self.register_name_or_address(address);
+        }
+        for sub in &dns.subdomains {
+            self.register_name(&sub.name);
+            for address in &sub.addresses {
+                self.register_name_or_address(address);
+            }
+        }
+    }
+
     /// Registers everything the graph knows to be private: host addresses,
     /// names, TLS SANs, redirect hosts, the hosts of URLs in the site's
     /// scripts and the names in their paths, the domain's DNS records
-    /// (service targets, subdomains, wildcard answers, SPF and DMARC
-    /// domains), local interface addresses, gateways and neighbours.
+    /// (mail and name servers, aliases, service targets, subdomains,
+    /// wildcard answers, SPF and DMARC domains), local interface addresses,
+    /// gateways and neighbours.
     pub fn register_graph(&mut self, graph: &Graph) {
-        let domain = |vault: &mut Self, name: &str| {
-            let name = name.trim_start_matches("*.");
-            if name.parse::<IpAddr>().is_ok() || !name.contains('.') {
-                // One word: a machine name, unless it is a word every scan
-                // and every request holds (a certificate can name anything).
-                if name.parse::<IpAddr>().is_err() && is_single_label_name(name) {
-                    vault.register(Kind::Dom, name);
-                }
-                return;
-            }
-            vault.register(Kind::Dom, name);
-            // app.lab.local -> every *.lab.local name is internal too.
-            // corp.co.uk -> parent is public suffix co.uk, so corp.co.uk itself is the root.
-            let labels: Vec<&str> = name.split('.').collect();
-            if labels.len() >= 3 {
-                let parent = labels[1..].join(".");
-                if is_public_multi_label_suffix(&parent) {
-                    vault.register_domain_suffix(name);
-                } else {
-                    vault.register_domain_suffix(&parent);
-                }
-            } else if labels.len() == 2 {
-                vault.register_domain_suffix(name);
-            }
-        };
-        // DNS answers and URLs give either one.
-        let name_or_address = |vault: &mut Self, text: &str| {
-            let text = text.trim().trim_end_matches('.');
-            match text.split('%').next().unwrap_or("").parse::<IpAddr>() {
-                Ok(_) => {
-                    vault.register(Kind::Host, text);
-                }
-                Err(_) => domain(vault, text),
-            }
-        };
         for host in graph.hosts.values() {
             match host
                 .address
@@ -1284,21 +1550,19 @@ impl Vault {
                         host.address.split('%').next().unwrap_or(&host.address),
                     );
                 }
-                Err(_) => domain(self, &host.address),
+                Err(_) => self.register_name(&host.address),
             }
             for name in &host.hostnames {
-                domain(self, name);
+                self.register_name(name);
             }
             for port in host.ports.values() {
                 for san in &port.tls_sans {
-                    domain(self, san);
+                    self.register_name(san);
                 }
                 let Some(http) = &port.http else {
                     continue;
                 };
-                // The host of a redirect, and of a URL a script names (often
-                // an internal API server). Their paths are web paths, which
-                // go as the crawled paths do.
+                // The host of a redirect, and of a URL a script names.
                 let urls = http
                     .location
                     .iter()
@@ -1306,78 +1570,17 @@ impl Vault {
                     .chain(&http.scripts)
                     .chain(http.js_secrets.iter().map(|secret| &secret.file));
                 for url in urls {
-                    let (written, rest) = split_url(url);
-                    if let Some(host_or_ip) = url_host(url) {
-                        // `http://10.1/` is 10.0.0.1 to the parser, but the
-                        // request holds it as written, which no pattern
-                        // finds: that form is registered too.
-                        let written = written.map(str::to_ascii_lowercase);
-                        if let Some(written) = written.filter(|written| {
-                            *written != host_or_ip
-                                && written.parse::<IpAddr>().is_err()
-                                && !is_dotted_quad(written)
-                        }) {
-                            self.register(Kind::Dom, &written);
-                        }
-                        name_or_address(self, &host_or_ip);
-                    }
-                    // A name in the path is taken for a file where it is
-                    // found (`/cgi-bin/status.pl`). In a URL from a script it
-                    // is more often a host: per-domain API routes
-                    // (`/v3/mg.example.com/messages`) and proxies name one.
-                    for found in HOSTNAME.find_iter(rest) {
-                        let name = found.as_str().to_ascii_lowercase();
-                        let tld = name.rsplit('.').next().unwrap_or("");
-                        if INTERNAL_TLDS.contains(&tld) || is_public_host_name(&name) {
-                            domain(self, &name);
-                        }
-                    }
+                    self.register_url(url);
                 }
             }
             if let Some(mac) = &host.mac {
                 self.register(Kind::Host, mac);
             }
+            for fact in host.facts.iter().filter(|f| f.record.source == Source::Dns) {
+                self.register_dns_fact(&fact.claim);
+            }
             if let Some(dns) = &host.dns_security {
-                domain(self, &dns.domain);
-                // The checks also name the registrable domain (DNSSEC, CAA,
-                // DMARC), which is not always the parent of the one checked.
-                if let Some(zone) = crate::osint::root_domain(&dns.domain) {
-                    domain(self, &zone);
-                }
-                // SPF includes and DMARC report addresses name the domain's
-                // mail providers and parent companies, under any ending.
-                // A public site's name stays readable.
-                for check in &dns.checks {
-                    for name in mail_policy_domains(&check.name, &check.value) {
-                        let name = name.to_ascii_lowercase();
-                        if !is_public_name(&name) {
-                            domain(self, &name);
-                        }
-                    }
-                }
-                for service in &dns.services {
-                    // _ldap._tcp.dc._msdcs.corp.example.com: the name after
-                    // the last service label is the domain's own.
-                    let labels: Vec<&str> = service.record.split('.').collect();
-                    let own = labels
-                        .iter()
-                        .rposition(|label| label.starts_with('_'))
-                        .map_or(0, |last| last + 1);
-                    let owner = labels[own..].join(".");
-                    if owner.contains('.') {
-                        domain(self, &owner);
-                    }
-                    name_or_address(self, without_port(&service.target));
-                }
-                for address in &dns.wildcard {
-                    name_or_address(self, address);
-                }
-                for sub in &dns.subdomains {
-                    domain(self, &sub.name);
-                    for address in &sub.addresses {
-                        name_or_address(self, address);
-                    }
-                }
+                self.register_dns_security(dns);
             }
         }
         let local = &graph.local;
@@ -3296,5 +3499,262 @@ mod tests {
         let reopened = Vault::open(db).unwrap();
         assert_eq!(reopened.exposed_secrets().len(), 1);
         assert_eq!(reopened.unmask("<<HOST_01>>"), "10.99.0.1");
+    }
+
+    #[test]
+    fn a_dev_host_named_for_its_role_does_not_mask_that_word() {
+        use crate::graph::HttpInfo;
+        let mut graph = Graph::default();
+        graph.apply(Observation::Path {
+            address: "198.51.100.40".into(),
+            port: 443,
+            scheme: "https".into(),
+            path: "/api/v1/users".into(),
+            status: Some(200),
+            record: EvidenceRecord::observed(Source::FeroxJson, Confidence::High, "x"),
+        });
+        graph.apply(Observation::WebMeta {
+            address: "198.51.100.40".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                location: Some("http://backend:3000/login".into()),
+                scripts: vec!["http://static/app.js".into()],
+                js_endpoints: vec![
+                    "http://api:8080/v1/orders".into(),
+                    "http://API:8080/v1/items".into(),
+                    "http://elasticsearch:9200/_search".into(),
+                    "ws://localhost:3000/socket".into(),
+                    "http://jenkins01:8080/x".into(),
+                    "http://build-srv:8080/".into(),
+                ],
+                ..HttpInfo::default()
+            }),
+            record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+        });
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+        let has =
+            |vault: &Vault, value: &str| vault.tokens.contains_key(&(Kind::Dom, value.to_owned()));
+        for word in ["api", "backend", "static", "elasticsearch", "localhost"] {
+            assert!(!has(&vault, word), "{word} is registered");
+        }
+        assert!(has(&vault, "jenkins01") && has(&vault, "build-srv"));
+
+        let request = vault.mask_text(
+            "paths /api/v1/users and /static/app.js; the API, backend and web app; \
+             Elasticsearch REST API 7.10.2; built on jenkins01 and BUILD-SRV",
+        );
+        assert!(
+            request.starts_with(
+                "paths /api/v1/users and /static/app.js; the API, backend and web app; \
+                 Elasticsearch REST API 7.10.2; built on "
+            ),
+            "{request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("jenkins01"),
+            "{request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("build-srv"),
+            "{request}"
+        );
+        // A name given as such that is a plain word stays one too.
+        assert_eq!(vault.mask_text("Server name: api"), "Server name: api");
+        // A plain word an earlier version registered still unmasks, but is
+        // no longer looked for.
+        let token = vault.register(Kind::Dom, "api");
+        assert_eq!(vault.unmask(&token), "api");
+        assert_eq!(vault.mask_text("GET /api/v1/users"), "GET /api/v1/users");
+    }
+
+    #[test]
+    fn software_makers_sites_in_urls_and_service_targets_stay_readable() {
+        use crate::graph::{DnsSecurity, DnsService, HttpInfo};
+        let mut graph = Graph::default();
+        graph.apply(Observation::WebMeta {
+            address: "198.51.100.41".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                scripts: vec![
+                    "https://www.apache.org/licenses/LICENSE-2.0".into(),
+                    // The same site, written as a name from the root.
+                    "https://www.apache.org./licenses/LICENSE-1.1".into(),
+                    "https://cdn.acme-app.zz/lib.js".into(),
+                ],
+                js_endpoints: vec![
+                    "https://api.github.com/repos/acme/x".into(),
+                    // A path on www.apache.org to the parser, which takes
+                    // the backslash for a slash; a host to whoever reads it.
+                    "http://www.apache.org\\@intranet.acme-lab.zz/x".into(),
+                ],
+                ..HttpInfo::default()
+            }),
+            record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+        });
+        graph.apply(Observation::DnsSecurity {
+            address: "198.51.100.41".into(),
+            info: Box::new(DnsSecurity {
+                domain: "acme-corp.zz".into(),
+                grade: "B".into(),
+                services: vec![
+                    DnsService {
+                        record: "enterpriseenrollment.acme-corp.zz".into(),
+                        target: "enterpriseenrollment.manage.microsoft.com".into(),
+                        meaning: "Intune device enrollment (Microsoft 365)".into(),
+                    },
+                    DnsService {
+                        record: "_sip._tcp.acme-corp.zz".into(),
+                        target: "sip.acme-voip.zz:5060".into(),
+                        meaning: "SIP calling".into(),
+                    },
+                ],
+                ..DnsSecurity::default()
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+        });
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+        for public in [
+            "www.apache.org",
+            "api.github.com",
+            "enterpriseenrollment.manage.microsoft.com",
+        ] {
+            assert!(
+                !vault.tokens.keys().any(|(_, value)| value == public),
+                "{public} is registered"
+            );
+        }
+        for suffix in [
+            "apache.org",
+            "github.com",
+            "manage.microsoft.com",
+            "microsoft.com",
+        ] {
+            assert!(!vault.suffixes.contains(suffix), "{suffix} is a suffix");
+        }
+        // The target's own names are registered as before.
+        for own in [
+            "cdn.acme-app.zz",
+            "acme-corp.zz",
+            "sip.acme-voip.zz",
+            "intranet.acme-lab.zz",
+        ] {
+            assert!(
+                vault.tokens.contains_key(&(Kind::Dom, own.to_owned())),
+                "{own}"
+            );
+        }
+        let text = "licensed under https://www.apache.org/licenses/LICENSE-2.0; \
+                    enrollment at enterpriseenrollment.manage.microsoft.com";
+        assert_eq!(vault.mask_text(text), text);
+        let masked = vault.mask_text("calls http://www.apache.org\\@intranet.acme-lab.zz/x");
+        assert!(!masked.contains("acme-lab"), "{masked}");
+        assert!(masked.contains("www.apache.org"), "{masked}");
+    }
+
+    #[test]
+    fn spf_and_dmarc_terms_are_read_past_stray_quotes() {
+        assert_eq!(
+            mail_policy_domains(
+                "SPF",
+                "v=spf1 include:_spf.acme-a.zz\" \"include:_spf.acme-b.zz -all"
+            ),
+            ["_spf.acme-a.zz", "_spf.acme-b.zz"]
+        );
+        assert_eq!(
+            mail_policy_domains("SPF", "\"v=spf1 \" \"-a:relay.acme-c.zz/24\" \"~all\""),
+            ["relay.acme-c.zz"]
+        );
+        assert_eq!(
+            mail_policy_domains(
+                "DMARC",
+                "v=DMARC1; p=none; \" \"rua=mailto:r@acme-r.zz\" \"; ruf=mailto:f@acme-f.zz!5m"
+            ),
+            ["acme-r.zz", "acme-f.zz"]
+        );
+    }
+
+    #[test]
+    fn a_url_registers_as_the_graph_registers_it() {
+        use crate::graph::HttpInfo;
+        let urls = [
+            "https://orders.acme-shop.zz:8443/v2/items",
+            "/api/proxy/db03.acme-corp.com/status",
+            "http://10.1/api/v1/status",
+            "http://api:8080/v1",
+            "/api/v1/users",
+            "https://www.apache.org/licenses/LICENSE-2.0",
+        ];
+        let mut one_by_one = Vault::ephemeral();
+        for url in urls {
+            one_by_one.register_url(url);
+        }
+        let has =
+            |kind: Kind, value: &str| one_by_one.tokens.contains_key(&(kind, value.to_owned()));
+        assert!(has(Kind::Dom, "orders.acme-shop.zz"));
+        assert!(has(Kind::Dom, "db03.acme-corp.com"));
+        assert!(has(Kind::Dom, "10.1") && has(Kind::Host, "10.0.0.1"));
+        assert!(!has(Kind::Dom, "api"));
+        assert!(one_by_one.suffixes.contains("acme-shop.zz"));
+        let masked = one_by_one.mask_text("calls https://orders.acme-shop.zz:8443/v2/items");
+        assert!(!masked.contains("acme-shop"), "{masked}");
+
+        // The graph registers the URLs it keeps the same way.
+        let mut graph = Graph::default();
+        graph.apply(Observation::WebMeta {
+            address: "198.51.100.42".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                js_endpoints: urls.iter().map(|url| (*url).to_owned()).collect(),
+                ..HttpInfo::default()
+            }),
+            record: EvidenceRecord::observed(Source::JsScan, Confidence::Medium, "x"),
+        });
+        let mut from_graph = Vault::ephemeral();
+        from_graph.register_graph(&graph);
+        from_graph
+            .tokens
+            .remove(&(Kind::Host, "198.51.100.42".to_owned()));
+        let keys = |vault: &Vault| vault.tokens.keys().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(keys(&from_graph), keys(&one_by_one));
+        assert_eq!(from_graph.suffixes, one_by_one.suffixes);
+    }
+
+    #[test]
+    fn a_dns_record_registers_whole_however_long() {
+        use crate::graph::{DnsCheck, DnsSecurity};
+        // Longer than the graph keeps of a check: the stage registers the
+        // record as it was found.
+        let spf = format!(
+            "v=spf1 {}include:_spf.acme-holding.ag -all",
+            "ip4:192.0.2.1 ".repeat(45)
+        );
+        assert!(spf.len() > 600);
+        let dns = DnsSecurity {
+            domain: "shop.acme-corp.zz".into(),
+            grade: "A".into(),
+            checks: vec![DnsCheck {
+                name: "SPF".into(),
+                status: "ok".into(),
+                value: spf.clone(),
+                advice: String::new(),
+            }],
+            ..DnsSecurity::default()
+        };
+        let mut vault = Vault::ephemeral();
+        vault.register_dns_security(&dns);
+        for name in ["shop.acme-corp.zz", "acme-corp.zz", "_spf.acme-holding.ag"] {
+            assert!(
+                vault.tokens.contains_key(&(Kind::Dom, name.to_owned())),
+                "{name} is not registered"
+            );
+        }
+        let masked = vault.mask_text(&format!("SPF for shop.acme-corp.zz: {spf}"));
+        assert!(!masked.contains("acme-holding"), "{masked}");
+        assert!(!masked.contains("acme-corp"), "{masked}");
     }
 }

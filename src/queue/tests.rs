@@ -1043,3 +1043,104 @@ fn zoned_ipv6_found_and_inline_preset_scripts_are_handled_cleanly() {
     assert!(is_secret_variable("OPENSSL_CONF"));
     assert!(!is_secret_variable("MEOW_TEST_SCANNER_PLAIN"));
 }
+
+#[test]
+fn a_script_s_endpoints_and_keys_reach_the_vault_before_its_facts() {
+    use crate::evidence::{Confidence, EvidenceRecord, Source};
+    use crate::vault::Vault;
+    let mut vault = Vault::ephemeral();
+    // `.zz` is an ending no pattern masks: only the vault can know the name.
+    let endpoints = vec![
+        "https://orders.acme-ops.zz/v2/items".to_owned(),
+        "/api/v1/users".to_owned(),
+    ];
+    // Built here, so that no key-shaped text stands in the source.
+    let key = format!("{}_{}_{}", "sk", "live", "Qm7x".repeat(7));
+    let (facts, secrets) = stages::script_facts(
+        &mut vault,
+        "198.51.100.7",
+        443,
+        "/static/app.js",
+        &endpoints,
+        vec![("Stripe secret key", key.clone())],
+    );
+    let claims: Vec<String> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            Observation::Fact { claim, .. } => Some(claim.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(claims.len(), 2, "{claims:?}");
+
+    // The graph keeps none of the endpoints, as when the port already has
+    // the 150 it keeps: the fact that names them is masked all the same.
+    let mut graph = Graph::default();
+    graph.apply(Observation::Port {
+        address: "198.51.100.7".into(),
+        port: 443,
+        protocol: "tcp".into(),
+        state: "open".into(),
+        service: Some("https".into()),
+        product: None,
+        version: None,
+        extra_info: None,
+        cpes: vec![],
+        record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+    });
+    graph.apply_all(facts);
+    vault.register_graph(&graph);
+    let masked = vault.mask_text(&claims[0]);
+    assert!(!masked.contains("acme-ops"), "{masked}");
+    assert!(masked.contains("/api/v1/users"), "{masked}");
+
+    // The key is in the vault, and the fact names it by its placeholder
+    // alone; the hint at it is kept for the map and the report.
+    let secret = &secrets[0];
+    assert_eq!(vault.unmask(&secret.token), key);
+    assert!(claims[1].ends_with(&format!("kept in the vault as {}", secret.token)));
+    assert!(!claims[1].contains(&key[..4]), "{}", claims[1]);
+    assert!(secret.preview.starts_with(&key[..4]), "{}", secret.preview);
+}
+
+#[test]
+fn mail_dns_puts_every_name_of_a_long_record_into_the_vault() {
+    use crate::evidence::{Confidence, EvidenceRecord, Source};
+    use crate::graph::{DnsCheck, DnsSecurity};
+    use crate::vault::Vault;
+    // Longer than the graph keeps of a check.
+    let spf = format!(
+        "v=spf1 {}include:_spf.acme-holding.zz -all",
+        "ip4:192.0.2.1 ".repeat(40)
+    );
+    let observations = vec![Observation::DnsSecurity {
+        address: "203.0.113.30".into(),
+        info: Box::new(DnsSecurity {
+            domain: "shop.acme-corp.zz".into(),
+            grade: "A".into(),
+            checks: vec![DnsCheck {
+                name: "SPF".into(),
+                status: "ok".into(),
+                value: spf.clone(),
+                advice: String::new(),
+            }],
+            ..DnsSecurity::default()
+        }),
+        record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+    }];
+    let mut vault = Vault::ephemeral();
+    stages::register_mail_dns(&mut vault, &observations);
+    let mut graph = Graph::default();
+    graph.apply_all(observations);
+    let kept = &graph.hosts["203.0.113.30"]
+        .dns_security
+        .as_ref()
+        .unwrap()
+        .checks[0];
+    assert!(!kept.value.contains("acme-holding"), "{}", kept.value);
+    // Only the stage saw the whole record.
+    vault.register_graph(&graph);
+    let masked = vault.mask_text(&format!("SPF for shop.acme-corp.zz: {spf}"));
+    assert!(!masked.contains("acme-holding"), "{masked}");
+    assert!(!masked.contains("acme-corp"), "{masked}");
+}

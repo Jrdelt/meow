@@ -176,7 +176,9 @@ jobs:
           name: meow-${{ matrix.name }}
           path: dist/
           if-no-files-found: error
-          retention-days: 1
+          # As long as a failed job of this run can be re-run: a re-run of
+          # the publish job needs these files.
+          retention-days: 30
           # A re-run of this job replaces what an earlier attempt kept,
           # instead of failing on the name.
           overwrite: true
@@ -218,6 +220,13 @@ jobs:
           # match the matrix; a test in src/release.rs checks that it does.
           builds="macos-arm64 macos-x86_64 linux-x86_64 linux-arm64 windows-x86_64"
           version=${TAG#v}
+          # Expired artifacts are not an error to download-artifact: it
+          # finds none and passes, or with one left unpacks it straight into
+          # dist/. Say so here rather than fail on a missing folder below.
+          if [ ! -d dist ] || [ -z "$(find dist -mindepth 1 -maxdepth 1 -type d -name 'meow-*' -print -quit)" ]; then
+            echo "dist/ holds no meow-* build folders: the build artifacts may have expired: re-run all jobs." >&2
+            exit 1
+          fi
           cd dist || exit 1
           # diff marks every line, so a file name cannot pass for a
           # workflow command in the log.

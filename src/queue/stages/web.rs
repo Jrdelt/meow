@@ -313,60 +313,18 @@ pub(crate) async fn js(cx: &Ctx<'_>) -> Result<StageEnd> {
         };
         let mut endpoints = Vec::new();
         let mut secrets = Vec::new();
-        let ev = |text: &str| {
-            crate::evidence::EvidenceRecord::observed(
-                crate::evidence::Source::JsScan,
-                crate::evidence::Confidence::Medium,
-                text,
-            )
-        };
         for (path, source) in &scripts {
             files += 1;
+            // Read before the vault is taken: a script can be megabytes.
             let found = crate::webfp::extract_endpoints(source, 60);
-            if !found.is_empty() {
-                let shown: Vec<&str> = found.iter().take(12).map(String::as_str).collect();
-                let more = found.len().saturating_sub(12);
-                observations.push(Observation::Fact {
-                    address: address.clone(),
-                    port: Some(*port),
-                    protocol: "tcp".to_owned(),
-                    claim: format!(
-                        "JavaScript {path} names {} endpoints: {}{}",
-                        found.len(),
-                        shown.join(", "),
-                        if more > 0 {
-                            format!(" (+{more} more)")
-                        } else {
-                            String::new()
-                        }
-                    ),
-                    record: ev(&format!("GET {path}")),
-                });
-            }
+            let keys = crate::webfp::find_secrets(source);
+            let (facts, kept) =
+                script_facts(&mut state.vault(), address, *port, path, &found, keys);
+            observations.extend(facts);
             endpoints_found += found.len();
             endpoints.extend(found);
-            // A key goes into the vault at once; only its
-            // placeholder is kept anywhere else.
-            for (kind, value) in crate::webfp::find_secrets(source) {
-                let token = state.vault().register(crate::vault::Kind::Sec, &value);
-                let preview = crate::webfp::preview(kind, &value);
-                keys_found += 1;
-                observations.push(Observation::Fact {
-                    address: address.clone(),
-                    port: Some(*port),
-                    protocol: "tcp".to_owned(),
-                    claim: format!(
-                        "exposed {kind} in {path}: kept in the vault as {token} ({preview})"
-                    ),
-                    record: ev(&format!("GET {path}: {kind} {token}")),
-                });
-                secrets.push(crate::graph::JsSecret {
-                    kind: kind.to_owned(),
-                    token,
-                    preview,
-                    file: path.clone(),
-                });
-            }
+            keys_found += kept.len();
+            secrets.extend(kept);
         }
         if !endpoints.is_empty() || !secrets.is_empty() {
             observations.push(Observation::WebMeta {
@@ -378,7 +336,7 @@ pub(crate) async fn js(cx: &Ctx<'_>) -> Result<StageEnd> {
                     js_secrets: secrets,
                     ..crate::graph::HttpInfo::default()
                 }),
-                record: ev("JavaScript files of the site"),
+                record: js_evidence("JavaScript files of the site"),
             });
         }
     }
@@ -392,6 +350,76 @@ pub(crate) async fn js(cx: &Ctx<'_>) -> Result<StageEnd> {
     Ok(StageEnd::Done(format!(
         "{files} scripts read: {endpoints_found} endpoints, {keys_found} exposed keys ({changed} new facts)"
     )))
+}
+
+fn js_evidence(text: &str) -> crate::evidence::EvidenceRecord {
+    crate::evidence::EvidenceRecord::observed(
+        crate::evidence::Source::JsScan,
+        crate::evidence::Confidence::Medium,
+        text,
+    )
+}
+
+/// The facts one script file of the site at `address:port` gives: the
+/// `endpoints` it names and the `keys` found in it, and the keys as the
+/// graph keeps them. Both go into the vault first. The graph keeps 150
+/// endpoints a port, but a fact names each file's first ones whatever it
+/// keeps, and a fact goes to the model too: every endpoint's host is
+/// registered. A key is kept only as its placeholder.
+pub(crate) fn script_facts(
+    vault: &mut crate::vault::Vault,
+    address: &str,
+    port: u16,
+    path: &str,
+    endpoints: &[String],
+    keys: Vec<(&'static str, String)>,
+) -> (Vec<Observation>, Vec<crate::graph::JsSecret>) {
+    for endpoint in endpoints {
+        vault.register_url(endpoint);
+    }
+    let fact = |claim: String, evidence: String| Observation::Fact {
+        address: address.to_owned(),
+        port: Some(port),
+        protocol: "tcp".to_owned(),
+        claim,
+        record: js_evidence(&evidence),
+    };
+    let mut facts = Vec::new();
+    if !endpoints.is_empty() {
+        let shown: Vec<&str> = endpoints.iter().take(12).map(String::as_str).collect();
+        let more = endpoints.len().saturating_sub(12);
+        facts.push(fact(
+            format!(
+                "JavaScript {path} names {} endpoints: {}{}",
+                endpoints.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                }
+            ),
+            format!("GET {path}"),
+        ));
+    }
+    let mut secrets = Vec::new();
+    for (kind, value) in keys {
+        let token = vault.register(crate::vault::Kind::Sec, &value);
+        // No hint at the key in the fact: facts go to the model, which gets
+        // a key by its placeholder only. The hint stays with the key, for
+        // the map and the report.
+        facts.push(fact(
+            format!("exposed {kind} in {path}: kept in the vault as {token}"),
+            format!("GET {path}: {kind} {token}"),
+        ));
+        secrets.push(crate::graph::JsSecret {
+            kind: kind.to_owned(),
+            preview: crate::webfp::preview(kind, &value),
+            token,
+            file: path.to_owned(),
+        });
+    }
+    (facts, secrets)
 }
 
 pub(crate) async fn crawl_or_dirs(cx: &Ctx<'_>) -> Result<StageEnd> {

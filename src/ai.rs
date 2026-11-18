@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::anthropic;
 use crate::checklist;
 use crate::db::Db;
-use crate::evidence::{sanitize, Source, VerificationStatus};
+use crate::evidence::{head_between, is_word_break, sanitize, Source, VerificationStatus};
 use crate::graph::{DnsSecurity, Graph, Host, HttpInfo};
 use crate::timeutil::{now_rfc3339, today_utc};
 use crate::vault::Vault;
@@ -497,8 +497,33 @@ pub struct Prompt {
     pub user: Value,
 }
 
+/// The longest piece of scan text one field of a request holds, in bytes.
+const MAX_TEXT: usize = 400;
+
+/// Scan text for a request, at most [`MAX_TEXT`] bytes. The request is
+/// masked after this, and the vault knows whole names: half of one matches
+/// no placeholder and would go out as it is. So a cut goes back to the last
+/// space or comma before the limit, where no name, address or URL can be
+/// split (see [`head_between`]), and ends in ` …` so the model knows text
+/// is missing.
 fn clean(text: &str) -> String {
-    sanitize(text, 400)
+    clip(text, MAX_TEXT)
+}
+
+/// [`clean`] with another limit, `max` bytes.
+fn clip(text: &str, max: usize) -> String {
+    const MARK: &str = " \u{2026}";
+    // Enough to tell whether anything is past the limit.
+    let full = sanitize(text, max.saturating_mul(2));
+    if full.len() <= max {
+        return full;
+    }
+    let kept = head_between(&full, max.saturating_sub(MARK.len()), is_word_break);
+    if kept.is_empty() {
+        MARK.trim_start().to_owned()
+    } else {
+        format!("{kept}{MARK}")
+    }
 }
 
 fn clean_list(items: &[String], max: usize) -> Vec<String> {
@@ -540,8 +565,8 @@ fn web_detail(http: &HttpInfo) -> serde_json::Map<String, Value> {
             .take(MAX_COOKIES_PER_PORT)
             .map(|cookie| {
                 let mut entry = json!({
-                    "name": sanitize(&cookie.name, 64),
-                    "flags": sanitize(&cookie.flags, 120),
+                    "name": clip(&cookie.name, 64),
+                    "flags": clip(&cookie.flags, 120),
                 });
                 if !cookie.issues.is_empty() {
                     entry["issues"] = json!(clean_list(&cookie.issues, MAX_ISSUES_PER_COOKIE));
@@ -2485,6 +2510,249 @@ mod tests {
         assert_eq!(checks[1]["name"], "DMARC");
         let value = checks[1]["value"].as_str().unwrap();
         assert!(value.contains("rua=mailto:dmarc@<<DOM_"), "{value}");
+    }
+
+    #[tokio::test]
+    async fn every_domain_of_a_long_spf_record_is_masked() {
+        // Record types by their DNS numbers.
+        const MX: u16 = 15;
+        const TXT: u16 = 16;
+        // 237 characters: the last include starts past character 200, and
+        // `.ag` and `.zz` are endings no pattern masks.
+        const SPF: &str = "v=spf1 ip4:192.0.2.0/24 ip4:198.51.100.0/24 \
+             include:_spf.acme-mail.zz include:_spf.acme-crm.zz include:_spf.acme-shop.zz \
+             include:_spf.acme-desk.zz include:_spf.acme-payroll.zz include:spf.acme-tickets.zz \
+             include:_spf.acme-holding.ag -all";
+        assert_eq!(SPF.len(), 237);
+        assert!(SPF.find("include:_spf.acme-holding.ag").unwrap() > 200);
+        let resolver = |name: String, rrtype: u16| async move {
+            let answer: &[&str] = match (name.as_str(), rrtype) {
+                ("shop.example.com", TXT) => &[SPF],
+                ("shop.example.com", MX) => &["10 mx1.shop.example.com"],
+                _ => &[],
+            };
+            answer
+                .iter()
+                .map(|a| (*a).to_owned())
+                .collect::<Vec<String>>()
+        };
+        let (observations, _) =
+            crate::maildns::run_with("shop.example.com", "203.0.113.10", &[], resolver)
+                .await
+                .unwrap();
+        let mut graph = Graph::default();
+        for observation in observations {
+            graph.apply(observation);
+        }
+        let host = &graph.hosts["203.0.113.10"];
+        // The fact quotes the whole record, and so does the check.
+        assert!(host
+            .facts
+            .iter()
+            .any(|fact| fact.claim.contains("include:_spf.acme-holding.ag -all")));
+        let dns = host.dns_security.as_ref().unwrap();
+        assert_eq!(dns.checks[0].value, SPF);
+        let prompt = triage_prompt(&graph, host);
+
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        for private in [
+            "acme-mail",
+            "acme-crm",
+            "acme-shop",
+            "acme-desk",
+            "acme-payroll",
+            "acme-tickets",
+            "acme-holding",
+            "shop.example",
+        ] {
+            assert!(
+                !masked.contains(private),
+                "{private} would reach the cloud:\n{masked}"
+            );
+        }
+        assert!(masked.contains(" include:<<DOM_"), "{masked}");
+        assert!(masked.contains(" -all"), "{masked}");
+    }
+
+    #[test]
+    fn scan_text_is_cut_between_words() {
+        let short = "nginx 1.18.0 on port 443";
+        assert_eq!(clean(short), short);
+        let exactly = "w".repeat(MAX_TEXT);
+        assert_eq!(clean(&exactly), exactly);
+        // A name over the limit goes back to the space before it.
+        let lead = "word ".repeat(78);
+        let text = format!("{lead}build-srv.acme-lab.zz answered");
+        assert!(lead.len() < MAX_TEXT && lead.len() + "build-srv".len() > MAX_TEXT - 4);
+        let cut = clean(&text);
+        assert!(cut.len() <= MAX_TEXT, "{}", cut.len());
+        assert_eq!(cut, format!("{} \u{2026}", lead.trim_end()));
+        // At a comma too, which is not kept.
+        let listed = format!("{},build-srv.acme-lab.zz", "a1".repeat(197));
+        assert_eq!(clean(&listed), format!("{} \u{2026}", "a1".repeat(197)));
+        // One word longer than the limit goes as a mark only.
+        assert_eq!(clean(&"x".repeat(MAX_TEXT + 1)), "\u{2026}");
+        // A cut that ends right before a space splits nothing.
+        let fits = format!("{} rest", "y".repeat(MAX_TEXT - 4));
+        assert_eq!(
+            clean(&fits),
+            format!("{} \u{2026}", "y".repeat(MAX_TEXT - 4))
+        );
+        // Characters of more than one byte are not cut through.
+        let wide = format!("{} {}", "\u{e9}".repeat(150), "\u{e9}".repeat(150));
+        assert_eq!(clean(&wide), format!("{} \u{2026}", "\u{e9}".repeat(150)));
+    }
+
+    #[test]
+    fn a_name_on_the_cut_of_a_long_claim_never_goes_out_in_part() {
+        let mut graph = lab();
+        // A name the graph registers, under an ending no pattern knows.
+        graph.apply(Observation::TlsSan {
+            address: "10.10.10.5".into(),
+            port: 443,
+            san: "build-srv.acme-lab.zz".into(),
+            record: EvidenceRecord::observed(Source::TlsSan, Confidence::High, "x"),
+        });
+        let lead = "word ".repeat(78);
+        let claim = format!("{lead}build-srv.acme-lab.zz answered on 443");
+        let at = claim.find("build-srv").unwrap();
+        assert!(at < MAX_TEXT && at + "build-srv.acme-lab.zz".len() > MAX_TEXT);
+        graph.apply(Observation::Fact {
+            address: "10.10.10.5".into(),
+            port: None,
+            protocol: "ip".into(),
+            claim,
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+        });
+        let host = &graph.hosts["10.10.10.5"];
+        let prompt = triage_prompt(&graph, host);
+        let facts = prompt.user["untrusted_scan_data"]["observed_facts"]
+            .as_array()
+            .unwrap();
+        let sent = facts
+            .iter()
+            .filter_map(|fact| fact["claim"].as_str())
+            .find(|claim| claim.starts_with("word word"))
+            .unwrap();
+        assert!(sent.ends_with("word \u{2026}"), "{sent}");
+
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        for private in ["build-srv", "acme-lab"] {
+            assert!(
+                !masked.contains(private),
+                "{private} would reach the cloud:\n{masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_names_in_dns_records_are_masked_without_the_mail_dns_stage() {
+        // What the `dns` stage records, with `mail-dns` skipped or failed:
+        // `.ag` is an ending no pattern masks.
+        let mut graph = Graph::default();
+        for claim in [
+            "MX record: 10 mx1.acme-mail.ag",
+            "NS record: ns1.acme-dns.ag",
+            "CNAME record: shop.acme-cdn.ag",
+            "PTR record: edge7.acme-net.ag",
+            "TXT record: v=spf1 ip4:192.0.2.0/24 include:spf.protection.microsoft.com \
+             include:_spf.acme-holding.ag -all",
+        ] {
+            graph.apply(Observation::Fact {
+                address: "203.0.113.20".into(),
+                port: None,
+                protocol: "ip".into(),
+                claim: claim.into(),
+                record: EvidenceRecord::observed(Source::Dns, Confidence::High, "x"),
+            });
+        }
+        let host = &graph.hosts["203.0.113.20"];
+        assert_eq!(host.facts.len(), 5);
+        let prompt = triage_prompt(&graph, host);
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        for private in [
+            "acme-mail",
+            "acme-dns",
+            "acme-cdn",
+            "acme-net",
+            "acme-holding",
+        ] {
+            assert!(
+                !masked.contains(private),
+                "{private} would reach the cloud:\n{masked}"
+            );
+        }
+        assert!(masked.contains("MX record: 10 <<DOM_"), "{masked}");
+        assert!(masked.contains(" include:<<DOM_"), "{masked}");
+        // A software maker's site says what serves the mail, and stays.
+        assert!(
+            masked.contains("include:spf.protection.microsoft.com"),
+            "{masked}"
+        );
+    }
+
+    #[test]
+    fn a_long_sign_in_redirect_never_goes_out_with_part_of_a_name() {
+        let mut graph = lab();
+        // The site to come back to is named in a parameter, and byte 200,
+        // where the graph cuts a header, falls inside that name: a fixed
+        // cut would leave `selfservice.acme-c`.
+        let head = "https://login.idp-vendor.zz/oauth2/v2.0/authorize?response_type=code\
+                    &scope=openid&state=";
+        let tail = "&redirect_uri=https%3A%2F%2Fselfservice.acme-crm.ag%2Fsso%2Fcallback";
+        let name_at = tail.find("selfservice").unwrap();
+        let state = "s".repeat(200 - 18 - head.len() - name_at);
+        let location = format!("{head}{state}{tail}");
+        let at = location.find("selfservice.acme-crm.ag").unwrap();
+        assert!(at < 200 && at + "selfservice.acme-crm.ag".len() > 200);
+        graph.apply(Observation::Http {
+            address: "10.10.10.5".into(),
+            port: 8443,
+            scheme: "https".into(),
+            server: None,
+            location: Some(location),
+            record: EvidenceRecord::observed(Source::HttpHeader, Confidence::High, "x"),
+        });
+        let host = &graph.hosts["10.10.10.5"];
+        // Cut before the parameter, not through the name in it.
+        let kept = host.ports["8443/tcp"].http.as_ref().unwrap();
+        assert_eq!(
+            kept.location.as_deref(),
+            Some(format!("{head}{state}").as_str())
+        );
+
+        let prompt = triage_prompt(&graph, host);
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        for piece in ["selfservice", "acme-c", "redirect_uri"] {
+            assert!(
+                !masked.contains(piece),
+                "{piece} would reach the cloud:\n{masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_secret_the_cut_runs_through_is_still_masked() {
+        for secret in [
+            "password = \"Summer 2024 Sale\"",
+            "dbPassword: 'Summer 2024 Sale'",
+        ] {
+            // The value starts at byte 382, and the cut goes back to the
+            // space after `2024`: inside the quotes, which stay open.
+            let open = secret.find(['"', '\'']).unwrap();
+            let text = format!("{} {secret} was found", "-".repeat(380 - open));
+            let cut = clean(&text);
+            assert!(cut.ends_with("Summer 2024 \u{2026}"), "{cut}");
+            let mut vault = Vault::ephemeral();
+            let masked = vault.mask_text(&cut);
+            for word in ["Summer", "2024"] {
+                assert!(!masked.contains(word), "{masked}");
+            }
+        }
     }
 
     #[test]
