@@ -426,13 +426,17 @@ mod tests {
     fn pid_is_written_past_byte_zero_and_zero_pid_is_ignored() {
         let (_dir, path) = lock_file();
         let held = SessionLock::acquire(&path).unwrap();
+        // Read past byte 0 while the lock is held, as other processes do.
+        assert_eq!(holder_pid(&path), Some(std::process::id()));
+        drop(held);
+        // The whole file can be read once the lock is gone: on Windows the
+        // held lock covers byte 0, so it is checked here, not before.
         let raw = fs::read_to_string(&path).unwrap();
         assert!(
             raw.starts_with(' '),
             "byte 0 must be a space outside Windows [0, 1) lock range: {raw:?}"
         );
-        assert_eq!(holder_pid(&path), Some(std::process::id()));
-        drop(held);
+        assert_eq!(raw.trim(), std::process::id().to_string());
 
         fs::write(&path, " 0\n").unwrap();
         assert_eq!(holder_pid(&path), None);

@@ -795,22 +795,30 @@ mod tests {
         pump_input(Cursor::new(typed.clone()), &mut pty);
         assert_eq!(*received.lock().unwrap(), typed);
 
+        received.lock().unwrap().clear();
         // At end of input the EOF character is repeated until the session
         // is over.
-        received.lock().unwrap().clear();
-        let over = Arc::new(AtomicBool::new(false));
-        let stopper = Arc::clone(&over);
-        let seen = Arc::clone(&received);
-        let watcher = spawn_pty(move || {
-            while seen.lock().unwrap().len() < 4 {
-                thread::sleep(Duration::from_millis(20));
-            }
-            stopper.store(true, Ordering::Relaxed);
-        });
-        signal_end_of_input(&mut pty, &over);
-        watcher.join().unwrap();
         #[cfg(unix)]
-        assert!(received.lock().unwrap().starts_with(b"\x04\x15\x04"));
+        {
+            let over = Arc::new(AtomicBool::new(false));
+            let stopper = Arc::clone(&over);
+            let seen = Arc::clone(&received);
+            let watcher = spawn_pty(move || {
+                while seen.lock().unwrap().len() < 4 {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                stopper.store(true, Ordering::Relaxed);
+            });
+            signal_end_of_input(&mut pty, &over);
+            watcher.join().unwrap();
+            assert!(received.lock().unwrap().starts_with(b"\x04\x15\x04"));
+        }
+        // On Windows nothing is typed: closing the writer ends ConPTY input.
+        #[cfg(not(unix))]
+        {
+            signal_end_of_input(&mut pty, &AtomicBool::new(false));
+            assert!(received.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
