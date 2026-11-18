@@ -280,6 +280,7 @@ nmap = "nmap"
 katana = "katana"
 feroxbuster = "feroxbuster"
 # wordlist_path = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+# skip = ["udp", "js"]   # stages to leave out
 
 [cve]
 enabled = true

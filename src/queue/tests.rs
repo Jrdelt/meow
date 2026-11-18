@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn stages_can_be_turned_off_in_the_config() {
+    let settings: ReconSettings =
+        toml::from_str("skip = [\"udp\", \" JS \", \"waf_cdn\", \"no-such-stage\"]").unwrap();
+    assert!(settings.skips(Stage::Udp));
+    assert!(settings.skips(Stage::Js));
+    assert!(settings.skips(Stage::WafCdn));
+    assert!(!settings.skips(Stage::Ports));
+    assert!(!ReconSettings::default().skips(Stage::Udp));
+}
+
+#[test]
 fn the_udp_scan_names_its_services_and_explains_open_ones() {
     let settings = ReconSettings::default();
     let command = udp_command(

@@ -207,6 +207,8 @@ pub struct ReconSettings {
     pub nmap: String,
     pub katana: String,
     pub feroxbuster: String,
+    /// Stages to leave out (`["udp", "js"]`): they are marked skipped.
+    pub skip: Vec<String>,
     pub mild: PresetOverride,
     pub aggressive: PresetOverride,
     /// `~/.meow/wordlists`: any `.txt` file put there is used when no
@@ -224,6 +226,7 @@ impl Default for ReconSettings {
             nmap: "nmap".to_owned(),
             katana: "katana".to_owned(),
             feroxbuster: "feroxbuster".to_owned(),
+            skip: Vec::new(),
             mild: PresetOverride::default(),
             aggressive: PresetOverride::default(),
             wordlist_dir: None,
@@ -232,6 +235,13 @@ impl Default for ReconSettings {
 }
 
 impl ReconSettings {
+    /// Whether `config.toml` turns `stage` off. Unknown names are ignored.
+    pub fn skips(&self, stage: Stage) -> bool {
+        self.skip
+            .iter()
+            .any(|name| Stage::parse(&name.trim().to_ascii_lowercase()) == Some(stage))
+    }
+
     /// Flags for `mode`: built-in, then `config.toml`, then `profile.toml`.
     pub fn preset(&self, mode: Mode, profile: &PresetOverride) -> Preset {
         let from_config = match mode {
@@ -1070,6 +1080,10 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
             .as_deref()
             .is_some_and(|s| matches!(s, "pending" | "interrupted" | "running"))
         {
+            continue;
+        }
+        if state.config.recon.skips(stage) {
+            update(stage, "skipped", "turned off in config.toml (recon.skip)")?;
             continue;
         }
         let end = loop {

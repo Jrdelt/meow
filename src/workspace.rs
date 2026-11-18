@@ -95,6 +95,7 @@ output_cap_mb = 50
 # without any wordlist the directory stage is skipped. A .txt file put in
 # ~/.meow/wordlists is used when nothing else is found.
 # wordlist_path = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+# skip = ["udp", "js"]   # stages to leave out
 # Override the built-in nmap flags per mode, for example:
 # [recon.mild]
 # nmap_ports = ["-sS", "-T3", "--top-ports", "1000"]
