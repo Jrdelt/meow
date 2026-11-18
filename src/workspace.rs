@@ -32,6 +32,9 @@ pub const MODE_ENV: &str = "MEOW_MODE";
 pub const HOME_ENV: &str = "MEOW_HOME";
 
 const LOCAL_DIR: &str = ".meow";
+/// The session shells that keep a history in the workspace. Each has a file
+/// of its own (`zsh_history`, ...), as each writes its own format.
+pub const HISTORY_SHELLS: [&str; 3] = ["zsh", "bash", "powershell"];
 const CONFIG_FILE: &str = "config.toml";
 const PROFILE_FILE: &str = "profile.toml";
 const AI_FILE: &str = "ai.toml";
@@ -1489,7 +1492,8 @@ impl Workspace {
 
     /// Accepts a `./.meow` that came with a folder as this user's own. Its
     /// stored mode is replaced by `mode` (the user's default), its recorded
-    /// `last_cwd` is discarded, and private permissions are enforced.
+    /// `last_cwd` and shell history are discarded, and private permissions
+    /// are enforced.
     pub fn adopt(&mut self, home: &MeowHome, mode: Mode) -> Result<()> {
         refuse_symlink(&self.dir)?;
         refuse_links_inside(&self.dir)?;
@@ -1499,6 +1503,10 @@ impl Workspace {
         enforce_private_tree(&self.dir)
             .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
         let _ = fs::remove_file(self.last_cwd_path());
+        // A planted history could put a dangerous command one up-arrow away.
+        for shell in HISTORY_SHELLS {
+            let _ = fs::remove_file(self.history_path(shell));
+        }
         let mark = new_mark()?;
         self.profile.id = Some(mark.clone());
         self.profile.mode = mode;
@@ -1605,6 +1613,12 @@ impl Workspace {
 
     pub fn last_cwd_path(&self) -> PathBuf {
         self.dir.join("last_cwd")
+    }
+
+    /// The history file of the session shell `shell`, one of
+    /// [`HISTORY_SHELLS`].
+    pub fn history_path(&self, shell: &str) -> PathBuf {
+        self.dir.join(format!("{shell}_history"))
     }
 
     /// The directory the previous session ended in, if it was recorded as a
@@ -1877,12 +1891,19 @@ pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
 }
 
 /// Removes the workspace directory with everything in it: replay log,
-/// graph, state, notes, chats and report. Refused while a session is open.
+/// graph, state, notes, chats and report, and fish's history of it.
+/// Refused while a session is open.
 pub fn delete(workspace: &WorkspaceSummary) -> Result<()> {
     refuse_symlink(&workspace.dir)?;
     ensure_closed(workspace)?;
+    // fish keeps the session's history in its own folder.
+    let fish_history = crate::shims::fish_history_file(&workspace.dir);
     fs::remove_dir_all(&workspace.dir)
-        .with_context(|| format!("cannot delete {}", workspace.dir.display()))
+        .with_context(|| format!("cannot delete {}", workspace.dir.display()))?;
+    if let Some(file) = fish_history {
+        let _ = fs::remove_file(file);
+    }
+    Ok(())
 }
 
 /// Number of hosts in a `graph.json`, read without validating the rest.
@@ -3100,6 +3121,9 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         )
         .unwrap();
         fs::write(dot_meow.join("last_cwd"), format!("{}\n", fx.cwd.display())).unwrap();
+        for shell in HISTORY_SHELLS {
+            fs::write(dot_meow.join(format!("{shell}_history")), "echo planted\n").unwrap();
+        }
         let (mut ws, _) =
             Workspace::open_or_create(&fx.home, &cloned, "review", true, Mode::Light).unwrap();
         assert!(ws.is_foreign(&fx.home));
@@ -3111,6 +3135,9 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert!(dot_meow.join("tmp").is_dir());
         assert!(dot_meow.join("chats").is_dir());
         assert!(!ws.last_cwd_path().exists());
+        for shell in HISTORY_SHELLS {
+            assert!(!ws.history_path(shell).exists(), "{shell}");
+        }
 
         // UNC paths in last_cwd are rejected before touching the filesystem.
         fs::write(ws.last_cwd_path(), "\\\\198.51.100.99\\share\\dir\n").unwrap();

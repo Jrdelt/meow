@@ -112,6 +112,8 @@ meow acme --local
 
 Type `exit` (or press `Ctrl-D`) at any time to close the session shell and save the workspace.
 
+Each workspace keeps its own shell history: `history`, the up arrow and `Ctrl-R` show only its commands. A shell started inside the session (or `exec zsh`) whose startup file sets `HISTFILE` uses that file instead.
+
 ### 2. Run commands or queue background recon
 
 Anything you run in the session shell (`nmap`, `ping`, `curl`, `ssh`, `dig`, `git diff`) is observed passively. When a command discovers a host, open port, service banner, HTTP path, or configuration diff, `meow` records it in the workspace graph and looks up matching advisories in the background.

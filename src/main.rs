@@ -484,13 +484,19 @@ fn start_session(home: &MeowHome, cwd: &Path, name: &str, local: bool) -> Result
     let config = Config::load_or_create(home)?;
     let (mut workspace, created) =
         Workspace::open_or_create(home, cwd, name, local, config.default_mode)?;
-    if workspace.is_foreign(home) {
+    let foreign = workspace.is_foreign(home);
+    if foreign {
         accept_foreign_workspace(home, &mut workspace, config.default_mode)?;
     }
     let _lock = SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
         LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
         LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
     })?;
+    if created || foreign {
+        // A list fish kept for an earlier workspace in this place is not
+        // this one's.
+        shims::forget_fish_history(&workspace.dir);
+    }
     workspace.forget_last_session();
     workspace.record_open()?;
 
@@ -666,12 +672,17 @@ fn accept_foreign_workspace(
             ", with its own scan settings"
         }
     );
-    for (file, what) in [
+    let histories = workspace::HISTORY_SHELLS.map(|shell| format!("{shell}_history"));
+    let carried = [
         ("state.db", "queued scans and cached lookups"),
         ("graph.json", "hosts and findings someone else recorded"),
         ("replay.sh", "a log of commands"),
         ("last_cwd", "the directory its shell starts in"),
-    ] {
+    ];
+    let histories = histories
+        .iter()
+        .map(|file| (file.as_str(), "shell history"));
+    for (file, what) in carried.into_iter().chain(histories) {
         if let Some(bytes) = size(file) {
             println!(
                 "    It carries {what} ({file}, {} KB).",

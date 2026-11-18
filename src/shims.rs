@@ -7,17 +7,26 @@
 //! * append every command to `replay.sh` in two stages: `# [CWD] <dir>` and
 //!   the command before it runs, `# [EXIT] <code>` once it has finished;
 //! * record the current directory in `last_cwd` for the next session;
-//! * refresh `$MEOW_MODE` from `profile.toml` at each prompt.
+//! * refresh `$MEOW_MODE` from `profile.toml` at each prompt;
+//! * keep the shell history in a file of the workspace's own, one per
+//!   shell (`zsh_history`, ...), so a session recalls only the workspace's
+//!   commands and none reach your usual one. `HISTFILE` is set again at
+//!   every prompt, and the file is checked like the others before the shell
+//!   may write it.
 //!
 //! zsh is pointed at the shim directory through `ZDOTDIR` only until its first
 //! startup file has run. That file restores the user's `ZDOTDIR` at once, so
-//! the system-wide files that follow (on macOS they decide where Terminal
-//! keeps the shell history) and the user's own `.zshrc` see the same
-//! environment as in a shell started without meow.
+//! the system-wide files that follow and the user's own `.zshrc` see the same
+//! environment as in a shell started without meow. Those files may set
+//! `HISTFILE`, so zsh moves to the workspace file at its first prompt.
+//! A read-only `HISTFILE` is left alone in both shells.
+//! `SHELL_SESSIONS_DISABLE=1` turns off macOS Terminal's per-tab history,
+//! which would otherwise copy the session's commands into `~/.zsh_history`
+//! or `~/.bash_history` when the shell exits.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -31,6 +40,11 @@ const REPLAY_HEADER: &str = "\
 #   <the command as typed>
 #   # [EXIT] <exit code>   (absent if the session ended while it was running)
 ";
+
+/// Said once when the workspace history file is gone or was replaced by a
+/// link during the session. Placed inside single quotes: no `'` in it.
+const HISTORY_LOST: &str =
+    "[meow] The workspace history file was removed or replaced by a link: history is no longer saved.";
 
 /// Shared by bash and zsh: re-read the mode from `profile.toml`.
 const SH_REFRESH_MODE: &str = r##"_meow_refresh_mode() {
@@ -86,11 +100,57 @@ const ZSH_HOOKS: &str = r##"# meow session hooks for zsh (generated).
 typeset -g _meow_replay=@REPLAY@
 typeset -g _meow_last_cwd=@LAST_CWD@
 typeset -g _meow_profile=@PROFILE@
+typeset -g _meow_history=@HISTORY@
 typeset -g _meow_pending=
 typeset -g _meow_tty_frozen=
+typeset -g _meow_history_on=
+typeset -g _meow_history_lost=
 
 @REFRESH_MODE@
 @RATE_WARNING@
+# Keeps HISTFILE on this workspace's file: sourcing a startup file again, or
+# a prompt hook, may point it back at your usual one. It is exported, so a
+# nested zsh or `exec zsh` keeps it unless its startup file sets another.
+# A file that is gone or was replaced by a link (a `git pull` in this
+# folder) is never read or written again. A read-only HISTFILE stays.
+_meow_pin_history() {
+  [[ $_meow_history_on == on && ${(t)HISTFILE-} != *readonly* ]] || return 0
+  if [[ -z $_meow_history_lost && -f $_meow_history && ! -L $_meow_history ]]; then
+    [[ ${HISTFILE-} == "$_meow_history" ]] || export HISTFILE=$_meow_history
+  else
+    if [[ -z $_meow_history_lost ]]; then
+      _meow_history_lost=1
+      print -r -- '@HISTORY_LOST@' >&2
+    fi
+    unset HISTFILE
+    SAVEHIST=0
+  fi
+  return 0
+}
+
+# Every startup file has run, and may have set HISTFILE. Drop it so the list
+# they loaded is never written back, then start a new list on this
+# workspace's own file (HISTSIZE and SAVEHIST stay yours).
+_meow_start_history() {
+  setopt local_options no_warn_create_global
+  unset HISTFILE
+  if [[ -f $_meow_history && ! -L $_meow_history ]]; then
+    fc -p "$_meow_history"
+    export HISTFILE
+  else
+    fc -p
+  fi
+}
+
+# Runs meow's prompt hook first, so $? is still the command's exit code, and
+# the history pin last, after any hook of yours.
+_meow_order_hooks() {
+  local -a rest
+  rest=(${precmd_functions[@]:+${precmd_functions[@]:#_meow_precmd}})
+  rest=(${rest[@]:+${rest[@]:#_meow_pin_history}})
+  precmd_functions=(_meow_precmd $rest _meow_pin_history)
+}
+
 # Stage 1: before the command runs.
 _meow_preexec() {
   local cmd=${1-}
@@ -116,8 +176,21 @@ _meow_precmd() {
     # child program cannot leave the session shell stuck in raw mode (~ISIG).
     ttyctl -f 2>/dev/null || true
   fi
-  if [[ ${precmd_functions[1]-} != _meow_precmd ]]; then
-    precmd_functions=(_meow_precmd ${precmd_functions[@]:+${precmd_functions[@]:#_meow_precmd}})
+  if [[ -z $_meow_history_on ]]; then
+    _meow_history_on=off
+    if [[ ${(t)HISTFILE-} != *readonly* ]]; then
+      _meow_history_on=on
+      # fcntl locking leaves no history.LOCK link in the workspace.
+      setopt hist_fcntl_lock
+      _meow_start_history
+      # Your own prompt hooks run after this one; from the next prompt on
+      # the pin runs after them, and at this one a scheduled event does.
+      zmodload zsh/sched 2>/dev/null && sched +0 _meow_pin_history
+    fi
+  fi
+  _meow_pin_history
+  if [[ ${precmd_functions[1]-} != _meow_precmd || ${precmd_functions[-1]-} != _meow_pin_history ]]; then
+    _meow_order_hooks
   fi
   if [[ -n $_meow_pending ]]; then
     _meow_pending=
@@ -131,8 +204,9 @@ _meow_precmd() {
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec _meow_preexec
 add-zsh-hook precmd _meow_precmd
-# Run first so $? is still the command's own exit code.
-precmd_functions=(_meow_precmd ${precmd_functions[@]:+${precmd_functions[@]:#_meow_precmd}})
+# Each command line is pinned too, before it is saved: this covers `exit`.
+add-zsh-hook zshaddhistory _meow_pin_history
+_meow_order_hooks
 "##;
 
 const BASH_RC: &str = r##"# meow session shim (generated, rewritten at every session start).
@@ -151,6 +225,46 @@ _meow_pending=@PENDING@
 _meow_histnum=
 _meow_ready=
 _meow_cwd=$PWD
+_meow_history=@HISTORY@
+_meow_history_lost=
+_meow_history_fixed=
+
+# True while HISTFILE is read-only, as some setups make it: it then stays.
+_meow_histfile_fixed() {
+  local flags
+  flags=$(declare -p HISTFILE 2>/dev/null)
+  flags=${flags#declare -}
+  [[ ${flags%% *} == *r* ]]
+}
+
+# Keeps HISTFILE on this workspace's file: sourcing ~/.bashrc again may point
+# it back at your usual one. It is exported, so a nested bash keeps it unless
+# its startup file sets another. A file that is gone or was replaced by a
+# link (a `git pull` in this folder) is never written: /dev/null takes it.
+_meow_pin_history() {
+  local file=$_meow_history
+  [[ -z $_meow_history_fixed ]] || return 0
+  if [[ -z $_meow_history_lost ]] && ! [[ -f $file && ! -L $file ]]; then
+    _meow_history_lost=1
+    printf '%s\n' '@HISTORY_LOST@' >&2
+  fi
+  [[ -z $_meow_history_lost ]] || file=/dev/null
+  [[ ${HISTFILE-} != "$file" ]] || return 0
+  if _meow_histfile_fixed; then
+    _meow_history_fixed=1
+  else
+    export HISTFILE=$file
+  fi
+}
+
+# This session's own history. Bash reads HISTFILE by itself once this rcfile
+# is done, so clearing the list here leaves exactly that file's entries.
+if _meow_histfile_fixed; then
+  _meow_history_fixed=1
+else
+  export HISTFILE=$_meow_history
+  builtin history -c
+fi
 
 @REFRESH_MODE@
 @RATE_WARNING@
@@ -204,6 +318,7 @@ _meow_preexec() {
 # Stage 2: runs from PROMPT_COMMAND after the command has finished.
 _meow_precmd() {
   local code=$?
+  _meow_pin_history
   if [[ -f $_meow_pending && ! -L $_meow_pending && -s $_meow_pending ]]; then
     [[ ! -L $_meow_replay ]] && printf '# [EXIT] %s\n' "$code" 2>/dev/null >> "$_meow_replay"
     : 2>/dev/null >| "$_meow_pending"
@@ -219,6 +334,7 @@ _meow_precmd() {
 # done, using the directory remembered from the previous prompt.
 _meow_precmd_legacy() {
   local code=$?
+  _meow_pin_history
   _meow_history_last
   if [[ -n $_meow_ready && -n $_meow_h_num && $_meow_h_num != "$_meow_histnum" ]]; then
     [[ ! -L $_meow_replay ]] && {
@@ -242,11 +358,13 @@ if [[ -z ${MEOW_BASH_LEGACY-} ]] &&
 else
   _meow_hook=_meow_precmd_legacy
 fi
-# Run first so $? is still the command's own exit code.
+# Run first so $? is still the command's own exit code. The history pin
+# runs again last, after your own prompt commands.
 if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
-  PROMPT_COMMAND=("$_meow_hook" "${PROMPT_COMMAND[@]}")
+  PROMPT_COMMAND=("$_meow_hook" "${PROMPT_COMMAND[@]}" _meow_pin_history)
 else
-  PROMPT_COMMAND="$_meow_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+  PROMPT_COMMAND="$_meow_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND
+}${PROMPT_COMMAND:+_meow_pin_history}"
 fi
 unset _meow_hook
 "##;
@@ -263,10 +381,18 @@ $global:__meow = @{
     Utf8    = (New-Object System.Text.UTF8Encoding $false)
     Cwd     = (Get-Location).ProviderPath
     Prompt  = $function:prompt
+    History = $null
 }
 $__meowLast = Get-History -Count 1
 if ($__meowLast) { $global:__meow.LastId = $__meowLast.Id }
 Remove-Variable __meowLast
+# Up-arrow and Ctrl-R recall only this workspace's commands.
+if (Get-Module PSReadLine) {
+    try {
+        Set-PSReadLineOption -HistorySavePath @HISTORY@
+        $global:__meow.History = @HISTORY@
+    } catch { }
+}
 
 function global:prompt {
     $ok = $?
@@ -279,6 +405,13 @@ function global:prompt {
                 return -not ($attr -band [System.IO.FileAttributes]::ReparsePoint) -and -not ($attr -band [System.IO.FileAttributes]::Directory)
             }
             return $true
+        }
+        # A history file replaced by a link (a `git pull` in this folder) is
+        # never written.
+        if ($global:__meow.History -and -not (& $isSafeTarget $global:__meow.History)) {
+            $global:__meow.History = $null
+            try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch { }
+            [Console]::Error.WriteLine('@HISTORY_LOST@')
         }
         $errTop = if ($global:Error.Count -gt 0) { $global:Error[0] } else { $null }
         $newErr = $errTop -and -not [object]::ReferenceEquals($errTop, $global:__meow.LastErr)
@@ -338,17 +471,59 @@ pub enum ShellKind {
 impl ShellKind {
     /// Classifies a shell by its program name (`/bin/zsh`, `pwsh.exe`, ...).
     pub fn detect(program: &str) -> Self {
-        let name = program
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(program)
-            .to_ascii_lowercase();
-        match name.strip_suffix(".exe").unwrap_or(&name) {
+        match program_name(program).as_str() {
             "zsh" => ShellKind::Zsh,
             "bash" => ShellKind::Bash,
             "pwsh" | "powershell" => ShellKind::PowerShell,
             _ => ShellKind::Other,
         }
+    }
+}
+
+/// `/usr/bin/zsh` -> `zsh`, `C:\...\pwsh.exe` -> `pwsh`.
+fn program_name(program: &str) -> String {
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_owned(),
+        None => name,
+    }
+}
+
+/// The fish history session for the workspace in `dir`. fish keeps it in
+/// its own data folder, so the name comes from a hash of the workspace
+/// folder: one list per workspace, never shared by two.
+fn fish_history_name(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let digest = Sha256::digest(dir.as_os_str().as_encoded_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("meow_{hex}")
+}
+
+/// The file fish keeps that history in: `$XDG_DATA_HOME/fish`, else
+/// `~/.local/share/fish`.
+pub fn fish_history_file(dir: &Path) -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))?;
+    Some(fish_history_in(&data, dir))
+}
+
+fn fish_history_in(data: &Path, dir: &Path) -> PathBuf {
+    data.join("fish")
+        .join(format!("{}_history", fish_history_name(dir)))
+}
+
+/// Removes fish's history of the workspace in `dir`: a workspace made anew
+/// in the same place must not inherit it.
+pub fn forget_fish_history(dir: &Path) {
+    if let Some(file) = fish_history_file(dir) {
+        let _ = std::fs::remove_file(file);
     }
 }
 
@@ -395,18 +570,21 @@ fn utf8(path: &Path) -> Result<&str> {
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
-fn ensure_replay_log(path: &Path) -> Result<()> {
+/// Makes sure `path` is a private regular file of its own, creating it with
+/// `initial` as its content when missing. An existing file is never
+/// truncated. `what` names it in errors.
+fn ensure_private_file(path: &Path, initial: &[u8], what: &str) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
                 anyhow::bail!(
-                    "{} is a symbolic link; refusing to write replay log",
+                    "{} is a symbolic link; refusing to write {what}",
                     path.display()
                 );
             }
             if !meta.is_file() {
                 anyhow::bail!(
-                    "{} is not a regular file; refusing to write replay log",
+                    "{} is not a regular file; refusing to write {what}",
                     path.display()
                 );
             }
@@ -415,7 +593,7 @@ fn ensure_replay_log(path: &Path) -> Result<()> {
                 use std::os::unix::fs::{MetadataExt, PermissionsExt};
                 if meta.nlink() > 1 {
                     anyhow::bail!(
-                        "{} has multiple hard links; refusing to write replay log",
+                        "{} has multiple hard links; refusing to write {what}",
                         path.display()
                     );
                 }
@@ -434,11 +612,50 @@ fn ensure_replay_log(path: &Path) -> Result<()> {
                 .create_new(true)
                 .open(path)
                 .with_context(|| format!("cannot create {}", path.display()))?;
-            file.write_all(REPLAY_HEADER.as_bytes())
+            file.write_all(initial)
                 .with_context(|| format!("cannot write {}", path.display()))
         }
         Err(e) => Err(e).with_context(|| format!("cannot inspect {}", path.display())),
     }
+}
+
+/// Replaces each `@NAME@` in `template` with its value in `values`, in one
+/// pass: a value is never searched again, so a path that holds `@HISTORY@`
+/// stays inside its quotes. Any other `@` is kept as it is.
+fn fill_template(template: &str, values: &[(&str, String)]) -> String {
+    let mut out = String::with_capacity(template.len() + 4096);
+    let mut rest = template;
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let found = after.find('@').and_then(|end| {
+            let name = &after[..end];
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (end, value))
+        });
+        match found {
+            Some((end, value)) => {
+                out.push_str(value);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('@');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// macOS Terminal's `/etc/zshrc_Apple_Terminal` and `/etc/bashrc_Apple_Terminal`
+/// give each tab its own history file and merge it into `~/.zsh_history` or
+/// `~/.bash_history` on exit. The session shell shares the outer tab's
+/// `TERM_SESSION_ID`, so it would also write into that tab's restore files.
+fn no_terminal_sessions() -> (String, OsString) {
+    ("SHELL_SESSIONS_DISABLE".to_owned(), "1".into())
 }
 
 /// Writes this session's shims for the shell `program` and returns how to
@@ -455,13 +672,31 @@ pub fn prepare(
         env: Vec::new(),
     };
     if kind == ShellKind::Other {
+        if program_name(program) == "fish" {
+            // fish gets no hooks, but keeps a history of its own under this
+            // name, in fish's data folder (see `fish_history_file`).
+            launch.env.push((
+                "fish_history".to_owned(),
+                fish_history_name(&workspace.dir).into(),
+            ));
+        }
         return Ok(launch);
     }
 
     let dir = workspace.tmp_dir().join("shell");
     create_private_subdir(&workspace.tmp_dir())?;
     create_private_subdir(&dir)?;
-    ensure_replay_log(&workspace.replay_path())?;
+    ensure_private_file(
+        &workspace.replay_path(),
+        REPLAY_HEADER.as_bytes(),
+        "replay log",
+    )?;
+    let history = workspace.history_path(match kind {
+        ShellKind::Zsh => "zsh",
+        ShellKind::Bash => "bash",
+        _ => "powershell",
+    });
+    ensure_private_file(&history, b"", "shell history")?;
 
     let quote: fn(&str) -> String = match kind {
         ShellKind::PowerShell => ps_quote,
@@ -472,16 +707,18 @@ pub fn prepare(
         ShellKind::Zsh => "hooks.zsh",
         _ => "hooks.bash",
     });
-    let fill = |template: &str| -> Result<String> {
-        Ok(template
-            .replace("@REFRESH_MODE@", SH_REFRESH_MODE)
-            .replace("@RATE_WARNING@", SH_RATE_WARNING)
-            .replace("@REPLAY@", &quote(utf8(&workspace.replay_path())?))
-            .replace("@LAST_CWD@", &quote(utf8(&workspace.last_cwd_path())?))
-            .replace("@PROFILE@", &quote(utf8(&workspace.profile_path())?))
-            .replace("@PENDING@", &quote(utf8(&pending)?))
-            .replace("@HOOKS@", &quote(utf8(&hooks)?)))
-    };
+    let values = [
+        ("REFRESH_MODE", SH_REFRESH_MODE.to_owned()),
+        ("RATE_WARNING", SH_RATE_WARNING.to_owned()),
+        ("HISTORY_LOST", HISTORY_LOST.to_owned()),
+        ("REPLAY", quote(utf8(&workspace.replay_path())?)),
+        ("LAST_CWD", quote(utf8(&workspace.last_cwd_path())?)),
+        ("PROFILE", quote(utf8(&workspace.profile_path())?)),
+        ("HISTORY", quote(utf8(&history)?)),
+        ("PENDING", quote(utf8(&pending)?)),
+        ("HOOKS", quote(utf8(&hooks)?)),
+    ];
+    let fill = |template: &str| -> Result<String> { Ok(fill_template(template, &values)) };
     let write = |name: &str, template: &str| -> Result<()> {
         write_private_atomic(&dir.join(name), fill(template)?.as_bytes())
     };
@@ -504,12 +741,14 @@ pub fn prepare(
                 "MEOW_ORIG_ZDOTDIR".to_owned(),
                 original_zdotdir.unwrap_or_default(),
             ));
+            launch.env.push(no_terminal_sessions());
         }
         ShellKind::Bash => {
             write("bashrc", BASH_RC)?;
             write("hooks.bash", BASH_HOOKS)?;
             write_private_atomic(&pending, b"")?;
             launch.args = vec!["--rcfile".to_owned(), utf8(&dir.join("bashrc"))?.to_owned()];
+            launch.env.push(no_terminal_sessions());
         }
         ShellKind::PowerShell => {
             // Windows PowerShell 5.1 parses BOM-less .ps1 files in the legacy
@@ -535,7 +774,7 @@ pub fn prepare(
 mod tests {
     use super::*;
     use crate::mode::Mode;
-    use crate::workspace::MeowHome;
+    use crate::workspace::{MeowHome, HISTORY_SHELLS};
     use std::fs;
 
     fn workspace(tmp: &tempfile::TempDir) -> Workspace {
@@ -558,6 +797,8 @@ mod tests {
             "@PROFILE@",
             "@PENDING@",
             "@HOOKS@",
+            "@HISTORY@",
+            "@HISTORY_LOST@",
         ] {
             assert!(
                 !text.contains(placeholder),
@@ -608,6 +849,117 @@ mod tests {
         assert!(launch.args.is_empty() && launch.env.is_empty());
         assert!(!ws.tmp_dir().join("shell").exists());
         assert!(!ws.replay_path().exists());
+        for shell in HISTORY_SHELLS {
+            assert!(!ws.history_path(shell).exists(), "{shell}");
+        }
+    }
+
+    #[test]
+    fn fish_gets_a_history_of_its_own_and_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = workspace(&tmp);
+        let launch = prepare(&ws, "/usr/bin/fish", None).unwrap();
+        assert!(!launch.hooked() && launch.args.is_empty());
+        let name = fish_history_name(&ws.dir);
+        assert_eq!(
+            launch.env,
+            [("fish_history".to_owned(), name.clone().into())]
+        );
+        assert!(!ws.tmp_dir().join("shell").exists());
+        for shell in HISTORY_SHELLS {
+            assert!(!ws.history_path(shell).exists(), "{shell}");
+        }
+
+        // fish accepts only letters, digits and `_`. The name is the same
+        // for every path of one folder, and differs for names that look
+        // alike, and for the same name in another folder.
+        assert!(name.starts_with("meow_") && name.len() == 21, "{name}");
+        assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        assert_eq!(fish_history_name(&ws.dir.join("tmp").join("..")), name);
+        let names: std::collections::HashSet<String> = ["web-01", "web_01", "web.01"]
+            .iter()
+            .map(|n| fish_history_name(&tmp.path().join(n)))
+            .chain([fish_history_name(&tmp.path().join("other").join("acme"))])
+            .chain([name.clone()])
+            .collect();
+        assert_eq!(names.len(), 5);
+        assert_eq!(
+            fish_history_in(Path::new("/data"), &ws.dir),
+            Path::new("/data/fish").join(format!("{name}_history"))
+        );
+    }
+
+    #[test]
+    fn each_shell_has_a_history_file_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = workspace(&tmp);
+        for (program, shell, file) in [
+            ("zsh", "zsh", "hooks.zsh"),
+            ("bash", "bash", "hooks.bash"),
+            ("pwsh", "powershell", "init.ps1"),
+        ] {
+            prepare(&ws, program, None).unwrap();
+            let text = read(ws.tmp_dir().join("shell").join(file));
+            let path = ws.history_path(shell);
+            assert!(path.ends_with(format!("{shell}_history")));
+            assert_eq!(read(&path), "");
+            let quoted = match shell {
+                "powershell" => ps_quote(path.to_str().unwrap()),
+                _ => sh_quote(path.to_str().unwrap()),
+            };
+            assert!(text.contains(&quoted), "{text}");
+            for other in HISTORY_SHELLS.iter().filter(|other| **other != shell) {
+                let other = format!("{other}_history");
+                assert!(!text.contains(&other), "{other} in:\n{text}");
+            }
+        }
+    }
+
+    /// A path that holds a placeholder's text stays inside its quotes: the
+    /// values are filled in one pass.
+    #[test]
+    fn placeholders_in_paths_are_not_filled_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join("p@HISTORY@$(touch x)@HOOKS@'@REPLAY@")).unwrap();
+        let ws = Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light)
+            .unwrap()
+            .0;
+        prepare(&ws, "bash", None).unwrap();
+        let hooks = read(ws.tmp_dir().join("shell").join("hooks.bash"));
+        let line =
+            |name: &str, path: &Path| format!("\n{name}={}\n", sh_quote(path.to_str().unwrap()));
+        assert!(
+            hooks.contains(&line("_meow_replay", &ws.replay_path())),
+            "{hooks}"
+        );
+        assert!(
+            hooks.contains(&line("_meow_history", &ws.history_path("bash"))),
+            "{hooks}"
+        );
+        // Inside quotes the path's own `'` is written as `'\''`.
+        let dir = ws.dir.to_str().unwrap().replace('\'', r"'\''");
+        assert_filled(&hooks.replace(&dir, ""));
+        let rc = read(ws.tmp_dir().join("shell").join("bashrc"));
+        let hooks_path = ws.tmp_dir().join("shell").join("hooks.bash");
+        assert!(
+            rc.contains(&format!(". {}\n", sh_quote(hooks_path.to_str().unwrap()))),
+            "{rc}"
+        );
+
+        prepare(&ws, "pwsh", None).unwrap();
+        let script = read(ws.tmp_dir().join("shell").join("init.ps1"));
+        let replay = ps_quote(ws.replay_path().to_str().unwrap());
+        assert!(
+            script.contains(&format!("Replay  = {replay}\n")),
+            "{script}"
+        );
+
+        // Only names it knows are filled; any other `@` stays.
+        let values = [("A", "1".to_owned()), ("B", "@A@".to_owned())];
+        assert_eq!(
+            fill_template("x@A@y@B@ @C@ a@b [@] @A", &values),
+            "x1y@A@ @C@ a@b [@] @A"
+        );
     }
 
     #[test]
@@ -616,7 +968,11 @@ mod tests {
         let ws = workspace(&tmp);
         let launch = prepare(&ws, "/bin/bash", None).unwrap();
         let dir = ws.tmp_dir().join("shell");
-        assert!(launch.hooked() && launch.env.is_empty());
+        assert!(launch.hooked());
+        assert_eq!(
+            launch.env,
+            [("SHELL_SESSIONS_DISABLE".to_owned(), "1".into())]
+        );
         assert_eq!(
             launch.args,
             ["--rcfile", dir.join("bashrc").to_str().unwrap()]
@@ -632,6 +988,46 @@ mod tests {
         assert!(hooks.contains("PROMPT_COMMAND="));
         assert_filled(&hooks);
         assert_eq!(read(dir.join("pending")), "");
+
+        // The history moves to the workspace file and the list is emptied;
+        // bash loads that file by itself after the rcfile, exactly once.
+        // Not when HISTFILE is read-only.
+        let history = format!(
+            "\n_meow_history={}\n",
+            sh_quote(ws.history_path("bash").to_str().unwrap())
+        );
+        let start = &hooks[hooks.find(&history).expect(&hooks)..];
+        let start = &start[start.find("\nif _meow_histfile_fixed; then\n").unwrap()..];
+        let set = start.find("  export HISTFILE=$_meow_history\n").unwrap();
+        assert!(
+            set < start.find("  builtin history -c\n").unwrap(),
+            "{hooks}"
+        );
+        assert!(!hooks.contains("history -r"), "{hooks}");
+        assert_eq!(read(ws.history_path("bash")), "");
+
+        // Every prompt sets it again, or moves it to /dev/null once the
+        // file is gone or a link.
+        for hook in ["_meow_precmd() {", "_meow_precmd_legacy() {"] {
+            let body = &hooks[hooks.find(hook).unwrap()..];
+            assert!(
+                body.starts_with(&format!("{hook}\n  local code=$?\n  _meow_pin_history\n")),
+                "{hooks}"
+            );
+        }
+        let pin = &hooks[hooks.find("_meow_pin_history() {").unwrap()..];
+        assert!(pin.contains("! [[ -f $file && ! -L $file ]]"), "{hooks}");
+        assert!(pin.contains("file=/dev/null"), "{hooks}");
+        assert!(pin.contains(HISTORY_LOST), "{hooks}");
+        // ... and again after your own prompt commands.
+        assert!(
+            hooks.contains("(\"$_meow_hook\" \"${PROMPT_COMMAND[@]}\" _meow_pin_history)"),
+            "{hooks}"
+        );
+        assert!(
+            hooks.contains("; $PROMPT_COMMAND\n}${PROMPT_COMMAND:+_meow_pin_history}\""),
+            "{hooks}"
+        );
     }
 
     #[test]
@@ -647,6 +1043,7 @@ mod tests {
             [
                 ("ZDOTDIR".to_owned(), OsString::from(&dir)),
                 ("MEOW_ORIG_ZDOTDIR".to_owned(), "/custom/zdot".into()),
+                ("SHELL_SESSIONS_DISABLE".to_owned(), "1".into()),
             ]
         );
         let launch = prepare(&ws, "zsh", None).unwrap();
@@ -666,6 +1063,51 @@ mod tests {
         assert!(hooks.contains("add-zsh-hook precmd _meow_precmd"));
         assert!(hooks.contains("ttyctl -f"));
         assert_filled(&hooks);
+
+        // The startup files set HISTFILE after the hooks are sourced, so the
+        // switch happens once, in the first precmd. The list they loaded is
+        // left without a file and never saved back. A read-only HISTFILE
+        // stays.
+        let quoted = sh_quote(ws.history_path("zsh").to_str().unwrap());
+        assert!(
+            hooks.contains(&format!("typeset -g _meow_history={quoted}\n")),
+            "{hooks}"
+        );
+        let start = &hooks[hooks.find("_meow_start_history() {").unwrap()..];
+        let unset = start.find("unset HISTFILE\n").unwrap();
+        let push = start.find("fc -p \"$_meow_history\"\n").unwrap();
+        assert!(unset < push, "{hooks}");
+        assert!(start[push..].starts_with("fc -p \"$_meow_history\"\n    export HISTFILE\n"));
+        assert!(!hooks.contains("fc -p -a"), "{hooks}");
+        let precmd = &hooks[hooks.find("_meow_precmd() {").unwrap()..];
+        let once = precmd.find("if [[ -z $_meow_history_on ]]").unwrap();
+        let free = precmd
+            .find("if [[ ${(t)HISTFILE-} != *readonly* ]]")
+            .unwrap();
+        let lock = precmd.find("setopt hist_fcntl_lock\n").unwrap();
+        let switch = precmd.find("_meow_start_history\n").unwrap();
+        assert!(once < free && free < lock && lock < switch, "{hooks}");
+
+        // Then HISTFILE is set again at every prompt, after your own prompt
+        // hooks too (a scheduled event at the first prompt), and before
+        // each line is saved.
+        let sched = precmd.find("sched +0 _meow_pin_history\n").unwrap();
+        assert!(switch < sched, "{hooks}");
+        assert!(
+            precmd.find("\n  _meow_pin_history\n").unwrap() > sched,
+            "{hooks}"
+        );
+        assert!(
+            hooks.contains("precmd_functions=(_meow_precmd $rest _meow_pin_history)"),
+            "{hooks}"
+        );
+        assert!(hooks.contains("add-zsh-hook zshaddhistory _meow_pin_history\n"));
+        assert!(hooks.ends_with("_meow_order_hooks\n"), "{hooks}");
+        let pin = &hooks[hooks.find("_meow_pin_history() {").unwrap()..];
+        let pin = &pin[..pin.find("\n}\n").unwrap()];
+        assert!(pin.contains("export HISTFILE=$_meow_history"), "{pin}");
+        assert!(pin.contains("unset HISTFILE\n    SAVEHIST=0"), "{pin}");
+        assert!(pin.ends_with("return 0"), "{pin}");
 
         // zsh reads the user's own .zshrc; a shim left by an older version
         // is removed.
@@ -704,6 +1146,22 @@ mod tests {
         assert!(script.contains("ReferenceEquals"));
         assert!(script.contains("it''s home"), "{script}");
         assert_filled(&script);
+
+        // PSReadLine's saved history is per workspace, and nothing happens
+        // without PSReadLine. A file replaced by a link is not written.
+        let path = ps_quote(ws.history_path("powershell").to_str().unwrap());
+        let set = format!(
+            "if (Get-Module PSReadLine) {{\n    try {{\n        Set-PSReadLineOption -HistorySavePath {path}\n        $global:__meow.History = {path}\n    }} catch {{ }}\n}}"
+        );
+        assert!(script.contains(&set), "{script}");
+        assert!(
+            script.contains(
+                "if ($global:__meow.History -and -not (& $isSafeTarget $global:__meow.History)) {"
+            ),
+            "{script}"
+        );
+        assert!(script.contains("-HistorySaveStyle SaveNothing"), "{script}");
+        assert!(script.contains(&format!("[Console]::Error.WriteLine('{HISTORY_LOST}')")));
     }
 
     #[test]
@@ -714,8 +1172,10 @@ mod tests {
         assert_eq!(read(ws.replay_path()), REPLAY_HEADER);
 
         fs::write(ws.replay_path(), format!("{REPLAY_HEADER}ls\n")).unwrap();
+        fs::write(ws.history_path("zsh"), "echo inside-1\n").unwrap();
         prepare(&ws, "zsh", None).unwrap();
         assert_eq!(read(ws.replay_path()), format!("{REPLAY_HEADER}ls\n"));
+        assert_eq!(read(ws.history_path("zsh")), "echo inside-1\n");
     }
 
     #[cfg(unix)]
@@ -734,6 +1194,11 @@ mod tests {
             assert_eq!(mode(&path), 0o600, "{}", path.display());
         }
         assert_eq!(mode(&ws.replay_path()), 0o600);
+        assert_eq!(mode(&ws.history_path("zsh")), 0o600);
+        assert_eq!(mode(&ws.history_path("bash")), 0o600);
+        fs::set_permissions(ws.history_path("zsh"), fs::Permissions::from_mode(0o644)).unwrap();
+        prepare(&ws, "zsh", None).unwrap();
+        assert_eq!(mode(&ws.history_path("zsh")), 0o600);
     }
 
     #[test]
@@ -771,6 +1236,25 @@ mod tests {
                 err.to_string().contains("hard links"),
                 "expected hardlink refusal, got: {err:#}"
             );
+
+            // The same for the shell history.
+            fs::remove_file(ws.replay_path()).unwrap();
+            fs::remove_file(ws.history_path("bash")).unwrap();
+            std::os::unix::fs::symlink(&target, ws.history_path("bash")).unwrap();
+            let err = prepare(&ws, "bash", None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("symbolic link; refusing to write shell history"),
+                "expected symlink refusal, got: {err:#}"
+            );
+            fs::remove_file(ws.history_path("bash")).unwrap();
+            fs::hard_link(&target, ws.history_path("zsh")).unwrap();
+            let err = prepare(&ws, "zsh", None).unwrap_err();
+            assert!(
+                err.to_string().contains("hard links"),
+                "expected hardlink refusal, got: {err:#}"
+            );
+            assert_eq!(read(&target), "secret");
         }
     }
 }
