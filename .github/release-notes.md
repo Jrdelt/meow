@@ -1,18 +1,9 @@
-### What's New in `meow` v0.2.2
+### What's New in `meow` v0.2.3
 
-- **Three new recon stages (17 in all):**
-  - **`mail-dns`** grades a domain's mail and DNS protection A–F (SPF, DMARC, DKIM, CAA, DNSSEC), names its mail provider, lists services it publishes in DNS (Active Directory, Microsoft 365, SIP…), and spots wildcard DNS so made-up subdomains are not taken for real hosts.
-  - **`udp`** checks 23 security-relevant UDP services such as SNMP, IPMI, NTP and DNS (aggressive mode, as root).
-  - **`js`** reads the site's own JavaScript for API endpoints and exposed keys. A key goes straight into the Privacy Vault; only a placeholder like `<<SEC_03>>` is ever shown.
-- **Web fingerprinting:** `headers` now names the software stack (flagging outdated libraries), checks cookie flags, and grades the security headers A–F.
-- **Map:**
-  - The drawing fills the window; your location floats in a corner and folds away. **Expand** gives the map the whole window.
-  - A selected host's details are in tabs: Overview, Ports, Web & TLS, DNS & Mail, Advisories, Evidence, Notes & AI.
-  - Much less text: explanations moved into hover hints, and empty cards are hidden.
-- **AI triage and the report** now use the DNS & Mail grade, the stack, cookie and header findings, JS endpoints and exposed keys (by placeholder). New names are masked before anything reaches a cloud model.
-- **`recon.skip`** in `config.toml` turns stages off, e.g. `skip = ["udp", "js"]`.
-- **Security:** release builds no longer hold a write token; Windows folder permissions and installer downloads are now tested on Windows in CI; cookie values are no longer kept in stored header evidence.
-- **Dependencies updated:** dirs 7, getrandom 0.4, ipnetwork 0.21, roxmltree 0.21, signal-hook 0.4, tokio-tungstenite 0.30, toml 1.2.
+- **Fixed: `exit` could hang and recon stopped halfway.** After a mild or aggressive `meow recon` reached the `waf-cdn` stage, that stage locked up, so the later stages (tls-audit, ssh-audit, cves, crawl, js, dirs) never ran and `exit` waited for ever with the terminal left raw. Recon now runs every stage, and leaving a session always gives your shell back within a few seconds.
+- **Sessions are saved where you run meow.** A new session asks where to save it, with the current folder filled in (edit it or press Enter). Sessions live in `./meow/<name>/` there, next to your other files, with a `.gitignore` so git leaves them out. `meow <name>` still reopens a session from any folder, and `meow list` shows where each one lives. `--home` keeps the old `~/.meow/workspaces/` place; sessions made by earlier versions keep working.
+- **Each session has its own shell history.** `history`, the up arrow and `Ctrl-R` show only that session's commands, and they stay out of your normal shell history (zsh, bash, PowerShell, fish). macOS Terminal's "Saving session…" no longer runs inside meow.
+- **CVEs are shown plainly.** They are grouped by the software and version they were found from, known-exploited first, with severity and the version that fixes them — on the map, in the HUD and in the report. The confirm / false-positive steps and the Evidence tab are gone.
 
 ---
 
