@@ -1088,13 +1088,16 @@ pub fn read_chats_and_replay(
 pub fn collect(workspace: &Workspace) -> Result<Inputs> {
     let db = Arc::new(Mutex::new(Db::open(&workspace.state_db_path())?));
     let tasks = queue::tasks(&db.lock().unwrap_or_else(|p| p.into_inner()), 200)?;
-    let secrets = Vault::open(Arc::clone(&db))?.exposed_secrets();
+    let vault = Vault::open(Arc::clone(&db))?;
+    let secrets = vault.exposed_secrets();
+    let mut graph = Graph::load(&workspace.graph_path())?;
+    graph.hide_script_keys(&vault);
     let (replay, chats) = read_chats_and_replay(&workspace.dir);
     Ok(Inputs {
         session: workspace.name.clone(),
         mode: workspace.profile.mode,
         generated_utc: now_rfc3339(),
-        graph: Graph::load(&workspace.graph_path())?,
+        graph,
         tasks,
         secrets,
         replay,

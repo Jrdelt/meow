@@ -267,4 +267,4 @@ pub fn distro_backport_note(text: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

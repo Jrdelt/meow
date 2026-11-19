@@ -51,8 +51,9 @@ signal-hook = "0.4"
 [target.'cfg(windows)'.dependencies]
 # Console-mode access for VT input/output; same crate crossterm uses.
 crossterm_winapi = "0.9"
-# Job Objects (kill a tool with everything it started) and the elevation check.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_UI_Shell"] }
+# Job Objects (kill a tool with everything it started), the elevation check
+# and the system's DNS servers (IpHelper).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_JobObjects", "Win32_UI_Shell"] }
 
 [build-dependencies]
 cc = "1.2"

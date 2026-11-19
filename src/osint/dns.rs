@@ -355,26 +355,167 @@ pub fn parse_dns_wire_response(packet: &[u8], expected_txid: u16, qtype: u16) ->
     out
 }
 
+/// This machine's DNS servers: on Unix those of `/etc/resolv.conf`, on
+/// Windows those of the network adapters that are up. Never a public
+/// resolver in their place: with none, a question goes nowhere but over
+/// DNS-over-HTTPS, and only for a public name.
 fn system_nameservers() -> Vec<SocketAddr> {
+    #[cfg(unix)]
+    {
+        std::fs::read_to_string("/etc/resolv.conf")
+            .map(|text| parse_resolv_conf(&text))
+            .unwrap_or_default()
+    }
+    #[cfg(windows)]
+    {
+        windows_dns::servers()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Vec::new()
+    }
+}
+
+/// The servers the `nameserver` lines of a `resolv.conf` name.
+#[cfg(any(unix, test))]
+pub(super) fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {
     let mut servers = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("nameserver") {
-                if let Some(addr_str) = rest.split_whitespace().next() {
-                    let clean_ip = addr_str.split('%').next().unwrap_or(addr_str);
-                    if let Ok(ip) = IpAddr::from_str(clean_ip) {
-                        servers.push(SocketAddr::new(ip, 53));
-                    }
-                }
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(address) = words.next() else {
+            continue;
+        };
+        let bare = address.split('%').next().unwrap_or(address);
+        if let Ok(ip) = IpAddr::from_str(bare) {
+            let server = SocketAddr::new(ip, 53);
+            if !servers.contains(&server) {
+                servers.push(server);
             }
         }
     }
-    if servers.is_empty() {
-        servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53));
-        servers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53));
-    }
     servers
+}
+
+/// The DNS servers Windows uses, from `GetAdaptersAddresses`.
+#[cfg(windows)]
+pub(super) mod windows_dns {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME,
+        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    pub fn servers() -> Vec<SocketAddr> {
+        let flags = GAA_FLAG_SKIP_UNICAST
+            | GAA_FLAG_SKIP_ANYCAST
+            | GAA_FLAG_SKIP_MULTICAST
+            | GAA_FLAG_SKIP_FRIENDLY_NAME;
+        // Microsoft suggests 15 KB to start with; the call says how much it
+        // needs when that is too little.
+        let mut size: u32 = 16 * 1024;
+        for _ in 0..4 {
+            // In u64 words: the records hold 8-byte fields.
+            let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+            size = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
+            let first = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+            // SAFETY: `first` points to `size` writable bytes, aligned for
+            // the record, alive until the end of this iteration.
+            let result = unsafe {
+                GetAdaptersAddresses(
+                    u32::from(AF_UNSPEC),
+                    flags,
+                    std::ptr::null(),
+                    first,
+                    &mut size,
+                )
+            };
+            match result {
+                // SAFETY: the call filled the buffer, which is still alive.
+                NO_ERROR => return unsafe { read_adapters(first) },
+                ERROR_BUFFER_OVERFLOW => continue,
+                _ => return Vec::new(),
+            }
+        }
+        Vec::new()
+    }
+
+    /// The DNS servers of the adapters that are up.
+    ///
+    /// # Safety
+    /// `first` is null or the start of a list `GetAdaptersAddresses` filled
+    /// in, in a buffer that is alive.
+    unsafe fn read_adapters(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<SocketAddr> {
+        let mut servers = Vec::new();
+        let mut adapter = first;
+        // SAFETY: each `Next` is null or the next record of the same list.
+        while let Some(record) = unsafe { adapter.as_ref() } {
+            if record.OperStatus == IfOperStatusUp {
+                let mut entry = record.FirstDnsServerAddress.cast_const();
+                // SAFETY: as above, for the adapter's list of DNS servers.
+                while let Some(server) = unsafe { entry.as_ref() } {
+                    let address = &server.Address;
+                    // SAFETY: the system wrote a socket address of this
+                    // length there.
+                    let found =
+                        unsafe { socket_address(address.lpSockaddr, address.iSockaddrLength) };
+                    if let Some(found) = found.filter(|s| !servers.contains(s)) {
+                        servers.push(found);
+                    }
+                    entry = server.Next.cast_const();
+                }
+            }
+            adapter = record.Next.cast_const();
+        }
+        servers
+    }
+
+    /// The DNS server at `sockaddr`, on port 53.
+    ///
+    /// # Safety
+    /// `sockaddr` is null or points to `length` readable bytes.
+    pub(in crate::osint) unsafe fn socket_address(
+        sockaddr: *const SOCKADDR,
+        length: i32,
+    ) -> Option<SocketAddr> {
+        let length = usize::try_from(length).ok()?;
+        if sockaddr.is_null() || length < std::mem::size_of::<SOCKADDR>() {
+            return None;
+        }
+        // SAFETY: not null, and at least a SOCKADDR long.
+        let family = unsafe { sockaddr.read_unaligned() }.sa_family;
+        match family {
+            AF_INET if length >= std::mem::size_of::<SOCKADDR_IN>() => {
+                // SAFETY: an AF_INET address this long is a SOCKADDR_IN.
+                let v4 = unsafe { sockaddr.cast::<SOCKADDR_IN>().read_unaligned() };
+                // SAFETY: every variant of the union is the same 4 bytes.
+                let octets = unsafe { v4.sin_addr.S_un.S_addr }.to_ne_bytes();
+                Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), 53))
+            }
+            AF_INET6 if length >= std::mem::size_of::<SOCKADDR_IN6>() => {
+                // SAFETY: an AF_INET6 address this long is a SOCKADDR_IN6.
+                let v6 = unsafe { sockaddr.cast::<SOCKADDR_IN6>().read_unaligned() };
+                // SAFETY: the variants of each union are the same bytes.
+                let (bytes, scope) = unsafe { (v6.sin6_addr.u.Byte, v6.Anonymous.sin6_scope_id) };
+                let ip = Ipv6Addr::from(bytes);
+                // fec0:0:0:ffff::1 to 3: what Windows lists when no IPv6 DNS
+                // server is set. Site-local addresses are long retired.
+                if (ip.segments()[0] & 0xffc0) == 0xfec0 {
+                    return None;
+                }
+                Some(SocketAddr::V6(SocketAddrV6::new(ip, 53, 0, scope)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The query with an EDNS0 OPT record asking for answers up to 1232 bytes,
@@ -397,36 +538,71 @@ pub(super) fn dns_rcode(packet: &[u8]) -> Option<u8> {
     (packet.len() >= 4).then(|| packet[3] & 0x0F)
 }
 
-async fn query_dns_udp(qname: &str, qtype: u16) -> Result<Vec<String>> {
-    let servers = system_nameservers();
-    let mut txid_bytes = [0u8; 2];
-    let txid = if getrandom::fill(&mut txid_bytes).is_ok() {
-        u16::from_be_bytes(txid_bytes).max(1)
-    } else {
-        ((qtype.wrapping_mul(31337)) ^ (qname.len() as u16)).max(1)
-    };
-    let plain = build_dns_query(txid, qname, qtype)?;
-    let extended = with_edns0(plain.clone());
-    for server in servers.into_iter().take(2) {
-        // EDNS0 first; the plain query again only if the server refused it.
-        for query in [&extended, &plain] {
-            match ask_dns_server(server, query, txid, qtype).await {
-                DnsAnswer::Records(records) => return Ok(records),
-                DnsAnswer::EdnsRefused if std::ptr::eq(query, &extended) => continue,
-                _ => break,
-            }
-        }
-    }
-    Ok(Vec::new())
-}
-
-enum DnsAnswer {
-    Records(Vec<String>),
+/// What one of this machine's DNS servers said to a question.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DnsAnswer {
+    /// A well-formed answer to the question asked: its records, or none
+    /// (NODATA, NXDOMAIN). It is final: nobody else is asked.
+    Answered(Vec<String>),
+    /// The server did not understand the EDNS0 query (FORMERR, NOTIMP).
     EdnsRefused,
+    /// Nothing to go by: SERVFAIL, REFUSED, a referral, an answer cut short
+    /// with no record left, or a packet that answers another question.
     Nothing,
 }
 
-async fn ask_dns_server(server: SocketAddr, query: &[u8], txid: u16, qtype: u16) -> DnsAnswer {
+/// Reads `packet` as the answer to question `txid`, about `qname` and
+/// `qtype`.
+pub(super) fn read_dns_answer(packet: &[u8], txid: u16, qname: &str, qtype: u16) -> DnsAnswer {
+    if packet.len() < 12 || u16::from_be_bytes([packet[0], packet[1]]) != txid {
+        return DnsAnswer::Nothing;
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    let Some(rcode) = dns_rcode(packet).filter(|_| flags & 0x8000 != 0) else {
+        return DnsAnswer::Nothing;
+    };
+    if matches!(rcode, 1 | 4) {
+        return DnsAnswer::EdnsRefused;
+    }
+    if !matches!(rcode, 0 | 3) {
+        return DnsAnswer::Nothing;
+    }
+    // A final answer repeats the question it answers.
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    let asked = read_dns_name(packet, 12).and_then(|(name, next)| {
+        let kind = packet.get(next..next + 2)?;
+        Some((name, u16::from_be_bytes([kind[0], kind[1]])))
+    });
+    let wanted = qname.trim_end_matches('.');
+    let same_question =
+        asked.is_some_and(|(name, kind)| kind == qtype && name.eq_ignore_ascii_case(wanted));
+    if qdcount != 1 || !same_question {
+        return DnsAnswer::Nothing;
+    }
+    let records = if rcode == 0 {
+        parse_dns_wire_response(packet, txid, qtype)
+    } else {
+        Vec::new()
+    };
+    if records.is_empty() {
+        // Cut short (TC), or neither recursive (RA) nor authoritative (AA):
+        // a referral, which says nothing about the name.
+        let truncated = flags & 0x0200 != 0;
+        let resolved = flags & 0x0080 != 0 || flags & 0x0400 != 0;
+        if truncated || !resolved {
+            return DnsAnswer::Nothing;
+        }
+    }
+    DnsAnswer::Answered(records)
+}
+
+async fn ask_dns_server(
+    server: SocketAddr,
+    query: &[u8],
+    txid: u16,
+    qname: &str,
+    qtype: u16,
+) -> DnsAnswer {
     let bind_addr = if server.is_ipv6() {
         "[::]:0"
     } else {
@@ -445,21 +621,18 @@ async fn ask_dns_server(server: SocketAddr, query: &[u8], txid: u16, qtype: u16)
         return DnsAnswer::Nothing;
     }
     let mut buf = [0u8; 2048];
-    if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await {
-        let answer = &buf[..n];
-        let records = parse_dns_wire_response(answer, txid, qtype);
-        if !records.is_empty() {
-            return DnsAnswer::Records(records);
-        }
-        let same_query = answer.len() >= 2 && u16::from_be_bytes([answer[0], answer[1]]) == txid;
-        if same_query && matches!(dns_rcode(answer), Some(1 | 4)) {
-            return DnsAnswer::EdnsRefused;
-        }
+    match tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await {
+        Ok(Ok(n)) => read_dns_answer(&buf[..n], txid, qname, qtype),
+        _ => DnsAnswer::Nothing,
     }
-    DnsAnswer::Nothing
 }
 
-async fn query_doh(client: &reqwest::Client, qname: &str, rrtype: u16) -> Result<Vec<String>> {
+async fn query_doh(
+    client: &reqwest::Client,
+    endpoints: &[String],
+    qname: &str,
+    rrtype: u16,
+) -> Result<Vec<String>> {
     let type_str = match rrtype {
         1 => "A",
         2 => "NS",
@@ -474,10 +647,7 @@ async fn query_doh(client: &reqwest::Client, qname: &str, rrtype: u16) -> Result
         257 => "CAA",
         _ => return Ok(Vec::new()),
     };
-    for endpoint in [
-        "https://cloudflare-dns.com/dns-query",
-        "https://dns.google/resolve",
-    ] {
+    for endpoint in endpoints {
         let resp = client
             .get(endpoint)
             .header("Accept", "application/dns-json")
@@ -574,39 +744,170 @@ pub fn may_ask_public_services(qname: &str) -> bool {
         .any(|suffix| name == *suffix || name.ends_with(&format!(".{suffix}")))
 }
 
-/// Queries a DNS record type from this machine's own resolvers first, as
-/// the system would, and only then, for names that may be asked publicly,
-/// over DNS-over-HTTPS.
-pub async fn resolve_rr(client: &reqwest::Client, qname: &str, rrtype: u16) -> Vec<String> {
-    if let Ok(records) = query_dns_udp(qname, rrtype).await {
-        if !records.is_empty() {
-            return records;
+/// The public DNS-over-HTTPS services, asked only when this machine's own
+/// resolvers give no answer.
+const DOH_ENDPOINTS: [&str; 2] = [
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+];
+
+/// Where the DNS questions of a stage go: this machine's own resolvers,
+/// whose answer is final, NXDOMAIN and "no such record" included. Only when
+/// none gives an answer (none known, no reply, SERVFAIL, REFUSED) is a
+/// public name asked over DNS-over-HTTPS, and never in the run for an
+/// internal target.
+pub struct Resolver {
+    client: reqwest::Client,
+    servers: Vec<SocketAddr>,
+    doh: Vec<String>,
+    /// Whether DNS-over-HTTPS may be used at all in this run.
+    public: bool,
+}
+
+impl Resolver {
+    /// This machine's resolvers, with `client` for DNS-over-HTTPS.
+    pub fn system(client: reqwest::Client) -> Self {
+        let doh = DOH_ENDPOINTS.iter().map(|e| (*e).to_owned()).collect();
+        Self::with(client, system_nameservers(), doh)
+    }
+
+    pub(super) fn with(
+        client: reqwest::Client,
+        servers: Vec<SocketAddr>,
+        doh: Vec<String>,
+    ) -> Self {
+        Self {
+            client,
+            servers,
+            doh,
+            public: true,
         }
     }
-    if !may_ask_public_services(qname) {
-        return Vec::new();
+
+    /// Keeps every later question on this machine's resolvers: the target
+    /// is internal, and so is every name asked about it.
+    pub fn keep_private(&mut self) {
+        self.public = false;
     }
-    query_doh(client, qname, rrtype).await.unwrap_or_default()
+
+    /// The records of type `rrtype` for `qname`.
+    pub async fn resolve(&self, qname: &str, rrtype: u16) -> Vec<String> {
+        if let Some(records) = self.ask_system(qname, rrtype).await {
+            return records;
+        }
+        if !self.public || !may_ask_public_services(qname) {
+            return Vec::new();
+        }
+        query_doh(&self.client, &self.doh, qname, rrtype)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// The answer of this machine's resolvers, or `None` when none gave one.
+    async fn ask_system(&self, qname: &str, qtype: u16) -> Option<Vec<String>> {
+        let mut txid_bytes = [0u8; 2];
+        let txid = if getrandom::fill(&mut txid_bytes).is_ok() {
+            u16::from_be_bytes(txid_bytes).max(1)
+        } else {
+            ((qtype.wrapping_mul(31337)) ^ (qname.len() as u16)).max(1)
+        };
+        let plain = build_dns_query(txid, qname, qtype).ok()?;
+        let extended = with_edns0(plain.clone());
+        for server in self.servers.iter().take(2) {
+            // EDNS0 first; the plain query again only if the server refused it.
+            for query in [&extended, &plain] {
+                match ask_dns_server(*server, query, txid, qname, qtype).await {
+                    DnsAnswer::Answered(records) => return Some(records),
+                    DnsAnswer::EdnsRefused if std::ptr::eq(query, &extended) => continue,
+                    _ => break,
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Queries a DNS record type the way the stages do (see [`Resolver`]), for
+/// a name that says nothing about the target (Team Cymru's).
+pub async fn resolve_rr(client: &reqwest::Client, qname: &str, rrtype: u16) -> Vec<String> {
+    Resolver::system(client.clone())
+        .resolve(qname, rrtype)
+        .await
+}
+
+/// The addresses the system resolves `name` to, as the scanner gets them
+/// (`/etc/hosts` included): IPv4, then IPv6.
+pub(super) async fn system_addresses(name: &str) -> (Vec<String>, Vec<String>) {
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    let found =
+        tokio::time::timeout(Duration::from_secs(4), tokio::net::lookup_host((name, 80))).await;
+    if let Ok(Ok(addrs)) = found {
+        for sock in addrs {
+            let ip = sock.ip().to_canonical();
+            let list = if ip.is_ipv4() { &mut v4 } else { &mut v6 };
+            let text = ip.to_string();
+            if !list.contains(&text) {
+                list.push(text);
+            }
+        }
+    }
+    (v4, v6)
+}
+
+/// Whether `name` is an internal target: a name only a local network
+/// knows, or one with a non-public address among `known`, or, with none
+/// known, among those the system resolves it to now. Nothing about such a
+/// target goes to a public resolver.
+pub async fn is_internal_target(name: &str, known: &[String]) -> bool {
+    if !may_ask_public_services(name) {
+        return true;
+    }
+    if known.iter().any(|ip| ip.parse::<IpAddr>().is_ok()) {
+        return any_non_public(known);
+    }
+    let (v4, v6) = system_addresses(name).await;
+    any_non_public(&v4) || any_non_public(&v6)
+}
+
+fn any_non_public(addresses: &[String]) -> bool {
+    addresses
+        .iter()
+        .filter_map(|ip| ip.parse::<IpAddr>().ok())
+        .any(is_non_public_ip)
 }
 
 /// Runs the passive `dns` stage for `target`.
 /// Returns `(observations, resolved_ips, summary_text)`.
 pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, String)> {
-    let client = build_http_client(Duration::from_secs(6))?;
+    let resolver = Resolver::system(build_http_client(Duration::from_secs(6))?);
+    let system = match target {
+        Target::Host(HostAddr::Name(name)) => system_addresses(name).await,
+        _ => (Vec::new(), Vec::new()),
+    };
+    Ok(run_dns_with(target, resolver, system).await)
+}
+
+/// The `dns` stage with `resolver` for the records, and `system`, the IPv4
+/// and IPv6 addresses the system resolved a name target to.
+pub(super) async fn run_dns_with(
+    target: &Target,
+    mut resolver: Resolver,
+    system: (Vec<String>, Vec<String>),
+) -> (Vec<Observation>, Vec<String>, String) {
     let mut observations = Vec::new();
     let mut resolved_ips = Vec::new();
 
     match target {
-        Target::Network(net) => Ok((
+        Target::Network(net) => (
             observations,
             resolved_ips,
             format!("network range {net} (skipped)"),
-        )),
+        ),
         Target::Host(HostAddr::Ip { addr: ip, .. }) => {
             let ip_str = ip.to_canonical().to_string();
             resolved_ips.push(ip_str.clone());
             let ptr_name = reverse_dns_name(*ip);
-            let ptrs = resolve_rr(&client, &ptr_name, 12).await;
+            let ptrs = resolver.resolve(&ptr_name, 12).await;
             for ptr in &ptrs {
                 let ev = format!("{ptr_name} IN PTR {ptr}");
                 // A reverse record says what the owner of the address chose
@@ -629,54 +930,47 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
             } else {
                 format!("PTR {}", ptrs.join(", "))
             };
-            Ok((observations, resolved_ips, summary))
+            (observations, resolved_ips, summary)
         }
         Target::Host(HostAddr::Name(domain)) => {
-            let (mut a_recs, mut aaaa_recs, cname_recs, mx_recs, ns_recs, raw_txt) = tokio::join!(
-                resolve_rr(&client, domain, 1),
-                resolve_rr(&client, domain, 28),
-                resolve_rr(&client, domain, 5),
-                resolve_rr(&client, domain, 15),
-                resolve_rr(&client, domain, 2),
-                resolve_rr(&client, domain, 16),
+            // The addresses are the system's, as the scanner gets them
+            // (`/etc/hosts` included); asked of DNS, to report, when it has
+            // none.
+            let (mut a_recs, mut aaaa_recs) = system;
+            let from_system = !a_recs.is_empty() || !aaaa_recs.is_empty();
+            if !from_system {
+                (a_recs, aaaa_recs) =
+                    tokio::join!(resolver.resolve(domain, 1), resolver.resolve(domain, 28));
+            }
+            if !may_ask_public_services(domain)
+                || any_non_public(&a_recs)
+                || any_non_public(&aaaa_recs)
+            {
+                resolver.keep_private();
+            }
+            // Whether the name publishes IPv6 when the system gave none
+            // (Windows leaves it out on a machine without IPv6): reported,
+            // never scanned.
+            let ask_aaaa = from_system && aaaa_recs.is_empty();
+            let resolver = &resolver;
+            let (cname_recs, mx_recs, ns_recs, raw_txt, published_aaaa) = tokio::join!(
+                resolver.resolve(domain, 5),
+                resolver.resolve(domain, 15),
+                resolver.resolve(domain, 2),
+                resolver.resolve(domain, 16),
+                async {
+                    if ask_aaaa {
+                        resolver.resolve(domain, 28).await
+                    } else {
+                        Vec::new()
+                    }
+                },
             );
 
-            // Fallback to OS resolver if both DoH and direct UDP were blocked.
-            if a_recs.is_empty() && aaaa_recs.is_empty() {
-                if let Ok(Ok(addrs)) = tokio::time::timeout(
-                    Duration::from_secs(4),
-                    tokio::net::lookup_host((domain.as_str(), 80)),
-                )
-                .await
-                {
-                    for sock in addrs {
-                        match sock.ip().to_canonical() {
-                            IpAddr::V4(v4) => {
-                                let s = v4.to_string();
-                                if !a_recs.contains(&s) {
-                                    a_recs.push(s);
-                                }
-                            }
-                            IpAddr::V6(v6) => {
-                                let s = v6.to_string();
-                                if !aaaa_recs.contains(&s) {
-                                    aaaa_recs.push(s);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for ip in &a_recs {
-                if IpAddr::from_str(ip)
-                    .is_ok_and(|addr| is_allowed_resolved_ip_for_name(domain, addr))
-                    && !resolved_ips.contains(ip)
-                {
-                    resolved_ips.push(ip.clone());
-                }
-            }
-            for ip in &aaaa_recs {
+            // Only the system's addresses are the target's. DNS's answer
+            // for a name the system does not resolve (refused, blocked) is
+            // reported, never probed.
+            for ip in a_recs.iter().chain(&aaaa_recs).filter(|_| from_system) {
                 if IpAddr::from_str(ip)
                     .is_ok_and(|addr| is_allowed_resolved_ip_for_name(domain, addr))
                     && !resolved_ips.contains(ip)
@@ -702,7 +996,7 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
                 });
                 if let Ok(ip) = IpAddr::from_str(&primary_address) {
                     let ptr_name = reverse_dns_name(ip);
-                    let ptrs = resolve_rr(&client, &ptr_name, 12).await;
+                    let ptrs = resolver.resolve(&ptr_name, 12).await;
                     for ptr in &ptrs {
                         let ev = format!("{ptr_name} IN PTR {ptr}");
                         // A claim of the address's owner (see above).
@@ -733,6 +1027,11 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
                 });
             }
 
+            let aaaa_recs = if aaaa_recs.is_empty() {
+                published_aaaa
+            } else {
+                aaaa_recs
+            };
             let ipv6_dns = if aaaa_recs.is_empty() {
                 let ev = format!("{domain} IN AAAA -> NODATA (no AAAA record published)");
                 observations.push(Observation::Fact {
@@ -809,14 +1108,17 @@ pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, 
                 });
             }
 
-            let summary = format!(
+            let mut summary = format!(
                 "{} A, {} AAAA, {} NS, {} MX",
                 a_recs.len(),
                 aaaa_recs.len(),
                 ns_recs.len(),
                 mx_recs.len()
             );
-            Ok((observations, resolved_ips, summary))
+            if !from_system && !(a_recs.is_empty() && aaaa_recs.is_empty()) {
+                summary.push_str("; this system does not resolve the name");
+            }
+            (observations, resolved_ips, summary)
         }
     }
 }

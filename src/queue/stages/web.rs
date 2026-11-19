@@ -320,11 +320,11 @@ pub(crate) async fn js(cx: &Ctx<'_>) -> Result<StageEnd> {
             // Read before the vault is taken: a script can be megabytes.
             let found = crate::webfp::extract_endpoints(source, 60);
             let keys = crate::webfp::find_secrets(source);
-            let (facts, kept) =
+            let (facts, kept, named) =
                 script_facts(&mut state.vault(), address, *port, path, &found, keys);
             observations.extend(facts);
             endpoints_found += found.len();
-            endpoints.extend(found);
+            endpoints.extend(named);
             keys_found += kept.len();
             secrets.extend(kept);
         }
@@ -363,11 +363,12 @@ fn js_evidence(text: &str) -> crate::evidence::EvidenceRecord {
 }
 
 /// The facts one script file of the site at `address:port` gives: the
-/// `endpoints` it names and the `keys` found in it, and the keys as the
-/// graph keeps them. Both go into the vault first. The graph keeps 150
-/// endpoints a port, but a fact names each file's first ones whatever it
-/// keeps, and a fact goes to the model too: every endpoint's host is
-/// registered. A key is kept only as its placeholder.
+/// `endpoints` it names and the `keys` found in it, then the keys and the
+/// endpoints as the graph keeps them. Both go into the vault first. The
+/// graph keeps 150 endpoints a port, but a fact names each file's first ones
+/// whatever it keeps, and a fact goes to the model too: every endpoint's
+/// host is registered. A key is kept only as its placeholder, also where an
+/// endpoint names it (see [`crate::webfp::kept_endpoint`]).
 pub(crate) fn script_facts(
     vault: &mut crate::vault::Vault,
     address: &str,
@@ -375,8 +376,26 @@ pub(crate) fn script_facts(
     path: &str,
     endpoints: &[String],
     keys: Vec<(&'static str, String)>,
-) -> (Vec<Observation>, Vec<crate::graph::JsSecret>) {
+) -> (Vec<Observation>, Vec<crate::graph::JsSecret>, Vec<String>) {
+    let registered: Vec<(String, String)> = keys
+        .iter()
+        .map(|(_, value)| {
+            (
+                value.clone(),
+                vault.register(crate::vault::Kind::Sec, value),
+            )
+        })
+        .collect();
+    let mut kept: Vec<String> = Vec::new();
     for endpoint in endpoints {
+        if let Some(endpoint) = crate::webfp::kept_endpoint(endpoint, &registered) {
+            if !kept.contains(&endpoint) {
+                kept.push(endpoint);
+            }
+        }
+    }
+    let endpoints = kept;
+    for endpoint in &endpoints {
         vault.register_url(endpoint);
     }
     let fact = |claim: String, evidence: String| Observation::Fact {
@@ -405,8 +424,7 @@ pub(crate) fn script_facts(
         ));
     }
     let mut secrets = Vec::new();
-    for (kind, value) in keys {
-        let token = vault.register(crate::vault::Kind::Sec, &value);
+    for ((kind, value), (_, token)) in keys.into_iter().zip(registered) {
         // No hint at the key in the fact: facts go to the model, which gets
         // a key by its placeholder only. The hint stays with the key, for
         // the map and the report.
@@ -421,7 +439,7 @@ pub(crate) fn script_facts(
             file: path.to_owned(),
         });
     }
-    (facts, secrets)
+    (facts, secrets, endpoints)
 }
 
 pub(crate) async fn crawl_or_dirs(cx: &Ctx<'_>) -> Result<StageEnd> {

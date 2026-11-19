@@ -309,7 +309,7 @@ impl HttpInfo {
             .filter(|g| matches!(g.as_str(), "A" | "B" | "C" | "D" | "E" | "F"));
         self.header_notes = clean_list(std::mem::take(&mut self.header_notes), 12, clean);
         self.scripts = clean_list(std::mem::take(&mut self.scripts), 40, clean_url);
-        self.js_endpoints = clean_list(std::mem::take(&mut self.js_endpoints), 150, clean_url);
+        self.js_endpoints = clean_list(std::mem::take(&mut self.js_endpoints), 150, clean_endpoint);
         for secret in &mut self.js_secrets {
             secret.kind = sanitize(&secret.kind, 80);
             secret.token = sanitize(&secret.token, 16);
@@ -1165,6 +1165,38 @@ fn clean_url(text: &str) -> String {
     sanitize_url(text, MAX_FIELD)
 }
 
+/// An endpoint a script names, without query values; none for one that
+/// holds a key. meow 0.2.3 kept both, and the map and the report show them.
+fn clean_endpoint(text: &str) -> String {
+    let kept = crate::webfp::endpoint_without_values(&clean_url(text));
+    if crate::webfp::holds_key(&kept) {
+        String::new()
+    } else {
+        kept
+    }
+}
+
+/// The endpoints a script fact names (`JavaScript /app.js names 3
+/// endpoints: a, b, c`), each as `keep` keeps it, if at all.
+fn clean_script_fact(claim: &mut String, keep: impl Fn(&str) -> Option<String>) {
+    let Some((head, list)) = claim.split_once(" endpoints: ") else {
+        return;
+    };
+    if !head.starts_with("JavaScript ") {
+        return;
+    }
+    let (list, more) = match list.rfind(" (+") {
+        Some(at) if list.ends_with(" more)") => list.split_at(at),
+        _ => (list, ""),
+    };
+    let kept: Vec<String> = list.split(", ").filter_map(keep).collect();
+    *claim = if kept.is_empty() && more.is_empty() {
+        format!("{head} endpoints")
+    } else {
+        format!("{head} endpoints: {}{more}", kept.join(", "))
+    };
+}
+
 fn clean_url_opt(text: Option<String>) -> Option<String> {
     text.map(|t| clean_url(&t)).filter(|t| !t.is_empty())
 }
@@ -1359,6 +1391,11 @@ fn sanitize_local_net(local: &mut LocalNet) {
 fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
     fact.claim = sanitize(&fact.claim, crate::evidence::EVIDENCE_MAX);
     reword_old_note(&mut fact.claim);
+    if fact.record.source == Source::JsScan {
+        clean_script_fact(&mut fact.claim, |endpoint| {
+            Some(clean_endpoint(endpoint)).filter(|kept| !kept.is_empty())
+        });
+    }
     fact.record.sanitize_fields();
     let duplicate = facts
         .iter()
@@ -1625,6 +1662,55 @@ impl Graph {
         // At least what the file itself weighed: that is known exactly.
         graph.tally.weight = graph.measure().max(text.len());
         Ok(graph)
+    }
+
+    /// Puts its vault placeholder where a script endpoint still names a key
+    /// the `js` stage found: meow 0.2.3 kept one in a path
+    /// (`/api/reports/<key>/latest`). Whether anything changed.
+    pub fn hide_script_keys(&mut self, vault: &crate::vault::Vault) -> bool {
+        let mut keys: Vec<(String, String)> = Vec::new();
+        let tokens = self
+            .hosts
+            .values()
+            .flat_map(|host| host.ports.values())
+            .filter_map(|port| port.http.as_ref())
+            .flat_map(|http| &http.js_secrets)
+            .map(|secret| &secret.token);
+        for token in tokens {
+            let value = vault.unmask(token);
+            if value != *token && value.len() >= 8 && !keys.iter().any(|(v, _)| *v == value) {
+                keys.push((value, token.clone()));
+            }
+        }
+        if keys.is_empty() {
+            return false;
+        }
+        let keep = |endpoint: &str| crate::webfp::kept_endpoint(endpoint, &keys);
+        let mut changed = false;
+        for port in self
+            .hosts
+            .values_mut()
+            .flat_map(|host| host.ports.values_mut())
+        {
+            if let Some(http) = port.http.as_mut() {
+                let mut kept: Vec<String> = Vec::new();
+                for endpoint in http.js_endpoints.iter().filter_map(|e| keep(e)) {
+                    if !kept.contains(&endpoint) {
+                        kept.push(endpoint);
+                    }
+                }
+                changed |= kept != http.js_endpoints;
+                http.js_endpoints = kept;
+            }
+            for fact in &mut port.facts {
+                if fact.record.source == Source::JsScan {
+                    let before = fact.claim.clone();
+                    clean_script_fact(&mut fact.claim, keep);
+                    changed |= fact.claim != before;
+                }
+            }
+        }
+        changed
     }
 
     /// The weight of what this graph already holds, counted the way
@@ -3437,6 +3523,182 @@ mod tests {
         let again = Graph::load(&file).unwrap();
         assert!(again.hosts.contains_key("www.example.org"));
         assert!(again.cleaned.is_empty());
+    }
+
+    #[test]
+    fn script_endpoints_lose_query_values_and_keys_when_a_0_2_3_graph_is_loaded() {
+        // Built here, so that no key-shaped text stands in the source.
+        let google = format!("{}{}", "AIza", "SyD-1234567890abcdefghijklmnopqrstu");
+        let hook = format!(
+            "https://hooks.slack.com/services/{}/{}/{}",
+            "T0123456", "B0123456", "abcdefghijklmnopqrstuvwx"
+        );
+        let token = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let raw = vec![
+            format!("/api/v1/orders?access_token={token}"),
+            format!("https://maps.googleapis.com/maps/api/js?key={google}"),
+            hook.clone(),
+        ];
+        let mut graph = Graph::default();
+        graph.apply(port("198.51.100.7", 443, "https", None));
+        // As meow 0.2.3 wrote them, past what `apply` keeps today.
+        let entry = graph.hosts.get_mut("198.51.100.7").unwrap();
+        let entry = entry.ports.values_mut().next().unwrap();
+        entry.http = Some(HttpInfo {
+            scheme: "https".into(),
+            js_endpoints: raw.clone(),
+            ..HttpInfo::default()
+        });
+        entry.facts.push(Fact {
+            claim: format!(
+                "JavaScript /app.js names 3 endpoints: {} (+2 more)",
+                raw.join(", ")
+            ),
+            record: rec(Source::JsScan),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        std::fs::write(&file, serde_json::to_string(&graph).unwrap()).unwrap();
+        let text = serde_json::to_string(&graph).unwrap();
+        assert!(text.contains(&google) && text.contains(token) && text.contains(&hook));
+
+        let loaded = Graph::load(&file).unwrap();
+        let port = loaded.hosts["198.51.100.7"].ports.values().next().unwrap();
+        assert_eq!(
+            port.http.as_ref().unwrap().js_endpoints,
+            [
+                "/api/v1/orders?access_token",
+                "https://maps.googleapis.com/maps/api/js?key"
+            ]
+        );
+        let script = port
+            .facts
+            .iter()
+            .find(|f| f.record.source == Source::JsScan)
+            .unwrap();
+        assert_eq!(
+            script.claim,
+            "JavaScript /app.js names 3 endpoints: /api/v1/orders?access_token, \
+             https://maps.googleapis.com/maps/api/js?key (+2 more)"
+        );
+        let text = serde_json::to_string(&loaded).unwrap();
+        for secret in [google.as_str(), token, hook.as_str()] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+    }
+
+    /// A graph as meow 0.2.3 wrote it: the js stage put `key` in the vault
+    /// as `token`, but kept it in an endpoint's path.
+    fn graph_with_a_key_in_a_script_endpoint(key: &str, token: &str) -> Graph {
+        let mut graph = Graph::default();
+        graph.apply(port("198.51.100.7", 443, "https", None));
+        let host = graph.hosts.get_mut("198.51.100.7").unwrap();
+        let entry = host.ports.values_mut().next().unwrap();
+        let endpoints = [
+            format!("/api/v1/reports/{key}/latest"),
+            format!("/{key}"),
+            "/api/v1/health".to_owned(),
+        ];
+        entry.http = Some(HttpInfo {
+            scheme: "https".into(),
+            js_endpoints: endpoints.to_vec(),
+            js_secrets: vec![JsSecret {
+                kind: "possible secret".into(),
+                token: token.into(),
+                preview: format!("{}... (20 chars)", &key[..4]),
+                file: "/app.js".into(),
+            }],
+            ..HttpInfo::default()
+        });
+        entry.facts.push(Fact {
+            claim: format!(
+                "JavaScript /app.js names 3 endpoints: {}",
+                endpoints.join(", ")
+            ),
+            record: rec(Source::JsScan),
+        });
+        graph
+    }
+
+    #[test]
+    fn a_vaulted_key_in_a_0_2_3_script_endpoint_gets_its_placeholder() {
+        let key = "Zq3vLm8pRt5wXy2nBc7k";
+        let mut vault = crate::vault::Vault::ephemeral();
+        let token = vault.register(crate::vault::Kind::Sec, key);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph.json");
+        graph_with_a_key_in_a_script_endpoint(key, &token)
+            .save(&file)
+            .unwrap();
+        // Alone, the graph cannot tell such a key from a path.
+        let mut loaded = Graph::load(&file).unwrap();
+        assert!(serde_json::to_string(&loaded).unwrap().contains(key));
+
+        assert!(loaded.hide_script_keys(&vault));
+        let port = loaded.hosts["198.51.100.7"].ports.values().next().unwrap();
+        let hidden = format!("/api/v1/reports/{token}/latest");
+        assert_eq!(
+            port.http.as_ref().unwrap().js_endpoints,
+            [hidden.as_str(), "/api/v1/health"]
+        );
+        assert_eq!(
+            port.facts
+                .iter()
+                .find(|f| f.record.source == Source::JsScan)
+                .unwrap()
+                .claim,
+            format!("JavaScript /app.js names 3 endpoints: {hidden}, /api/v1/health")
+        );
+        assert!(!serde_json::to_string(&loaded).unwrap().contains(key));
+        // Once is enough, and a vault without the key changes nothing.
+        assert!(!loaded.hide_script_keys(&vault));
+        let mut other = Graph::load(&file).unwrap();
+        assert!(!other.hide_script_keys(&crate::vault::Vault::ephemeral()));
+    }
+
+    #[test]
+    fn the_report_and_the_session_hide_a_key_a_0_2_3_graph_kept() {
+        use crate::coordinator::Coordinator;
+        use crate::workspace::{Config, MeowHome, Workspace};
+        use std::sync::{Arc, Mutex};
+
+        let key = "Zq3vLm8pRt5wXy2nBc7k";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, crate::mode::Mode::Light)
+                .unwrap();
+        let token = {
+            let db = crate::db::Db::open(&workspace.state_db_path()).unwrap();
+            let mut vault = crate::vault::Vault::open(Arc::new(Mutex::new(db))).unwrap();
+            vault.register(crate::vault::Kind::Sec, key)
+        };
+        let path = workspace.graph_path();
+        graph_with_a_key_in_a_script_endpoint(key, &token)
+            .save(&path)
+            .unwrap();
+        let hidden = format!("/api/v1/reports/{token}/latest");
+
+        // REPORT.md written from the files.
+        let report = crate::report::render(&crate::report::collect(&workspace).unwrap());
+        assert!(
+            report.contains("Endpoints named in the scripts"),
+            "{report}"
+        );
+        assert!(
+            report.contains("latest") && !report.contains(key),
+            "{report}"
+        );
+
+        // The session: graph.json, saved at once, and the map.
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        let coordinator = Coordinator::start(workspace, config).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&hidden) && !saved.contains(key), "{saved}");
+        let shown = serde_json::to_string(&*coordinator.state().graph()).unwrap();
+        assert!(shown.contains(&hidden) && !shown.contains(key), "{shown}");
+        coordinator.shutdown();
     }
 
     #[cfg(unix)]

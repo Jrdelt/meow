@@ -1791,6 +1791,8 @@ impl Coordinator {
         graph.local = observer::observe(&graph.target_ips());
         let db = Arc::new(Mutex::new(Db::open(&workspace.state_db_path())?));
         let vault = Vault::open(Arc::clone(&db))?;
+        // A key meow 0.2.3 left in a script endpoint (saved below).
+        graph.hide_script_keys(&vault);
         let engine = AiEngine::new(config.ai.clone(), Arc::clone(&db))?;
         let cve = if config.cve.enabled {
             Some(CveClient::new(config.cve.clone(), Arc::clone(&db))?)

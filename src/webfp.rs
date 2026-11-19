@@ -614,21 +614,73 @@ const STATIC_FILES: &[&str] = &[
     ".ttf", ".eot", ".map", ".webp", ".mp4", ".webm",
 ];
 
+/// An endpoint as it is kept: without its fragment and without the values
+/// of its query, which can hold a key or a token (`?key=...`,
+/// `?access_token=...`). The parameter names stay: `/api/x?key&page`.
+pub fn endpoint_without_values(endpoint: &str) -> String {
+    let endpoint = endpoint.split('#').next().unwrap_or("");
+    let Some((base, query)) = endpoint.split_once('?') else {
+        return endpoint.to_owned();
+    };
+    let mut names: Vec<&str> = Vec::new();
+    for pair in query.split(['&', ';']) {
+        let name = pair.split('=').next().unwrap_or("");
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", names.join("&"))
+    }
+}
+
+/// Whether `text` holds a key [`find_secrets`] knows. A Slack webhook URL
+/// is a key whole.
+pub fn holds_key(text: &str) -> bool {
+    KEYS.iter().any(|key| key.pattern.is_match(text))
+}
+
+/// `endpoint` as it is kept: without query values (see
+/// [`endpoint_without_values`]), and with each of `keys`, a key's value and
+/// its vault placeholder, as the placeholder. Nothing else in it is masked:
+/// an id in a path is no key. `None` for an endpoint that holds a key
+/// [`find_secrets`] knows (a Slack webhook URL), or that is a key alone.
+pub fn kept_endpoint(endpoint: &str, keys: &[(String, String)]) -> Option<String> {
+    let mut kept = endpoint_without_values(endpoint);
+    if kept.is_empty() || holds_key(&kept) {
+        return None;
+    }
+    let mut rest = kept.clone();
+    for (value, token) in keys.iter().filter(|(value, _)| !value.is_empty()) {
+        kept = kept.replace(value.as_str(), token);
+        rest = rest.replace(value.as_str(), "");
+    }
+    rest.chars().any(char::is_alphanumeric).then_some(kept)
+}
+
 /// API paths and URLs named in a script: same-site paths first, then other
-/// sites' URLs (third-party APIs and internal hosts), at most `max`.
+/// sites' URLs (third-party APIs and internal hosts), at most `max`. Each
+/// without its query values (see [`endpoint_without_values`]); one that
+/// holds a key is left out, since [`find_secrets`] reports the key.
 pub fn extract_endpoints(source: &str, max: usize) -> Vec<String> {
     let mut paths = Vec::new();
     for found in API_PATH.captures_iter(source) {
-        let path = found[1].to_owned();
-        let bare = path
+        let raw = &found[1];
+        let bare = raw
             .split(['?', '#'])
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if path.len() < 3 || path.len() > 200 || path.contains("//") {
+        if raw.len() < 3 || raw.len() > 200 || raw.contains("//") {
             continue;
         }
         if STATIC_FILES.iter().any(|ext| bare.ends_with(ext)) {
+            continue;
+        }
+        let path = endpoint_without_values(raw);
+        if holds_key(&path) {
             continue;
         }
         if !paths.contains(&path) {
@@ -656,7 +708,11 @@ pub fn extract_endpoints(source: &str, max: usize) -> Vec<String> {
         if STATIC_FILES.iter().any(|ext| bare.ends_with(ext)) {
             continue;
         }
-        if url.len() <= 200 && !paths.contains(&url) {
+        if url.len() > 200 {
+            continue;
+        }
+        let url = endpoint_without_values(&url);
+        if !holds_key(&url) && !paths.contains(&url) {
             paths.push(url);
         }
         if paths.len() >= max {
@@ -1006,6 +1062,69 @@ mod tests {
             preview("possible secret (x)", "hunter2hunter2hunter2"),
             "21 chars"
         );
+    }
+
+    #[test]
+    fn endpoints_keep_their_parameter_names_but_never_a_value_or_a_key() {
+        // Built here, so that no key-shaped text stands in the source.
+        let google = format!("{}{}", "AIza", "SyD-1234567890abcdefghijklmnopqrstu");
+        let hook = format!(
+            "https://hooks.slack.com/services/{}/{}/{}",
+            "T0123456", "B0123456", "abcdefghijklmnopqrstuvwx"
+        );
+        let token = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let source = format!(
+            r#"const maps = "https://maps.googleapis.com/maps/api/js?key={google}&v=3";
+            const hook = "{hook}";
+            fetch("/api/v1/orders?access_token={token}&page=2&page=3");
+            fetch("/api/v1/orders?access_token={token}2");
+            fetch("/api/v1/search?q");"#
+        );
+        let endpoints = extract_endpoints(&source, 60);
+        assert_eq!(
+            endpoints,
+            [
+                "/api/v1/orders?access_token&page",
+                "/api/v1/orders?access_token",
+                "/api/v1/search?q",
+                "https://maps.googleapis.com/maps/api/js?key&v",
+            ]
+        );
+        for endpoint in &endpoints {
+            assert!(!holds_key(endpoint), "{endpoint}");
+        }
+        assert!(holds_key(&hook) && holds_key(&google));
+        assert_eq!(
+            endpoint_without_values("/login#access_token=abc&state=x"),
+            "/login"
+        );
+        assert_eq!(endpoint_without_values("/api/x?=1&&a=1;b"), "/api/x?a&b");
+        assert_eq!(endpoint_without_values("/api/x?"), "/api/x");
+        assert_eq!(endpoint_without_values("/api/x"), "/api/x");
+    }
+
+    #[test]
+    fn a_kept_endpoint_hides_the_keys_given_and_nothing_else() {
+        let keys = [("Zq3vLm8pRt5wXy2nBc7k".to_owned(), "<<SEC_04>>".to_owned())];
+        assert_eq!(
+            kept_endpoint("/api/v1/reports/Zq3vLm8pRt5wXy2nBc7k/latest?x=1", &keys).as_deref(),
+            Some("/api/v1/reports/<<SEC_04>>/latest?x")
+        );
+        // Ids are no keys.
+        for id in [
+            "/api/v2/projects/5f8d0d55b54764421b7156c5/members",
+            "https://api.example.com/v1/orders/550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            assert_eq!(kept_endpoint(id, &keys).as_deref(), Some(id));
+        }
+        // A key alone, or one find_secrets knows: left out.
+        assert_eq!(kept_endpoint("/Zq3vLm8pRt5wXy2nBc7k", &keys), None);
+        let hook = format!(
+            "https://hooks.slack.com/services/{}/{}/{}",
+            "T0123456", "B0123456", "abcdefghijklmnopqrstuvwx"
+        );
+        assert_eq!(kept_endpoint(&hook, &[]), None);
+        assert_eq!(kept_endpoint("?", &[]), None);
     }
 
     #[test]

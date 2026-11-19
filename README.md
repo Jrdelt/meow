@@ -230,9 +230,9 @@ meow mode aggressive
 Good to know:
 
 - A missing tool skips its stage with the reason; the rest still run. `meow tools` installs them.
-- DNS questions go to your own resolvers first. DNS-over-HTTPS and `crt.sh` are used only for public names, never for internal ones or private addresses.
+- DNS questions go to your own resolvers. DNS-over-HTTPS is used only when they give no answer; it and `crt.sh` only get public names, never internal ones or private addresses. The target's address is the one your system gives (`/etc/hosts` included), as for `nmap`.
 - `mail-dns` only asks DNS questions; nothing is sent to the target's servers.
-- `js` reads only the target site's scripts (15 in mild, 40 in aggressive). A key it finds goes straight into the Privacy Vault: you only ever see a placeholder like `<<SEC_03>>`, and the report lists it to rotate.
+- `js` reads only the target site's scripts (15 in mild, 40 in aggressive). A key it finds goes straight into the Privacy Vault: you only ever see a placeholder like `<<SEC_03>>`, and the report lists it to rotate. Endpoints keep their parameter names, never the values.
 - Cookie values are never stored. `dirs` skips sites behind a WAF in mild mode.
 
 ---

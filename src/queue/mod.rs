@@ -926,8 +926,19 @@ fn load_probed(state: &State, task_id: i64, target: &Target) -> Found {
 
 async fn resolve_target_ips(state: &State, task_id: i64, target: &Target) -> Vec<std::net::IpAddr> {
     let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    // For a name, the addresses the port inventory scanned come first: the
+    // scanner resolved the name as the system does.
+    let scanned = match target {
+        Target::Host(HostAddr::Name(_)) => {
+            Found::load(&state.db_lock(), task_id, Stage::Ports, target)
+                .hosts
+                .into_keys()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let dns_found = Found::load(&state.db_lock(), task_id, Stage::Dns, target);
-    for ip_str in &dns_found.ips {
+    for ip_str in scanned.iter().chain(&dns_found.ips) {
         if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
             if !ips.contains(&ip) {
                 ips.push(ip);

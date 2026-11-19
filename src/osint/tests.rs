@@ -623,3 +623,402 @@ async fn resolved_ip_policy_blocks_loopback_and_imds_for_external_domains() {
             .is_err()
     );
 }
+
+/// What a stand-in DNS server says to a question.
+#[derive(Clone, Copy)]
+pub(crate) enum Reply {
+    Address([u8; 4]),
+    NxDomain,
+    ServFail,
+    Refused,
+    NoData,
+}
+
+pub(crate) type Asked = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A stand-in for this machine's DNS server on 127.0.0.1, answering by
+/// `reply`, and the questions it was asked (`TYPE name`).
+pub(crate) async fn stand_in_dns(reply: fn(&str, u16) -> Reply) -> (SocketAddr, Asked) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let asked = Asked::default();
+    let log = std::sync::Arc::clone(&asked);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            let query = &buf[..n];
+            let mut at = 12;
+            let mut labels = Vec::new();
+            while at < n && query[at] != 0 {
+                let len = query[at] as usize;
+                labels.push(String::from_utf8_lossy(&query[at + 1..at + 1 + len]).into_owned());
+                at += len + 1;
+            }
+            let name = labels.join(".");
+            let qtype = u16::from_be_bytes([query[at + 1], query[at + 2]]);
+            log.lock().unwrap().push(format!("{qtype} {name}"));
+            let (rcode, rdata) = match reply(&name, qtype) {
+                Reply::Address(ip) if qtype == 1 => (0u16, Some(ip)),
+                Reply::Address(_) | Reply::NoData => (0, None),
+                Reply::NxDomain => (3, None),
+                Reply::ServFail => (2, None),
+                Reply::Refused => (5, None),
+            };
+            let mut packet = query[..2].to_vec();
+            packet.extend_from_slice(&(0x8180u16 | rcode).to_be_bytes());
+            packet.extend_from_slice(&[0, 1, 0, u8::from(rdata.is_some()), 0, 0, 0, 0]);
+            packet.extend_from_slice(&query[12..at + 5]);
+            if let Some(ip) = rdata {
+                packet.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                packet.extend_from_slice(&ip);
+            }
+            let _ = sock.send_to(&packet, peer).await;
+        }
+    });
+    (addr, asked)
+}
+
+/// A stand-in DNS-over-HTTPS service on 127.0.0.1 that answers `a` to an
+/// A question and "no records" to the others, and the questions it was
+/// asked (`TYPE name`).
+pub(crate) async fn stand_in_doh(a: Option<[u8; 4]>) -> (String, Asked) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/dns-query",
+        listener.local_addr().unwrap().port()
+    );
+    let asked = Asked::default();
+    let log = std::sync::Arc::clone(&asked);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let target = request.split_whitespace().nth(1).unwrap_or("").to_owned();
+            let query = url::Url::parse(&format!("http://stand-in.invalid{target}")).unwrap();
+            let field = |key: &str| {
+                query
+                    .query_pairs()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default()
+            };
+            log.lock()
+                .unwrap()
+                .push(format!("{} {}", field("type"), field("name")));
+            let body = match a.filter(|_| field("type") == "A") {
+                Some(ip) => format!(
+                    r#"{{"Status":0,"Answer":[{{"name":"{}","type":1,"TTL":60,"data":"{}"}}]}}"#,
+                    field("name"),
+                    std::net::Ipv4Addr::from(ip)
+                ),
+                None => r#"{"Status":0,"Answer":[]}"#.to_owned(),
+            };
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(reply.as_bytes()).await;
+        }
+    });
+    (url, asked)
+}
+
+pub(crate) fn stand_in_resolver(servers: Vec<SocketAddr>, doh: &str) -> Resolver {
+    // Straight to the stand-in, whatever proxy the machine sets.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    Resolver::with(client, servers, vec![doh.to_owned()])
+}
+
+pub(crate) fn taken(asked: &Asked) -> Vec<String> {
+    asked.lock().unwrap().clone()
+}
+
+#[test]
+fn resolv_conf_names_the_servers_and_nothing_stands_in_for_none() {
+    let text = "# comment\nsearch corp.example.org\nnameserver 192.0.2.53\n\
+                nameserver 192.0.2.53\nnameserverx 198.51.100.1\n\
+                nameserver fe80::53%eth0\n  nameserver 2001:db8::53 # trailing\n";
+    let servers: Vec<String> = parse_resolv_conf(text)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        servers,
+        ["192.0.2.53:53", "[fe80::53]:53", "[2001:db8::53]:53"]
+    );
+    // No file, or one without servers: no public resolver takes their place.
+    assert!(parse_resolv_conf("").is_empty());
+    assert!(parse_resolv_conf("search example.org\n").is_empty());
+}
+
+#[test]
+fn a_system_answer_is_final_only_when_it_answers_the_question() {
+    let question = build_dns_query(0x4242, "www.example.org", 16).unwrap();
+    let with_flags = |flags: u16| {
+        let mut packet = question.clone();
+        packet[2..4].copy_from_slice(&flags.to_be_bytes());
+        packet
+    };
+    let none = DnsAnswer::Answered(Vec::new());
+    let read = |packet: &[u8]| read_dns_answer(packet, 0x4242, "www.example.org", 16);
+    // NOERROR without the record (NODATA) and NXDOMAIN are answers, also
+    // from an authoritative server that does not recurse.
+    assert_eq!(read(&with_flags(0x8180)), none);
+    assert_eq!(read(&with_flags(0x8183)), none);
+    assert_eq!(read(&with_flags(0x8400)), none);
+    // SERVFAIL, REFUSED, a referral and an answer cut short are not.
+    for flags in [0x8182, 0x8185, 0x8100, 0x8380] {
+        assert_eq!(read(&with_flags(flags)), DnsAnswer::Nothing, "{flags:#x}");
+    }
+    assert_eq!(read(&with_flags(0x8181)), DnsAnswer::EdnsRefused);
+    // Another question, another transaction, or no answer at all: nothing.
+    let mut other = build_dns_query(0x4242, "mail.example.org", 16).unwrap();
+    other[2..4].copy_from_slice(&0x8183u16.to_be_bytes());
+    assert_eq!(read(&other), DnsAnswer::Nothing);
+    let nxdomain = with_flags(0x8183);
+    assert_eq!(
+        read_dns_answer(&nxdomain, 0x4243, "www.example.org", 16),
+        DnsAnswer::Nothing
+    );
+    assert_eq!(
+        read_dns_answer(&nxdomain, 0x4242, "www.example.org", 1),
+        DnsAnswer::Nothing
+    );
+    assert_eq!(read(&with_flags(0x0100)), DnsAnswer::Nothing);
+    assert_eq!(read(&question[..10]), DnsAnswer::Nothing);
+    // Names are compared without regard to case.
+    assert_eq!(
+        read_dns_answer(&nxdomain, 0x4242, "WWW.Example.org.", 16),
+        none
+    );
+}
+
+#[tokio::test]
+async fn doh_is_asked_only_when_the_system_resolver_gives_no_answer() {
+    let (server, asked) = stand_in_dns(|name, _| match name {
+        "gone.example.org" => Reply::NxDomain,
+        "www.example.org" => Reply::NoData,
+        "refused.example.org" => Reply::Refused,
+        _ => Reply::ServFail,
+    })
+    .await;
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let resolver = stand_in_resolver(vec![server], &doh);
+    // A final answer, records or none, is not asked of anyone else.
+    assert!(resolver.resolve("gone.example.org", 1).await.is_empty());
+    assert!(resolver.resolve("www.example.org", 16).await.is_empty());
+    assert!(taken(&doh_asked).is_empty());
+    // No answer: a public name goes over DNS-over-HTTPS, a private one not.
+    assert!(resolver.resolve("broken.example.org", 15).await.is_empty());
+    assert!(resolver.resolve("refused.example.org", 15).await.is_empty());
+    let private_ptr = reverse_dns_name("10.0.0.5".parse().unwrap());
+    assert!(resolver.resolve(&private_ptr, 12).await.is_empty());
+    assert!(resolver.resolve("dc01.corp.local", 1).await.is_empty());
+    assert_eq!(
+        taken(&doh_asked),
+        ["MX broken.example.org", "MX refused.example.org"]
+    );
+    assert_eq!(taken(&asked).len(), 6);
+}
+
+#[tokio::test]
+async fn without_a_system_resolver_only_public_names_go_out_and_only_over_doh() {
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let resolver = stand_in_resolver(Vec::new(), &doh);
+    for (name, rrtype) in [
+        (reverse_dns_name("10.0.0.5".parse().unwrap()), 12),
+        ("dc01.corp.local".to_owned(), 16),
+        ("_ldap._tcp.dc._msdcs.corp.local".to_owned(), 33),
+        ("_dmarc.dc01.corp.local".to_owned(), 16),
+        ("www.example.org".to_owned(), 16),
+    ] {
+        assert!(resolver.resolve(&name, rrtype).await.is_empty());
+    }
+    assert_eq!(taken(&doh_asked), ["TXT www.example.org"]);
+}
+
+#[tokio::test]
+async fn an_internal_target_is_never_asked_over_doh() {
+    // The system resolver answers nothing (SERVFAIL), which would send a
+    // public name over DNS-over-HTTPS.
+    let (server, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let target = Target::parse("dc01.corp.example.org").unwrap();
+    // The dns stage: the system resolved the name to a private address.
+    let (_, ips, _) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![server], &doh),
+        (vec!["10.0.0.5".to_owned()], Vec::new()),
+    )
+    .await;
+    assert_eq!(ips, ["10.0.0.5"]);
+    assert!(taken(&asked).contains(&"16 dc01.corp.example.org".to_owned()));
+    assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+    // The mail-dns stage for that target.
+    assert!(is_internal_target("dc01.corp.example.org", &ips).await);
+    assert!(is_internal_target("dc01.corp.local", &[]).await);
+    let mail_dns = |internal| {
+        crate::maildns::run_on(
+            stand_in_resolver(vec![server], &doh),
+            "dc01.corp.example.org",
+            "10.0.0.5",
+            &[],
+            internal,
+        )
+    };
+    mail_dns(true).await.unwrap();
+    let mail = taken(&asked);
+    assert!(mail.contains(&"16 _dmarc.dc01.corp.example.org".to_owned()));
+    assert!(mail
+        .iter()
+        .any(|q| q.ends_with("._domainkey.dc01.corp.example.org")));
+    assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+    // Not internal: what the system cannot answer goes over DoH.
+    mail_dns(false).await.unwrap();
+    assert!(
+        taken(&doh_asked).contains(&"TXT _dmarc.dc01.corp.example.org".to_owned()),
+        "{:?}",
+        taken(&doh_asked)
+    );
+    doh_asked.lock().unwrap().clear();
+
+    // A public name the system cannot resolve still has DNS-over-HTTPS.
+    let public = Target::parse("www.example.org").unwrap();
+    run_dns_with(
+        &public,
+        stand_in_resolver(vec![server], &doh),
+        (Vec::new(), Vec::new()),
+    )
+    .await;
+    assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
+}
+
+#[tokio::test]
+async fn an_address_only_doh_gives_is_reported_and_never_the_target_s() {
+    // The system resolver refuses the name (a policy, a sinkhole); public
+    // DNS has an address for it.
+    let (server, _) = stand_in_dns(|_, _| Reply::Refused).await;
+    let (doh, doh_asked) = stand_in_doh(Some([203, 0, 113, 66])).await;
+    let target = Target::parse("www.example.org").unwrap();
+    let (observations, ips, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![server], &doh),
+        (Vec::new(), Vec::new()),
+    )
+    .await;
+    assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
+    assert!(ips.is_empty(), "{ips:?}");
+    assert!(
+        summary.starts_with("1 A,") && summary.contains("does not resolve"),
+        "{summary}"
+    );
+    let text = format!("{observations:?}");
+    assert!(text.contains("A record: 203.0.113.66"), "{text}");
+    assert!(
+        !observations
+            .iter()
+            .any(|o| matches!(o, Observation::Hostname { .. })),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn the_dns_stage_takes_the_addresses_the_system_resolves() {
+    // DNS publishes one address; the system (`/etc/hosts`) gives another,
+    // the one the scanner scans.
+    let (server, asked) = stand_in_dns(|name, _| match name {
+        "www.example.org" => Reply::Address([198, 51, 100, 66]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let (doh, _) = stand_in_doh(None).await;
+    let target = Target::parse("www.example.org").unwrap();
+    let (observations, ips, _) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![server], &doh),
+        (vec!["192.0.2.10".to_owned()], Vec::new()),
+    )
+    .await;
+    assert_eq!(ips, ["192.0.2.10"]);
+    let resolved: Vec<&str> = observations
+        .iter()
+        .filter_map(|o| match o {
+            Observation::Hostname { address, .. } => Some(address.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resolved, ["192.0.2.10"]);
+    assert!(!format!("{observations:?}").contains("198.51.100.66"));
+    assert!(!taken(&asked).contains(&"1 www.example.org".to_owned()));
+    // The system's own resolution reads /etc/hosts and its like.
+    let (v4, _) = system_addresses("localhost").await;
+    assert!(v4.contains(&"127.0.0.1".to_owned()), "{v4:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_dns_servers_are_read_from_socket_addresses() {
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN,
+        SOCKADDR_IN6, SOCKADDR_IN6_0,
+    };
+    let v4 = SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: 0,
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes([192, 0, 2, 53]),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    let size = |n: usize| i32::try_from(n).unwrap();
+    // SAFETY: each pointer is to a live socket address at least that long.
+    let read =
+        |ptr: *const SOCKADDR, len: i32| unsafe { dns::windows_dns::socket_address(ptr, len) };
+    let len4 = size(std::mem::size_of::<SOCKADDR_IN>());
+    assert_eq!(
+        read(std::ptr::from_ref(&v4).cast(), len4),
+        Some("192.0.2.53:53".parse().unwrap())
+    );
+    assert_eq!(read(std::ptr::from_ref(&v4).cast(), 4), None);
+    assert_eq!(read(std::ptr::null(), len4), None);
+    let v6 = |ip: &str, scope: u32| SOCKADDR_IN6 {
+        sin6_family: AF_INET6,
+        sin6_port: 0,
+        sin6_flowinfo: 0,
+        sin6_addr: IN6_ADDR {
+            u: IN6_ADDR_0 {
+                Byte: ip.parse::<Ipv6Addr>().unwrap().octets(),
+            },
+        },
+        Anonymous: SOCKADDR_IN6_0 {
+            sin6_scope_id: scope,
+        },
+    };
+    let len6 = size(std::mem::size_of::<SOCKADDR_IN6>());
+    let link = v6("fe80::53", 7);
+    assert_eq!(
+        read(std::ptr::from_ref(&link).cast(), len6),
+        Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::53".parse().unwrap(),
+            53,
+            0,
+            7
+        )))
+    );
+    // Windows' stand-ins for "no IPv6 DNS server" are left out.
+    let placeholder = v6("fec0:0:0:ffff::1", 0);
+    assert_eq!(read(std::ptr::from_ref(&placeholder).cast(), len6), None);
+    // The real list: every server on port 53, none a stand-in.
+    for server in dns::windows_dns::servers() {
+        assert_eq!(server.port(), 53);
+        assert!(!server.ip().to_string().starts_with("fec0:"), "{server}");
+    }
+}

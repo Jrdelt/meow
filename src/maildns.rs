@@ -11,9 +11,10 @@
 //! - Wildcard DNS: whether made-up names resolve, and which names from the
 //!   certificate logs only resolve through that wildcard.
 //!
-//! Everything is a DNS question asked the way the `dns` stage asks: this
-//! machine's resolvers first, DNS-over-HTTPS only for public names. Nothing
-//! is sent to the target's own servers.
+//! Everything is a DNS question asked the way the `dns` stage asks: of this
+//! machine's resolvers, DNS-over-HTTPS only when they give no answer, only
+//! for public names and never for an internal target. Nothing is sent to
+//! the target's own servers.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -23,7 +24,7 @@ use futures_util::future::join_all;
 
 use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::graph::{DnsCheck, DnsSecurity, DnsService, Observation, SubdomainCheck};
-use crate::osint::{build_http_client, resolve_rr, root_domain};
+use crate::osint::{build_http_client, root_domain, Resolver};
 
 const A: u16 = 1;
 const CNAME: u16 = 5;
@@ -567,19 +568,36 @@ fn fact(address: &str, claim: String, evidence: &str) -> Observation {
 
 /// Runs the stage for `domain`, whose records are kept on `primary_address`
 /// (the address it resolves to, or the name itself). `ct_names` are names
-/// the certificate logs gave for the same domain.
+/// the certificate logs gave for the same domain. For an `internal` target
+/// (see [`crate::osint::is_internal_target`]), no question leaves this
+/// machine's resolvers.
 pub async fn run(
     domain: &str,
     primary_address: &str,
     ct_names: &[String],
+    internal: bool,
 ) -> Result<(Vec<Observation>, String)> {
-    let client = build_http_client(Duration::from_secs(6))?;
-    let client = &client;
+    let resolver = Resolver::system(build_http_client(Duration::from_secs(6))?);
+    run_on(resolver, domain, primary_address, ct_names, internal).await
+}
+
+/// [`run`] with `resolver` for the questions.
+pub async fn run_on(
+    mut resolver: Resolver,
+    domain: &str,
+    primary_address: &str,
+    ct_names: &[String],
+    internal: bool,
+) -> Result<(Vec<Observation>, String)> {
+    if internal {
+        resolver.keep_private();
+    }
+    let resolver = &resolver;
     run_with(
         domain,
         primary_address,
         ct_names,
-        |name: String, rrtype: u16| async move { resolve_rr(client, &name, rrtype).await },
+        |name: String, rrtype: u16| async move { resolver.resolve(&name, rrtype).await },
     )
     .await
 }

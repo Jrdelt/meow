@@ -138,6 +138,17 @@ pub(crate) async fn subdomains(cx: &Ctx<'_>) -> Result<StageEnd> {
 }
 
 pub(crate) async fn mail_dns(cx: &Ctx<'_>) -> Result<StageEnd> {
+    match crate::osint::build_http_client(Duration::from_secs(6)) {
+        Ok(client) => mail_dns_with(cx, crate::osint::Resolver::system(client)).await,
+        Err(err) => Ok(StageEnd::Skipped(format!("DNS lookups unavailable: {err}"))),
+    }
+}
+
+/// The `mail-dns` stage, with `resolver` for its questions.
+pub(crate) async fn mail_dns_with(
+    cx: &Ctx<'_>,
+    resolver: crate::osint::Resolver,
+) -> Result<StageEnd> {
     let state = cx.state;
     let task = cx.task;
     let target = cx.target;
@@ -165,9 +176,11 @@ pub(crate) async fn mail_dns(cx: &Ctx<'_>) -> Result<StageEnd> {
         })
         .map(|host| host.address.clone())
         .collect();
+    // An internal target's questions stay on this machine's resolvers.
+    let internal = crate::osint::is_internal_target(domain, &dns_found.ips).await;
     let ran = while_same_mode(
         &same_mode,
-        crate::maildns::run(domain, &primary_address, &ct_names),
+        crate::maildns::run_on(resolver, domain, &primary_address, &ct_names, internal),
     )
     .await;
     let (observations, summary) = match ran {

@@ -1056,7 +1056,7 @@ fn a_script_s_endpoints_and_keys_reach_the_vault_before_its_facts() {
     ];
     // Built here, so that no key-shaped text stands in the source.
     let key = format!("{}_{}_{}", "sk", "live", "Qm7x".repeat(7));
-    let (facts, secrets) = stages::script_facts(
+    let (facts, secrets, _) = stages::script_facts(
         &mut vault,
         "198.51.100.7",
         443,
@@ -1101,6 +1101,227 @@ fn a_script_s_endpoints_and_keys_reach_the_vault_before_its_facts() {
     assert!(claims[1].ends_with(&format!("kept in the vault as {}", secret.token)));
     assert!(!claims[1].contains(&key[..4]), "{}", claims[1]);
     assert!(secret.preview.starts_with(&key[..4]), "{}", secret.preview);
+}
+
+#[test]
+fn a_key_a_script_names_in_an_endpoint_stays_in_the_vault() {
+    use crate::vault::Vault;
+    // Built here, so that no key-shaped text stands in the source.
+    let google = format!("{}{}", "AIza", "SyD-1234567890abcdefghijklmnopqrstu");
+    let hook = format!(
+        "https://hooks.slack.com/services/{}/{}/{}",
+        "T0123456", "B0123456", "abcdefghijklmnopqrstuvwx"
+    );
+    let token = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    let generic = "Zq3vLm8pRt5wXy2nBc7k";
+    let path_id = "aB3dE5fG7hJ9kL1mN2pQ4xY6zW8vT0";
+    let source = format!(
+        r#"const maps = "https://maps.googleapis.com/maps/api/js?key={google}&v=3#frag";
+        const hook = "{hook}";
+        fetch("/api/v1/orders?access_token={token}");
+        var config = {{ apiKey: "{generic}" }};
+        fetch("/api/v1/reports/{generic}/latest");
+        fetch("/api/v1/hooks/{path_id}");"#
+    );
+    let found = crate::webfp::extract_endpoints(&source, 60);
+    let keys = crate::webfp::find_secrets(&source);
+    let mut vault = Vault::ephemeral();
+    let (facts, secrets, endpoints) =
+        stages::script_facts(&mut vault, "198.51.100.7", 443, "/app.js", &found, keys);
+    assert_eq!(secrets.len(), 3, "{secrets:?}");
+    let generic_token = &secrets
+        .iter()
+        .find(|s| s.kind.starts_with("possible secret"))
+        .unwrap()
+        .token;
+    assert!(endpoints.contains(&"https://maps.googleapis.com/maps/api/js?key&v".to_owned()));
+    assert!(endpoints.contains(&"/api/v1/orders?access_token".to_owned()));
+    assert!(
+        endpoints.contains(&format!("/api/v1/reports/{generic_token}/latest")),
+        "{endpoints:?}"
+    );
+    // A Slack webhook URL is a key whole: listed with the keys only.
+    assert!(
+        !endpoints.iter().any(|e| e.contains("hooks.slack.com")),
+        "{endpoints:?}"
+    );
+    // An id in a path is no key: kept as it is, and not listed to rotate.
+    assert!(
+        endpoints.contains(&format!("/api/v1/hooks/{path_id}")),
+        "{endpoints:?}"
+    );
+    assert_eq!(vault.exposed_secrets().len(), 3);
+    // What the graph, the facts, the map and the report hold: no key.
+    let mut graph = Graph::default();
+    graph.apply(Observation::Port {
+        address: "198.51.100.7".into(),
+        port: 443,
+        protocol: "tcp".into(),
+        state: "open".into(),
+        service: Some("https".into()),
+        product: None,
+        version: None,
+        extra_info: None,
+        cpes: vec![],
+        record: crate::evidence::EvidenceRecord::observed(
+            crate::evidence::Source::NmapXml,
+            crate::evidence::Confidence::High,
+            "x",
+        ),
+    });
+    graph.apply_all(facts.clone());
+    graph.apply(Observation::WebMeta {
+        address: "198.51.100.7".into(),
+        port: 443,
+        http: Box::new(crate::graph::HttpInfo {
+            scheme: "https".into(),
+            js_endpoints: endpoints.clone(),
+            js_secrets: secrets,
+            ..crate::graph::HttpInfo::default()
+        }),
+        record: crate::evidence::EvidenceRecord::observed(
+            crate::evidence::Source::JsScan,
+            crate::evidence::Confidence::Medium,
+            "x",
+        ),
+    });
+    let report = crate::report::render(&crate::report::Inputs {
+        session: "acme".into(),
+        mode: Mode::Mild,
+        generated_utc: String::new(),
+        graph: graph.clone(),
+        tasks: Vec::new(),
+        secrets: vault.exposed_secrets(),
+        replay: None,
+        chats: Vec::new(),
+    });
+    assert!(
+        report.contains("Endpoints named in the scripts"),
+        "{report}"
+    );
+    let kept = serde_json::to_string(&graph).unwrap() + &format!("{facts:?}") + &report;
+    for secret in [google.as_str(), hook.as_str(), token, generic] {
+        assert!(!kept.contains(secret), "{secret} in {kept}");
+    }
+    assert!(kept.contains("https://maps.googleapis.com/maps/api/js?key&v"));
+}
+
+#[test]
+fn ids_in_script_endpoints_are_kept_and_never_listed_to_rotate() {
+    let endpoints: Vec<String> = [
+        "/api/v2/projects/5f8d0d55b54764421b7156c5/members",
+        "/api/v1/session/Zx81Kd02Lm77Qa19Wv44/refresh",
+        "/api/v1/orders/550e8400-e29b-41d4-a716-446655440000",
+        "https://api.example.com/v1/users/5f8d0d55b54764421b7156c5/avatar",
+        "/api/v1/search?q",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let mut vault = crate::vault::Vault::ephemeral();
+    let (facts, secrets, kept) = stages::script_facts(
+        &mut vault,
+        "198.51.100.7",
+        443,
+        "/app.js",
+        &endpoints,
+        Vec::new(),
+    );
+    assert_eq!(kept, endpoints);
+    assert!(secrets.is_empty());
+    assert!(vault.exposed_secrets().is_empty());
+    let facts = format!("{facts:?}");
+    for endpoint in &endpoints {
+        assert!(facts.contains(endpoint.as_str()), "{endpoint} in {facts}");
+    }
+}
+
+#[test]
+fn trace_goes_to_the_address_the_port_inventory_scanned() {
+    use crate::coordinator::Coordinator;
+    use crate::workspace::{Config, MeowHome, Workspace};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+    // Light: the queue runs nothing on its own.
+    let (workspace, _) =
+        Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+    let mut config = Config::default();
+    config.cve.enabled = false;
+    let coordinator = Coordinator::start(workspace, config).unwrap();
+    let state = coordinator.state();
+    let name = "www.example.org";
+    let target = Target::parse(name).unwrap();
+    let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+    // DNS published one address; the scanner resolved the name (with the
+    // user's /etc/hosts) to another and scanned that.
+    let dns = Found {
+        ips: vec!["198.51.100.66".into()],
+        ..Found::default()
+    };
+    dns.save(&state.db_lock(), id, Stage::Dns).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let first = || {
+        runtime
+            .block_on(resolve_target_ips(&state, id, &target))
+            .first()
+            .map(ToString::to_string)
+    };
+    assert_eq!(first().as_deref(), Some("198.51.100.66"));
+    let ports = Found {
+        up: 1,
+        hosts: BTreeMap::from([("192.0.2.10".to_owned(), vec![80])]),
+        ..Found::default()
+    };
+    ports.save(&state.db_lock(), id, Stage::Ports).unwrap();
+    assert_eq!(first().as_deref(), Some("192.0.2.10"));
+    coordinator.shutdown();
+}
+
+#[test]
+fn the_mail_dns_stage_keeps_an_internal_target_off_doh() {
+    use crate::coordinator::Coordinator;
+    use crate::osint::tests::{stand_in_dns, stand_in_doh, stand_in_resolver, taken, Reply};
+    use crate::workspace::{Config, MeowHome, Workspace};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+    // Light: the queue runs nothing on its own.
+    let (workspace, _) =
+        Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+    let mut config = Config::default();
+    config.cve.enabled = false;
+    let coordinator = Coordinator::start(workspace, config).unwrap();
+    let state = coordinator.state();
+    // A name under a public suffix that the dns stage found private.
+    let name = "dc01.corp.example.org";
+    let target = Target::parse(name).unwrap();
+    let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+    let dns = Found {
+        ips: vec!["10.0.0.5".into()],
+        ..Found::default()
+    };
+    dns.save(&state.db_lock(), id, Stage::Dns).unwrap();
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The system resolver answers nothing, which would send a public
+        // name over DNS-over-HTTPS.
+        let (server, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
+        let (doh, doh_asked) = stand_in_doh(None).await;
+        let cx = stages::Ctx::new(&state, &task, &target, Stage::MailDns).unwrap();
+        stages::mail_dns_with(&cx, stand_in_resolver(vec![server], &doh))
+            .await
+            .unwrap();
+        assert!(taken(&asked).contains(&format!("16 _dmarc.{name}")));
+        assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+    });
+    coordinator.shutdown();
 }
 
 #[test]
