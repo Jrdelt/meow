@@ -485,58 +485,41 @@ fn validate_remote_url(dir: &Path, remote_url: &str, allow_local: bool) -> Resul
     )
 }
 
-fn is_unsafe_local_git_config_key(key: &str) -> bool {
-    let k = key.trim().to_ascii_lowercase();
-    let http_tail = k
-        .strip_prefix("http.")
-        .map(|rest| rest.rsplit_once('.').map_or(rest, |(_, leaf)| leaf));
-    matches!(
-        k.as_str(),
-        "core.fsmonitor"
-            | "core.alternaterefscommand"
-            | "core.sshcommand"
-            | "core.askpass"
-            | "core.gitproxy"
-            | "core.pager"
-            | "core.editor"
-            | "core.hookspath"
-            | "core.worktree"
-            | "credential.helper"
-            | "protocol.allow"
-            | "https.proxy"
-            | "diff.external"
-            | "interactive.difffilter"
-            | "ssh.variant"
-            | "include.path"
-            | "fetch.recursesubmodules"
-    ) || http_tail.is_some_and(|leaf| {
-        leaf == "proxy"
-            || leaf == "extraheader"
-            || leaf.starts_with("ssl")
-            || leaf.starts_with("curlopt")
-            || leaf == "followredirects"
-    }) || k.starts_with("credential.") && k.ends_with(".helper")
-        || k.starts_with("protocol.") && k.ends_with(".allow")
-        || k.starts_with("remote.")
-            && (k.ends_with(".uploadpack")
-                || k.ends_with(".receivepack")
-                || k.ends_with(".proxy")
-                || k.ends_with(".vcs"))
-        || k.starts_with("submodule.")
-        || k.starts_with("uploadpack.")
-        || k.starts_with("receivepack.")
-        || k.starts_with("filter.")
-        || k.starts_with("diff.") && (k.ends_with(".command") || k.ends_with(".textconv"))
-        || k.starts_with("difftool.")
-        || k.starts_with("mergetool.")
-        || k.starts_with("merge.") && k.ends_with(".driver")
-        || k.starts_with("man.") && k.ends_with(".cmd")
-        || k.starts_with("gpg.")
-        || k.starts_with("pager.")
-        || k.starts_with("extensions.")
-        || k.starts_with("alias.")
-        || k.starts_with("includeif.")
-        || k.starts_with("url.") && (k.ends_with(".insteadof") || k.ends_with(".pushinsteadof"))
+/// Whether `key`, from the checkout's own `.git/config`, is one that a plain
+/// clone has (on macOS and Windows too) or that a user sets by hand without
+/// harm. Every other key is refused: many make git run a program or write a
+/// file (`gc.recentObjectsHook`, `http.cookieFile`, `filter.*`, ...), and
+/// git keeps adding more.
+fn is_allowed_local_git_config_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    let (section, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
+    // `branch.<name>.merge`: the name may hold dots, the leaf cannot.
+    let (name, leaf) = match rest.rsplit_once('.') {
+        Some((name, leaf)) => (Some(name).filter(|name| !name.is_empty()), leaf),
+        None => (None, rest),
+    };
+    match (section, name) {
+        ("core", None) => matches!(
+            leaf,
+            "repositoryformatversion"
+                | "filemode"
+                | "bare"
+                | "logallrefupdates"
+                | "ignorecase"
+                | "precomposeunicode"
+                | "symlinks"
+        ),
+        // Written by `git clone` with newer defaults (reftable, SHA-256).
+        ("extensions", None) => matches!(leaf, "objectformat" | "refstorage"),
+        ("remote", Some(_)) => matches!(leaf, "url" | "fetch" | "tagopt"),
+        ("branch", Some(_)) => matches!(leaf, "remote" | "merge" | "rebase"),
+        ("user", None) => matches!(leaf, "name" | "email"),
+        // meow never pulls; git's own advice has users set these.
+        ("pull", None) => matches!(leaf, "rebase" | "ff"),
+        // meow passes `-c gc.auto=0` itself.
+        ("gc", None) => leaf == "auto",
+        _ => false,
+    }
 }
 
 fn audit_local_git_config(dir: &Path) -> Result<()> {
@@ -544,9 +527,10 @@ fn audit_local_git_config(dir: &Path) -> Result<()> {
     let keys = git(dir, &["config", "--local", "--name-only", "--list"])
         .with_context(|| format!("cannot audit local .git/config in {safe_dir}"))?;
     for key in keys.lines() {
-        if is_unsafe_local_git_config_key(key) {
+        if !is_allowed_local_git_config_key(key) {
             bail!(
-                "refusing unsafe local .git/config setting '{}' in {safe_dir}",
+                "refusing unsafe local .git/config setting '{}' in {safe_dir}: \
+                 meow allows only the settings a plain clone has",
                 sanitize(key.trim(), 80),
             );
         }
@@ -598,7 +582,20 @@ fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
         .arg("-c")
         .arg("protocol.http.allow=never")
         .arg("-c")
-        .arg("protocol.git.allow=never");
+        .arg("protocol.git.allow=never")
+        // `git fetch` and `git merge` would otherwise start `git maintenance`
+        // and `git gc`, which run commands from the config. These win over
+        // the checkout's keys of the same name, but not over a URL-scoped
+        // `http.<url>.cookieFile`: git picks the closest URL first. The
+        // allow-list, which takes no `http.*` key, is what blocks those.
+        .arg("-c")
+        .arg("maintenance.auto=false")
+        .arg("-c")
+        .arg("gc.auto=0")
+        .arg("-c")
+        .arg("http.saveCookies=false")
+        .arg("-c")
+        .arg("http.cookieFile=");
 }
 
 /// Runs git in `dir` with hooks and fsmonitor disabled and returns its trimmed standard output.
@@ -697,6 +694,45 @@ fn install_command(dir: &Path, target: &Path) -> Command {
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .current_dir(dir);
     cmd
+}
+
+/// Lists local changes. Nested repositories are left alone: `git status`
+/// would run their own git config.
+const LOCAL_CHANGES: &[&str] = &[
+    "status",
+    "--porcelain",
+    "--untracked-files=no",
+    "--ignore-submodules=all",
+];
+
+/// A submodule has a git config of its own that is never audited, and `git
+/// status` in the checkout runs it. meow's tree has none. Other repositories
+/// below the top (no gitlink), such as `git worktree add` folders, are fine:
+/// no git call here reads their config.
+fn refuse_submodules(dir: &Path) -> Result<()> {
+    let safe_dir = sanitize(&dir.display().to_string(), 400);
+    let index = git(dir, &["ls-files", "--stage"])?;
+    if let Some(line) = index.lines().find(|line| line.starts_with("160000 ")) {
+        let path = line.split_once('\t').map_or("", |(_, path)| path);
+        bail!(
+            "refusing to update {safe_dir}: it has a submodule at '{}'",
+            sanitize(path, 200)
+        );
+    }
+    Ok(())
+}
+
+/// With `.git/commondir`, git takes the config, objects and refs from the
+/// folder it names, which the ownership checks never see. A plain clone
+/// has none.
+fn refuse_shared_git_dir(dir: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(dir.join(".git").join("commondir")).is_ok() {
+        bail!(
+            "refusing to update {}: its .git/commondir makes git use another folder's settings",
+            sanitize(&dir.display().to_string(), 400)
+        );
+    }
+    Ok(())
 }
 
 fn short(commit: &str) -> &str {
@@ -891,11 +927,13 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         );
     }
     ensure_own_checkout(&dir)?;
+    refuse_shared_git_dir(&dir)?;
     audit_local_git_config(&dir)?;
+    refuse_submodules(&dir)?;
     audit_untracked_build_overrides(&dir)?;
     println!("[+] meow source: {safe_dir}");
 
-    let changed = git(&dir, &["status", "--porcelain", "--untracked-files=no"])?;
+    let changed = git(&dir, LOCAL_CHANGES)?;
     if !changed.is_empty() {
         bail!(
             "{safe_dir} has local changes, so nothing was pulled. Commit or discard them first:\n{}",
@@ -1001,6 +1039,8 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
 
     verify_checkout_security(&dir, explicit_source)?;
     ensure_own_checkout(&dir)?;
+    // build.rs runs git as well.
+    refuse_shared_git_dir(&dir)?;
     audit_local_git_config(&dir)?;
     audit_untracked_build_overrides(&dir)?;
     if cfg!(windows) {
@@ -1109,10 +1149,40 @@ mod tests {
             "fetch.recursesubmodules",
             "submodule.evil.url",
             "submodule.evil.update",
+            // Not on the old list of refused keys: they run a program,
+            // write or read a file, or reach the network.
+            "gc.recentobjectshook",
+            "gc.autopacklimit",
+            "maintenance.auto",
+            "maintenance.strategy",
+            "http.cookiefile",
+            "http.savecookies",
+            "http.https://github.com/.cookiefile",
+            "http.lowspeedlimit",
+            "http.proxysslcert",
+            "fetch.bundleuri",
+            "transfer.bundleuri",
+            "bundle.list.uri",
+            "core.sharedrepository",
+            "core.splitindex",
+            "extensions.worktreeconfig",
+            "extensions.partialclone",
+            "remote.origin.promisor",
+            "remote.origin.pushurl",
+            "branch.main.mergeoptions",
+            "user.signingkey",
+            // Leaves that are allowed elsewhere, in the wrong place.
+            "core",
+            "core.url",
+            "core.origin.bare",
+            "remote.url",
+            "remote..url",
+            "branch.merge",
+            "user.main.name",
         ] {
             assert!(
-                is_unsafe_local_git_config_key(unsafe_key),
-                "expected {unsafe_key} to be flagged unsafe"
+                !is_allowed_local_git_config_key(unsafe_key),
+                "expected {unsafe_key} to be refused"
             );
         }
         for benign_key in [
@@ -1120,13 +1190,28 @@ mod tests {
             "core.filemode",
             "core.bare",
             "core.logallrefupdates",
+            "core.ignorecase",
+            "core.precomposeunicode",
+            "core.symlinks",
+            "extensions.objectformat",
+            "extensions.refstorage",
             "remote.origin.url",
             "remote.origin.fetch",
+            "remote.origin.tagopt",
+            "remote.my.fork.url",
             "branch.main.remote",
             "branch.main.merge",
+            "branch.main.rebase",
+            "branch.release/1.0.merge",
+            "branch.Feature.remote",
+            "user.name",
+            "user.email",
+            "pull.rebase",
+            "pull.ff",
+            "gc.auto",
         ] {
             assert!(
-                !is_unsafe_local_git_config_key(benign_key),
+                is_allowed_local_git_config_key(benign_key),
                 "expected {benign_key} to be allowed"
             );
         }
@@ -1426,5 +1511,344 @@ mod tests {
         assert!(parse_homebrew_cellar_exe(&bad_formula).is_none());
         let plain_bin = PathBuf::from(root).join("bin").join("meow");
         assert!(parse_homebrew_cellar_exe(&plain_bin).is_none());
+    }
+
+    /// Runs git for a test, without system or global config.
+    #[cfg(unix)]
+    fn repo_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=meow-test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Only the owner may write anything under `path`, whatever the umask.
+    #[cfg(unix)]
+    fn private_tree(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        let mode = meta.permissions().mode();
+        if meta.is_dir() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for entry in std::fs::read_dir(path).unwrap() {
+                private_tree(&entry.unwrap().path());
+            }
+        } else if meta.is_file() {
+            let mode = (mode & 0o755) | 0o400;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    /// A bare `origin.git` and `clone`, the checkout to update, which is one
+    /// commit behind it. `prepare` runs in the first commit's work tree.
+    #[cfg(unix)]
+    fn sample_checkout(tmp: &Path, prepare: impl FnOnce(&Path)) -> PathBuf {
+        let work = tmp.join("work");
+        std::fs::create_dir(&work).unwrap();
+        repo_git(&work, &["init", "-q"]);
+        std::fs::write(work.join("Cargo.toml"), "[package]\nname = \"meow\"\n").unwrap();
+        std::fs::write(work.join("install.sh"), "exit 0\n").unwrap();
+        repo_git(&work, &["add", "Cargo.toml", "install.sh"]);
+        prepare(&work);
+        repo_git(&work, &["commit", "-qm", "initial"]);
+        repo_git(tmp, &["clone", "-q", "--bare", "work", "origin.git"]);
+        repo_git(tmp, &["clone", "-q", "origin.git", "clone"]);
+        std::fs::write(work.join("new.txt"), "new").unwrap();
+        repo_git(&work, &["add", "new.txt"]);
+        repo_git(&work, &["commit", "-qm", "new"]);
+        repo_git(&work, &["push", "-q", "../origin.git", "HEAD:main"]);
+        let clone = tmp.join("clone");
+        private_tree(&clone);
+        clone
+    }
+
+    #[cfg(unix)]
+    fn set_old_mtime(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_config_keys_a_plain_clone_lacks_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = sample_checkout(tmp.path(), |_| {});
+        let marker = tmp.path().join("hook-ran");
+        let hook = format!("sh -c 'echo ran > \"{}\"; true'", marker.display());
+        let victim = tmp.path().join("victim");
+        let victim = victim.to_str().unwrap();
+        for (key, value) in [
+            ("gc.recentObjectsHook", hook.as_str()),
+            ("gc.autoPackLimit", "1"),
+            ("http.cookieFile", victim),
+            ("http.saveCookies", "true"),
+            ("http.https://example.invalid/.cookieFile", victim),
+            ("http.https://example.invalid/.saveCookies", "true"),
+            ("maintenance.auto", "true"),
+            ("core.sharedRepository", "0666"),
+            ("branch.main.mergeOptions", "--no-ff"),
+        ] {
+            repo_git(&clone, &["config", key, value]);
+            private_tree(&clone);
+            let err = run(&UpdateArgs {
+                check: true,
+                source: Some(clone.clone()),
+            })
+            .unwrap_err();
+            let said = format!("{err:#}");
+            // git lists the keys in lower case.
+            let shown = key.to_ascii_lowercase();
+            assert!(
+                said.contains(&format!(
+                    "refusing unsafe local .git/config setting '{shown}'"
+                )),
+                "{key}: {said}"
+            );
+            repo_git(&clone, &["config", "--unset", key]);
+        }
+        assert!(!marker.exists());
+        assert!(!clone.join("new.txt").exists());
+
+        // What git writes on a clone on macOS and Windows, and the name and
+        // address a user may give: the update goes ahead.
+        for (key, value) in [
+            ("core.ignorecase", "true"),
+            ("core.precomposeunicode", "true"),
+            ("core.symlinks", "false"),
+            ("user.name", "meow-test"),
+            ("user.email", "test@example.invalid"),
+            ("branch.main.rebase", "false"),
+            ("gc.auto", "0"),
+        ] {
+            repo_git(&clone, &["config", key, value]);
+        }
+        private_tree(&clone);
+        let _ = run(&UpdateArgs {
+            check: true,
+            source: Some(clone.clone()),
+        })
+        .unwrap();
+    }
+
+    /// PoC: a checkout's gc.recentObjectsHook ran during `meow update
+    /// --check`, through the automatic maintenance `git fetch` and `git
+    /// merge` start. And libcurl wrote the cookie jar http.cookieFile names.
+    #[cfg(unix)]
+    #[test]
+    fn git_calls_run_no_automatic_maintenance_and_save_no_cookies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = sample_checkout(tmp.path(), |_| {});
+        // Packs for `gc --auto` to merge, and an old unreachable object.
+        for name in ["b.txt", "c.txt"] {
+            std::fs::write(clone.join(name), name).unwrap();
+            repo_git(&clone, &["add", name]);
+            repo_git(&clone, &["commit", "-qm", name]);
+            repo_git(&clone, &["repack", "-q"]);
+        }
+        repo_git(&clone, &["reset", "-q", "--hard", "HEAD~2"]);
+        repo_git(&clone, &["reflog", "expire", "--expire=now", "--all"]);
+        std::fs::write(tmp.path().join("dangling"), "dangling").unwrap();
+        let blob = repo_git(&clone, &["hash-object", "-w", "../dangling"]);
+        set_old_mtime(&clone.join(".git/objects").join(&blob[..2]).join(&blob[2..]));
+        let marker = tmp.path().join("hook-ran");
+        for (key, value) in [
+            ("gc.autoPackLimit", "1"),
+            ("gc.autoDetach", "false"),
+            (
+                "gc.recentObjectsHook",
+                &format!("sh -c 'echo ran > \"{}\"; true'", marker.display()),
+            ),
+        ] {
+            repo_git(&clone, &["config", key, value]);
+        }
+
+        git_live(&clone, true, &["fetch", "--quiet", "--", "origin"]).unwrap();
+        assert!(!marker.exists(), "git fetch ran automatic maintenance");
+        git(&clone, &["merge", "--ff-only", "--quiet", "@{u}"]).unwrap();
+        assert!(!marker.exists(), "git merge ran automatic maintenance");
+        assert!(clone.join("new.txt").exists());
+
+        // The settings meow gives git win over the checkout's own.
+        for (key, own, forced) in [("gc.auto", "1", "0"), ("maintenance.auto", "true", "false")] {
+            repo_git(&clone, &["config", key, own]);
+            assert_eq!(git(&clone, &["config", "--get", key]).unwrap(), forced);
+        }
+        // For http keys git picks the closest URL first, so these win only
+        // over the checkout's generic keys. The allow-list refuses all of
+        // them, URL-scoped ones included.
+        let url = "https://example.invalid/meow.git";
+        for (leaf, own, forced) in [
+            ("savecookies", "true", "false"),
+            ("cookiefile", "/dev/null", ""),
+        ] {
+            let key = format!("http.{leaf}");
+            repo_git(&clone, &["config", &key, own]);
+            let used = git(&clone, &["config", "--get-urlmatch", &key, url]).unwrap();
+            assert_eq!(used, forced);
+            assert!(!is_allowed_local_git_config_key(&key));
+            let scoped = format!("http.https://example.invalid/.{leaf}");
+            assert!(!is_allowed_local_git_config_key(&scoped));
+        }
+    }
+
+    /// PoC: a nested repository at a gitlink of the checkout carried its own
+    /// config, and `git status` in the checkout ran its clean filter.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_with_a_submodule_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("filter-ran");
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        repo_git(&sub, &["init", "-q"]);
+        std::fs::write(sub.join(".gitattributes"), "* filter=x\n").unwrap();
+        std::fs::write(sub.join("f.txt"), "data\n").unwrap();
+        repo_git(&sub, &["add", "."]);
+        repo_git(&sub, &["commit", "-qm", "sub"]);
+        let sub_head = repo_git(&sub, &["rev-parse", "HEAD"]);
+        let clone = sample_checkout(tmp.path(), |work| {
+            let gitlink = format!("160000,{sub_head},sub");
+            repo_git(work, &["update-index", "--add", "--cacheinfo", &gitlink]);
+        });
+        // The nested repository where the gitlink is, with a clean filter
+        // in its own config and a file git has to filter again.
+        repo_git(tmp.path(), &["clone", "-q", "sub", "clone/sub"]);
+        let filter = format!("sh -c 'echo ran > \"{}\"; cat'", marker.display());
+        repo_git(&clone.join("sub"), &["config", "filter.x.clean", &filter]);
+        set_old_mtime(&clone.join("sub/f.txt"));
+        private_tree(&clone);
+
+        let err = run(&UpdateArgs {
+            check: true,
+            source: Some(clone.clone()),
+        })
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("has a submodule at 'sub'"),
+            "{err:#}"
+        );
+        assert!(!marker.exists(), "the nested repository's filter ran");
+
+        // Should the check be passed, `git status` leaves it alone too.
+        git(&clone, LOCAL_CHANGES).unwrap();
+        assert!(!marker.exists(), "the nested repository's filter ran");
+        // (Without it, git does run the filter: the test is a real one.)
+        let unguarded = &LOCAL_CHANGES[..3];
+        git(&clone, &[unguarded, &["--ignore-submodules=none"]].concat()).unwrap();
+        assert!(marker.exists());
+    }
+
+    /// A linked worktree (`git worktree add`, as Claude Code makes under
+    /// .claude/worktrees) or another repository below the top, with no
+    /// gitlink, is fine: git never reads its config.
+    #[cfg(unix)]
+    #[test]
+    fn repositories_inside_the_checkout_without_a_gitlink_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("filter-ran");
+        let clone = sample_checkout(tmp.path(), |work| {
+            std::fs::create_dir(work.join("docs")).unwrap();
+            std::fs::write(work.join("docs/a.md"), "a\n").unwrap();
+            repo_git(work, &["add", "docs/a.md"]);
+        });
+        repo_git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                ".claude/worktrees/feature",
+            ],
+        );
+        // In a tracked folder and in an untracked one: a repository with a
+        // clean filter in its own config and a file git would filter again.
+        for inner in ["docs", "scratch/inner"] {
+            let inner = clone.join(inner);
+            std::fs::create_dir_all(&inner).unwrap();
+            repo_git(&inner, &["init", "-q"]);
+            std::fs::write(inner.join(".gitattributes"), "* filter=x\n").unwrap();
+            std::fs::write(inner.join("f.txt"), "data\n").unwrap();
+            repo_git(&inner, &["add", ".gitattributes", "f.txt"]);
+            repo_git(&inner, &["commit", "-qm", "inner"]);
+            let filter = format!("sh -c 'echo ran > \"{}\"; cat'", marker.display());
+            repo_git(&inner, &["config", "filter.x.clean", &filter]);
+            set_old_mtime(&inner.join("f.txt"));
+        }
+        set_old_mtime(&clone.join("docs/a.md"));
+        private_tree(&clone);
+
+        let _ = run(&UpdateArgs {
+            check: true,
+            source: Some(clone.clone()),
+        })
+        .unwrap();
+        assert!(!marker.exists(), "an inner repository's filter ran");
+    }
+
+    /// PoC: with `.git/commondir`, git took the checkout's config, objects
+    /// and refs from another folder, which the ownership checks never saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_whose_git_folder_points_elsewhere_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = sample_checkout(tmp.path(), |_| {});
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        for name in [
+            "config",
+            "objects",
+            "refs",
+            "info",
+            "hooks",
+            "logs",
+            "packed-refs",
+        ] {
+            let from = clone.join(".git").join(name);
+            if from.exists() {
+                std::fs::rename(&from, shared.join(name)).unwrap();
+            }
+        }
+        std::fs::create_dir(clone.join(".git/refs")).unwrap();
+        std::fs::write(clone.join(".git/commondir"), "../../shared\n").unwrap();
+        // git does use the other folder's config.
+        repo_git(&clone, &["config", "meow.test", "shared"]);
+        assert!(std::fs::read_to_string(shared.join("config"))
+            .unwrap()
+            .contains("test = shared"));
+        repo_git(&clone, &["config", "--unset", "meow.test"]);
+        private_tree(&clone);
+        private_tree(&shared);
+
+        let err = run(&UpdateArgs {
+            check: true,
+            source: Some(clone.clone()),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains(".git/commondir"), "{err:#}");
     }
 }

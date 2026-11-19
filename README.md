@@ -320,6 +320,10 @@ map = true
   If `brew upgrade meow` says `Error: jrdelt/meow/meow not installed`, install it first with `brew install meow`.
 - **If you installed from a git clone and deleted or moved that folder:** pass `--source <path-to-meow-clone>` (or set `MEOW_SOURCE=<path-to-meow-clone>`) to update from the moved checkout, or install a release download (`.pkg`, `.tar.gz`, `.zip`): a meow installed from a release updates itself from GitHub Releases, SHA-256 verified.
 
+### `meow update` refuses a `.git/config` setting or a submodule
+
+meow only runs git in a checkout that looks like a plain clone: its `.git/config` holds only what `git clone` writes (plus `user.name`, `user.email`, `pull.rebase`, `pull.ff`, `gc.auto`), its `.git` has no `commondir`, and it has no submodules. Remove what the message names, or clone meow again.
+
 ### macOS says the `.pkg` installer "cannot be opened because it is from an unidentified developer"
 
 On macOS 15 (Sequoia) and newer, open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** (on macOS 14 and earlier, Control-click the `.pkg` in Finder and choose **Open**), or install directly from Terminal:

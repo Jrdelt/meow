@@ -1155,9 +1155,20 @@ mod tests {
         assert!(top.contains("\npermissions:\n  contents: read\n"));
         let jobs = workflow_jobs(&workflow);
         let ids: Vec<&str> = jobs.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, ["draft", "build", "publish"]);
+        assert_eq!(
+            ids,
+            [
+                "draft",
+                "build-macos-arm64",
+                "build-macos-x86_64",
+                "build-linux-x86_64",
+                "build-linux-arm64",
+                "build-windows-x86_64",
+                "publish"
+            ]
+        );
         for (id, job) in &jobs {
-            let wanted = if *id == "build" {
+            let wanted = if id.starts_with("build-") {
                 "contents: read"
             } else {
                 "contents: write"
@@ -1167,25 +1178,32 @@ mod tests {
         assert_eq!(workflow.matches("contents: write").count(), 2);
         assert!(!workflow.contains("write-all"));
 
-        let build = &jobs[1].1;
-        for needle in [
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "github.token",
-            "secrets.",
-            "gh release",
-            ": write",
-        ] {
-            assert!(!build.contains(needle), "the build job has {needle}");
+        let builds: Vec<(&str, &String)> = jobs
+            .iter()
+            .filter_map(|(id, job)| Some((id.strip_prefix("build-")?, job)))
+            .collect();
+        for (name, build) in &builds {
+            for needle in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "github.token",
+                "secrets.",
+                "gh release",
+                ": write",
+            ] {
+                assert!(!build.contains(needle), "build-{name} has {needle}");
+            }
+            assert!(build.contains("uses: actions/upload-artifact@"));
+            assert!(build.contains("if-no-files-found: error"));
+            // A failed job can be re-run for 30 days; the publish job then
+            // needs the builds' files, and says so when they are gone.
+            assert!(build.contains("retention-days: 30\n"));
+            // Each build's artifact is named after the build.
+            assert!(build.contains("          name: meow-${{ env.BUILD_NAME }}\n"));
         }
-        assert!(build.contains("uses: actions/upload-artifact@"));
-        assert!(build.contains("if-no-files-found: error"));
-        // A failed job can be re-run for 30 days; the publish job then
-        // needs the builds' files, and says so when they are gone.
-        assert!(build.contains("retention-days: 30\n"));
         assert!(!workflow.contains("retention-days: 1\n"));
 
-        let publish = &jobs[2].1;
+        let publish = &jobs.last().unwrap().1;
         assert!(publish.contains("uses: actions/download-artifact@"));
         assert!(publish.contains("the build artifacts may have expired: re-run all jobs"));
         assert!(
@@ -1195,20 +1213,14 @@ mod tests {
         assert!(publish.contains("sha256sum --check --strict"));
         assert!(publish.contains("--clobber"));
         // Each build's artifact stays in its own folder, named after the
-        // build, and is checked there. Merged into one folder, a build could
-        // hand over its own copy of another build's file and .sha256.
-        assert!(build.contains("          name: meow-${{ matrix.name }}\n"));
+        // build, and is checked there against that build job's outputs.
         assert!(!publish.contains("merge-multiple"));
         assert!(publish.contains("dir=\"meow-$build\""));
         assert!(publish.contains("(cd \"$dir\" && sha256sum --check --strict"));
         assert!(publish.contains("uploads=\"$uploads $dir/$file $dir/$file.sha256\""));
         // The publish job takes exactly the files of these builds, so its
-        // list has to be the build matrix.
-        let matrix: Vec<&str> = build
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("- { name: "))
-            .map(|rest| rest.split(',').next().unwrap().trim())
-            .collect();
+        // list has to be the build jobs.
+        let names: Vec<&str> = builds.iter().map(|(name, _)| *name).collect();
         let listed: Vec<&str> = publish
             .lines()
             .find_map(|line| line.trim().strip_prefix("builds=\""))
@@ -1216,7 +1228,67 @@ mod tests {
             .expect("the publish job lists the builds")
             .split_whitespace()
             .collect();
-        assert_eq!(matrix.len(), 5);
-        assert_eq!(listed, matrix);
+        assert_eq!(names.len(), 5);
+        assert_eq!(listed, names);
+    }
+
+    #[test]
+    fn each_release_file_must_have_the_sha256_its_own_build_job_gave() {
+        // Any job of a run can replace any artifact of the run, so a build
+        // script in one build could hand over its own copy of another
+        // platform's archive and .sha256. Only a job sets its own outputs
+        // (matrix jobs share one set): each platform has a job of its own,
+        // which gives its files' SHA-256 as outputs, and the publish job
+        // checks every file against the outputs of the job that built it.
+        let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+        assert!(!workflow.contains("${{ matrix"));
+        assert!(!workflow.contains("strategy:"));
+        let jobs = workflow_jobs(&workflow);
+        let publish = &jobs.last().unwrap().1;
+        let mut first: Option<String> = None;
+        for (id, job) in &jobs {
+            let Some(name) = id.strip_prefix("build-") else {
+                continue;
+            };
+            let value = |key: &str| {
+                job.lines()
+                    .find_map(|line| line.trim().strip_prefix(key))
+                    .unwrap_or_else(|| panic!("{id} has no {key}"))
+                    .trim()
+            };
+            assert_eq!(value("BUILD_NAME:"), name);
+            // The same job for every platform, but for these.
+            let text = job
+                .replace(value("BUILD_TARGET:"), "<target>")
+                .replace(name, "<name>")
+                .replace(value("runs-on:"), "<runner>");
+            match &first {
+                None => first = Some(text),
+                Some(first) => assert_eq!(&text, first, "{id} differs from the first build"),
+            }
+            // The publish job waits for this job and has its outputs.
+            assert!(publish.contains(&format!("      - {id}\n")), "{id}");
+            let var = format!("SHA256_{}", name.to_ascii_uppercase().replace('-', "_"));
+            let archive =
+                format!("          {var}_ARCHIVE: ${{{{ needs.{id}.outputs.archive-sha256 }}}}\n");
+            assert!(publish.contains(&archive), "{id}");
+            let pkg = format!("          {var}_PKG: ${{{{ needs.{id}.outputs.pkg-sha256 }}}}\n");
+            assert_eq!(publish.contains(&pkg), name.starts_with("macos-"), "{id}");
+        }
+        let build = first.expect("build jobs");
+        assert!(build.contains(
+            "    outputs:\n      archive-sha256: ${{ steps.package.outputs.archive-sha256 }}\n      \
+             pkg-sha256: ${{ steps.package.outputs.pkg-sha256 }}\n"
+        ));
+        assert!(build.contains("        id: package\n"));
+        assert!(build.contains("*.pkg) echo \"pkg-sha256=$sum\" >>\"$GITHUB_OUTPUT\" ;;"));
+        assert!(build.contains("*) echo \"archive-sha256=$sum\" >>\"$GITHUB_OUTPUT\" ;;"));
+        // Every file is compared, before anything is uploaded.
+        let compare = "if [ \"${#want}\" -ne 64 ] || [ \"$got\" != \"$want\" ]; then";
+        assert!(publish
+            .contains("var=$(printf 'SHA256_%s_%s' \"$build\" \"$kind\" | tr 'a-z-' 'A-Z_')"));
+        assert!(publish.contains("got=$(sha256sum -- \"$dir/$file\" | cut -d ' ' -f 1)"));
+        assert!(publish.find(compare).unwrap() < publish.find("uploads=\"$uploads").unwrap());
+        assert!(publish.find(compare).unwrap() < publish.find("gh release upload").unwrap());
     }
 }
