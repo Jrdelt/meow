@@ -1403,6 +1403,393 @@ fn lsof_owner(uids: &[u32], me: u32) -> Option<u32> {
     }
 }
 
+/// [`another_users_server`]'s answer on Windows for a server of another
+/// user: users have no number there.
+#[cfg(any(windows, test))]
+const ANOTHER_USER: u32 = u32::MAX - 1;
+
+/// Windows: whose process a listener on the port is.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listener {
+    /// This process, or one that runs as this user.
+    Own,
+    /// A process that runs as another user.
+    Other,
+    /// A process whose user cannot be read: the system's own, a service's,
+    /// or another user's seen without the rights to ask.
+    Unknown,
+}
+
+/// Windows: who listens on a port, from whose each of its listeners is.
+/// The server is this user's only when all of them are: another user's
+/// process can listen on the same port at a more specific address. With
+/// no listener, nothing of another user's is there, as on Linux.
+#[cfg(any(windows, test))]
+fn listeners_owner(listeners: &[Listener]) -> Option<u32> {
+    if listeners.contains(&Listener::Other) {
+        Some(ANOTHER_USER)
+    } else if listeners.contains(&Listener::Unknown) {
+        Some(u32::MAX)
+    } else {
+        None
+    }
+}
+
+/// Windows: the port in a row of the system's table of TCP sockets. It is
+/// in network byte order in the low 16 bits; the rest may hold anything.
+#[cfg(any(windows, test))]
+fn table_port(raw: u32) -> u16 {
+    u16::from_be((raw & 0xffff) as u16)
+}
+
+/// Windows: the longest step of the system's clock, 15.625 ms, in the
+/// 100 ns steps its times are told in.
+#[cfg(any(windows, test))]
+const CLOCK_TICK: u64 = 156_250;
+
+/// Windows: whether a process made at `process_created` can be the one
+/// that bound a socket at `socket_bound`, both in the system's time (100 ns
+/// steps since 1601). The system's table names a listening socket's process
+/// by the id of the one that bound it, and goes on naming that id when the
+/// process is gone and another one holds the socket; the id can then be
+/// given to a new process, of any user. A process made after the socket
+/// was bound did not bind it.
+///
+/// The two times are taken by different parts of the system, and either
+/// may be the clock as it stood at its last tick, which is up to one tick
+/// early. So a process that binds a socket right after it starts can be
+/// told a time for the socket that is less than a tick before its own: it
+/// is still taken as the one that bound it, and only a full tick or more
+/// proves that it did not. A time of 0 is one the system did not tell, and
+/// is never a match.
+#[cfg(any(windows, test))]
+fn bound_by(process_created: u64, socket_bound: i64) -> bool {
+    process_created != 0
+        && u64::try_from(socket_bound)
+            .is_ok_and(|bound| bound != 0 && process_created < bound.saturating_add(CLOCK_TICK))
+}
+
+/// Windows: the listeners on a TCP port, from the system's table of
+/// listening sockets (`GetExtendedTcpTable`): whether the process named
+/// for each is the one that bound it ([`bound_by`]) and runs as this user
+/// (the user of its token).
+#[cfg(windows)]
+mod windows_ports {
+    use std::mem::{align_of, offset_of, size_of, size_of_val};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_SUPPORTED, FILETIME, HANDLE, NO_ERROR,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_MODULE, MIB_TCP6TABLE_OWNER_MODULE,
+        MIB_TCPROW_OWNER_MODULE, MIB_TCPTABLE_OWNER_MODULE, TCP_TABLE_OWNER_MODULE_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenUser, PSID, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    use super::{bound_by, listeners_owner, table_port, Listener};
+
+    /// A table is some tens of kilobytes at most; one that claims to need
+    /// more than this is not read.
+    const MAX_TABLE_BYTES: u32 = 8 * 1024 * 1024;
+    /// Room for a `TOKEN_USER` and the longest SID (68 bytes) several times
+    /// over, in `u64` words.
+    const TOKEN_USER_WORDS: usize = 32;
+
+    /// A process or token handle, closed when dropped.
+    struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is open, owned by this guard alone and
+            // closed exactly once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// The system's table of the listening TCP sockets of one address
+    /// family, each with the id of the process that bound it and when it
+    /// did, as the call fills it in; the error code when it cannot be read.
+    fn listener_table(family: u16) -> Result<Vec<u64>, u32> {
+        let mut size: u32 = 32 * 1024;
+        for _ in 0..6 {
+            // In u64 words: aligned for the table, whose widest fields
+            // are 64 bits.
+            let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+            size = u32::try_from(size_of_val(buffer.as_slice()))
+                .map_err(|_| ERROR_INSUFFICIENT_BUFFER)?;
+            // SAFETY: the buffer is `size` writable bytes, aligned for the
+            // table and alive through the call; `size` is a valid place
+            // for the length the call needs.
+            let result = unsafe {
+                GetExtendedTcpTable(
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    u32::from(family),
+                    TCP_TABLE_OWNER_MODULE_LISTENER,
+                    0,
+                )
+            };
+            match result {
+                NO_ERROR => return Ok(buffer),
+                // The call said how much it needs; sockets opened before
+                // the next try need a little more.
+                ERROR_INSUFFICIENT_BUFFER if size <= MAX_TABLE_BYTES => {
+                    size = size.saturating_add(4096);
+                }
+                error => return Err(error),
+            }
+        }
+        Err(ERROR_INSUFFICIENT_BUFFER)
+    }
+
+    /// The rows of a table [`listener_table`] filled in.
+    ///
+    /// # Safety
+    /// `table` holds what `GetExtendedTcpTable` wrote: a `u32` count of
+    /// rows, then, `first` bytes in, that many rows of the plain-data type
+    /// `Row`.
+    unsafe fn rows<Row: Copy>(table: &[u64], first: usize) -> &[Row] {
+        if table.is_empty()
+            || size_of::<Row>() == 0
+            || align_of::<Row>() > align_of::<u64>()
+            || !first.is_multiple_of(align_of::<Row>())
+        {
+            return &[];
+        }
+        // SAFETY: the buffer is not empty and starts with the count.
+        let count = unsafe { table.as_ptr().cast::<u32>().read() } as usize;
+        // Never past the end of the buffer, whatever the count says.
+        let fit = size_of_val(table).saturating_sub(first) / size_of::<Row>();
+        // SAFETY: `first` bytes into the buffer (in bounds: `fit` is 0
+        // otherwise, and the pointer is then one past the end at most)
+        // rows of this type follow one another, aligned as checked above;
+        // `count.min(fit)` of them lie within the buffer the slice borrows.
+        unsafe {
+            std::slice::from_raw_parts(
+                table
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(first.min(size_of_val(table)))
+                    .cast::<Row>(),
+                count.min(fit),
+            )
+        }
+    }
+
+    /// The sockets listening on `port`, at any address of either family:
+    /// for each, the id of the process that bound it and when it did.
+    /// `None` when the system's tables cannot be read.
+    fn listening_on(port: u16) -> Option<Vec<(u32, i64)>> {
+        let v4 = listener_table(AF_INET).ok()?;
+        // SAFETY: the IPv4 table of this class holds these rows.
+        let rows4 = unsafe {
+            rows::<MIB_TCPROW_OWNER_MODULE>(&v4, offset_of!(MIB_TCPTABLE_OWNER_MODULE, table))
+        };
+        let mut sockets: Vec<(u32, i64)> = rows4
+            .iter()
+            .filter(|row| table_port(row.dwLocalPort) == port)
+            .map(|row| (row.dwOwningPid, row.liCreateTimestamp))
+            .collect();
+        match listener_table(AF_INET6) {
+            Ok(v6) => {
+                // SAFETY: the IPv6 table of this class holds these rows.
+                let rows6 = unsafe {
+                    rows::<MIB_TCP6ROW_OWNER_MODULE>(
+                        &v6,
+                        offset_of!(MIB_TCP6TABLE_OWNER_MODULE, table),
+                    )
+                };
+                sockets.extend(
+                    rows6
+                        .iter()
+                        .filter(|row| table_port(row.dwLocalPort) == port)
+                        .map(|row| (row.dwOwningPid, row.liCreateTimestamp)),
+                );
+            }
+            // A system without IPv6 has no listener there.
+            Err(ERROR_NOT_SUPPORTED) => {}
+            Err(_) => return None,
+        }
+        sockets.sort_unstable();
+        sockets.dedup();
+        Some(sockets)
+    }
+
+    /// When a process was made, in the system's time; `None` when it does
+    /// not tell.
+    fn made_at(process: HANDLE) -> Option<u64> {
+        let mut made = FILETIME::default();
+        let (mut ended, mut kernel, mut user) = (made, made, made);
+        // SAFETY: `process` is an open process handle with the right to
+        // ask this, or the pseudo handle of this process; the four are
+        // valid places for the times the call writes.
+        let read =
+            unsafe { GetProcessTimes(process, &mut made, &mut ended, &mut kernel, &mut user) };
+        (read != 0).then(|| (u64::from(made.dwHighDateTime) << 32) | u64::from(made.dwLowDateTime))
+    }
+
+    /// The user a process runs as: the `TOKEN_USER` of its token and the
+    /// SID that points to, in one buffer on the heap, so the pointer stays
+    /// good wherever this value moves.
+    struct ProcessUser(Vec<u64>);
+
+    impl ProcessUser {
+        /// `None` when the token of the process cannot be opened or read,
+        /// which is what the system's, a service's and another user's
+        /// process answer to a user without the rights to ask.
+        fn of(process: HANDLE) -> Option<Self> {
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: `process` is an open process handle, or the pseudo
+            // handle of this process; `token` is a valid place for the
+            // handle the call opens.
+            let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+            if opened == 0 || token.is_null() {
+                return None;
+            }
+            let token = Handle(token);
+            let mut buffer = vec![0u64; TOKEN_USER_WORDS];
+            let size = u32::try_from(size_of_val(buffer.as_slice())).ok()?;
+            let mut used = 0u32;
+            // SAFETY: the token is open for queries; the buffer is `size`
+            // writable bytes, aligned for a TOKEN_USER and alive through
+            // the call; `used` is a valid place for the length written.
+            let read = unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    size,
+                    &mut used,
+                )
+            };
+            if read == 0 {
+                return None;
+            }
+            // The SID lies in the same buffer, after the structure.
+            let start = buffer.as_ptr() as usize;
+            let sids = start + size_of::<TOKEN_USER>()..start + size_of_val(buffer.as_slice());
+            let user = Self(buffer);
+            sids.contains(&(user.sid() as usize)).then_some(user)
+        }
+
+        fn sid(&self) -> PSID {
+            // SAFETY: the buffer is alive, aligned for a TOKEN_USER and
+            // large enough for one (zeroed, or as the system wrote it).
+            unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        }
+
+        fn is(&self, other: &Self) -> bool {
+            // SAFETY: each points to a valid SID that the system wrote
+            // into a buffer that is alive and unchanged since.
+            unsafe { EqualSid(self.sid(), other.sid()) != 0 }
+        }
+    }
+
+    /// Whose the process is that the table names, by the id `pid`, for a
+    /// socket bound at `bound`.
+    fn listener(pid: u32, bound: i64, me: &ProcessUser) -> Listener {
+        // The idle process and the system's own (the kernel listens for
+        // anyone's HTTP.sys address) cannot be asked.
+        if pid == 0 || pid == 4 {
+            return Listener::Unknown;
+        }
+        // SAFETY: no pointers are passed; a process that is gone or out of
+        // reach gives a null handle.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Listener::Unknown;
+        }
+        // The id stays this process's for as long as the handle is open.
+        let process = Handle(process);
+        // Made after the socket was bound: the process that bound it is
+        // gone and this one was given its id. Who holds the socket now is
+        // not known.
+        if !made_at(process.0).is_some_and(|made| bound_by(made, bound)) {
+            return Listener::Unknown;
+        }
+        match ProcessUser::of(process.0) {
+            Some(user) if user.is(me) => Listener::Own,
+            Some(_) => Listener::Other,
+            None => Listener::Unknown,
+        }
+    }
+
+    /// When this process was made.
+    fn this_process_made_at() -> Option<u64> {
+        // SAFETY: no preconditions; the pseudo handle is never closed.
+        made_at(unsafe { GetCurrentProcess() })
+    }
+
+    /// [`super::port_owner`] on Windows.
+    pub(super) fn owner(port: u16) -> Option<u32> {
+        let Some(sockets) = listening_on(port) else {
+            return Some(u32::MAX);
+        };
+        // Nobody listens: nothing of another user's is there.
+        if sockets.is_empty() {
+            return None;
+        }
+        // SAFETY: no preconditions.
+        let own_pid = unsafe { GetCurrentProcessId() };
+        // The user to compare the other processes with.
+        let me = if sockets.iter().all(|(pid, _)| *pid == own_pid) {
+            None
+        } else {
+            // SAFETY: no preconditions; the pseudo handle is never closed.
+            match ProcessUser::of(unsafe { GetCurrentProcess() }) {
+                Some(me) => Some(me),
+                None => return Some(u32::MAX),
+            }
+        };
+        let listeners: Vec<Listener> = sockets
+            .iter()
+            .map(|&(pid, bound)| {
+                if pid != own_pid {
+                    return me
+                        .as_ref()
+                        .map_or(Listener::Unknown, |me| listener(pid, bound, me));
+                }
+                // This process, unless its id was another's when the
+                // socket was bound.
+                match this_process_made_at() {
+                    Some(made) if bound_by(made, bound) => Listener::Own,
+                    _ => Listener::Unknown,
+                }
+            })
+            .collect();
+        listeners_owner(&listeners)
+    }
+
+    /// Tests: whether anything listens on `port`.
+    #[cfg(test)]
+    pub(super) fn has_listener(port: u16) -> bool {
+        listening_on(port).is_some_and(|sockets| !sockets.is_empty())
+    }
+
+    /// Tests: when this process was made, and when each socket listening
+    /// on `port` was bound, as the system tells them.
+    #[cfg(test)]
+    pub(super) fn times(port: u16) -> (Option<u64>, Vec<i64>) {
+        let bound = listening_on(port)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, bound)| bound)
+            .collect();
+        (this_process_made_at(), bound)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Tests: who listens on every port, in place of asking the system.
@@ -1432,7 +1819,8 @@ impl Drop for FakePortOwner {
 /// Another login user who listens on the port of a loopback server, or
 /// `u32::MAX` when that cannot be verified. `None` means this user's own.
 /// On a shared machine anyone can answer on an unused loopback port, and
-/// the local tier sends evidence unmasked.
+/// the local tier sends evidence unmasked. Windows has no number for a
+/// user: say it with [`not_own_server`].
 pub(crate) fn another_users_server(url: &str) -> Option<u32> {
     #[cfg(test)]
     if let Some(owner) = PORT_OWNER.with(std::cell::Cell::get) {
@@ -1524,8 +1912,19 @@ fn port_owner(port: u16) -> Option<u32> {
     lsof_owner(&lsof_listener_uids(&out), me)
 }
 
+/// Windows: the system lists every listening socket with the id of the
+/// process that bound it and when it did, and a process tells its user to
+/// that same user (and to an administrator). The id is not the process:
+/// it outlives one whose socket another process holds, and is then given
+/// to a new one. A process made after the socket was bound, and one that
+/// does not tell its user, is never taken as this user's.
+#[cfg(windows)]
+fn port_owner(port: u16) -> Option<u32> {
+    windows_ports::owner(port)
+}
+
 /// Elsewhere there is no way here to tell who listens on a port.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn port_owner(_port: u16) -> Option<u32> {
     Some(u32::MAX)
 }
@@ -1538,6 +1937,8 @@ pub(crate) fn not_own_server(url: &str) -> Option<String> {
     }
     another_users_server(url).map(|uid| match uid {
         u32::MAX => "cannot verify that the server on that port is yours".to_owned(),
+        // Windows names its users by no number.
+        _ if cfg!(windows) => "the server belongs to another user".to_owned(),
         uid => format!("the server belongs to another user, uid {uid}"),
     })
 }
@@ -4569,7 +4970,8 @@ mod tests {
 
     /// The key and unmasked evidence go only to the user's own server on
     /// this machine: not to a port another user owns, nor to one whose
-    /// owner cannot be verified (macOS, Windows, `lsof` failing).
+    /// owner cannot be verified (`lsof` failing on macOS, a process that
+    /// does not tell its user on Windows).
     #[tokio::test]
     async fn a_port_of_another_user_gets_no_key_and_no_evidence() {
         if !no_env_key() {
@@ -4634,12 +5036,168 @@ mod tests {
     }
 
     /// Where no way to see a port's owner is built in, none is assumed.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     #[test]
     fn elsewhere_a_loopback_port_owner_cannot_be_verified() {
         assert_eq!(port_owner(1234), Some(u32::MAX));
         assert!(not_own_server("http://127.0.0.1:1234/v1").is_some());
         assert!(check_server("http://127.0.0.1:1234/v1", Carries::Key).is_err());
+    }
+
+    /// Windows: the server is the user's own only when every listener on
+    /// its port is, and another user is named by no number.
+    #[test]
+    fn on_windows_every_listener_on_the_port_must_be_the_users_own() {
+        use Listener::{Other, Own, Unknown};
+        assert_eq!(listeners_owner(&[]), None);
+        assert_eq!(listeners_owner(&[Own]), None);
+        assert_eq!(listeners_owner(&[Own, Own]), None);
+        assert_eq!(listeners_owner(&[Unknown]), Some(u32::MAX));
+        assert_eq!(listeners_owner(&[Own, Unknown]), Some(u32::MAX));
+        assert_eq!(listeners_owner(&[Own, Other]), Some(ANOTHER_USER));
+        assert_eq!(listeners_owner(&[Unknown, Other]), Some(ANOTHER_USER));
+        // The system's table holds a port in network byte order, in the
+        // low half of the field.
+        assert_eq!(table_port(u32::from(8080u16.to_be())), 8080);
+        assert_eq!(table_port(u32::from(1u16.to_be())), 1);
+        assert_eq!(table_port(0xdead_0000 | u32::from(443u16.to_be())), 443);
+        let _owner = FakePortOwner::set(Some(ANOTHER_USER));
+        let why = not_own_server("http://127.0.0.1:1234/v1").unwrap();
+        if cfg!(windows) {
+            assert_eq!(why, "the server belongs to another user");
+        } else {
+            assert!(why.starts_with("the server belongs to another user, uid "));
+        }
+    }
+
+    /// Windows: the id the system names for a socket can be a new
+    /// process's by now. Only a process made before the socket was bound
+    /// is the one that bound it, as far as the steps of the clock tell,
+    /// and a time the system did not tell proves nothing.
+    #[test]
+    fn on_windows_a_process_made_after_the_socket_was_bound_did_not_bind_it() {
+        // A day in 2026 in the system's time: 100 ns steps since 1601.
+        let bound: i64 = 134_200_000_000_000_000;
+        let at = |offset: i64| u64::try_from(bound + offset).unwrap();
+        let tick = i64::try_from(CLOCK_TICK).unwrap();
+        assert_eq!(tick, 15_625 * 10);
+        assert!(bound_by(at(-600_000_000), bound));
+        assert!(bound_by(at(-1), bound));
+        assert!(bound_by(at(0), bound));
+        // The socket's time is the clock at its last tick, the process's
+        // the clock at that moment: less than a tick apart.
+        assert!(bound_by(at(tick - 1), bound));
+        assert!(!bound_by(at(tick), bound));
+        assert!(!bound_by(at(600_000_000), bound));
+        assert!(!bound_by(u64::MAX, bound));
+        // Not told: of the process, of the socket, of both.
+        assert!(!bound_by(0, bound));
+        assert!(!bound_by(at(-1), 0));
+        assert!(!bound_by(0, 0));
+        assert!(!bound_by(1, -1));
+        assert!(!bound_by(1, i64::MIN));
+        assert!(bound_by(1, i64::MAX));
+    }
+
+    /// Windows: a server in this process is the user's own, at either
+    /// loopback address, and a port nobody listens on is nobody else's.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_server_in_this_process_is_the_users_own() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(windows_ports::has_listener(port), "found in the table");
+        // The system says when the socket was bound, and that is not
+        // before this process was made, as far as its clock tells.
+        let (made, bound) = windows_ports::times(port);
+        let made = made.expect("when this process was made");
+        assert_ne!(made, 0);
+        assert!(!bound.is_empty());
+        for bound in bound {
+            assert!(bound > 0, "no time for the socket: {bound}");
+            assert!(
+                bound_by(made, bound),
+                "socket bound at {bound}, this process made at {made}"
+            );
+        }
+        assert_eq!(port_owner(port), None);
+        let base = format!("http://127.0.0.1:{port}/v1");
+        assert_eq!(not_own_server(&base), None);
+        check_server(&base, Carries::Key).unwrap();
+        check_server(&base, Carries::Evidence).unwrap();
+        drop(listener);
+        assert_eq!(port_owner(port), None, "nobody listens there now");
+        // The same over IPv6, where the machine has it.
+        if let Ok(listener) = std::net::TcpListener::bind("[::1]:0") {
+            let port = listener.local_addr().unwrap().port();
+            assert!(windows_ports::has_listener(port), "found in the table");
+            assert_eq!(port_owner(port), None);
+            assert_eq!(not_own_server(&format!("http://[::1]:{port}/v1")), None);
+        }
+    }
+
+    #[cfg(windows)]
+    const CHILD_LISTENS_ENV: &str = "MEOW_TEST_LISTEN";
+    #[cfg(windows)]
+    const CHILD_LISTENS_TEST: &str = "ai::tests::child_process_listens_on_a_loopback_port";
+
+    /// Not a test of its own: the test below re-runs this test binary with
+    /// `CHILD_LISTENS_ENV` set so that another process of this user
+    /// listens. Without the variable it does nothing.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper process for on_windows_a_server_in_another_process_of_this_user_is_the_users_own"]
+    fn child_process_listens_on_a_loopback_port() {
+        if std::env::var_os(CHILD_LISTENS_ENV).is_none() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        println!("listening {}", listener.local_addr().unwrap().port());
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Windows: the user's own server is usually another process (LM
+    /// Studio, Ollama): the user it runs as is read from its token.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_server_in_another_process_of_this_user_is_the_users_own() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", CHILD_LISTENS_TEST, "--nocapture"])
+            .env(CHILD_LISTENS_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let port = stdout.lines().map_while(Result::ok).find_map(|line| {
+            let (_, port) = line.rsplit_once("listening ")?;
+            port.trim().parse::<u16>().ok()
+        });
+        let listed = port.is_some_and(windows_ports::has_listener);
+        let owner = port.map(port_owner);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(listed, "the child never listened: {port:?}");
+        assert_eq!(owner, Some(None), "the child runs as this user");
+    }
+
+    /// Windows: what the system itself listens on (the RPC endpoint mapper
+    /// on port 135, a service's process) is never taken as the user's own.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_listener_of_the_system_is_not_the_users_own() {
+        if !windows_ports::has_listener(135) {
+            return;
+        }
+        assert!(port_owner(135).is_some());
+        let base = "http://127.0.0.1:135/v1";
+        assert!(not_own_server(base).is_some());
+        for carries in [Carries::Key, Carries::Evidence] {
+            let error = format!("{:#}", check_server(base, carries).unwrap_err());
+            assert!(error.starts_with("refusing to send"), "{error}");
+        }
     }
 
     /// A stand-in for the Claude API whose research turns all pause, as

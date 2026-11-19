@@ -1531,8 +1531,11 @@ fn is_stale(entry: &Entry) -> bool {
     }
 }
 
-/// How long a change of the record waits for another meow changing it.
-const RECORD_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a change of the record waits for other meows changing it, at
+/// the worst: each holds it for one short update, but on Windows an update
+/// runs a PowerShell to set the access list of `~/.meow`, about a second
+/// each when a script starts many sessions at once.
+const RECORD_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// Holds the record for one read-change-write, so two meow processes
 /// changing it at once (two terminals, a script) never drop each other's
@@ -2641,14 +2644,25 @@ const SEEN_MAX: u64 = 4 * 1024 * 1024;
 /// Which file it is (its number on the device, and when it was made, 0
 /// where the file system does not say: a number can be given to a new
 /// file as soon as the old one is gone), its size, and when it was last
-/// written.
+/// written. On Windows the number is the volume's serial number and the
+/// file's index on it. NTFS gives an index to no later file; FAT and
+/// exFAT make it from where the file's entry lies in its folder, which a
+/// file made in that place gets again, and a network share passes on
+/// whatever its server numbers files by. It is 0 where the file system
+/// has no such number or does not tell it, and [`NO_NUMBER`] for a file
+/// that could not be asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
-    ino: u64,
+    ino: u128,
     born: i128,
     size: u64,
     written: i128,
 }
+
+/// Windows: the number of a file that is seen in its folder but cannot be
+/// opened to ask for its number. It is no file's (a real one is a 32-bit
+/// serial number and a 64-bit index) and fits the record of a session.
+const NO_NUMBER: u128 = 1 << 100;
 
 impl FileId {
     /// Whether `now` is this file as meow left it: the same size and last
@@ -2667,7 +2681,27 @@ impl FileId {
     /// not: made at the same time where the file system tells, else with
     /// the same number. Only used within one session.
     fn same_file(&self, now: &FileId) -> bool {
-        if self.born != 0 && now.born != 0 {
+        self.same_file_where(now, cfg!(windows))
+    }
+
+    /// [`FileId::same_file`]. `by_number` is how Windows tells: a file made
+    /// under the name of one deleted or renamed away seconds before is
+    /// given the time that one was made at (file system tunneling), so a
+    /// file put in place of another looks as old as it. On NTFS its number
+    /// is its own, so there a file must have the same number wherever it
+    /// has one. The number alone does not make it the same file: other
+    /// file systems give a number again (FAT, exFAT, a share of a Unix
+    /// server), so a file with the same number that was made at another
+    /// time is another file. A file with a number at one end of the
+    /// session only, or one that could not be asked for its number, is
+    /// never taken as the same. Where no number is told at all, the rule
+    /// above is all there is.
+    fn same_file_where(&self, now: &FileId, by_number: bool) -> bool {
+        if by_number && (self.ino != 0 || now.ino != 0) {
+            self.ino == now.ino
+                && self.ino != NO_NUMBER
+                && (self.born == 0 || now.born == 0 || self.born == now.born)
+        } else if self.born != 0 && now.born != 0 {
             self.born == now.born
         } else {
             self.ino == now.ino
@@ -2683,25 +2717,80 @@ fn nanos(at: io::Result<SystemTime>) -> i128 {
         .unwrap_or(0)
 }
 
+/// The [`FileId`] of the file at `path`, which `meta` was just read of.
+/// Fails where the file cannot be told any more: with `NotFound` when it
+/// is gone, with another error when something else stands in its place.
 #[cfg(unix)]
-fn file_id(meta: &fs::Metadata) -> FileId {
+fn file_id(_path: &Path, meta: &fs::Metadata) -> io::Result<FileId> {
     use std::os::unix::fs::MetadataExt;
-    FileId {
-        ino: meta.ino(),
+    Ok(FileId {
+        ino: u128::from(meta.ino()),
         born: nanos(meta.created()),
         size: meta.len(),
         written: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-    }
+    })
 }
 
-#[cfg(not(unix))]
-fn file_id(meta: &fs::Metadata) -> FileId {
-    FileId {
+/// Windows tells a file's number through an open handle only. The file is
+/// opened for no access to what it holds, so nobody's use of it is in the
+/// way, and as itself, never as what a link put in its place points to;
+/// the handle is closed again at once. A file that is seen in its folder
+/// but cannot be opened (one being deleted) gets [`NO_NUMBER`]; one whose
+/// file system tells no number, or none but 0, gets 0.
+#[cfg(windows)]
+fn file_id(path: &Path, meta: &fs::Metadata) -> io::Result<FileId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let unnumbered = |meta: &fs::Metadata| FileId {
         ino: 0,
         born: nanos(meta.created()),
         size: meta.len(),
         written: nanos(meta.modified()),
+    };
+    let opened = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {
+            return Ok(FileId {
+                ino: NO_NUMBER,
+                ..unnumbered(meta)
+            })
+        }
+    };
+    // Size and times from the same open file as the number.
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("is not a regular file"));
     }
+    let mut id = unnumbered(&meta);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open until `file` is dropped, and `info` is a
+    // valid place for what the call writes.
+    let read = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0;
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    if read && index != 0 {
+        id.ino = (u128::from(info.dwVolumeSerialNumber) << 64) | u128::from(index);
+    }
+    Ok(id)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_path: &Path, meta: &fs::Metadata) -> io::Result<FileId> {
+    Ok(FileId {
+        ino: 0,
+        born: nanos(meta.created()),
+        size: meta.len(),
+        written: nanos(meta.modified()),
+    })
 }
 
 /// The read-back files of a session as they are. `odd` is set by anything
@@ -2745,9 +2834,14 @@ impl Snapshot {
             // A read-only open of the database leaves an empty write-ahead
             // log behind (`meow list`); an empty one holds nothing.
             Ok(meta) if meta.is_file() && meta.len() == 0 && name == "state.db-wal" => {}
-            Ok(meta) if meta.is_file() => {
-                self.files.insert(name.to_owned(), file_id(&meta));
-            }
+            Ok(meta) if meta.is_file() => match file_id(path, &meta) {
+                Ok(id) => {
+                    self.files.insert(name.to_owned(), id);
+                }
+                // Gone since it was looked at.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => self.odd = true,
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             _ => self.odd = true,
         }
@@ -2808,7 +2902,7 @@ impl Snapshot {
             let mut number = || parts.next().and_then(|part| part.parse::<i128>().ok());
             let (ino, born, size, written) = (number()?, number()?, number()?, number()?);
             let id = FileId {
-                ino: u64::try_from(ino).ok()?,
+                ino: u128::try_from(ino).ok()?,
                 born,
                 size: u64::try_from(size).ok()?,
                 written,
@@ -6149,7 +6243,9 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             let files = SessionFiles::for_session(&fx.home, &ws, false);
             // Later than the file it replaces was made, as a pull is.
             std::thread::sleep(Duration::from_millis(30));
-            let path = ws.dir.join(name);
+            let path = name
+                .split('/')
+                .fold(ws.dir.clone(), |path, part| path.join(part));
             fs::remove_file(&path).unwrap();
             fs::write(&path, "planted").unwrap();
             drop(files);
@@ -6203,11 +6299,102 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             written: 2,
         };
         let moved = FileId { ino: 6, ..id };
-        assert!(id.same_file(&moved));
-        assert!(!id.same_file(&FileId { born: 10, ..id }));
+        assert!(id.same_file_where(&moved, false));
+        assert!(!id.same_file_where(&FileId { born: 10, ..id }, false));
         let unknown = FileId { born: 0, ..id };
-        assert!(unknown.same_file(&id));
-        assert!(!unknown.same_file(&FileId { born: 0, ..moved }));
+        assert!(unknown.same_file_where(&id, false));
+        assert!(!unknown.same_file_where(&FileId { born: 0, ..moved }, false));
+        // Windows gives a file put under the name of one just deleted the
+        // time that one was made at: there the number tells, written since
+        // or not, and a file with no number to compare is another file.
+        let written = FileId {
+            size: 7,
+            written: 3,
+            ..id
+        };
+        assert!(id.same_file_where(&written, true));
+        assert!(!id.same_file_where(&moved, true));
+        // A number alone is not the file: FAT, exFAT and a share of a
+        // Unix server give one again. Made at another time, another file.
+        assert!(!id.same_file_where(&FileId { born: 10, ..id }, true));
+        assert!(id.same_file_where(&FileId { born: 0, ..id }, true));
+        let unnumbered = FileId { ino: 0, ..id };
+        assert!(!id.same_file_where(&unnumbered, true));
+        assert!(!unnumbered.same_file_where(&id, true));
+        let unasked = FileId {
+            ino: NO_NUMBER,
+            ..id
+        };
+        assert!(!unasked.same_file_where(&unasked, true));
+        assert!(!unasked.same_file_where(&unnumbered, true));
+        assert!(!unnumbered.same_file_where(&unasked, true));
+        // A file system that tells no numbers: as elsewhere.
+        assert!(unnumbered.same_file_where(&unnumbered, true));
+        assert!(!unnumbered.same_file_where(
+            &FileId {
+                born: 10,
+                ..unnumbered
+            },
+            true
+        ));
+        assert_eq!(id.same_file(&moved), !cfg!(windows));
+        // The record keeps a number of either kind.
+        let mut record = Snapshot::default();
+        for (name, ino) in [
+            ("a", NO_NUMBER),
+            ("b", (0xffff_ffff << 64) | u128::from(u64::MAX)),
+        ] {
+            record.files.insert(name.to_owned(), FileId { ino, ..id });
+        }
+        assert_eq!(Snapshot::from_text(&record.to_text()), Some(record));
+    }
+
+    /// Windows: a file is told by its number, which a file put in its
+    /// place under the same name does not get, whatever time the file
+    /// system says it was made at; a file in use is still asked, and what
+    /// cannot be opened is no file meow knows.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_file_is_told_by_its_number() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let id = |path: &Path| file_id(path, &fs::symlink_metadata(path).unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        let first = id(&path);
+        assert_ne!(first.ino, NO_NUMBER);
+        if first.ino == 0 {
+            // A temporary folder on a file system without file numbers.
+            return;
+        }
+        assert_eq!(id(&path), first);
+        // Written in place, by a program that shares it with nobody.
+        let mut held = OpenOptions::new()
+            .append(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        held.write_all(b"more").unwrap();
+        let written = id(&path);
+        assert_eq!((written.ino, written.size), (first.ino, 5));
+        assert!(first.same_file(&written));
+        drop(held);
+        // Put in its place, as a pull does.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "x").unwrap();
+        let replaced = id(&path);
+        assert_ne!(replaced.ino, first.ino);
+        assert!(!first.same_file(&replaced));
+        // Gone, and a folder in its place, since it was looked at.
+        let meta = fs::symlink_metadata(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let gone = file_id(&path, &meta).unwrap_err();
+        assert_eq!(gone.kind(), io::ErrorKind::NotFound);
+        fs::create_dir(&path).unwrap();
+        let unasked = file_id(&path, &meta).unwrap();
+        assert_eq!(unasked.ino, NO_NUMBER);
+        assert!(!replaced.same_file(&unasked));
+        assert!(!unasked.same_file(&unasked));
     }
 
     /// An open that warned about files changed outside meow, or accepted a
@@ -6302,7 +6489,13 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         if !with_git {
             fs::create_dir(repo.join(".git")).unwrap();
         }
-        let deeper = repo.join("a [b]*").join("c");
+        // Characters a pattern must escape. Windows allows no `*` in a name.
+        let (odd, listed) = if cfg!(windows) {
+            ("a [b]!", "/a \\[b\\]!/c/meow/")
+        } else {
+            ("a [b]*", "/a \\[b\\]\\*/c/meow/")
+        };
+        let deeper = repo.join(odd).join("c");
         fs::create_dir_all(&deeper).unwrap();
         let acme = open_in(&fx, &repo, "acme");
         open_in(&fx, &deeper, "beta");
@@ -6313,7 +6506,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             .lines()
             .filter(|line| !line.starts_with('#') && !line.is_empty())
             .collect();
-        assert_eq!(lines, ["/meow/", "/a \\[b\\]\\*/c/meow/"], "{exclude}");
+        assert_eq!(lines, ["/meow/", listed], "{exclude}");
         fs::write(acme.dir.join("chats").join("192.0.2.5.md"), "x").unwrap();
         if with_git {
             // A pull that replaced meow's .gitignore with one letting
@@ -6400,7 +6593,10 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
     fn sessions_recorded_at_the_same_time_are_all_kept() {
         let fx = fixture();
         create_private_dir(fx.home.root()).unwrap();
-        let made: Vec<String> = (0..24).map(|i| format!("{i:032x}")).collect();
+        // Fewer on Windows, where each update of the record takes about a
+        // second (a PowerShell sets the access list of `~/.meow`).
+        let (first, second) = if cfg!(windows) { (8, 4) } else { (24, 12) };
+        let made: Vec<String> = (0..first).map(|i| format!("{i:032x}")).collect();
         std::thread::scope(|scope| {
             for (i, mark) in made.iter().enumerate() {
                 let home = &fx.home;
@@ -6413,7 +6609,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert_eq!(kept, made);
         // And a delete running alongside new ones takes only its own.
         let gone = fx.cwd.join("p3").join("meow").join("s");
-        let more: Vec<String> = (100..112).map(|i| format!("{i:032x}")).collect();
+        let more: Vec<String> = (100..100 + second).map(|i| format!("{i:032x}")).collect();
         std::thread::scope(|scope| {
             scope.spawn(|| forget(&fx.home, &gone, Some(&made[3])).unwrap());
             for (i, mark) in more.iter().enumerate() {

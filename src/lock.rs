@@ -56,6 +56,11 @@ impl Drop for UpdateLock {
 impl UpdateLock {
     /// Takes the lock on `path`, created private if missing, waiting at
     /// most `wait` for whoever holds it ([`LockError::Held`] after that).
+    /// The system keeps no queue for a lock that is only tried (`flock`
+    /// with `LOCK_NB`, `LockFileEx` failing at once): everyone waiting asks
+    /// again every 2 ms, and the first to ask after it is freed has it.
+    /// `wait` is time on the clock, so it must cover the updates of all
+    /// who may wait at once.
     pub fn acquire(path: &Path, wait: std::time::Duration) -> Result<Self, LockError> {
         let mut lock = RwLock::new(open_lock_file(path)?);
         let deadline = std::time::Instant::now() + wait;
@@ -374,6 +379,28 @@ mod tests {
             assert!(UpdateLock::acquire(&path, Duration::from_millis(10)).is_err());
             assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
         }
+    }
+
+    /// Many waiting at once (a script that starts sessions together) each
+    /// get the lock, one at a time, within their wait.
+    #[test]
+    fn every_waiter_gets_the_update_lock_in_turn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (_dir, path) = lock_file();
+        let (inside, turns) = (AtomicBool::new(false), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let lock = UpdateLock::acquire(&path, Duration::from_secs(30)).unwrap();
+                    assert!(!inside.swap(true, Ordering::SeqCst), "two hold it at once");
+                    std::thread::sleep(Duration::from_millis(10));
+                    inside.store(false, Ordering::SeqCst);
+                    turns.fetch_add(1, Ordering::SeqCst);
+                    drop(lock);
+                });
+            }
+        });
+        assert_eq!(turns.load(Ordering::SeqCst), 8);
     }
 
     #[test]

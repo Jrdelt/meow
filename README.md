@@ -380,7 +380,7 @@ meow setup --check
 
 - For **OpenRouter** (`sk-or-...`) or **Claude API** (`sk-ant-...`), run `meow setup` to re-enter your key or switch providers.
 - For **Ollama** (`http://127.0.0.1:11434`) or **LM Studio** (`http://127.0.0.1:1234`), verify the local server is running and has at least one model pulled (`ollama list`).
-- A server on this machine gets unmasked text and API keys only when meow can see it is yours. Another user's server, or one meow cannot check (Windows, or `lsof` failing on macOS), gets masked text and no key.
+- A server on this machine gets unmasked text and API keys only when meow can see it is yours. Another user's server, or one meow cannot check (on Windows a system or service process, which does not tell whose it is, or a port opened by a process that has since exited; `lsof` failing on macOS), gets masked text and no key.
 
 ### Removing `meow`
 

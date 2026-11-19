@@ -1228,10 +1228,8 @@ impl CveClient {
                 }
                 if let Some(api_key) = self.settings.api_key() {
                     if crate::ai::is_loopback_url(&self.settings.nvd_url) {
-                        if let Some(uid) = crate::ai::another_users_server(&self.settings.nvd_url) {
-                            bail!(
-                                "refusing to send NVD API key to loopback listener owned by another user (uid {uid})"
-                            );
+                        if let Some(why) = crate::ai::not_own_server(&self.settings.nvd_url) {
+                            bail!("refusing to send the NVD API key to a loopback address: {why}");
                         }
                     }
                     let mut val = reqwest::header::HeaderValue::from_str(api_key)
