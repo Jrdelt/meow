@@ -696,6 +696,8 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
                     snapshot.budget.calls,
                     snapshot.budget.max_calls
                 )
+            } else if snapshot.budget.setup_unreadable {
+                " | cloud off: ai.toml cannot be read (run `meow setup`)".to_owned()
             } else {
                 " | cloud: no API key (run `meow setup`)".to_owned()
             },

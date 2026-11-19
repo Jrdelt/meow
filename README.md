@@ -8,7 +8,7 @@
 
 `meow` wraps your normal interactive shell (`zsh`, `bash`, `fish`, or `pwsh`), passively observes authorized reconnaissance and command output, grounds discovered services against public vulnerability feeds, maps your OPSEC transit path and target topology on a live local canvas, and compiles a Markdown or printable PDF audit report.
 
-Everything stays on your machine in a private session folder (`./meow/<name>/` in the folder you run `meow` from, unless you pick another). When you ask a cloud AI model for triage notes, `meow` masks IP addresses, hostnames, domains, emails, MAC addresses, and credentials into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine, and restores the real values locally when the reply returns.
+Everything stays on your machine in a private session folder (`./meow/<name>/` in the folder you run `meow` from, unless you pick another). When you ask a cloud AI model for triage notes, `meow` masks IP addresses, hostnames, domains, emails, MAC addresses, and credentials into placeholders (`<<HOST_01>>`, `<<DOM_01>>`, `<<SEC_01>>`) before any text leaves your machine. In the reply, only the host's own address and names are put back.
 
 > **Authorized use only.** Use `meow` only on systems and networks you own or have explicit written permission to test. `meow` inventories services, configurations, and public advisories to help operators patch and verify systems; it never generates exploits or attacks.
 
@@ -246,7 +246,7 @@ Good to know:
 - **Host tabs** — Overview, Ports, Web & TLS, DNS & Mail, CVEs, and Notes & AI. Use ←/→ or `1`–`6`. Hover a row for details.
 - **Check now** — one connection to each of a host's known open ports, to see if it is up (mild and aggressive mode).
 - **CVEs** — found by software version and listed per software, known exploited first, with the release that fixes them.
-- **AI triage** — `[L]` local, `[C]` cloud, `[R]` research. Answers come as a **Red Team** plan (authorized testing, no exploit code) and a **Blue Team** plan (defense). Private addresses, names and secrets are masked before anything leaves your machine.
+- **AI triage** — `[L]` local, `[C]` cloud, `[R]` research. Answers come as a **Red Team** plan (authorized testing, no exploit code) and a **Blue Team** plan (defense). Private addresses, names and secrets are masked before anything leaves your machine. Answers get back only the host's own address and names, and not on a line that names another host; anything else stays a placeholder (the report lists secrets to rotate).
 - **Export** — **Export report (.md)** or **Print / PDF**, for the whole workspace or one host.
 
 ---
@@ -277,7 +277,7 @@ meow setup --forget-key
 
 All user configuration lives in `~/.meow/` (or `$MEOW_HOME` if set) with owner-only (`0600`) permissions:
 
-- **`~/.meow/ai.toml`** — AI provider, model names, local server URL, `disable_cloud` lock, and API key (managed by `meow setup`).
+- **`~/.meow/ai.toml`** — AI provider, model names, local server URL, `disable_cloud` lock, and API key (managed by `meow setup`). If the file cannot be read, cloud AI stays off until it is fixed. A key goes only to the service it was set for, also one in `config.toml`.
 - **`~/.meow/config.toml`** — Default mode, scanner paths, wordlist path, NVD API key, and offline location database settings. Created automatically on first run with commented defaults:
 
 ```toml
@@ -375,6 +375,7 @@ meow setup --check
 
 - For **OpenRouter** (`sk-or-...`) or **Claude API** (`sk-ant-...`), run `meow setup` to re-enter your key or switch providers.
 - For **Ollama** (`http://127.0.0.1:11434`) or **LM Studio** (`http://127.0.0.1:1234`), verify the local server is running and has at least one model pulled (`ollama list`).
+- A server on this machine gets unmasked text and API keys only when meow can see it is yours. Another user's server, or one meow cannot check (Windows, or `lsof` failing on macOS), gets masked text and no key.
 
 ### Removing `meow`
 

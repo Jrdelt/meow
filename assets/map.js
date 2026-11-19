@@ -1836,6 +1836,9 @@
     if (budget.has_key) {
       ai.appendChild(row('Cloud today', '$' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
         (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
+    } else if (budget.setup_unreadable) {
+      ai.appendChild(hint(el('p', 'note', 'Cloud off: ~/.meow/ai.toml cannot be read.'),
+        'Fix the file or run `meow setup`. Until then [C] answers with the local model and [R] is unavailable.'));
     } else {
       ai.appendChild(hint(el('p', 'note', 'No cloud key: run `meow setup`.'),
         '[C] answers with the local model and [R] is unavailable until a key is added. ' +

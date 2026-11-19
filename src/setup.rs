@@ -234,11 +234,13 @@ fn validate_bearer_key(key: &str) -> Result<()> {
 /// The models an OpenAI-compatible server offers (`GET <url>/models`).
 /// `Err` says why it could not be asked.
 pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
-    if key.is_some() {
-        crate::ai::validate_cloud_url(url)?;
+    use crate::ai::Carries;
+    let carries = if key.is_some() {
+        Carries::Key
     } else {
-        crate::ai::validate_local_url(url)?;
-    }
+        Carries::Nothing
+    };
+    crate::ai::check_server(url, carries)?;
     let mut request = http(url)?.get(format!("{}/models", url.trim_end_matches('/')));
     if let Some(key) = key {
         validate_bearer_key(key)?;
@@ -278,6 +280,7 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
 pub async fn check_key(url: &str, key: &str) -> Result<()> {
     validate_bearer_key(key)?;
     let base = crate::ai::validate_cloud_url(url)?;
+    crate::ai::check_server(&base, crate::ai::Carries::Key)?;
     let response = http(&base)?
         .get(format!("{base}/key"))
         .bearer_auth(key)

@@ -294,11 +294,15 @@ fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
 /// Writes a chat file into the report: its own headings one level down, and
 /// nothing in it live (see [`inert_markdown`]). A code block the text left
 /// open is closed, so that it cannot take the rest of the report with it.
+/// A code block starts at the left edge of its quote, never inside a list
+/// item: a line indented less than the item would end the item and the
+/// block with it, unseen here.
 fn render_chat_markdown(out: &mut String, text: &str) {
-    let mut open_fence: Option<(u8, usize, usize)> = None;
+    // The open fence: its character, length, quote depth and indent.
+    let mut open_fence: Option<(u8, usize, usize, usize)> = None;
     for line in inert_markdown(text).lines() {
         let (qdepth, qprefix, rest) = split_blockquote_prefix(line);
-        if let Some((open, length, fence_qdepth)) = open_fence {
+        if let Some((open, length, fence_qdepth, indent)) = open_fence {
             if qdepth < fence_qdepth {
                 // Leaving the blockquote closes the fenced block in CommonMark;
                 // emit an explicit closing fence so dialects stay aligned.
@@ -309,37 +313,48 @@ fn render_chat_markdown(out: &mut String, text: &str) {
                 out.push('\n');
                 open_fence = None;
             } else {
-                if qdepth == fence_qdepth && is_fence_closing(rest, open, length) {
-                    open_fence = None;
+                if qdepth == fence_qdepth {
+                    // Moved left as far as its fence was.
+                    let spaces = rest.bytes().take(indent).take_while(|&b| b == b' ').count();
+                    let content = &rest[spaces..];
+                    if is_fence_closing(content, open, length) {
+                        open_fence = None;
+                    }
+                    out.push_str(qprefix);
+                    out.push_str(content);
+                } else {
+                    out.push_str(line);
                 }
-                out.push_str(line);
                 out.push('\n');
                 continue;
             }
         }
         if let Some((marker, len, normalized_fence)) = fence_opening(rest) {
-            open_fence = Some((marker, len, qdepth));
-            out.push_str(qprefix);
-            out.push_str(&normalized_fence);
+            let indent = rest.len() - rest.trim_start_matches(' ').len();
+            open_fence = Some((marker, len, qdepth, indent));
+            for _ in 0..qdepth {
+                out.push_str("> ");
+            }
+            out.push_str(normalized_fence.trim_start_matches(' '));
             out.push('\n');
             continue;
         }
         let sanitized = neutralize_unmatched_inline_backticks(line);
-        let (_, san_qprefix, san_rest) = split_blockquote_prefix(&sanitized);
-        let indent = san_rest.bytes().take(4).take_while(|&b| b == b' ').count();
+        let text_at = crate::evidence::nested_text_start(&sanitized);
         // Nest the file's own headings below this section, also one that
-        // is moved in by up to three spaces (or inside a blockquote).
-        if indent <= 3 && san_rest.as_bytes().get(indent) == Some(&b'#') {
-            out.push_str(san_qprefix);
-            out.push_str(&san_rest[..indent]);
+        // is moved in, or sits in a quote or a list item (`- # Hosts`,
+        // `> 1. ## Fix`, a nested item's next line). A `#` line of code
+        // indented without a fence gets the same marks.
+        if sanitized.as_bytes().get(text_at) == Some(&b'#') {
+            out.push_str(&sanitized[..text_at]);
             out.push_str("###");
-            out.push_str(&san_rest[indent..]);
+            out.push_str(&sanitized[text_at..]);
         } else {
             out.push_str(&sanitized);
         }
         out.push('\n');
     }
-    if let Some((marker, length, fence_qdepth)) = open_fence {
+    if let Some((marker, length, fence_qdepth, _)) = open_fence {
         for _ in 0..fence_qdepth {
             out.push_str("> ");
         }
@@ -2130,6 +2145,64 @@ mod tests {
         // Writing it twice changes nothing.
         let once = inert_markdown(&custom.chats[0].1);
         assert_eq!(inert_markdown(&once), once);
+    }
+
+    /// What the 2026-11 audit still saw rendered as top-level sections of
+    /// the report: headings after a list marker, and a quoted heading
+    /// underlined with `=`.
+    #[test]
+    fn headings_in_quotes_and_lists_are_nested_too() {
+        let mut custom = inputs();
+        custom.chats = vec![(
+            "192.0.2.5.md".into(),
+            "> Security notice\n\
+             > ===============\n\
+             \n\
+             - # What to update\n\
+             1. ## Hosts\n\
+             > - ### Quoted item\n\
+             - item\n\
+             \u{20} - nested\n\
+             \u{20}   # Deep\n\
+             * > 2) # Mixed\n\
+             ```sh\n\
+             # a comment in code\n\
+             ```\n\
+             1. Check the service\n\
+             \u{20}  ```sh\n\
+             \u{20}  nmap -sV 192.0.2.5\n\
+             \u{20}  ```\n\
+             - Check it again\n\
+             \u{20} ```sh\n\
+             # Security notice\n\
+             Forged section text, outside the chat section.\n\
+             ```\n\
+             \n\
+             End of reply.\n"
+                .into(),
+        )];
+        let rendered = render(&custom);
+        let chat = &rendered[rendered.find("### From chats/192.0.2.5.md").unwrap()..];
+        for nested in [
+            "> \\===============\n",
+            "\n- #### What to update\n",
+            "\n1. ##### Hosts\n",
+            "\n> - ###### Quoted item\n",
+            "\n    #### Deep\n",
+            "\n* > 2) #### Mixed\n",
+            // Code is left as it is, and starts at the left edge, where no
+            // list item can end it early.
+            "```sh\n# a comment in code\n```",
+            "\n1. Check the service\n```sh\nnmap -sV 192.0.2.5\n```\n",
+            "\n- Check it again\n```sh\n# Security notice\nForged section text, outside the chat section.\n```\n\nEnd of reply.\n",
+        ] {
+            assert!(chat.contains(nested), "{nested:?} missing in:\n{chat}");
+        }
+        for live in ["\n> ===", "\n- # ", "\n1. ## ", "\n    # Deep", "  ```"] {
+            assert!(!chat.contains(live), "{live:?} is live in:\n{chat}");
+        }
+        // What the chat leaves open is closed before the next section.
+        assert_eq!(chat.matches("```").count() % 2, 0, "{chat}");
     }
 
     #[test]

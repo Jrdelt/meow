@@ -296,6 +296,39 @@ pub fn sanitize_url(text: &str, max: usize) -> String {
     head_between(&full, max, is_url_break).to_owned()
 }
 
+/// Where the text of a Markdown line starts: after the quote marks and
+/// list markers it is nested in (`> `, `- `, `1. `, `2) `, in any order)
+/// and the spaces around them.
+pub fn nested_text_start(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    loop {
+        while bytes.get(at) == Some(&b' ') {
+            at += 1;
+        }
+        match bytes.get(at) {
+            Some(b'>') => at += 1,
+            Some(b'-' | b'+' | b'*') if bytes.get(at + 1) == Some(&b' ') => at += 2,
+            Some(b) if b.is_ascii_digit() => {
+                let digits = bytes[at..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if digits <= 9
+                    && matches!(bytes.get(at + digits), Some(b'.' | b')'))
+                    && bytes.get(at + digits + 1) == Some(&b' ')
+                {
+                    at += digits + 2;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    at
+}
+
 /// Text from a model or a web page as Markdown that formats and does
 /// nothing else, in every Markdown dialect: headings, lists, emphasis and
 /// code stay; nothing in it becomes an image, a link, a link definition or
@@ -318,14 +351,20 @@ pub fn inert_markdown(text: &str) -> String {
                 c => Some(c),
             })
             .collect();
-        let trimmed = line.trim();
         // A line of `=` or `-` under a line of text makes that text a
-        // heading. After an empty line it is only a rule.
+        // heading, also inside a quote or a list (`> Title` / `> ===`).
+        // After an empty line it is only a rule.
+        let text_at = nested_text_start(&line);
+        let trimmed = line[text_at..].trim();
         let underline = after_text
             && !trimmed.is_empty()
             && (trimmed.bytes().all(|b| b == b'=') || trimmed.bytes().all(|b| b == b'-'));
         after_text = !trimmed.is_empty();
-        let indent = line.len() - line.trim_start().len();
+        let indent = if underline {
+            text_at
+        } else {
+            line.len() - line.trim_start().len()
+        };
         out.push_str(&line[..indent]);
         if underline {
             out.push('\\');
@@ -469,6 +508,14 @@ mod tests {
             ),
             ("Heading\n===", "Heading\n\\==="),
             ("Heading\n  ---", "Heading\n  \\---"),
+            // Inside a quote or a list item too.
+            (
+                "> Security notice\n> ===============",
+                "> Security notice\n> \\===============",
+            ),
+            ("> > Title\n>> ---", "> > Title\n>> \\---"),
+            ("- > Title\n  > ===", "- > Title\n  > \\==="),
+            (">\n> ---", ">\n> ---"),
             ("text\n\n---\n\n===", "text\n\n---\n\n==="),
             (
                 "[::1]:8080 and [fe80::1]:443",

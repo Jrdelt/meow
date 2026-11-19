@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::ai::Usage;
+use crate::ai::{Allowance, Usage};
 use crate::evidence::sanitize;
 
 /// Where the Claude API lives; `/messages` and `/models` hang off it.
@@ -111,6 +111,17 @@ pub fn cost_usd(model: &str, input_tokens: u64, output_tokens: u64, searches: u3
         + f64::from(searches) * WEB_SEARCH_USD
 }
 
+/// The most one request of `bytes` is likely to cost on `model`: input at
+/// three bytes a token (prose runs about four), what every search allowed
+/// adds to it, and the whole reply allowance used.
+fn most_usd(model: &str, bytes: usize, research: bool) -> f64 {
+    /// What the results of one web search add to the input, about.
+    const SEARCH_INPUT_TOKENS: u64 = 25_000;
+    let searches = if research { MAX_SEARCHES } else { 0 };
+    let input = (bytes as u64).div_ceil(3) + u64::from(searches) * SEARCH_INPUT_TOKENS;
+    cost_usd(model, input, u64::from(MAX_TOKENS), searches)
+}
+
 /// The request body for one question. Thinking is adaptive (asked for by
 /// name, because the 4.x models run without it otherwise); how hard the
 /// model works is set with the effort level. `own_chain` is true when meow
@@ -173,14 +184,7 @@ fn request(
 /// Sends the request and turns anything but a success into a message a
 /// person can act on.
 async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::Response> {
-    crate::ai::validate_cloud_url(base)?;
-    if crate::ai::is_loopback_url(base) {
-        if let Some(uid) = crate::ai::another_users_server(base) {
-            bail!(
-                "refusing to send the Claude API key to {base}: port belongs to another user (uid {uid})"
-            );
-        }
-    }
+    crate::ai::check_server(base, crate::ai::Carries::Key)?;
     let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() => bail!("cannot connect to the Claude API at {base}"),
@@ -360,10 +364,14 @@ async fn triage(
     user: &str,
     on_text: &mut (dyn FnMut(&str) + Send),
     counts: &mut Counts,
+    allowance: &mut Allowance,
+    spent: f64,
 ) -> Result<Attempt> {
     let messages = json!([{ "role": "user", "content": user }]);
     let body = body(model, false, own_chain, system, &messages);
-    let mut response = send(request(http, base, key, &body)?, base).await?;
+    let request = request(http, base, key, &body)?;
+    allowance.take_call(spent, most_usd(model, body.to_string().len(), false))?;
+    let mut response = send(request, base).await?;
     if let Some(len) = response.content_length() {
         if len > crate::ai::MAX_ANSWER_BYTES as u64 {
             bail!(
@@ -465,6 +473,8 @@ async fn research(
     system: &str,
     user: &str,
     counts: &mut Counts,
+    allowance: &mut Allowance,
+    spent: f64,
 ) -> Result<Attempt> {
     const MAX_RESUME_MESSAGES_BYTES: usize = 2 * 1024 * 1024;
     const MAX_SOURCES: usize = 12;
@@ -475,6 +485,9 @@ async fn research(
     for _ in 0..=MAX_RESUMES {
         let body = body(model, true, own_chain, system, &json!(messages));
         let request = request(http, base, key, &body)?.timeout(RESEARCH_TIMEOUT);
+        // A resumed turn is a request of its own, billed again.
+        let so_far = spent + counts.usage(model).cost_usd;
+        allowance.take_call(so_far, most_usd(model, body.to_string().len(), true))?;
         let mut response = send(request, base).await?;
         let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
         let reply: Value =
@@ -661,6 +674,7 @@ pub async fn ask_with_spend(
         user,
         on_text,
         &mut || {},
+        &mut Allowance::unlimited(),
         spent,
     )
     .await
@@ -668,7 +682,9 @@ pub async fn ask_with_spend(
 
 /// Like [`ask_with_spend`], invoking `on_reset` between declined attempts so
 /// stateful stream unmaskers never carry unclosed Markdown/HTML state from a
-/// declined model into the next fallback model.
+/// declined model into the next fallback model. Every request it makes (a
+/// model after one declined, a resumed research turn) is first checked
+/// against `allowance`, the day's budget, and counted there.
 #[allow(clippy::too_many_arguments)]
 pub async fn ask_with_spend_and_reset(
     http: &reqwest::Client,
@@ -681,6 +697,7 @@ pub async fn ask_with_spend_and_reset(
     user: &str,
     on_text: &mut (dyn FnMut(&str) + Send),
     on_reset: &mut (dyn FnMut() + Send),
+    allowance: &mut Allowance,
     spent: &mut Usage,
 ) -> Result<Answer> {
     let mut chain: Vec<&str> = vec![model];
@@ -693,6 +710,7 @@ pub async fn ask_with_spend_and_reset(
     let mut last_category = None;
     for (index, current) in chain.iter().enumerate() {
         let mut counts = Counts::default();
+        let so_far = spent.cost_usd;
         let result = if research_tier {
             research(
                 http,
@@ -703,6 +721,8 @@ pub async fn ask_with_spend_and_reset(
                 system,
                 user,
                 &mut counts,
+                allowance,
+                so_far,
             )
             .await
         } else {
@@ -716,6 +736,8 @@ pub async fn ask_with_spend_and_reset(
                 user,
                 on_text,
                 &mut counts,
+                allowance,
+                so_far,
             )
             .await
         };
@@ -1233,6 +1255,10 @@ mod tests {
             format!("{missing:#}").starts_with("the Claude API does not know this model"),
             "{missing:#}"
         );
+        // Nothing listens there; were it the user's own server, the key
+        // would be tried (elsewhere than Linux, no listener means the
+        // owner cannot be verified, and the key is not sent at all).
+        let _owner = crate::ai::FakePortOwner::set(None);
         let nobody = ask(
             &http,
             "http://127.0.0.1:9/v1",

