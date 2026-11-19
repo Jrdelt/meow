@@ -124,6 +124,7 @@ Each workspace keeps its own shell history: `history`, the up arrow and `Ctrl-R`
 ### 2. Run commands or queue background recon
 
 Anything you run in the session shell (`nmap`, `ping`, `curl`, `ssh`, `dig`, `git diff`) is observed passively. When a command discovers a host, open port, service banner, HTTP path, or configuration diff, `meow` records it in the workspace graph and looks up matching advisories in the background.
+Lookups for hosts and ports known only from terminal text or `meow add` wait behind those for what `meow recon` finds and stop at 256 per session; a notice says when.
 
 For an automated inventory of an authorized target, switch to `mild` (or `aggressive`) mode and run `meow recon`:
 

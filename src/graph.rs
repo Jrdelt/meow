@@ -25,6 +25,8 @@ pub const GRAPH_VERSION: u32 = 2;
 const MAX_FACTS: usize = 200;
 const MAX_PATH_NODES: usize = 5000;
 const MAX_FIELD: usize = 200;
+/// A host's address or name: a DNS name is at most 253 bytes.
+const MAX_NAME: usize = 256;
 /// The longest value of a mail-dns check (an SPF or DMARC record). The
 /// stage's facts quote the record, and a fact goes to the model with up to
 /// 400 characters: the vault learns the names in a record from what is kept
@@ -40,10 +42,15 @@ pub const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_GRAPH_WEIGHT: usize = 48 * 1024 * 1024;
 /// The structure around one recorded item in the file.
 const ITEM_OVERHEAD: usize = 400;
+/// The most one observation, CVE or fact may weigh, far above what any of
+/// them keeps. One that weighs more is refused on its own: it does not
+/// make the graph full.
+const MAX_ITEM_WEIGHT: usize = 1024 * 1024;
 const MAX_HOSTS: usize = 4096;
 const MAX_PORTS_PER_HOST: usize = 1024;
 const MAX_HOSTNAMES_PER_HOST: usize = 128;
 const MAX_CPES_PER_PORT: usize = 64;
+const MAX_HOPS: usize = 32;
 const MAX_TLS_SANS_PER_PORT: usize = 128;
 const MAX_ADVISORIES_PER_HOST: usize = 500;
 
@@ -1426,21 +1433,36 @@ fn advisory_weight(advisory: &Advisory) -> usize {
 impl Observation {
     /// An upper estimate of what recording this adds to `graph.json`: its
     /// text (escaped it is at most twice as long) and the structure around
-    /// it.
+    /// it. Each field counts only as much of it as is kept: an imported
+    /// value of megabytes is stored cut to a line, and weighs that much.
     fn weight(&self) -> usize {
-        let opt = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+        use crate::endpoint::MAX_PATH_DEPTH;
+        use crate::evidence::EVIDENCE_MAX;
+        let field = |value: &str| value.len().min(MAX_FIELD);
+        let opt = |value: &Option<String>| value.as_deref().map_or(0, field);
+        let name = |value: &str| value.len().min(MAX_NAME);
+        let claim = |len: usize| len.min(EVIDENCE_MAX);
+        let evidence = |record: &EvidenceRecord| record.evidence.len().min(EVIDENCE_MAX);
+        // A list keeps `most` of its entries that are not empty once cleaned.
+        let list = |values: &[String], most: usize| {
+            values
+                .iter()
+                .map(|value| field(value) + 4)
+                .sum::<usize>()
+                .min(most * (MAX_FIELD + 4))
+        };
         let text = match self {
             Observation::Host {
                 address,
                 os,
                 mac,
                 record,
-            } => address.len() + opt(os) + opt(mac) + record.evidence.len(),
+            } => name(address) + opt(os) + opt(mac) + evidence(record),
             Observation::Hostname {
                 address,
                 hostname,
                 record,
-            } => address.len() + hostname.len() + record.evidence.len(),
+            } => name(address) + name(hostname) + evidence(record),
             Observation::Port {
                 address,
                 protocol,
@@ -1454,22 +1476,22 @@ impl Observation {
                 ..
             } => {
                 // The port's name is also the claim of the fact it leaves.
-                2 * (address.len()
-                    + protocol.len()
-                    + state.len()
+                2 * (name(address)
+                    + field(protocol)
+                    + field(state)
                     + opt(service)
                     + opt(product)
                     + opt(version)
                     + opt(extra_info))
-                    + cpes.iter().map(|cpe| cpe.len() + 4).sum::<usize>()
-                    + record.evidence.len()
+                    + list(cpes, MAX_CPES_PER_PORT)
+                    + evidence(record)
             }
             Observation::TlsSan {
                 address,
                 san,
                 record,
                 ..
-            } => address.len() + 2 * san.len() + record.evidence.len(),
+            } => name(address) + 2 * field(san) + evidence(record),
             Observation::Http {
                 address,
                 scheme,
@@ -1478,10 +1500,7 @@ impl Observation {
                 record,
                 ..
             } => {
-                address.len()
-                    + scheme.len()
-                    + 2 * (opt(server) + opt(location))
-                    + record.evidence.len()
+                name(address) + field(scheme) + 2 * (opt(server) + opt(location)) + evidence(record)
             }
             Observation::Path {
                 address,
@@ -1491,14 +1510,22 @@ impl Observation {
                 ..
             } => {
                 // Every segment is a node of its own in the tree.
-                let segments = path.bytes().filter(|byte| *byte == b'/').count();
-                address.len() + scheme.len() + path.len() + 16 * segments + record.evidence.len()
+                let segments = path
+                    .bytes()
+                    .filter(|byte| *byte == b'/')
+                    .count()
+                    .min(MAX_PATH_DEPTH);
+                name(address)
+                    + field(scheme)
+                    + path.len().min(MAX_PATH_DEPTH * (MAX_FIELD + 1))
+                    + 16 * segments
+                    + evidence(record)
             }
             Observation::Note {
                 address,
                 text,
                 record,
-            } => opt(address) + text.len() + record.evidence.len(),
+            } => address.as_deref().map_or(0, name) + claim(text.len()) + evidence(record),
             Observation::NotOpen {
                 address,
                 protocol,
@@ -1506,7 +1533,13 @@ impl Observation {
                 ports,
                 record,
                 ..
-            } => address.len() + protocol.len() + state.len() + ports.len() + record.evidence.len(),
+            } => {
+                name(address)
+                    + field(protocol)
+                    + field(state)
+                    + ports.len().min(NOT_OPEN_MAX + 4)
+                    + evidence(record)
+            }
             Observation::Script {
                 address,
                 protocol,
@@ -1514,14 +1547,20 @@ impl Observation {
                 output,
                 record,
                 ..
-            } => address.len() + protocol.len() + id.len() + output.len() + record.evidence.len(),
+            } => {
+                // Kept as one fact: `nmap script <id>: <output>`.
+                name(address)
+                    + field(protocol)
+                    + claim(id.len() + output.len() + 16)
+                    + evidence(record)
+            }
             Observation::Fact {
                 address,
                 protocol,
-                claim,
+                claim: said,
                 record,
                 ..
-            } => address.len() + protocol.len() + claim.len() + record.evidence.len(),
+            } => name(address) + field(protocol) + claim(said.len()) + evidence(record),
             Observation::HostMeta {
                 address,
                 asn,
@@ -1532,26 +1571,27 @@ impl Observation {
                 hops,
                 record,
             } => {
-                address.len()
+                name(address)
                     + opt(asn)
                     + opt(bgp_prefix)
                     + opt(country)
                     + opt(ipv6_dns)
                     + opt(waf_cdn)
-                    + hops.iter().map(|h| h.len() + 4).sum::<usize>()
-                    + record.evidence.len()
+                    + list(hops, MAX_HOPS)
+                    + evidence(record)
             }
+            // Cleaned before they are weighed (see `apply`).
             Observation::WebMeta {
                 address,
                 http,
                 record,
                 ..
-            } => address.len() + http.weight() / 2 + record.evidence.len(),
+            } => name(address) + http.weight() / 2 + evidence(record),
             Observation::DnsSecurity {
                 address,
                 info,
                 record,
-            } => address.len() + info.weight() / 2 + record.evidence.len(),
+            } => name(address) + info.weight() / 2 + evidence(record),
         };
         2 * text + ITEM_OVERHEAD
     }
@@ -1888,7 +1928,7 @@ impl Graph {
                 .into_iter()
                 .map(|h| clean(&h))
                 .filter(|h| !h.is_empty())
-                .take(32)
+                .take(MAX_HOPS)
                 .collect();
             hosts.insert(
                 key.clone(),
@@ -2161,7 +2201,7 @@ impl Graph {
     /// in-place updates caused `tally.weight` to drift above what is actually
     /// stored, re-measuring snaps it back before latching `full`.
     fn has_room_for(&mut self, weight: usize) -> bool {
-        if self.tally.full {
+        if self.tally.full || weight > MAX_ITEM_WEIGHT {
             return false;
         }
         if self.tally.weight.saturating_add(weight) > MAX_GRAPH_WEIGHT {
@@ -2181,7 +2221,13 @@ impl Graph {
     /// A graph that is full records nothing more: every observation has a
     /// weight, and their sum stays below what `graph.json` may hold, however
     /// much a scanned server, a crawl or an imported file sends.
-    pub fn apply(&mut self, observation: Observation) -> bool {
+    pub fn apply(&mut self, mut observation: Observation) -> bool {
+        // Weighed as they will be kept.
+        match &mut observation {
+            Observation::WebMeta { http, .. } => http.sanitize(),
+            Observation::DnsSecurity { info, .. } => info.sanitize(),
+            _ => {}
+        }
         let weight = observation.weight();
         if !self.has_room_for(weight) {
             return false;
@@ -2512,7 +2558,7 @@ impl Graph {
                     .into_iter()
                     .map(|h| clean(&h))
                     .filter(|h| !h.is_empty())
-                    .take(32)
+                    .take(MAX_HOPS)
                     .collect();
                 if !clean_hops.is_empty() && host.hops != clean_hops {
                     host.hops = clean_hops;
@@ -2671,7 +2717,9 @@ impl Graph {
     /// Adds a host-level fact that did not come from a parser (for example
     /// a CISA KEV listing found during CVE grounding).
     pub fn add_host_fact(&mut self, address: &str, fact: Fact) -> bool {
-        let weight = 2 * (fact.claim.len() + fact.record.evidence.len()) + ITEM_OVERHEAD;
+        // Both are cut to this when the fact is kept.
+        let kept = |text: &str| text.len().min(crate::evidence::EVIDENCE_MAX);
+        let weight = 2 * (kept(&fact.claim) + kept(&fact.record.evidence)) + ITEM_OVERHEAD;
         if !self.has_room_for(weight) {
             return false;
         }
@@ -4116,6 +4164,11 @@ mod tests {
         assert!(!graph.is_full());
         assert!(graph.tally.weight < MAX_GRAPH_WEIGHT / 2);
 
+        // One item larger than any is refused on its own: the graph is
+        // not full for it.
+        assert!(!graph.has_room_for(MAX_ITEM_WEIGHT + 1));
+        assert!(!graph.is_full());
+
         // Once full is latched, even tiny updates to an existing host are refused.
         graph.tally.full = true;
         assert!(!graph.apply(port("198.51.100.10", 8080, "http", None)));
@@ -4127,5 +4180,81 @@ mod tests {
                 record: rec(Source::ManualNote),
             },
         ));
+    }
+
+    #[test]
+    fn one_huge_imported_value_weighs_what_is_kept_and_fills_nothing() {
+        // 30 MB in a diff path; 1 MB in each field of the rest.
+        let huge = "A".repeat(30 * 1024 * 1024);
+        let big = "A".repeat(1024 * 1024);
+        let mut graph = Graph::default();
+        let items = [
+            Observation::Note {
+                address: None,
+                text: format!("git diff: {huge} (+1 -0)"),
+                record: rec(Source::GitDiff),
+            },
+            Observation::Port {
+                address: "192.0.2.77".into(),
+                port: 80,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some(big.clone()),
+                product: Some(format!("nginx {big}")),
+                version: Some(big.clone()),
+                extra_info: Some(big.clone()),
+                cpes: vec![format!("cpe:/a:x:{}", &big[..4096]); 1000],
+                record: EvidenceRecord {
+                    evidence: big.clone(),
+                    ..rec(Source::NmapXml)
+                },
+            },
+            Observation::Hostname {
+                address: "192.0.2.77".into(),
+                hostname: big.clone(),
+                record: rec(Source::NmapXml),
+            },
+            Observation::Script {
+                address: "192.0.2.77".into(),
+                port: Some(80),
+                protocol: "tcp".into(),
+                id: "http-title".into(),
+                output: big.clone(),
+                record: rec(Source::NmapXml),
+            },
+            Observation::Path {
+                address: "192.0.2.77".into(),
+                port: 80,
+                scheme: "http".into(),
+                path: format!("/a/{big}"),
+                status: Some(200),
+                record: rec(Source::FeroxJson),
+            },
+            Observation::Http {
+                address: "192.0.2.77".into(),
+                port: 80,
+                scheme: "http".into(),
+                server: Some(big.clone()),
+                location: Some(format!("http://example.com/{big}")),
+                record: rec(Source::HttpHeader),
+            },
+        ];
+        for item in items {
+            assert!(item.weight() < 64 * 1024, "weighed as kept");
+            graph.apply(item);
+            assert!(!graph.is_full());
+        }
+        assert!(graph.notes[0].claim.len() <= crate::evidence::EVIDENCE_MAX);
+        // What comes after is still recorded.
+        assert!(graph.apply(port("192.0.2.77", 22, "ssh", Some("OpenSSH"))));
+        assert!(graph.add_host_fact(
+            "192.0.2.77",
+            Fact {
+                claim: big.clone(),
+                record: rec(Source::CisaKev),
+            },
+        ));
+        assert!(graph.tally.weight < 1024 * 1024);
+        assert!(!graph.is_full());
     }
 }

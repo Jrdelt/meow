@@ -322,6 +322,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 unreachable!("built above");
             };
             if let Some(result) = live {
+                if result["full"] == true {
+                    println!(
+                        "[!] This workspace's graph is full: not everything in the file was recorded. Open a new workspace for further targets."
+                    );
+                }
                 println!(
                     "[+] {} ({}): {total} facts parsed, {} new or updated{skipped}",
                     sanitize_path_display(file),

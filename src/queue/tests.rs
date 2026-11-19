@@ -54,7 +54,7 @@ fn the_udp_scan_names_its_services_and_explains_open_ones() {
 <port protocol="udp" portid="161"><state state="open" reason="udp-response"/><service name="snmp" product="net-snmp" method="probed" conf="10"/></port>
 <port protocol="udp" portid="123"><state state="open|filtered" reason="no-response"/><service name="ntp" method="table" conf="3"/></port>
 </ports></host><runstats><hosts up="1" down="0" total="1"/></runstats></nmaprun>"#;
-    let observations = parsers::nmap::parse(xml).unwrap();
+    let observations = parsers::nmap::parse(xml, true).unwrap();
     let state_of = |number: u16| {
         observations.iter().find_map(|o| match o {
             Observation::Port {
@@ -649,6 +649,7 @@ fn what_a_scan_found_is_taken_from_its_own_output_only() {
 </ports></host>
 <host><status state="up"/><address addr="10.0.0.7" addrtype="ipv4"/><ports></ports></host>
 </nmaprun>"#,
+        true,
     )
     .unwrap();
     let range = target("10.0.0.0/24");
@@ -998,6 +999,7 @@ fn zoned_ipv6_found_and_inline_preset_scripts_are_handled_cleanly() {
 <port protocol="tcp" portid="8443"><state state="open"/><service name="https"/></port>
 </ports></host>
 </nmaprun>"#,
+        true,
     )
     .unwrap();
     let found = Found::of(&observations, &target("fe80::1%eth0"));
@@ -1417,5 +1419,144 @@ fn the_waf_cdn_stage_does_not_deadlock_on_the_database() {
         .expect("the waf-cdn stage hung")
         .unwrap();
     assert!(detail.contains("no blocking WAF/CDN detected"), "{detail}");
+    coordinator.shutdown();
+}
+
+/// Terminal text can call any host of a recon target open, with any
+/// software. The CVE stage looks up what the task's own scans found at once
+/// and in full; the rest is looked up as text is: later, and only so much.
+#[test]
+fn the_cve_stage_looks_up_its_own_findings_first_and_text_only_so_much() {
+    use crate::coordinator::Coordinator;
+    use crate::evidence::{Confidence, EvidenceRecord, Source};
+    use crate::workspace::{Config, MeowHome, Workspace};
+    use axum::routing::{get, post};
+    use serde_json::json;
+
+    // A stand-in for NVD, OSV and the KEV list that answers nothing and
+    // keeps the NVD questions it was asked.
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&asked);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let nvd = move |query: axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| async move {
+                if let Some(words) = query.get("keywordSearch") {
+                    log.lock().unwrap().push(words.clone());
+                }
+                axum::Json(json!({ "totalResults": 0, "vulnerabilities": [] }))
+            };
+            let app = axum::Router::new()
+                .route("/nvd", get(nvd))
+                .route(
+                    "/kev",
+                    get(|| async { axum::Json(json!({ "vulnerabilities": [] })) }),
+                )
+                .route(
+                    "/osv/v1/querybatch",
+                    post(|| async { axum::Json(json!({ "results": [] })) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tx.send(format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    let base = rx.recv().unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+    let (workspace, _) =
+        Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+    let mut config = Config::default();
+    config.cve.nvd_api_key = Some("stand-in".into());
+    config.cve.nvd_url = format!("{base}/nvd");
+    config.cve.osv_url = format!("{base}/osv");
+    config.cve.kev_url = format!("{base}/kev");
+    let coordinator = Coordinator::start(workspace, config).unwrap();
+    let state = coordinator.state();
+    state.limit_text_questions(1);
+
+    // The scan found 203.0.113.200 with OpenSSH; text added two ports to
+    // it, and a host the scan never saw.
+    let port = |address: &str, port: u16, product: &str, source, confidence| Observation::Port {
+        address: address.into(),
+        port,
+        protocol: "tcp".into(),
+        state: "open".into(),
+        service: None,
+        product: Some(product.into()),
+        version: Some(if product == "OpenSSH" { "9.6p1" } else { "1.0" }.into()),
+        extra_info: None,
+        cpes: Vec::new(),
+        record: EvidenceRecord::observed(source, confidence, "x"),
+    };
+    let scanned = "203.0.113.200";
+    state.graph().apply_all(vec![
+        port(scanned, 22, "OpenSSH", Source::NmapXml, Confidence::High),
+        port(scanned, 2222, "ProdY", Source::PtyRegex, Confidence::Medium),
+        port(scanned, 2223, "ProdZ", Source::PtyRegex, Confidence::Medium),
+        port(
+            "203.0.113.1",
+            80,
+            "ProdX",
+            Source::PtyRegex,
+            Confidence::Medium,
+        ),
+    ]);
+    let range = target("203.0.113.0/24");
+    let id = enqueue(&state.db_lock(), "203.0.113.0/24", Mode::Mild, &[]).unwrap();
+    let found = |hosts, udp| Found {
+        hosts,
+        udp,
+        ..Found::default()
+    };
+    found(BTreeMap::from([(scanned.to_owned(), vec![22])]), Vec::new())
+        .save(&state.db_lock(), id, Stage::Ports)
+        .unwrap();
+    found(BTreeMap::new(), vec![(scanned.to_owned(), 161)])
+        .save(&state.db_lock(), id, Stage::Udp)
+        .unwrap();
+    assert_eq!(
+        own_ports(&state, id, &range),
+        BTreeMap::from([(
+            scanned.to_owned(),
+            BTreeSet::from(["22/tcp".to_owned(), "161/udp".to_owned()])
+        )])
+    );
+
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let end = runtime
+        .block_on(async {
+            let cx = stages::Ctx::new(&state, &task, &range, Stage::Cves)?;
+            stages::cves(&cx).await
+        })
+        .unwrap();
+    assert!(matches!(end, StageEnd::Done(_)));
+    // What the scan found first and in full; one question text may ask.
+    assert_eq!(*asked.lock().unwrap(), ["OpenSSH 9.6p1", "ProdY 1.0"]);
+    // The host only text knows was queued as text: nothing left to ask.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        asked.lock().unwrap().len(),
+        2,
+        "{:?}",
+        asked.lock().unwrap()
+    );
+    let notices = state.snapshot()["notices"].to_string();
+    assert!(
+        notices.contains("reached this session's limit"),
+        "{notices}"
+    );
     coordinator.shutdown();
 }

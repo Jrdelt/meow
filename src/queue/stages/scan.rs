@@ -103,6 +103,7 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
         bail!(describe_failure(&command.program, &outcome, limits));
     }
     let (_, mut observations) = read_scan_with_up(&command.output)?;
+    Found::of(&observations, target).save(&state.db_lock(), task.id, cx.stage)?;
     let (mut open, mut maybe) = (0usize, 0usize);
     let mut notes = Vec::new();
     for observation in &observations {
@@ -219,8 +220,11 @@ pub(crate) async fn cves(cx: &Ctx<'_>) -> Result<StageEnd> {
             "CVE lookups are disabled in config.toml".to_owned(),
         ));
     }
-    let probed = load_probed(state, task.id, target);
-    let mut candidate_addrs: BTreeSet<String> = probed.hosts.keys().cloned().collect();
+    // What this task's own scans found is looked up now and in full. The
+    // rest of the target is known from terminal text or imports, which
+    // anyone can write: looked up later, and only so much.
+    let own = own_ports(state, task.id, target);
+    let mut candidate_addrs: BTreeSet<String> = own.keys().cloned().collect();
     for host in hosts_in_target(&state.graph(), target) {
         candidate_addrs.insert(host.address);
     }
@@ -272,14 +276,24 @@ pub(crate) async fn cves(cx: &Ctx<'_>) -> Result<StageEnd> {
     }
     let (mut changed, _) = record(state, backport_obs, None);
     let mut added_total = 0usize;
-    for addr in &versioned_hosts {
+    for (addr, ports) in versioned_hosts
+        .iter()
+        .filter_map(|addr| Some((addr, own.get(addr)?)))
+    {
         if !same_mode() {
             return Ok(StageEnd::ModeChanged);
         }
-        if let Some((merged, _kev, _errs)) = state.ground_host(addr).await {
+        let asked = crate::cve::Asked::Recon(ports.clone());
+        if let Some((merged, _kev, _errs)) = state.ground_host_for(addr, asked).await {
             added_total += merged.added;
             changed += merged.added;
         }
+    }
+    for addr in versioned_hosts
+        .iter()
+        .filter(|addr| !own.contains_key(*addr))
+    {
+        state.request_grounding(addr, crate::cve::Asked::Text);
     }
     let total: usize = {
         let graph = state.graph();

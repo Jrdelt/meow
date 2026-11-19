@@ -641,6 +641,9 @@ pub struct Found {
     /// Open ports the scanner called SSH: (address, port).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh: Vec<(String, u16)>,
+    /// Open UDP ports: (address, port).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp: Vec<(String, u16)>,
     /// Resolved IP addresses from the `dns` stage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ips: Vec<String>,
@@ -721,6 +724,17 @@ impl Found {
                         found.ssh.push((address, *port));
                     }
                 }
+                Observation::Port {
+                    address,
+                    port,
+                    protocol,
+                    state,
+                    ..
+                } if protocol == "udp" && state == "open" => {
+                    found
+                        .udp
+                        .extend(canonical(address).map(|address| (address, *port)));
+                }
                 Observation::Http {
                     address,
                     port,
@@ -783,6 +797,11 @@ impl Found {
             }
         }
         self.ssh = ssh;
+        self.udp
+            .retain(|(address, _)| Self::belongs(address, target));
+        self.udp.sort_unstable();
+        self.udp.dedup();
+        self.udp.truncate(MAX_FOUND);
         self.ips.retain(|ip| Self::belongs(ip, target));
         self.ips.sort_unstable();
         self.ips.dedup();
@@ -837,7 +856,8 @@ fn read_scan_with_up(output: &Path) -> Result<(Option<u64>, Vec<Observation>)> {
     crate::workspace::refuse_file_symlink(output)?;
     let parsed = parsers::read_capped(output).and_then(|xml| {
         let up = nmap_hosts_up(&xml);
-        let observations = parsers::nmap::parse(&xml)
+        // This session's own scanner wrote it.
+        let observations = parsers::nmap::parse(&xml, true)
             .with_context(|| format!("cannot parse {}", output.display()))?;
         Ok((up, observations))
     });
@@ -876,10 +896,14 @@ fn record(state: &State, observations: Vec<Observation>, only: Option<&Names>) -
             keep
         })
         .collect();
-    let changed = state.graph().apply_all(kept);
+    let (changed, full) = {
+        let mut graph = state.graph();
+        (graph.apply_all(kept), graph.is_full())
+    };
     if changed > 0 {
         state.mark_dirty();
     }
+    state.notice_if_full(full);
     (changed, dropped)
 }
 
@@ -896,6 +920,31 @@ fn describe_failure(program: &str, outcome: &RunOutcome, limits: RunLimits) -> S
         RunOutcome::Failed(reason) => reason.clone(),
         RunOutcome::Stopped => format!("{program} was stopped: the mode changed"),
     }
+}
+
+/// The most ports per host whose CVE lookups a task asks for as its own.
+const MAX_OWN_PORTS: usize = 256;
+
+/// The open ports this task's own scans reported, per host (`22/tcp`).
+/// Their CVE lookups go first and are not limited; any other host or port
+/// of the target is known from terminal text or imports, and is looked up
+/// as they are.
+fn own_ports(state: &State, task_id: i64, target: &Target) -> BTreeMap<String, BTreeSet<String>> {
+    let probed = load_probed(state, task_id, target);
+    let udp = Found::load(&state.db_lock(), task_id, Stage::Udp, target).udp;
+    let tcp = probed
+        .hosts
+        .iter()
+        .flat_map(|(address, ports)| ports.iter().map(move |port| (address, *port, "tcp")));
+    let udp = udp.iter().map(|(address, port)| (address, *port, "udp"));
+    let mut own: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (address, port, protocol) in tcp.chain(udp) {
+        let ports = own.entry(address.clone()).or_default();
+        if ports.len() < MAX_OWN_PORTS {
+            ports.insert(crate::graph::port_key(port, protocol));
+        }
+    }
+    own
 }
 
 fn load_probed(state: &State, task_id: i64, target: &Target) -> Found {
@@ -1162,12 +1211,10 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
             }
         }
     }
-    let addresses: Vec<String> = hosts_in_target(&state.graph(), &target)
-        .into_iter()
-        .map(|host| host.address)
-        .collect();
-    for address in addresses {
-        state.request_grounding(&address);
+    // The stages after `cves` may have found more to look up. Only what
+    // this task found: text and imports asked for the rest themselves.
+    for (address, ports) in own_ports(state, id, &target) {
+        state.request_grounding(&address, crate::cve::Asked::Recon(ports));
     }
     Ok(())
 }

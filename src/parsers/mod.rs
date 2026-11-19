@@ -80,7 +80,8 @@ pub fn detect(text: &str) -> Format {
 pub fn parse_text(text: &str) -> Result<Parsed> {
     let format = detect(text);
     let (observations, skipped) = match format {
-        Format::NmapXml => (nmap::parse(text)?, 0),
+        // An imported file is not this session's scan: its names are claims.
+        Format::NmapXml => (nmap::parse(text, false)?, 0),
         Format::Jsonl => jsonl::parse(text),
         Format::GitDiff => (diff::parse(text), 0),
         Format::Log => (text::TextParser::parse(Source::LogRegex, text), 0),
@@ -216,6 +217,72 @@ mod tests {
         );
         assert_eq!(detect("{ not json\n"), Format::Log);
         assert_eq!(detect(""), Format::Log);
+    }
+
+    #[test]
+    fn an_imported_scan_never_moves_a_name_or_takes_over_a_host_worked_on() {
+        use crate::evidence::{Confidence, EvidenceRecord};
+        use crate::graph::{Advisory, Graph, Observation};
+        let mut graph = Graph::default();
+        // The session's own scan named 192.0.2.10.
+        let own = r#"<nmaprun><host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/>
+<hostnames><hostname name="portal.example" type="user"/></hostnames></host></nmaprun>"#;
+        graph.apply_all(nmap::parse(own, true).unwrap());
+        // A name seen in the terminal, with the operator's note and a CVE.
+        graph.apply(Observation::Note {
+            address: Some("intranet.example".into()),
+            text: "admin panel creds rotated, keep watching".into(),
+            record: EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, "note"),
+        });
+        graph.add_advisory(
+            "intranet.example",
+            Advisory {
+                id: "CVE-2021-23017".into(),
+                title: "t".into(),
+                severity: None,
+                cvss: None,
+                kev: false,
+                matched: "keywordSearch=nginx 1.18.0".into(),
+                port: None,
+                references: vec![],
+                fixed_in: None,
+                last_affected: None,
+                record: EvidenceRecord::observed(Source::NvdApi, Confidence::Medium, "{}"),
+            },
+        );
+        // A name nobody worked on yet.
+        graph.apply(Observation::Hostname {
+            address: "www.example".into(),
+            hostname: "www.example".into(),
+            record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Medium, "www"),
+        });
+        let before = graph.hosts["intranet.example"].clone();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hostile.xml");
+        std::fs::write(
+            &file,
+            r#"<?xml version="1.0"?><nmaprun>
+<host><status state="up"/><address addr="198.51.100.66" addrtype="ipv4"/><hostnames><hostname name="intranet.example" type="user"/></hostnames></host>
+<host><status state="up"/><address addr="198.51.100.67" addrtype="ipv4"/><hostnames><hostname name="portal.example" type="user"/></hostnames></host>
+<host><status state="up"/><address addr="198.51.100.68" addrtype="ipv4"/><hostnames><hostname name="www.example" type="user"/></hostnames></host>
+</nmaprun>"#,
+        )
+        .unwrap();
+        graph.apply_all(parse_file(&file).unwrap().observations);
+
+        assert_eq!(graph.hosts["intranet.example"], before, "not taken over");
+        assert!(graph.hosts["198.51.100.66"].hostnames.is_empty());
+        assert!(graph.hosts["198.51.100.66"].advisories.is_empty());
+        assert!(graph.hosts["192.0.2.10"]
+            .hostnames
+            .contains("portal.example"));
+        assert!(graph.hosts["198.51.100.67"].hostnames.is_empty());
+        // A name nobody owns or worked on still joins its address.
+        assert!(!graph.hosts.contains_key("www.example"));
+        assert!(graph.hosts["198.51.100.68"]
+            .hostnames
+            .contains("www.example"));
     }
 
     #[test]

@@ -285,8 +285,11 @@ pub struct State {
     /// Bumped on every visible change; WebSocket clients and the saver watch it.
     revision: watch::Sender<u64>,
     dirty: AtomicBool,
-    ground_queue: mpsc::UnboundedSender<String>,
-    ground_pending: Mutex<std::collections::HashSet<String>>,
+    /// Hosts waiting for CVE lookups, and the task that runs them.
+    grounds: Mutex<cve::GroundQueue>,
+    ground_wake: tokio::sync::Notify,
+    /// Lookups text asked for were left out, and the user was told.
+    ground_cut_noticed: AtomicBool,
     recon_queue: mpsc::UnboundedSender<i64>,
     cve: Option<CveClient>,
     vault: Mutex<Vault>,
@@ -446,6 +449,12 @@ impl State {
             // is too large stays too large.
             self.notice(format!("cannot save graph.json: {error:#}"));
         }
+        self.notice_if_full(full);
+    }
+
+    /// Says once that the graph is full, as soon as it is: what it refuses
+    /// from then on changes nothing, and nothing would be saved to say so.
+    pub fn notice_if_full(&self, full: bool) {
         if full && !self.full_noticed.swap(true, Ordering::SeqCst) {
             self.notice(
                 "this workspace's graph is full: new hosts, ports and paths are no longer \
@@ -481,19 +490,46 @@ impl State {
 
     /// Runs CVE grounding for `address` immediately and adds the CVEs found to the graph.
     pub async fn ground_host(&self, address: &str) -> Option<(cve::Merged, usize, Vec<String>)> {
+        self.ground_host_for(address, cve::Asked::Operator).await
+    }
+
+    /// [`Self::ground_host`] for whoever `asked`: what text asked for is
+    /// limited.
+    pub async fn ground_host_for(
+        &self,
+        address: &str,
+        asked: cve::Asked,
+    ) -> Option<(cve::Merged, usize, Vec<String>)> {
         let client = self.cve.as_ref()?;
         let host = self.graph().hosts.get(address).cloned()?;
-        let grounding = client.ground(&host).await;
+        let (mut lookups, text) = match &asked {
+            cve::Asked::Operator => (cve::plan(&host), Vec::new()),
+            cve::Asked::Recon(ports) => cve::plan_split(&host, |port| ports.contains(&port.key())),
+            cve::Asked::Text => (Vec::new(), cve::plan(&host)),
+        };
+        let (allowed, cut) = lock(&self.grounds).allow(text);
+        lookups.extend(allowed);
+        if cut && !self.ground_cut_noticed.swap(true, Ordering::SeqCst) {
+            self.notice(format!(
+                "CVE lookups for terminal text and imports reached this session's \
+                 limit ({}); what `meow recon` finds is still looked up",
+                cve::TEXT_QUESTIONS
+            ));
+        }
+        let mut grounding = client.ground_lookups(&host, lookups).await;
+        // What was left out was not asked: earlier matches for it stay.
+        grounding.partial |= cut;
         let total_matches = grounding.advisories.len();
-        let (merged, first_fix) = {
+        let (merged, first_fix, full) = {
             let mut graph = self.graph();
             let merged = cve::merge(&mut graph, address, &grounding);
             let first_fix = graph
                 .hosts
                 .get(address)
                 .and_then(|h| cve::fix_plan(h).into_iter().next());
-            (merged, first_fix)
+            (merged, first_fix, graph.is_full())
         };
+        self.notice_if_full(full);
         if !grounding.errors.is_empty() {
             let shown: Vec<&str> = grounding
                 .errors
@@ -549,11 +585,18 @@ impl State {
     }
 
     /// Queues CVE lookups for a host (no-op when grounding is disabled or
-    /// the host is already queued).
-    pub fn request_grounding(&self, address: &str) {
-        if self.cve.is_some() && lock(&self.ground_pending).insert(address.to_owned()) {
-            let _ = self.ground_queue.send(address.to_owned());
+    /// the host is already queued). `asked`: who wants them, which says
+    /// how soon and how many.
+    pub fn request_grounding(&self, address: &str, asked: cve::Asked) {
+        if self.cve.is_some() && lock(&self.grounds).push(address, asked) {
+            self.ground_wake.notify_one();
         }
+    }
+
+    /// Lets text ask only `questions` new CVE questions (tests).
+    #[cfg(test)]
+    pub(crate) fn limit_text_questions(&self, questions: usize) {
+        *lock(&self.grounds) = cve::GroundQueue::new(questions);
     }
 
     /// The snapshot sent to the HUD and the browser map.
@@ -677,13 +720,21 @@ impl State {
                     text,
                     record,
                 };
-                if !self.graph().apply(observation) {
+                let (stored, full) = {
+                    let mut graph = self.graph();
+                    (graph.apply(observation), graph.is_full())
+                };
+                self.notice_if_full(full);
+                if !stored && full {
+                    bail!("the note was not stored: this workspace's graph is full");
+                }
+                if !stored {
                     bail!("the note was not stored (unknown host, or a duplicate)");
                 }
                 self.mark_dirty();
                 // A note may carry a package URL worth looking up.
                 if let Some(address) = &address {
-                    self.request_grounding(address);
+                    self.request_grounding(address, cve::Asked::Operator);
                 }
                 Ok(json!({ "stored": true }))
             }
@@ -691,9 +742,14 @@ impl State {
                 let total = items.len();
                 let mut touched: Vec<String> = Vec::new();
                 let mut changed = 0;
-                {
+                let full = {
                     let mut graph = self.graph();
-                    for item in items {
+                    for mut item in items {
+                        // A file, not this session's scan: a name in it is a
+                        // claim, whatever the file says of it.
+                        if let Observation::Hostname { record, .. } = &mut item {
+                            record.confidence = record.confidence.min(Confidence::Medium);
+                        }
                         let address = observation_address(&item);
                         if graph.apply(item) {
                             changed += 1;
@@ -706,21 +762,27 @@ impl State {
                             }
                         }
                     }
-                }
+                    graph.is_full()
+                };
                 let hosts = self.graph().hosts.len();
                 if changed > 0 {
                     self.mark_dirty();
                     self.notice(format!("imported {changed} new facts ({total} parsed)"));
                 }
+                self.notice_if_full(full);
                 let grounding = ground && self.cve.is_some();
                 if grounding {
                     for address in &touched {
-                        self.request_grounding(address);
+                        self.request_grounding(address, cve::Asked::Text);
                     }
                 }
-                Ok(
-                    json!({ "parsed": total, "changed": changed, "hosts": hosts, "grounding": grounding }),
-                )
+                Ok(json!({
+                    "parsed": total,
+                    "changed": changed,
+                    "hosts": hosts,
+                    "grounding": grounding,
+                    "full": full,
+                }))
             }
             Command::Recon { target, flags } => {
                 let mode = self.mode();
@@ -995,6 +1057,20 @@ fn origin_allowed(headers: &HeaderMap, port: u16) -> bool {
     })
 }
 
+/// What a browser says of a request in a Fetch Metadata header
+/// (`Sec-Fetch-Site`, `Sec-Fetch-Mode`): true when it says `expected`, or
+/// says nothing (an older browser, or a client that is not one).
+fn fetch_says(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return true;
+    };
+    values.next().is_none()
+        && value
+            .to_str()
+            .is_ok_and(|said| said.trim().eq_ignore_ascii_case(expected))
+}
+
 /// The session token a request carries: in its `Authorization` header or
 /// its `?token=` query. Never a cookie: browsers send a cookie of
 /// 127.0.0.1 to every port of 127.0.0.1, so any other program listening
@@ -1060,10 +1136,16 @@ async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response
     let Some(presented) = token_from(headers, request.uri().query()) else {
         // A reload of the map, which keeps its token out of the address
         // bar: a page without secrets that reads it back from the tab.
+        // Only the tab itself is answered: a page of another origin that
+        // loads them learns that meow runs here.
         if request.method() == axum::http::Method::GET {
             match request.uri().path() {
-                "/" => return webui::reload_page(),
-                "/reload.js" => return webui::reload_script(),
+                "/" if fetch_says(headers, "sec-fetch-mode", "navigate") => {
+                    return webui::reload_page()
+                }
+                "/reload.js" if fetch_says(headers, "sec-fetch-site", "same-origin") => {
+                    return webui::reload_script()
+                }
                 _ => {}
             }
         }
@@ -1661,7 +1743,7 @@ async fn tap_loop(state: Shared, mut lines: mpsc::Receiver<String>) {
         }
         let mut ground: Vec<String> = Vec::new();
         let mut changed = false;
-        {
+        let full = {
             let mut graph = state.graph();
             for observation in observations {
                 let versioned = matches!(
@@ -1681,21 +1763,29 @@ async fn tap_loop(state: Shared, mut lines: mpsc::Receiver<String>) {
                     }
                 }
             }
-        }
+            graph.is_full()
+        };
         if changed {
             state.mark_dirty();
         }
+        state.notice_if_full(full);
         for address in ground {
-            state.request_grounding(&address);
+            state.request_grounding(&address, cve::Asked::Text);
         }
     }
 }
 
-/// Runs CVE lookups one host at a time, off the request path.
-async fn grounding_loop(state: Shared, mut queue: mpsc::UnboundedReceiver<String>) {
-    while let Some(address) = queue.recv().await {
-        lock(&state.ground_pending).remove(&address);
-        let _ = state.ground_host(&address).await;
+/// Runs CVE lookups one host at a time, off the request path: those the
+/// operator asked for first.
+async fn grounding_loop(state: Shared) {
+    loop {
+        let next = lock(&state.grounds).pop();
+        match next {
+            Some((address, asked)) => {
+                let _ = state.ground_host_for(&address, asked).await;
+            }
+            None => state.ground_wake.notified().await,
+        }
     }
 }
 
@@ -1814,7 +1904,6 @@ impl Coordinator {
         let runtime_file = RuntimeFile(runtime_path);
 
         let (revision, _) = watch::channel(0u64);
-        let (ground_queue, ground_rx) = mpsc::unbounded_channel();
         let (recon_queue, recon_rx) = mpsc::unbounded_channel();
         // Stages left "running" belong to a session that ended mid-run.
         queue::mark_running_interrupted(&lock(&db))?;
@@ -1852,8 +1941,9 @@ impl Coordinator {
             notices: Mutex::new(VecDeque::new()),
             revision,
             dirty: AtomicBool::new(true),
-            ground_queue,
-            ground_pending: Mutex::new(std::collections::HashSet::new()),
+            grounds: Mutex::new(cve::GroundQueue::new(cve::TEXT_QUESTIONS)),
+            ground_wake: tokio::sync::Notify::new(),
+            ground_cut_noticed: AtomicBool::new(false),
             recon_queue,
             cve,
             vault: Mutex::new(vault),
@@ -1884,7 +1974,7 @@ impl Coordinator {
         runtime.spawn(observe_loop(Arc::clone(&state)));
         runtime.spawn(git_guard(Arc::clone(&state)));
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
-        runtime.spawn(grounding_loop(Arc::clone(&state), ground_rx));
+        runtime.spawn(grounding_loop(Arc::clone(&state)));
         runtime.spawn(queue::worker(Arc::clone(&state), recon_rx));
         let cleaned = std::mem::take(&mut state.graph().cleaned);
         if !cleaned.is_empty() {
@@ -2971,10 +3061,80 @@ mod tests {
     }
 
     #[test]
+    fn an_import_only_claims_names_and_a_full_graph_says_so_at_once() {
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        let name = |address: &str, hostname: &str, confidence| Observation::Hostname {
+            address: address.into(),
+            hostname: hostname.into(),
+            record: EvidenceRecord::observed(Source::NmapXml, confidence, "x"),
+        };
+        state
+            .graph()
+            .apply(name("192.0.2.10", "portal.example", Confidence::High));
+        // `meow add` is never this session's scan, whatever its records say.
+        state
+            .execute(Command::Observations {
+                items: vec![name("198.51.100.66", "portal.example", Confidence::High)],
+                ground: false,
+            })
+            .unwrap();
+        let graph = state.graph().clone();
+        assert!(graph.hosts["192.0.2.10"]
+            .hostnames
+            .contains("portal.example"));
+        assert!(graph.hosts["198.51.100.66"].hostnames.is_empty());
+
+        // Fill the graph with hosts; the one after them is refused, which
+        // changes nothing, and is told at once.
+        let host = |n: usize| Observation::Host {
+            address: format!("10.{}.{}.{}", n >> 16, (n >> 8) & 255, n & 255),
+            os: None,
+            mac: None,
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "up"),
+        };
+        let room = 4096 - state.graph().hosts.len();
+        let result = state
+            .execute(Command::Observations {
+                items: (0..room).map(host).collect(),
+                ground: false,
+            })
+            .unwrap();
+        assert_eq!(result["full"], false);
+        let full_notice = |state: &State| {
+            lock(&state.notices)
+                .iter()
+                .any(|n| n.text.contains("graph is full"))
+        };
+        assert!(!full_notice(&state));
+        let result = state
+            .execute(Command::Observations {
+                items: vec![host(room)],
+                ground: false,
+            })
+            .unwrap();
+        assert_eq!(
+            (result["changed"].as_u64(), result["full"].as_bool()),
+            (Some(0), Some(true))
+        );
+        assert!(full_notice(&state), "no notice for a full graph");
+        let refused = state
+            .execute(Command::Note {
+                address: Some("192.0.2.10".into()),
+                text: "check later".into(),
+            })
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("graph is full"),
+            "{refused:#}"
+        );
+    }
+
+    #[test]
     fn imported_observations_and_cves_reach_the_map_and_the_graph_file() {
         let fx = fixture();
         let state = fx.coordinator.state();
-        let items = crate::parsers::nmap::parse(crate::parsers::nmap::SAMPLE).unwrap();
+        let items = crate::parsers::nmap::parse(crate::parsers::nmap::SAMPLE, false).unwrap();
         let result = state
             .execute(Command::Observations {
                 items,
@@ -3212,6 +3372,123 @@ mod tests {
         rx.recv().unwrap()
     }
 
+    /// A stand-in for NVD, OSV and the KEV list that answers nothing and
+    /// keeps the NVD questions it was asked.
+    fn cve_stand_in() -> (String, Arc<Mutex<Vec<String>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&asked);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            block_on(async move {
+                let app = Router::new()
+                    .route(
+                        "/nvd",
+                        get(
+                            move |query: axum::extract::Query<
+                                std::collections::HashMap<String, String>,
+                            >| async move {
+                                if let Some(words) = query.get("keywordSearch") {
+                                    lock(&log).push(words.clone());
+                                }
+                                Json(json!({ "totalResults": 0, "vulnerabilities": [] }))
+                            },
+                        ),
+                    )
+                    .route(
+                        "/kev",
+                        get(|| async { Json(json!({ "vulnerabilities": [] })) }),
+                    )
+                    .route(
+                        "/osv/v1/querybatch",
+                        post(|| async { Json(json!({ "results": [] })) }),
+                    );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        (rx.recv().unwrap(), asked)
+    }
+
+    #[test]
+    fn terminal_text_asks_only_so_many_cve_questions_and_the_operator_goes_first() {
+        let (base, asked) = cve_stand_in();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let mut config = Config::default();
+        config.cve.nvd_api_key = Some("stand-in".into());
+        config.cve.nvd_url = format!("{base}/nvd");
+        config.cve.osv_url = format!("{base}/osv");
+        config.cve.kev_url = format!("{base}/kev");
+        let coordinator = Coordinator::start(workspace, config).unwrap();
+        let state = coordinator.state();
+        // Two new questions for this session's terminal text.
+        *lock(&state.grounds) = cve::GroundQueue::new(2);
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}: {:?}", lock(&asked));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let mut sink = coordinator.tap_sink();
+        for line in [
+            "Nmap scan report for 198.51.100.1",
+            "21/tcp open ftp ProdA 1.0",
+            "22/tcp open ssh ProdB 1.0",
+            "23/tcp open telnet ProdC 1.0",
+            "",
+            "Nmap scan report for 198.51.100.2",
+            "21/tcp open ftp ProdA 1.0",
+            "",
+        ] {
+            sink(line);
+        }
+        let told = || {
+            lock(&state.notices)
+                .iter()
+                .any(|n| n.text.contains("reached this session's limit"))
+        };
+        wait_for("two questions and the notice", &|| {
+            lock(&asked).len() == 2 && told()
+        });
+        // The second host's software was asked about already.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(lock(&asked).len(), 2, "{:?}", lock(&asked));
+
+        // The operator's own request is not limited.
+        state.request_grounding("198.51.100.1", cve::Asked::Operator);
+        wait_for("the operator's question", &|| lock(&asked).len() == 3);
+        assert_eq!(lock(&asked)[2], "ProdC 1.0");
+
+        // A recon task's request is not limited for the ports its scans
+        // found, and is for those text added to the host.
+        for line in [
+            "Nmap scan report for 198.51.100.3",
+            "80/tcp open http ProdD 1.0",
+            "81/tcp open http ProdE 1.0",
+            "",
+        ] {
+            sink(line);
+        }
+        wait_for("the text host", &|| {
+            state
+                .graph()
+                .hosts
+                .get("198.51.100.3")
+                .is_some_and(|h| h.ports.len() == 2)
+        });
+        let own = ["80/tcp".to_owned()].into();
+        block_on(state.ground_host_for("198.51.100.3", cve::Asked::Recon(own))).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(lock(&asked)[3..], ["ProdD 1.0"]);
+    }
+
     #[test]
     fn ai_requests_stream_into_the_status_and_are_saved_per_host() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3235,7 +3512,7 @@ mod tests {
             .to_string()
             .contains("unknown host"));
 
-        let items = crate::parsers::nmap::parse(crate::parsers::nmap::SAMPLE).unwrap();
+        let items = crate::parsers::nmap::parse(crate::parsers::nmap::SAMPLE, false).unwrap();
         state
             .execute(Command::Observations {
                 items,
@@ -3367,6 +3644,41 @@ mod tests {
             "{script}"
         );
         assert!(!script.contains(&info.token));
+        // Another page may not load it (every port of 127.0.0.1 is the
+        // same site): its onload would say that meow runs on this port.
+        assert!(
+            script
+                .to_ascii_lowercase()
+                .contains("cross-origin-resource-policy: same-origin"),
+            "{script}"
+        );
+        let get = |path: &str, headers: &[(&str, &str)]| request(&info, "GET", path, headers, None);
+        for site in ["cross-site", "same-site", "none"] {
+            let (status, _) = get("/reload.js", &[("Sec-Fetch-Site", site)]);
+            assert_eq!(status, 401, "{site}");
+        }
+        let (status, body) = get("/reload.js", &[("Sec-Fetch-Site", "same-origin")]);
+        assert_eq!(status, 200, "{body}");
+        // The reload page is for the tab only, not a probe of another page.
+        let probe = [
+            ("Sec-Fetch-Site", "cross-site"),
+            ("Sec-Fetch-Mode", "no-cors"),
+        ];
+        assert_eq!(get("/", &probe).0, 401);
+        let reload = [("Sec-Fetch-Site", "none"), ("Sec-Fetch-Mode", "navigate")];
+        let (status, body) = get("/", &reload);
+        assert_eq!(status, 200);
+        assert!(body.to_string().contains("/reload.js"), "{body}");
+        // `meow map` opens the map from a file: a cross-site navigation,
+        // with the token.
+        let opener = [
+            ("Sec-Fetch-Site", "cross-site"),
+            ("Sec-Fetch-Mode", "navigate"),
+            ("Sec-Fetch-Dest", "document"),
+        ];
+        let (status, body) = get(&format!("/?token={}", info.token), &opener);
+        assert_eq!(status, 200);
+        assert!(body.to_string().contains("map.js"), "{body}");
 
         // Duplicate Host or Origin headers are refused.
         let mut headers = HeaderMap::new();

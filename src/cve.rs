@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::cpe;
 use crate::db::Db;
 use crate::evidence::{Confidence, EvidenceRecord, Source};
-use crate::graph::{Advisory, Fact, Host};
+use crate::graph::{Advisory, Fact, Host, Port};
 
 pub const NVD_URL: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
 pub const OSV_URL: &str = "https://api.osv.dev";
@@ -772,66 +772,118 @@ fn is_safe_keyword_token(s: &str, allow_spaces: bool) -> bool {
 /// software with a known version are looked up: a product without a
 /// version would match thousands of unrelated CVEs.
 pub fn plan(host: &Host) -> Vec<Lookup> {
+    plan_split(host, |_| true).0
+}
+
+/// [`plan`] in two parts: the lookups for the open ports `own` accepts and
+/// the operator's notes, then those for the host's other open ports, within
+/// the same limit.
+pub fn plan_split(host: &Host, own: impl Fn(&Port) -> bool) -> (Vec<Lookup>, Vec<Lookup>) {
     let mut out: Vec<Lookup> = Vec::new();
-    let mut push = |lookup: Lookup| {
-        if out.len() < MAX_LOOKUPS_PER_HOST && !out.contains(&lookup) {
-            out.push(lookup);
+    for port in host.open_ports().filter(|port| own(port)) {
+        plan_port(port, &mut out);
+    }
+    // Package URLs the operator wrote into notes.
+    for fact in &host.facts {
+        if fact.record.source != Source::ManualNote {
+            continue;
         }
-    };
-    for port in host.open_ports() {
-        let key = port.key();
-        let mut keyworded = false;
-        for name in &port.cpes {
-            let Some(parts) = cpe::parts(name) else {
-                continue;
-            };
-            let Some(reported) = parts.version else {
-                continue;
-            };
-            // Nmap reports Windows OpenSSH as version `for_windows_9.5`,
-            // which no database entry is written against.
-            let version = cpe::clean_version(&reported);
-            let cpe = (version != reported)
-                .then(|| cpe::with_version(name, &version))
-                .flatten()
-                .unwrap_or_else(|| name.clone());
-            push(Lookup::Cpe {
+        for found in PURL.find_iter(&fact.claim) {
+            push_lookup(
+                &mut out,
+                Lookup::Package {
+                    package: Package {
+                        purl: Some(found.as_str().to_owned()),
+                        name: String::new(),
+                        ecosystem: String::new(),
+                        version: String::new(),
+                        declared: true,
+                    },
+                    port: None,
+                },
+            );
+        }
+    }
+    let first = out.len();
+    for port in host.open_ports().filter(|port| !own(port)) {
+        plan_port(port, &mut out);
+    }
+    let rest = out.split_off(first);
+    (out, rest)
+}
+
+fn push_lookup(out: &mut Vec<Lookup>, lookup: Lookup) {
+    if out.len() < MAX_LOOKUPS_PER_HOST && !out.contains(&lookup) {
+        out.push(lookup);
+    }
+}
+
+/// The lookups one open port justifies.
+fn plan_port(port: &Port, out: &mut Vec<Lookup>) {
+    let key = port.key();
+    let mut keyworded = false;
+    for name in &port.cpes {
+        let Some(parts) = cpe::parts(name) else {
+            continue;
+        };
+        let Some(reported) = parts.version else {
+            continue;
+        };
+        // Nmap reports Windows OpenSSH as version `for_windows_9.5`,
+        // which no database entry is written against.
+        let version = cpe::clean_version(&reported);
+        let cpe = (version != reported)
+            .then(|| cpe::with_version(name, &version))
+            .flatten()
+            .unwrap_or_else(|| name.clone());
+        push_lookup(
+            out,
+            Lookup::Cpe {
                 cpe,
                 port: key.clone(),
-            });
-            let product = parts.product.replace('_', " ");
-            if is_safe_keyword_token(&product, true) && is_safe_keyword_token(&version, false) {
-                push(Lookup::Keyword {
+            },
+        );
+        let product = parts.product.replace('_', " ");
+        if is_safe_keyword_token(&product, true) && is_safe_keyword_token(&version, false) {
+            push_lookup(
+                out,
+                Lookup::Keyword {
                     product,
                     version,
                     port: key.clone(),
-                });
-                if parts.part == 'a' {
-                    keyworded = true;
-                }
+                },
+            );
+            if parts.part == 'a' {
+                keyworded = true;
             }
         }
-        if !keyworded {
-            if let (Some(product), Some(version)) =
-                (&port.product, port.version.as_deref().and_then(first_token))
-            {
-                if is_safe_keyword_token(product, true) && is_safe_keyword_token(&version, false) {
-                    push(Lookup::Keyword {
+    }
+    if !keyworded {
+        if let (Some(product), Some(version)) =
+            (&port.product, port.version.as_deref().and_then(first_token))
+        {
+            if is_safe_keyword_token(product, true) && is_safe_keyword_token(&version, false) {
+                push_lookup(
+                    out,
+                    Lookup::Keyword {
                         product: product.clone(),
                         version,
                         port: key.clone(),
-                    });
-                }
+                    },
+                );
             }
         }
-        for (path, _) in port.paths.walk() {
-            let file = path.rsplit('/').next().unwrap_or("");
-            let Some(found) = JS_LIBRARY.captures(file) else {
-                continue;
-            };
-            let name = found[1].to_ascii_lowercase().replace('.', "-");
-            if KNOWN_JS.contains(&name.as_str()) {
-                push(Lookup::Package {
+    }
+    for (path, _) in port.paths.walk() {
+        let file = path.rsplit('/').next().unwrap_or("");
+        let Some(found) = JS_LIBRARY.captures(file) else {
+            continue;
+        };
+        let name = found[1].to_ascii_lowercase().replace('.', "-");
+        if KNOWN_JS.contains(&name.as_str()) {
+            push_lookup(
+                out,
+                Lookup::Package {
                     package: Package {
                         purl: None,
                         name,
@@ -840,29 +892,10 @@ pub fn plan(host: &Host) -> Vec<Lookup> {
                         declared: false,
                     },
                     port: Some(key.clone()),
-                });
-            }
-        }
-    }
-    // Package URLs the operator wrote into notes.
-    for fact in &host.facts {
-        if fact.record.source != Source::ManualNote {
-            continue;
-        }
-        for found in PURL.find_iter(&fact.claim) {
-            push(Lookup::Package {
-                package: Package {
-                    purl: Some(found.as_str().to_owned()),
-                    name: String::new(),
-                    ecosystem: String::new(),
-                    version: String::new(),
-                    declared: true,
                 },
-                port: None,
-            });
+            );
         }
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,7 +1444,11 @@ impl CveClient {
     /// after two consecutive failures NVD lookups stop so an offline or
     /// rate-limited session is not kept waiting.
     pub async fn ground(&self, host: &Host) -> Grounding {
-        let lookups = plan(host);
+        self.ground_lookups(host, plan(host)).await
+    }
+
+    /// [`Self::ground`] with only `lookups`, a part of what [`plan`] gave.
+    pub async fn ground_lookups(&self, host: &Host, lookups: Vec<Lookup>) -> Grounding {
         let mut grounding = Grounding {
             lookups: lookups.len(),
             ..Grounding::default()
@@ -1620,6 +1657,144 @@ impl CveClient {
             });
         }
         grounding
+    }
+}
+
+impl Lookup {
+    /// What is asked: the same software asked about for two hosts is one
+    /// question, answered the second time from the cache.
+    fn question(&self) -> String {
+        match self {
+            Lookup::Cpe { cpe, .. } => format!("cpe {cpe}"),
+            Lookup::Keyword {
+                product, version, ..
+            } => format!("keyword {product} {version}"),
+            Lookup::Package { package, .. } => format!("package {}", package.label()),
+        }
+    }
+}
+
+/// Who asked for a host's CVE lookups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asked {
+    /// The operator: looked up first, as many as needed.
+    Operator,
+    /// A recon task, for the open ports its own scans reported (`22/tcp`):
+    /// those first, as many as needed. The host's other ports are known
+    /// from text, and are looked up as text is.
+    Recon(BTreeSet<String>),
+    /// Terminal text or an imported file, which anyone can write: looked up
+    /// after the rest, and only so many new questions per session.
+    Text,
+}
+
+impl Asked {
+    /// Who asked, when two did: the operator before a recon task before
+    /// text; two recon tasks for the ports of both.
+    fn and(self, other: Asked) -> Asked {
+        match (self, other) {
+            (Asked::Operator, _) | (_, Asked::Operator) => Asked::Operator,
+            (Asked::Recon(mut ports), Asked::Recon(more)) => {
+                ports.extend(more);
+                Asked::Recon(ports)
+            }
+            (Asked::Recon(ports), Asked::Text) | (Asked::Text, Asked::Recon(ports)) => {
+                Asked::Recon(ports)
+            }
+            (Asked::Text, Asked::Text) => Asked::Text,
+        }
+    }
+}
+
+/// New questions terminal text and imports may ask in one session. NVD
+/// answers one every 6.5 s without a key: about half an hour of lookups.
+pub const TEXT_QUESTIONS: usize = 256;
+/// Hosts waiting for their lookups in each queue, at most (a graph holds
+/// 4096): text cannot hold up what the operator asks for.
+const MAX_WAITING: usize = 4096;
+
+/// The hosts waiting for CVE lookups: those the operator or a recon task
+/// asked for first, each host once, and what text may still ask.
+#[derive(Debug)]
+pub struct GroundQueue {
+    first: std::collections::VecDeque<String>,
+    later: std::collections::VecDeque<String>,
+    /// Each waiting host, and who asked for it.
+    waiting: std::collections::HashMap<String, Asked>,
+    /// Questions text asked this session, and how many more it may ask.
+    asked: std::collections::HashSet<String>,
+    left: usize,
+}
+
+impl GroundQueue {
+    pub fn new(text_questions: usize) -> Self {
+        Self {
+            first: std::collections::VecDeque::new(),
+            later: std::collections::VecDeque::new(),
+            waiting: std::collections::HashMap::new(),
+            asked: std::collections::HashSet::new(),
+            left: text_questions,
+        }
+    }
+
+    /// Queues `address`; false when it waits already or its queue is full.
+    /// The operator or a recon task asking for a host that text queued
+    /// moves it forward.
+    pub fn push(&mut self, address: &str, asked: Asked) -> bool {
+        let first = asked != Asked::Text;
+        let queue = if first { &self.first } else { &self.later };
+        if queue.len() >= MAX_WAITING {
+            return false;
+        }
+        if let Some(waits) = self.waiting.get_mut(address) {
+            let moves = first && *waits == Asked::Text;
+            *waits = std::mem::replace(waits, Asked::Text).and(asked);
+            if moves {
+                if let Some(at) = self.later.iter().position(|a| a == address) {
+                    self.later.remove(at);
+                }
+                self.first.push_back(address.to_owned());
+            }
+            return moves;
+        }
+        self.waiting.insert(address.to_owned(), asked);
+        if first {
+            self.first.push_back(address.to_owned());
+        } else {
+            self.later.push_back(address.to_owned());
+        }
+        true
+    }
+
+    /// The next host to look up, the operator's and recon's first.
+    pub fn pop(&mut self) -> Option<(String, Asked)> {
+        let address = match self.first.pop_front() {
+            Some(address) => address,
+            None => self.later.pop_front()?,
+        };
+        let asked = self.waiting.remove(&address).unwrap_or(Asked::Text);
+        Some((address, asked))
+    }
+
+    /// The lookups text may make for a host: questions already asked this
+    /// session (answered from the cache), and new ones while any are left.
+    /// Also says whether any were left out.
+    pub fn allow(&mut self, lookups: Vec<Lookup>) -> (Vec<Lookup>, bool) {
+        let mut cut = false;
+        let mut kept = Vec::with_capacity(lookups.len());
+        for lookup in lookups {
+            let question = lookup.question();
+            if !self.asked.contains(&question) {
+                if self.left == 0 {
+                    cut = true;
+                    continue;
+                }
+                self.left -= 1;
+                self.asked.insert(question);
+            }
+            kept.push(lookup);
+        }
+        (kept, cut)
     }
 }
 
@@ -3068,5 +3243,128 @@ mod tests {
         assert!(!is_safe_keyword_token("-flag", true));
         assert!(is_safe_keyword_token("Apache httpd", true));
         assert!(is_safe_keyword_token("9.4.31.v20200723", false));
+    }
+
+    #[test]
+    fn the_operator_is_looked_up_first_and_text_only_so_much() {
+        let mut queue = GroundQueue::new(3);
+        assert!(queue.push("198.51.100.1", Asked::Text));
+        assert!(queue.push("198.51.100.2", Asked::Text));
+        assert!(!queue.push("198.51.100.1", Asked::Text), "each host once");
+        assert!(queue.push("192.0.2.10", Asked::Operator));
+        // Asked for by the operator too, a host text queued moves forward.
+        assert!(queue.push("198.51.100.2", Asked::Operator));
+        assert_eq!(
+            [queue.pop(), queue.pop(), queue.pop(), queue.pop()],
+            [
+                Some(("192.0.2.10".to_owned(), Asked::Operator)),
+                Some(("198.51.100.2".to_owned(), Asked::Operator)),
+                Some(("198.51.100.1".to_owned(), Asked::Text)),
+                None
+            ]
+        );
+        assert!(
+            queue.push("198.51.100.1", Asked::Text),
+            "queued again once done"
+        );
+
+        // The same software on many hosts is one question; new questions
+        // stop at the limit.
+        let keyword = |product: &str| Lookup::Keyword {
+            product: product.to_owned(),
+            version: "1.0".to_owned(),
+            port: "80/tcp".to_owned(),
+        };
+        let (kept, cut) = queue.allow(vec![keyword("a"), keyword("b")]);
+        assert_eq!((kept.len(), cut), (2, false));
+        let (kept, cut) = queue.allow(vec![keyword("a"), keyword("b"), keyword("c")]);
+        assert_eq!((kept.len(), cut), (3, false));
+        let (kept, cut) = queue.allow(vec![keyword("d"), keyword("a")]);
+        assert_eq!((kept, cut), (vec![keyword("a")], true));
+    }
+
+    #[test]
+    fn a_recon_task_goes_first_for_its_own_ports_only() {
+        let ports = |keys: &[&str]| -> BTreeSet<String> {
+            keys.iter().map(|key| (*key).to_owned()).collect()
+        };
+        let mut queue = GroundQueue::new(3);
+        assert!(queue.push("198.51.100.1", Asked::Text));
+        assert!(queue.push("198.51.100.2", Asked::Text));
+        assert!(queue.push("198.51.100.3", Asked::Recon(ports(&["22/tcp"]))));
+        // A recon task asking for a host text queued moves it forward; two
+        // tasks ask for the ports of both.
+        assert!(queue.push("198.51.100.2", Asked::Recon(ports(&["80/tcp"]))));
+        assert!(!queue.push("198.51.100.3", Asked::Recon(ports(&["53/udp"]))));
+        assert!(!queue.push("198.51.100.3", Asked::Text));
+        assert_eq!(
+            [queue.pop(), queue.pop(), queue.pop(), queue.pop()],
+            [
+                Some((
+                    "198.51.100.3".to_owned(),
+                    Asked::Recon(ports(&["22/tcp", "53/udp"]))
+                )),
+                Some(("198.51.100.2".to_owned(), Asked::Recon(ports(&["80/tcp"])))),
+                Some(("198.51.100.1".to_owned(), Asked::Text)),
+                None
+            ]
+        );
+        assert!(queue.push("198.51.100.4", Asked::Recon(ports(&["22/tcp"]))));
+        assert!(!queue.push("198.51.100.4", Asked::Operator));
+        assert_eq!(
+            queue.pop(),
+            Some(("198.51.100.4".to_owned(), Asked::Operator))
+        );
+
+        // Text calls 70 ports of a host open; the scan found one. Its
+        // lookup comes first, whatever text says.
+        let mut graph = Graph::default();
+        for port in (1..=70u16).chain([9000]) {
+            graph.apply(Observation::Port {
+                address: "198.51.100.5".into(),
+                port,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: None,
+                product: Some(if port == 9000 {
+                    "OpenSSH".into()
+                } else {
+                    format!("Prod{port}")
+                }),
+                version: Some("1.0".into()),
+                extra_info: None,
+                cpes: Vec::new(),
+                record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Medium, "x"),
+            });
+        }
+        let host = graph.hosts.remove("198.51.100.5").unwrap();
+        let openssh = |lookups: &[Lookup]| {
+            lookups.iter().any(
+                |lookup| matches!(lookup, Lookup::Keyword { product, .. } if product == "OpenSSH"),
+            )
+        };
+        assert!(!openssh(&plan(&host)), "the limit was reached before it");
+        let (own, rest) = plan_split(&host, |port| port.key() == "9000/tcp");
+        assert_eq!(own.len(), 1);
+        assert!(openssh(&own));
+        assert_eq!(rest.len(), MAX_LOOKUPS_PER_HOST - 1);
+        assert!(!openssh(&rest));
+    }
+
+    #[test]
+    fn hosts_waiting_for_lookups_are_bounded() {
+        let mut queue = GroundQueue::new(TEXT_QUESTIONS);
+        for n in 0..MAX_WAITING {
+            assert!(queue.push(&format!("host{n}.example"), Asked::Text));
+        }
+        assert!(!queue.push("one-more.example", Asked::Text));
+        // Text filling its queue does not hold up the operator.
+        assert!(queue.push("one-more.example", Asked::Operator));
+        assert_eq!(queue.pop().unwrap().0, "one-more.example");
+        for n in 0..MAX_WAITING {
+            assert!(queue.push(&format!("asked{n}.example"), Asked::Operator));
+        }
+        assert!(!queue.push("one-more.example", Asked::Operator));
+        assert_eq!(queue.waiting.len(), 2 * MAX_WAITING);
     }
 }

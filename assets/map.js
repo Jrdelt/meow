@@ -2365,9 +2365,39 @@
     }
   }
 
+  // Finds where a code span closes: at the next run of as many backticks.
+  // The longest run still ahead is known, so a span that never closes is
+  // not looked for to the end of the text again for each run before it.
+  function codeSpanCloser(text) {
+    var starts = null;
+    var longest = null;
+    var next = 0;
+    return function (ticks, from) {
+      if (!starts) {
+        starts = [];
+        longest = [];
+        var at = text.indexOf('`');
+        while (at >= 0) {
+          var stop = at;
+          while (stop < text.length && text.charAt(stop) === '`') { stop += 1; }
+          starts.push(at);
+          longest.push(stop - at);
+          at = text.indexOf('`', stop);
+        }
+        for (var k = longest.length - 2; k >= 0; k -= 1) {
+          if (longest[k + 1] > longest[k]) { longest[k] = longest[k + 1]; }
+        }
+      }
+      while (next < starts.length && starts[next] < from) { next += 1; }
+      if (next >= starts.length || longest[next] < ticks.length) { return -1; }
+      return text.indexOf(ticks, from);
+    };
+  }
+
   function appendInlineCodeOnly(parent, text) {
     var buf = '';
     var i = 0;
+    var closeSpan = codeSpanCloser(text);
     function flush() {
       if (buf) {
         parent.appendChild(document.createTextNode(buf));
@@ -2379,7 +2409,7 @@
         var tickEnd = i;
         while (tickEnd < text.length && text.charAt(tickEnd) === '`') { tickEnd += 1; }
         var ticks = text.slice(i, tickEnd);
-        var closeIdx = text.indexOf(ticks, tickEnd);
+        var closeIdx = closeSpan(ticks, tickEnd);
         if (closeIdx > tickEnd) {
           flush();
           parent.appendChild(el('code', null, text.slice(tickEnd, closeIdx)));
@@ -2402,6 +2432,12 @@
   function appendInlineFormatted(parent, text) {
     var buf = '';
     var i = 0;
+    // Where the next `](` and the `)` after it are, looked for once and
+    // used for every `[` before them (-2: not looked for, -1: none). Looked
+    // for again at each `[`, they made `[]` repeated take seconds.
+    var linkMid = -2;
+    var linkClose = -2;
+    var closeSpan = codeSpanCloser(text);
     function flush() {
       if (buf) {
         parent.appendChild(document.createTextNode(buf));
@@ -2414,7 +2450,7 @@
         var tickEnd = i;
         while (tickEnd < text.length && text.charAt(tickEnd) === '`') { tickEnd += 1; }
         var ticks = text.slice(i, tickEnd);
-        var closeIdx = text.indexOf(ticks, tickEnd);
+        var closeIdx = closeSpan(ticks, tickEnd);
         if (closeIdx > tickEnd) {
           flush();
           parent.appendChild(el('code', null, text.slice(tickEnd, closeIdx)));
@@ -2426,11 +2462,13 @@
         continue;
       }
       if (ch === '[') {
-        var mid = text.indexOf('](', i + 1);
+        if (linkMid !== -1 && linkMid <= i) { linkMid = text.indexOf('](', i + 1); }
+        var mid = linkMid;
         if (mid > i + 1) {
           var label = text.slice(i + 1, mid);
           if (label.indexOf('[') < 0 && label.indexOf('\n') < 0) {
-            var closeParen = text.indexOf(')', mid + 2);
+            if (linkClose !== -1 && linkClose < mid + 2) { linkClose = text.indexOf(')', mid + 2); }
+            var closeParen = linkClose;
             if (closeParen > mid + 2) {
               var rawUrl = text.slice(mid + 2, closeParen).trim();
               if (/^https?:\/\/\S+$/.test(rawUrl)) {
@@ -2523,6 +2561,20 @@
     return cells.every(function (c) { return /^:?-{3,}:?$/.test(c); });
   }
 
+  // A table row has at most this many cells: the rest of it goes in the
+  // last one. Short rows get empty cells up to the header's count, only so
+  // many per reply: a wide header over many '|' rows asked for millions.
+  var MAX_TABLE_COLUMNS = 32;
+  var MAX_TABLE_PADDING = 2000;
+
+  function tableCells(line) {
+    var cells = splitTableCells(line);
+    if (cells.length <= MAX_TABLE_COLUMNS) { return cells; }
+    var kept = cells.slice(0, MAX_TABLE_COLUMNS - 1);
+    kept.push(cells.slice(MAX_TABLE_COLUMNS - 1).join(' | '));
+    return kept;
+  }
+
   function matchListItem(line) {
     if (isHrLine(line)) { return null; }
     var u = /^(\s*)[-*+]\s+(.*)$/.exec(line);
@@ -2535,6 +2587,7 @@
   function renderAiMarkdown(container, rawText) {
     var lines = String(rawText || '').replace(/\r\n?/g, '\n').split('\n');
     var i = 0;
+    var padding = MAX_TABLE_PADDING;
     while (i < lines.length) {
       var line = lines[i];
       if (!/\S/.test(line)) {
@@ -2559,10 +2612,16 @@
         pre.appendChild(el('code', null, codeLines.join('\n')));
         continue;
       }
-      var headMatch = /^ {0,3}(#{1,6})\s+(.*?)\s*#*$/.exec(line);
+      var headMatch = /^ {0,3}(#{1,6})\s+/.exec(line);
       if (headMatch) {
+        // Closing #s and spaces are cut here, not by the expression: one
+        // that looks for them at the end of the line goes back over all its
+        // spaces again for each one, for many seconds on a long line.
+        var heading = line.slice(headMatch[0].length);
+        var headEnd = heading.length;
+        while (headEnd > 0 && heading.charAt(headEnd - 1) === '#') { headEnd -= 1; }
         var hNode = container.appendChild(el(headMatch[1].length <= 2 ? 'h3' : 'h4'));
-        appendInlineFormatted(hNode, headMatch[2]);
+        appendInlineFormatted(hNode, heading.slice(0, headEnd).trimEnd());
         i += 1;
         continue;
       }
@@ -2572,7 +2631,7 @@
         continue;
       }
       if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
-        var headers = splitTableCells(line);
+        var headers = tableCells(line);
         var tbl = container.appendChild(el('table'));
         var thead = tbl.appendChild(el('thead'));
         var headTr = thead.appendChild(el('tr'));
@@ -2583,9 +2642,14 @@
         i += 2;
         var tbody = tbl.appendChild(el('tbody'));
         while (i < lines.length && /\S/.test(lines[i]) && isTableRow(lines[i])) {
-          var rowCells = splitTableCells(lines[i]);
+          var rowCells = tableCells(lines[i]);
+          var width = rowCells.length;
+          if (width < headers.length && headers.length - width <= padding) {
+            padding -= headers.length - width;
+            width = headers.length;
+          }
           var tr = tbody.appendChild(el('tr'));
-          for (var c = 0; c < Math.max(headers.length, rowCells.length); c += 1) {
+          for (var c = 0; c < width; c += 1) {
             var td = tr.appendChild(el('td'));
             appendInlineFormatted(td, rowCells[c] || '');
           }
@@ -2707,7 +2771,19 @@
     { re: /^##\s+Red Team\b.*$/m, cls: 'team-red', title: 'Red Team \u2014 Authorized Pen Test' },
     { re: /^##\s+Blue Team\b.*$/m, cls: 'team-blue', title: 'Blue Team \u2014 SOC Defense' }
   ];
+  // Formatting is for a reply of some pages. Past that, the rest is shown
+  // as it is: no reply keeps the page busy, however it is written.
+  var MAX_MARKDOWN = 50000;
+
   function renderTriage(container, text) {
+    if (text.length > MAX_MARKDOWN) {
+      var cut = MAX_MARKDOWN;
+      var unit = text.charCodeAt(cut - 1);
+      if (unit >= 0xd800 && unit <= 0xdbff) { cut -= 1; }
+      renderTriage(container, text.slice(0, cut));
+      container.appendChild(el('pre', 'reply', text.slice(cut)));
+      return;
+    }
     var found = TEAM_HEADINGS.map(function (team) {
       var match = team.re.exec(text);
       return match ? { team: team, at: match.index, after: match.index + match[0].length } : null;

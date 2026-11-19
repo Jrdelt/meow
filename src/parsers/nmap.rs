@@ -16,11 +16,15 @@ fn children<'a>(node: Node<'a, 'a>, name: &'a str) -> impl Iterator<Item = Node<
     node.children().filter(move |n| n.has_tag_name(name))
 }
 
+/// The most of one attribute that is read. The graph keeps a line of a
+/// product, a version or a name; megabytes of one are not carried along.
+const MAX_ATTR: usize = 8 * 1024;
+
 fn attr(node: Node<'_, '_>, name: &str) -> Option<String> {
     node.attribute(name)
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(str::to_owned)
+        .map(|v| crate::evidence::head(v, MAX_ATTR).to_owned())
 }
 
 /// The exact source text of an element, used as the evidence snippet.
@@ -215,7 +219,11 @@ fn nested_deeper_than(xml: &str, limit: usize) -> bool {
     false
 }
 
-pub fn parse(xml: &str) -> Result<Vec<Observation>> {
+/// Reads nmap's XML. `trusted_names`: the file is the output of the scan
+/// this session ran, so the name it was pointed at (`type="user"`) is the
+/// scanner's own resolution. Any other file (`meow add`) only claims it:
+/// whoever wrote it chose the name and the address alike.
+pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
     // nmap writes `<!DOCTYPE nmaprun>` and declares nothing. A file that
     // declares entities of its own can make a few kilobytes stand for
     // gigabytes: a reference to one is replaced by its text each time.
@@ -282,7 +290,8 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                     // `user`: the name the scan was pointed at, resolved by
                     // the scanner. Anything else (`PTR`) is what the owner
                     // of the address makes its reverse record say.
-                    let asked_for = attr(name, "type").is_some_and(|kind| kind == "user");
+                    let asked_for =
+                        trusted_names && attr(name, "type").is_some_and(|kind| kind == "user");
                     out.push(Observation::Hostname {
                         address: address.clone(),
                         hostname,
@@ -424,7 +433,7 @@ pub fn parse(xml: &str) -> Result<Vec<Observation>> {
                         address: address.clone(),
                         port: number,
                         scheme: scheme.to_owned(),
-                        server: Some(output.to_owned()),
+                        server: Some(crate::evidence::head(output, MAX_ATTR).to_owned()),
                         location: None,
                         record: EvidenceRecord::observed(
                             Source::HttpHeader,
@@ -527,7 +536,7 @@ fn host_scripts(xml: &str, host: Node, address: &str, os_known: bool, out: &mut 
 /// Open TCP ports per host in an Nmap XML document, for stage 2 of recon.
 pub fn open_tcp_ports(xml: &str) -> Result<Vec<(String, Vec<u16>)>> {
     let mut by_host: Vec<(String, Vec<u16>)> = Vec::new();
-    for observation in parse(xml)? {
+    for observation in parse(xml, true)? {
         if let Observation::Port {
             address,
             port,
@@ -591,7 +600,7 @@ mod tests {
 <port protocol="tcp" portid="443"><state state="filtered"/></port>
 </ports></host></nmaprun>"#;
         let mut graph = Graph::default();
-        graph.apply_all(parse(xml).unwrap());
+        graph.apply_all(parse(xml, true).unwrap());
         let host = &graph.hosts["192.0.2.7"];
         assert_eq!(host.open_ports().count(), 2);
         let closed = &host.not_open["tcp closed"];
@@ -604,7 +613,7 @@ mod tests {
         // Older nmap gives only a count.
         let bare = r#"<nmaprun><host><status state="up"/><address addr="192.0.2.8" addrtype="ipv4"/>
 <ports><extraports state="filtered" count="1000"/></ports></host></nmaprun>"#;
-        graph.apply_all(parse(bare).unwrap());
+        graph.apply_all(parse(bare, true).unwrap());
         let group = &graph.hosts["192.0.2.8"].not_open["tcp filtered"];
         assert_eq!((group.count, group.ports.as_str()), (1000, ""));
         assert_eq!(
@@ -614,8 +623,58 @@ mod tests {
     }
 
     #[test]
+    fn only_the_sessions_own_scan_resolves_the_name_it_was_given() {
+        let xml = r#"<nmaprun><host><status state="up"/><address addr="198.51.100.66" addrtype="ipv4"/>
+<hostnames><hostname name="intranet.example" type="user"/><hostname name="ptr.example" type="PTR"/></hostnames></host></nmaprun>"#;
+        let confidence = |trusted: bool| -> Vec<(String, Confidence)> {
+            parse(xml, trusted)
+                .unwrap()
+                .into_iter()
+                .filter_map(|o| match o {
+                    Observation::Hostname {
+                        hostname, record, ..
+                    } => Some((hostname, record.confidence)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            confidence(true),
+            [
+                ("intranet.example".to_owned(), Confidence::High),
+                ("ptr.example".to_owned(), Confidence::Medium)
+            ]
+        );
+        // A file anyone may have written only claims it.
+        assert!(confidence(false)
+            .iter()
+            .all(|(_, confidence)| *confidence == Confidence::Medium));
+    }
+
+    #[test]
+    fn an_attribute_of_megabytes_is_not_carried_along() {
+        let long = "A".repeat(2 * 1024 * 1024);
+        let xml = format!(
+            r#"<nmaprun><host><status state="up"/><address addr="192.0.2.77" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="{long}" version="1.0"/>
+<script id="http-server-header" output="{long}"/></port></ports></host></nmaprun>"#
+        );
+        for observation in parse(&xml, true).unwrap() {
+            match observation {
+                Observation::Port { product, .. } => {
+                    assert_eq!(product.map(|p| p.len()), Some(MAX_ATTR));
+                }
+                Observation::Http { server, .. } => {
+                    assert_eq!(server.map(|s| s.len()), Some(MAX_ATTR));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn sample_scan_becomes_hosts_ports_and_names() {
-        let observations = parse(SAMPLE).unwrap();
+        let observations = parse(SAMPLE, true).unwrap();
         let mut graph = Graph::default();
         graph.apply_all(observations);
 
@@ -698,7 +757,7 @@ mod tests {
 <script id="smb2-security-mode" output="&#xa;  3:1:1: &#xa;    Message signing enabled but not required"/></hostscript>
 </host></nmaprun>"#;
         let mut graph = Graph::default();
-        graph.apply_all(parse(xml).unwrap());
+        graph.apply_all(parse(xml, true).unwrap());
         let host = &graph.hosts["192.0.2.10"];
         assert_eq!(
             host.os.as_deref(),
@@ -730,14 +789,14 @@ mod tests {
 
     #[test]
     fn bad_input_is_an_error_not_a_panic() {
-        assert!(parse("").is_err());
-        assert!(parse("<nmaprun><host>").is_err());
-        let err = parse("<html><body/></html>").unwrap_err();
+        assert!(parse("", true).is_err());
+        assert!(parse("<nmaprun><host>", true).is_err());
+        let err = parse("<html><body/></html>", true).unwrap_err();
         assert!(err.to_string().contains("not an Nmap XML file"));
         // Hosts without an address or ports without a number are skipped.
         let odd = r#"<nmaprun><host><status state="up"/></host>
             <host><address addr="10.0.0.7" addrtype="ipv4"/><ports><port protocol="tcp" portid="x"/></ports></host></nmaprun>"#;
-        assert_eq!(parse(odd).unwrap().len(), 1);
+        assert_eq!(parse(odd, true).unwrap().len(), 1);
     }
 
     #[test]
@@ -749,7 +808,7 @@ mod tests {
             <!ENTITY g "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;"><!ENTITY h "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">
         ]><nmaprun><host><address addr="&h;" addrtype="ipv4"/></host></nmaprun>"#;
         // Either rejected or parsed without producing a host; never a hang.
-        assert!(parse(bomb).map(|o| o.is_empty()).unwrap_or(true));
+        assert!(parse(bomb, true).map(|o| o.is_empty()).unwrap_or(true));
     }
 
     #[test]
@@ -766,7 +825,7 @@ mod tests {
             "&b;".repeat(6000)
         );
         assert!(bomb.len() < 30_000);
-        let error = format!("{:#}", parse(&bomb).unwrap_err());
+        let error = format!("{:#}", parse(&bomb, true).unwrap_err());
         assert!(error.contains("declares its own XML entities"), "{error}");
 
         // 1,500 elements inside one another (10 KB) ended the program on a
@@ -777,7 +836,7 @@ mod tests {
                 "<a>".repeat(depth),
                 "</a>".repeat(depth)
             );
-            let error = format!("{:#}", parse(&deep).unwrap_err());
+            let error = format!("{:#}", parse(&deep, true).unwrap_err());
             assert!(
                 error.contains("nested more than 64 elements deep"),
                 "{error}"
@@ -797,7 +856,10 @@ mod tests {
         assert!(nested_deeper_than("<a><b><c/></b></a>", 1));
         assert!(!nested_deeper_than("<a><b><c/></b></a>", 2));
         assert!(!nested_deeper_than("<![CDATA[<a><a><a>]]><?pi <a><a>?>", 0));
-        assert!(parse(SAMPLE).is_ok(), "the DOCTYPE nmap writes is fine");
+        assert!(
+            parse(SAMPLE, true).is_ok(),
+            "the DOCTYPE nmap writes is fine"
+        );
     }
 
     #[test]
@@ -827,7 +889,7 @@ mod tests {
             " ".repeat(2 * 1024 * 1024)
         );
         let started = std::time::Instant::now();
-        let observations = parse(&xml).unwrap();
+        let observations = parse(&xml, true).unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
@@ -882,7 +944,7 @@ mod tests {
     </ports>
   </host>
 </nmaprun>"#;
-        let observations = parse(xml).unwrap();
+        let observations = parse(xml, true).unwrap();
         let mut graph = Graph::default();
         graph.apply_all(observations);
         let host = &graph.hosts["192.0.2.15"];
@@ -909,13 +971,13 @@ mod tests {
                 "depth bypass was not caught: {}",
                 &crafted[..48]
             );
-            let err = format!("{:#}", parse(&crafted).unwrap_err());
+            let err = format!("{:#}", parse(&crafted, true).unwrap_err());
             assert!(err.contains("nested more than 64 elements deep"), "{err}");
         }
 
         let lower_entity =
             "<?xml version=\"1.0\"?><!DOCTYPE nmaprun [<!entity a \"x\">]><nmaprun/>";
-        assert!(format!("{:#}", parse(lower_entity).unwrap_err()).contains("XML entities"));
+        assert!(format!("{:#}", parse(lower_entity, true).unwrap_err()).contains("XML entities"));
 
         let cpes: String = (0..300)
             .map(|n| format!("<cpe>cpe:/a:vendor:p{n}:1.0</cpe>"))
@@ -928,7 +990,7 @@ mod tests {
              <ports><port protocol=\"tcp\" portid=\"80\"><state state=\"open\"/>\
              <service name=\"http\">{cpes}</service>{scripts}</port></ports></host></nmaprun>"
         );
-        let obs = parse(&xml).unwrap();
+        let obs = parse(&xml, true).unwrap();
         let port_cpes = obs
             .iter()
             .find_map(|o| match o {

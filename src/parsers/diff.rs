@@ -38,6 +38,14 @@ fn strip_side(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// The most of a file's path that is kept. The note that names it is cut
+/// to a line anyway; a header line of megabytes is not carried along.
+const MAX_DIFF_PATH: usize = 1024;
+
+fn kept_path(path: &str) -> String {
+    crate::evidence::head(path, MAX_DIFF_PATH).to_owned()
+}
+
 const MAX_DIFF_FILES: usize = 512;
 
 pub fn parse(text: &str) -> Vec<Observation> {
@@ -56,14 +64,14 @@ pub fn parse(text: &str) -> Vec<Observation> {
             }
             in_hunk = false;
             // "a/old b/new": the new path is after the last " b/".
-            current.path = rest
-                .rsplit_once(" b/")
-                .map(|(_, new)| new.to_owned())
-                .unwrap_or_else(|| strip_side(rest).to_owned());
+            current.path = kept_path(
+                rest.rsplit_once(" b/")
+                    .map_or_else(|| strip_side(rest), |(_, new)| new),
+            );
         } else if let Some(rest) = line.strip_prefix("+++ ") {
             if !in_hunk {
                 if rest.trim() != "/dev/null" {
-                    current.path = strip_side(rest).to_owned();
+                    current.path = kept_path(strip_side(rest));
                 }
                 continue;
             }
@@ -81,7 +89,7 @@ pub fn parse(text: &str) -> Vec<Observation> {
                 }
                 in_hunk = false;
                 if current.path.is_empty() && rest.trim() != "/dev/null" {
-                    current.path = strip_side(rest).to_owned();
+                    current.path = kept_path(strip_side(rest));
                 }
                 continue;
             }
@@ -190,5 +198,20 @@ new file mode 100644
             ]
         );
         assert!(parse("just some text\n+ not a diff\n").is_empty());
+    }
+
+    #[test]
+    fn a_path_of_megabytes_is_cut_to_a_line() {
+        let long = "A".repeat(4 * 1024 * 1024);
+        for text in [
+            format!("diff --git a/x b/{long}\n@@ -1 +1 @@\n+b\n"),
+            format!("--- a/{long}\n+++ b/{long}\n@@ -1 +1 @@\n+b\n"),
+        ] {
+            let notes = notes(&text);
+            assert_eq!(notes.len(), 1);
+            // `git diff: <path> (+1 -0)`, the path cut to a kilobyte.
+            assert!(notes[0].0.len() < 1100, "{}", notes[0].0.len());
+            assert!(notes[0].0.ends_with("AAA (+1 -0)"));
+        }
     }
 }

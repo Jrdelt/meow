@@ -125,8 +125,9 @@ pub fn asset(name: &str) -> Response {
 }
 
 /// Headers added to every response of the loopback server: no framing, no
-/// caching of token-bearing pages, no referrer, and a content policy that
-/// allows scripts only from the coordinator itself.
+/// caching of token-bearing pages, no referrer, a content policy that
+/// allows scripts only from the coordinator itself, and nothing loaded by
+/// a page of another origin (which would learn that meow runs, and where).
 pub fn security_headers(response: &mut Response, port: u16) {
     let policy = format!(
         "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
@@ -147,6 +148,10 @@ pub fn security_headers(response: &mut Response, port: u16) {
         HeaderValue::from_static("no-referrer"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
 }
 
 /// `http://127.0.0.1:<port>/?token=<token>`
@@ -474,5 +479,104 @@ mod tests {
         assert!(STYLE.contains(".ai-prose"));
         assert!(SCRIPT.contains("function renderAiMarkdown("));
         assert!(SCRIPT.contains("function renderAiPanel("));
+    }
+
+    /// Runs the map's renderer of AI replies under Node, with a small
+    /// stand-in for the page, on replies written to stall it: 200 KB each
+    /// (a reply's limit), formatted in full, then the cap on what is. No
+    /// reply makes many more elements than it has characters.
+    const RENDER_CHECK: &str = r#"'use strict';
+const src = require('fs').readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('  function codeSpanCloser(');
+const end = src.indexOf('  function renderAiPanel(');
+if (start < 0 || end < start) { throw new Error('renderer not found'); }
+let made = 0;
+function node(tag) {
+  made += 1;
+  return { tag, children: [], appendChild(child) { this.children.push(child); return child; } };
+}
+const document = { createElement: node, createTextNode: (text) => { made += 1; return { text }; } };
+function el(tag, className, text) {
+  const n = node(tag);
+  if (text !== undefined && text !== null) { n.textContent = String(text); }
+  return n;
+}
+const [markdown, triage] = new Function('document', 'el',
+  src.slice(start, end) + '\nreturn [renderAiMarkdown, renderTriage];')(document, el);
+const N = 200000;
+const fill = (unit) => unit.repeat(Math.floor(N / unit.length));
+let failed = false;
+function time(name, render, text) {
+  const root = node('div');
+  made = 0;
+  const t = Date.now();
+  render(root, text);
+  const ms = Date.now() - t;
+  console.log(`${name}: ${ms} ms, ${made} elements`);
+  failed = failed || ms > 1500 || made > text.length + 10000;
+  return root;
+}
+let backticks = '';
+for (let run = 1; backticks.length < N; run += 1) { backticks = '`'.repeat(run) + 'a' + backticks; }
+const table = (head) => '|'.repeat(head) + '\n|---\n' + '|\n'.repeat((N - head) / 2);
+const formatted = {
+  'heading of spaces': '# a' + ' '.repeat(N - 4) + 'b',
+  'heading closed by spaced #s': '# a' + fill(' #'),
+  'brackets': fill('[]'),
+  'paragraph of short bracket lines': fill('[] [] [] [] []\n'),
+  'quote of bracket lines': fill('> [] [] [] []\n'),
+  'list of bracket items': fill('- [] [] [] []\n'),
+  'links never closed': fill('[a]('),
+  'links closed once at the end': fill('[a](http://x ') + ')',
+  'code spans never closed': backticks,
+  'wide table header over one-pipe rows': table(1000),
+  'table header of half the reply': table(N / 2),
+};
+for (const [name, text] of Object.entries(formatted)) { time(name, markdown, text); }
+// Past the cap the rest is one plain text node, whatever it holds.
+const capped = { 'capped brackets': fill('[]'), 'capped backticks': backticks, 'capped table': table(1000) };
+for (const [name, text] of Object.entries(capped)) {
+  const root = time(name, triage, text);
+  const rest = root.children[root.children.length - 1];
+  if (!(rest.tag === 'pre' && rest.textContent.length > N / 2 && text.endsWith(rest.textContent))) {
+    console.log(`${name}: the rest is not one plain text node`);
+    failed = true;
+  }
+}
+// A table still reads as one: short rows get the header's empty cells, and
+// a row of more cells than allowed keeps the rest in its last one.
+const wide = Array.from({ length: 40 }, (_, n) => `c${n}`).join(' | ');
+const small = node('div');
+markdown(small, '| a | b | c |\n|---|---|---|\n| 1 |\n| ' + wide + ' |');
+const rows = small.children[0].children[1].children;
+const cells = rows.map((row) => row.children.length);
+const last = rows[1].children[31].children.map((text) => text.text).join('');
+if (cells.join() !== '3,32' || last !== 'c31 | ' + wide.split(' | ').slice(32).join(' | ')) {
+  console.log(`table cells ${cells}, last ${last}`);
+  failed = true;
+}
+process.exit(failed ? 1 : 0);
+"#;
+
+    #[test]
+    fn ai_replies_written_to_stall_the_map_render_quickly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (check, script) = (dir.path().join("check.js"), dir.path().join("map.js"));
+        std::fs::write(&check, RENDER_CHECK).unwrap();
+        std::fs::write(&script, SCRIPT).unwrap();
+        let Ok(output) = std::process::Command::new("node")
+            .arg(&check)
+            .arg(&script)
+            .output()
+        else {
+            eprintln!("Node is not installed: the map's reply renderer was not timed");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
