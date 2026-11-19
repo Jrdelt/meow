@@ -21,6 +21,7 @@ pub mod mode;
 pub mod observer;
 pub mod osint;
 pub mod parsers;
+pub mod perms;
 pub mod pty;
 pub mod queue;
 pub mod release;

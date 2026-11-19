@@ -51,7 +51,7 @@ use crate::timeutil::now_rfc3339;
 use crate::topology::Topology;
 use crate::vault::Vault;
 use crate::webui;
-use crate::workspace::{write_private_atomic, Config, Workspace};
+use crate::workspace::{write_private_atomic, Config, GitWatch, Workspace};
 
 pub const FIRST_PORT: u16 = 8765;
 const PORT_ATTEMPTS: u16 = 100;
@@ -74,6 +74,8 @@ const MAX_NOTICES: usize = 100;
 const TAP_QUEUE: usize = 4096;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 const OBSERVE_EVERY: Duration = Duration::from_secs(30);
+/// How often a running session checks that git keeps out of `./meow`.
+const GIT_GUARD_EVERY: Duration = Duration::from_secs(2);
 /// How often the location is checked against the network, and how long
 /// after a failed lookup it is tried again.
 const LOCATE_EVERY: Duration = Duration::from_secs(30);
@@ -414,6 +416,15 @@ impl State {
         });
         drop(notices);
         self.touch();
+    }
+
+    /// Puts back what a pull changed to let git take in session files,
+    /// and says what git would still take in (see [`GitWatch`]).
+    fn watch_git(&self, watch: &mut GitWatch) {
+        let dir = lock(&self.workspace).dir.clone();
+        for note in watch.check(&dir) {
+            self.notice(note);
+        }
     }
 
     fn save_if_dirty(&self) {
@@ -1480,6 +1491,23 @@ async fn saver(state: Shared) {
     }
 }
 
+/// Keeps git out of the session folder while the session runs, whether or
+/// not anything else changes: a pull can change what git ignores at any
+/// time.
+async fn git_guard(state: Shared) {
+    let mut watch = GitWatch::default();
+    loop {
+        tokio::time::sleep(GIT_GUARD_EVERY).await;
+        let state = Arc::clone(&state);
+        watch = tokio::task::spawn_blocking(move || {
+            state.watch_git(&mut watch);
+            watch
+        })
+        .await
+        .unwrap_or_default();
+    }
+}
+
 fn same_tables(a: &LocalNet, b: &LocalNet) -> bool {
     a.interfaces == b.interfaces
         && a.routes == b.routes
@@ -1852,6 +1880,7 @@ impl Coordinator {
         ));
         runtime.spawn(saver(Arc::clone(&state)));
         runtime.spawn(observe_loop(Arc::clone(&state)));
+        runtime.spawn(git_guard(Arc::clone(&state)));
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
         runtime.spawn(grounding_loop(Arc::clone(&state), ground_rx));
         runtime.spawn(queue::worker(Arc::clone(&state), recon_rx));
@@ -1951,6 +1980,9 @@ impl Coordinator {
         // behind with any lock it holds: hence the deadline below.
         runtime.shutdown_timeout(STOP_STEP);
         let deadline = Instant::now() + STOP_STEP;
+        // Saved whether or not it changed: a graph.json put there during
+        // the session (a git pull) is not left for the next one.
+        self.state.dirty.store(true, Ordering::SeqCst);
         if !self.state.save_on_exit(&self.graph_path, deadline) {
             skipped.push("saving graph.json");
         }
@@ -2005,6 +2037,53 @@ mod tests {
             workspace,
             coordinator,
         }
+    }
+
+    /// A `git pull` run in the session's own shell: meow's `.gitignore`
+    /// files in `./meow` and in the session are put back on the next check,
+    /// and a `graph.json` put in place meanwhile is written over when the
+    /// session ends.
+    #[test]
+    fn what_a_pull_changes_during_the_session_is_put_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, &project, "acme", true, Mode::Light).unwrap();
+        let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        let coordinator = Coordinator::start(workspace.clone(), config).unwrap();
+        let state = coordinator.state();
+        let marker = project.join("meow").join(".gitignore");
+        let meows = std::fs::read_to_string(&marker).unwrap();
+        std::fs::write(&marker, "!*\n").unwrap();
+        std::fs::write(workspace.dir.join(".gitignore"), "!*\n").unwrap();
+        // Checked on a timer, whether or not anything is saved.
+        state.watch_git(&mut GitWatch::default());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), meows);
+        assert_eq!(
+            std::fs::read_to_string(workspace.dir.join(".gitignore")).unwrap(),
+            meows
+        );
+        for shown in ["meow/.gitignore", "meow/acme/.gitignore"] {
+            assert!(
+                lock(&state.notices)
+                    .iter()
+                    .any(|notice| notice.text.starts_with(shown)),
+                "{shown}"
+            );
+        }
+        std::fs::write(
+            workspace.graph_path(),
+            r#"{"hosts":{"198.51.100.9":{"address":"198.51.100.9"}}}"#,
+        )
+        .unwrap();
+        drop(state);
+        assert!(coordinator.shutdown().is_empty());
+        let graph = std::fs::read_to_string(workspace.graph_path()).unwrap();
+        assert!(!graph.contains("198.51.100.9"), "{graph}");
     }
 
     #[test]

@@ -279,6 +279,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     workspace.ensure_own(&home, &cwd)?;
+    // What the command writes there is recorded as meow's own when it ends.
+    let _files = workspace::SessionFiles::for_helper(&home, &workspace);
     match command {
         Command::List
         | Command::Delete { .. }
@@ -575,6 +577,14 @@ fn session_location(
         return workspace::local_location(home, cwd, name).map(Some);
     }
     if let Some(found) = workspace::find_session(home, cwd, name)? {
+        if let Some(other) = workspace::foreign_here(home, cwd, name)
+            .filter(|other| found.dir(home, name).is_ok_and(|dir| dir != *other))
+        {
+            println!(
+                "[!] {} came with this folder; opening your own '{name}' (`meow {name} --local` opens the other)",
+                sanitize_path_display(&other)
+            );
+        }
         return Ok(Some(found));
     }
     if let Some(away) = workspace::unreachable_session(home, name) {
@@ -613,6 +623,24 @@ fn start_session(
         LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
         LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
     })?;
+    // Files a pull or an unpacked archive replaced are not the user's: no
+    // planted history or start folder, and no scan resumes without a yes.
+    let files_changed = !created && !foreign && workspace.files_changed(home);
+    if files_changed {
+        println!(
+            "[!] Files in this session changed outside meow (a git pull or an unpacked archive?): \
+             its shell history and last folder are not used"
+        );
+        workspace.drop_carried_files();
+    }
+    // Session files a pull made git track, or let in.
+    for note in workspace::GitWatch::default().check(&workspace.dir) {
+        println!("[!] {}", sanitize_terminal_line(&note, 400));
+    }
+    // Recorded once the shell and the coordinator have stopped; as meow's
+    // own only if the session gets that far.
+    let doubtful = foreign || files_changed;
+    let mut files = workspace::SessionFiles::for_session(home, &workspace, doubtful);
     if created || foreign {
         // A list fish kept for an earlier workspace in this place is not
         // this one's.
@@ -693,11 +721,15 @@ fn start_session(
         );
     }
 
-    offer_resume(&state)?;
+    offer_resume(&state, doubtful)?;
 
     let sink = tee_sink(coordinator.tap_sink(), debug_tap_log()?);
+    files.started();
     let outcome = pty::run_session(&spec, sink);
     let skipped = coordinator.shutdown();
+    // The database closes with its last handle; then the files are recorded.
+    drop(state);
+    drop(files);
     if !skipped.is_empty() {
         println!("[!] Skipped on exit (stuck): {}", skipped.join(", "));
     }
@@ -773,6 +805,8 @@ fn accept_foreign_workspace(
     workspace: &mut Workspace,
     default_mode: Mode,
 ) -> Result<()> {
+    // Said before asking: accepting it under a name already taken fails.
+    workspace.check_name_free(home)?;
     let size = |name: &str| {
         std::fs::symlink_metadata(workspace.dir.join(name))
             .ok()
@@ -845,8 +879,11 @@ fn accept_foreign_workspace(
 }
 
 /// Background tasks left unfinished by an earlier session: ask whether to
-/// resume them. Without a terminal nothing is started unattended.
-fn offer_resume(state: &coordinator::State) -> Result<()> {
+/// resume them. Without a terminal nothing is started unattended. When the
+/// tasks may not be the user's own (`doubtful`: a session that came with a
+/// folder, or files changed outside meow), only an explicit yes resumes
+/// them, and without a terminal they are declined.
+fn offer_resume(state: &coordinator::State, doubtful: bool) -> Result<()> {
     let unfinished = queue::unfinished(&state.db_lock())?;
     if unfinished.is_empty() {
         return Ok(());
@@ -855,24 +892,37 @@ fn offer_resume(state: &coordinator::State) -> Result<()> {
     for task in &unfinished {
         println!("      {}", sanitize_terminal_line(&task.describe(), 200));
     }
+    let decline = |why: &str| -> Result<()> {
+        for task in &unfinished {
+            queue::decline(&state.db_lock(), task.id)?;
+        }
+        println!("[+] Not resumed{why}; the remaining stages are marked skipped");
+        Ok(())
+    };
     if !std::io::stdin().is_terminal() {
+        if doubtful {
+            return decline(" (no terminal to ask on)");
+        }
         println!(
             "[!] Not resumed (no terminal to ask on); they continue when the mode \
              is set to mild or aggressive"
         );
         return Ok(());
     }
-    print!("[?] Resume? [Y/n] ");
+    print!("[?] Resume? {} ", if doubtful { "[y/N]" } else { "[Y/n]" });
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
         .context("cannot read the answer")?;
-    if answer.trim().to_ascii_lowercase().starts_with('n') {
-        for task in &unfinished {
-            queue::decline(&state.db_lock(), task.id)?;
-        }
-        println!("[+] Not resumed; the remaining stages are marked skipped");
+    let answer = answer.trim().to_ascii_lowercase();
+    let resume = if doubtful {
+        answer.starts_with('y')
+    } else {
+        !answer.starts_with('n')
+    };
+    if !resume {
+        decline("")?;
     } else {
         state.resume_unfinished()?;
         if state.mode() == Mode::Light {

@@ -41,15 +41,25 @@ const REPLAY_HEADER: &str = "\
 #   # [EXIT] <exit code>   (absent if the session ended while it was running)
 ";
 
-/// Said once when the workspace history file is gone or was replaced by a
-/// link during the session. Placed inside single quotes: no `'` in it.
+/// Said once when the workspace history file is gone, or was replaced by a
+/// link or by a file of another account, during the session. Placed inside
+/// single quotes: no `'` in it.
 const HISTORY_LOST: &str =
-    "[meow] The workspace history file was removed or replaced by a link: history is no longer saved.";
+    "[meow] The workspace history file was removed or replaced: history is no longer saved.";
+
+/// Shared by bash and zsh: whether meow may write the file `$1`. Not a
+/// link, this user's own or not there yet, in a folder of this user's: an
+/// account that swapped the session's folder for its own (one it could
+/// write to) gets nothing written into its files.
+const SH_OURS: &str = r##"_meow_ours() {
+  [[ ! -L $1 && -O ${1%/*} ]] && { [[ ! -e $1 ]] || [[ -O $1 ]]; }
+}
+"##;
 
 /// Shared by bash and zsh: re-read the mode from `profile.toml`.
 const SH_REFRESH_MODE: &str = r##"_meow_refresh_mode() {
   local line
-  [[ -f $_meow_profile && ! -L $_meow_profile ]] || return 0
+  [[ -f $_meow_profile && ! -L $_meow_profile && -O $_meow_profile ]] || return 0
   while IFS= read -r line; do
     case $line in
       'mode = "'*'"')
@@ -106,16 +116,18 @@ typeset -g _meow_tty_frozen=
 typeset -g _meow_history_on=
 typeset -g _meow_history_lost=
 
+@OURS@
 @REFRESH_MODE@
 @RATE_WARNING@
 # Keeps HISTFILE on this workspace's file: sourcing a startup file again, or
 # a prompt hook, may point it back at your usual one. It is exported, so a
 # nested zsh or `exec zsh` keeps it unless its startup file sets another.
-# A file that is gone or was replaced by a link (a `git pull` in this
-# folder) is never read or written again. A read-only HISTFILE stays.
+# A file that is gone, or was replaced by a link (a `git pull` in this
+# folder) or by another account's file, is never read or written again.
+# A read-only HISTFILE stays.
 _meow_pin_history() {
   [[ $_meow_history_on == on && ${(t)HISTFILE-} != *readonly* ]] || return 0
-  if [[ -z $_meow_history_lost && -f $_meow_history && ! -L $_meow_history ]]; then
+  if [[ -z $_meow_history_lost && -f $_meow_history && ! -L $_meow_history && -O $_meow_history ]]; then
     [[ ${HISTFILE-} == "$_meow_history" ]] || export HISTFILE=$_meow_history
   else
     if [[ -z $_meow_history_lost ]]; then
@@ -134,7 +146,7 @@ _meow_pin_history() {
 _meow_start_history() {
   setopt local_options no_warn_create_global
   unset HISTFILE
-  if [[ -f $_meow_history && ! -L $_meow_history ]]; then
+  if [[ -f $_meow_history && ! -L $_meow_history && -O $_meow_history ]]; then
     fc -p "$_meow_history"
     export HISTFILE
   else
@@ -157,7 +169,7 @@ _meow_preexec() {
   [[ -n $cmd ]] || cmd=${3-}
   _meow_pending=1
   _meow_rate_warning "$cmd"
-  [[ ! -L $_meow_replay ]] && {
+  _meow_ours "$_meow_replay" && {
     print -r -- "# [CWD] ${PWD//[$'\r\n']/ }"
     if [[ -z $cmd ]] || [[ -o hist_ignore_space && $cmd == ' '* ]]; then
       print -r -- '# [UNRECORDED] command kept out of the shell history'
@@ -194,9 +206,9 @@ _meow_precmd() {
   fi
   if [[ -n $_meow_pending ]]; then
     _meow_pending=
-    [[ ! -L $_meow_replay ]] && print -r -- "# [EXIT] $code" 2>/dev/null >> "$_meow_replay"
+    _meow_ours "$_meow_replay" && print -r -- "# [EXIT] $code" 2>/dev/null >> "$_meow_replay"
   fi
-  [[ $PWD == *[$'\r\n']* || -L $_meow_last_cwd ]] || print -r -- "$PWD" 2>/dev/null >| "$_meow_last_cwd"
+  [[ $PWD == *[$'\r\n']* ]] || ! _meow_ours "$_meow_last_cwd" || print -r -- "$PWD" 2>/dev/null >| "$_meow_last_cwd"
   _meow_refresh_mode
   return $code
 }
@@ -239,12 +251,13 @@ _meow_histfile_fixed() {
 
 # Keeps HISTFILE on this workspace's file: sourcing ~/.bashrc again may point
 # it back at your usual one. It is exported, so a nested bash keeps it unless
-# its startup file sets another. A file that is gone or was replaced by a
-# link (a `git pull` in this folder) is never written: /dev/null takes it.
+# its startup file sets another. A file that is gone, or was replaced by a
+# link (a `git pull` in this folder) or by another account's file, is never
+# written: /dev/null takes it.
 _meow_pin_history() {
   local file=$_meow_history
   [[ -z $_meow_history_fixed ]] || return 0
-  if [[ -z $_meow_history_lost ]] && ! [[ -f $file && ! -L $file ]]; then
+  if [[ -z $_meow_history_lost ]] && ! [[ -f $file && ! -L $file && -O $file ]]; then
     _meow_history_lost=1
     printf '%s\n' '@HISTORY_LOST@' >&2
   fi
@@ -266,6 +279,7 @@ else
   builtin history -c
 fi
 
+@OURS@
 @REFRESH_MODE@
 @RATE_WARNING@
 # Sets _meow_h_num / _meow_h_cmd from the newest history entry without
@@ -304,7 +318,7 @@ _meow_fix_histcontrol() {
 _meow_preexec() {
   _meow_history_last
   _meow_rate_warning "$_meow_h_cmd"
-  [[ ! -L $_meow_replay ]] && {
+  _meow_ours "$_meow_replay" && {
     printf '# [CWD] %s\n' "${PWD//[$'\r\n']/ }"
     if [[ -n $_meow_h_num && $_meow_h_num != "$_meow_histnum" ]]; then
       printf '%s\n' "$_meow_h_cmd"
@@ -312,18 +326,18 @@ _meow_preexec() {
       printf '%s\n' '# [UNRECORDED] command kept out of the shell history'
     fi
   } 2>/dev/null >> "$_meow_replay"
-  [[ ! -L $_meow_pending ]] && printf '1\n' 2>/dev/null >| "$_meow_pending"
+  _meow_ours "$_meow_pending" && printf '1\n' 2>/dev/null >| "$_meow_pending"
 }
 
 # Stage 2: runs from PROMPT_COMMAND after the command has finished.
 _meow_precmd() {
   local code=$?
   _meow_pin_history
-  if [[ -f $_meow_pending && ! -L $_meow_pending && -s $_meow_pending ]]; then
-    [[ ! -L $_meow_replay ]] && printf '# [EXIT] %s\n' "$code" 2>/dev/null >> "$_meow_replay"
+  if [[ -f $_meow_pending && ! -L $_meow_pending && -O $_meow_pending && -s $_meow_pending ]]; then
+    _meow_ours "$_meow_replay" && printf '# [EXIT] %s\n' "$code" 2>/dev/null >> "$_meow_replay"
     : 2>/dev/null >| "$_meow_pending"
   fi
-  [[ $PWD == *[$'\r\n']* || -L $_meow_last_cwd ]] || printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
+  [[ $PWD == *[$'\r\n']* ]] || ! _meow_ours "$_meow_last_cwd" || printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
   _meow_refresh_mode
   _meow_history_last
   _meow_histnum=$_meow_h_num
@@ -337,7 +351,7 @@ _meow_precmd_legacy() {
   _meow_pin_history
   _meow_history_last
   if [[ -n $_meow_ready && -n $_meow_h_num && $_meow_h_num != "$_meow_histnum" ]]; then
-    [[ ! -L $_meow_replay ]] && {
+    _meow_ours "$_meow_replay" && {
       printf '# [CWD] %s\n' "${_meow_cwd//[$'\r\n']/ }"
       printf '%s\n' "$_meow_h_cmd"
       printf '# [EXIT] %s\n' "$code"
@@ -346,7 +360,7 @@ _meow_precmd_legacy() {
   _meow_ready=1
   _meow_histnum=$_meow_h_num
   _meow_cwd=$PWD
-  [[ $PWD == *[$'\r\n']* || -L $_meow_last_cwd ]] || printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
+  [[ $PWD == *[$'\r\n']* ]] || ! _meow_ours "$_meow_last_cwd" || printf '%s\n' "$PWD" 2>/dev/null >| "$_meow_last_cwd"
   _meow_refresh_mode
   return $code
 }
@@ -708,6 +722,7 @@ pub fn prepare(
         _ => "hooks.bash",
     });
     let values = [
+        ("OURS", SH_OURS.to_owned()),
         ("REFRESH_MODE", SH_REFRESH_MODE.to_owned()),
         ("RATE_WARNING", SH_RATE_WARNING.to_owned()),
         ("HISTORY_LOST", HISTORY_LOST.to_owned()),
@@ -790,6 +805,7 @@ mod tests {
 
     fn assert_filled(text: &str) {
         for placeholder in [
+            "@OURS@",
             "@REFRESH_MODE@",
             "@RATE_WARNING@",
             "@REPLAY@",
@@ -1021,7 +1037,10 @@ mod tests {
             );
         }
         let pin = &hooks[hooks.find("_meow_pin_history() {").unwrap()..];
-        assert!(pin.contains("! [[ -f $file && ! -L $file ]]"), "{hooks}");
+        assert!(
+            pin.contains("! [[ -f $file && ! -L $file && -O $file ]]"),
+            "{hooks}"
+        );
         assert!(pin.contains("file=/dev/null"), "{hooks}");
         assert!(pin.contains(HISTORY_LOST), "{hooks}");
         // ... and again after your own prompt commands.
@@ -1206,15 +1225,108 @@ mod tests {
         assert_eq!(mode(&ws.history_path("zsh")), 0o600);
     }
 
+    /// The check the hooks run before each write, in the shells themselves:
+    /// a file of another account, or any file in a folder of another
+    /// account (a session folder swapped for one of its own), is never
+    /// written.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_write_only_files_of_the_users_own() {
+        let shells: Vec<String> = ["bash", "zsh"]
+            .iter()
+            .filter_map(|name| {
+                ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+                    .iter()
+                    .map(|dir| format!("{dir}/{name}"))
+                    .find(|path| Path::new(path).exists())
+            })
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join("mine");
+        fs::write(&mine, "").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&mine, &link).unwrap();
+        let mut cases = vec![
+            (tmp.path().join("missing"), true),
+            (mine.clone(), true),
+            (link, false),
+        ];
+        // SAFETY: no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            let chown = |path: &Path| {
+                let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a valid C string; the test runs as root.
+                assert_eq!(unsafe { libc::lchown(path.as_ptr(), 4242, 4242) }, 0);
+            };
+            let theirs = tmp.path().join("theirs");
+            fs::write(&theirs, "").unwrap();
+            chown(&theirs);
+            let their_folder = tmp.path().join("their-folder");
+            fs::create_dir(&their_folder).unwrap();
+            fs::write(their_folder.join("mine"), "").unwrap();
+            chown(&their_folder);
+            cases.extend([
+                (theirs, false),
+                (their_folder.join("mine"), false),
+                (their_folder.join("missing"), false),
+            ]);
+        } else {
+            // Files and folders of root's.
+            cases.extend([
+                (PathBuf::from("/etc/hosts"), false),
+                (PathBuf::from("/etc/meow-missing"), false),
+            ]);
+        }
+        for shell in &shells {
+            for (path, ours) in &cases {
+                let script = format!(
+                    "{SH_OURS}_meow_ours {} && echo yes || echo no",
+                    sh_quote(path.to_str().unwrap())
+                );
+                let out = std::process::Command::new(shell)
+                    .args(["-c", &script])
+                    .output()
+                    .unwrap();
+                let said = String::from_utf8_lossy(&out.stdout);
+                let expected = if *ours { "yes" } else { "no" };
+                assert_eq!(said.trim(), expected, "{shell} {}", path.display());
+            }
+        }
+    }
+
     #[test]
     fn replay_log_refuses_symlinks_and_hooks_guard_mode_and_targets() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = workspace(&tmp);
         prepare(&ws, "bash", None).unwrap();
         let bash_hooks = read(ws.tmp_dir().join("shell").join("hooks.bash"));
-        assert!(bash_hooks.contains("[[ -f $_meow_profile && ! -L $_meow_profile ]]"));
+        assert!(bash_hooks
+            .contains("[[ -f $_meow_profile && ! -L $_meow_profile && -O $_meow_profile ]]"));
         assert!(bash_hooks.contains("light | mild | aggressive) export MEOW_MODE=$line"));
-        assert!(bash_hooks.contains("[[ ! -L $_meow_replay ]]"));
+        // Every file the hooks write is checked first: not a link, and
+        // this user's own, in a folder of this user's.
+        assert!(bash_hooks.contains(SH_OURS), "{bash_hooks}");
+        for file in ["$_meow_replay", "$_meow_last_cwd", "$_meow_pending"] {
+            assert!(
+                bash_hooks.contains(&format!("_meow_ours \"{file}\"")),
+                "{file}"
+            );
+        }
+        assert!(
+            !bash_hooks.contains("[[ ! -L $_meow_replay ]]"),
+            "{bash_hooks}"
+        );
+        prepare(&ws, "zsh", None).unwrap();
+        let zsh_hooks = read(ws.tmp_dir().join("shell").join("hooks.zsh"));
+        assert!(zsh_hooks.contains(SH_OURS), "{zsh_hooks}");
+        for file in ["$_meow_replay", "$_meow_last_cwd"] {
+            assert!(
+                zsh_hooks.contains(&format!("_meow_ours \"{file}\"")),
+                "{file}"
+            );
+        }
+        assert!(zsh_hooks.contains("-L $_meow_history && -O $_meow_history ]]"));
+        fs::remove_file(ws.history_path("zsh")).unwrap();
 
         prepare(&ws, "pwsh.exe", None).unwrap();
         let ps_init = read(ws.tmp_dir().join("shell").join("init.ps1"));

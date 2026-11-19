@@ -39,13 +39,22 @@ belong to those projects.
 
 New sessions are saved in `./meow/<name>/` of the folder you pick (the one
 meow runs from by default). On macOS and Linux meow refuses a folder that
-another user owns or can write to, or that sits in one they could change
-(a sticky folder like `/tmp` is fine). It keeps `./meow` private (`0700`,
-or a current-user ACL on Windows), never follows a link there, and disables
-SQLite schema execution (`trusted_schema = OFF`). A session that came with
-a cloned, unpacked, copied or moved folder is not opened until you accept
-it. On Windows, and when working inside untrusted or shared directories,
-use `meow <name> --home` (`~/.meow/workspaces/`).
+another user owns or can write to (also through a group they share, such
+as macOS's `staff`, or an ACL), or that sits in one they could change (a
+sticky folder like `/tmp` is fine), and checks this again each time a
+session there is opened, used or deleted. On Linux it does not use SMB
+shares, whose access lists it cannot read. It keeps `./meow` private
+(`0700`, or a current-user ACL on Windows), never follows a link there, and
+disables SQLite schema execution (`trusted_schema = OFF`). A session that
+came with a cloned, unpacked, copied or moved folder is not opened until
+you accept it, and never under the name of one of yours. If a `git pull`
+or an unpacked archive replaces files of your own session, meow says so,
+drops its shell history and last folder, and resumes its scans only on a
+yes. `./meow` and each session in it have a `.gitignore`. A running
+session puts back one a pull changed and warns when git tracks session
+files; between sessions, a pull that knows a session's name can still let
+git take its files in. On Windows, and when working inside untrusted or
+shared directories, use `meow <name> --home` (`~/.meow/workspaces/`).
 
 ## Supported versions
 

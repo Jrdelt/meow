@@ -110,7 +110,7 @@ A new session asks where to save it. Press Enter to keep the folder you are in, 
     -> /Users/j/Desktop/meow/acme
 ```
 
-Sessions saved in the same folder share one `meow/` folder there (`meow/acme/`, `meow/beta/`). It is private and has a `.gitignore`, so git leaves it out. `meow acme` reopens the same session from any folder.
+Sessions saved in the same folder share one `meow/` folder there (`meow/acme/`, `meow/beta/`). It is private, and the `.gitignore` files in it keep it out of git; a running session puts them back if a pull changes them, and warns if git tracks files there. If a pull or an unpacked archive replaces files in it, meow says so, drops that session's shell history and asks before resuming its scans. `meow acme` reopens the same session from any folder.
 
 Then your normal shell opens inside the session. Your prompt is prefixed with `(meow:acme:light)` (reflecting the active session and mode) so you always know a session is active, and `meow` prints the localhost URL for the live topology map.
 

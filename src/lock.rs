@@ -22,16 +22,65 @@ pub struct SessionLock {
 }
 
 impl Drop for SessionLock {
-    /// Unlocks explicitly instead of relying on the file closing: a child
-    /// process forked while the lock was held briefly shares the open file,
-    /// which would otherwise keep the lock alive until that child execs.
     fn drop(&mut self) {
-        // Re-taking a lock this file already holds succeeds on Unix, and
-        // dropping the guard unlocks. On Windows the attempt fails and the
-        // lock is released when the handle closes.
-        if let Ok(guard) = self.file.try_write() {
-            drop(guard);
+        unlock(&mut self.file);
+    }
+}
+
+/// Unlocks explicitly instead of relying on the file closing: a child
+/// process forked while the lock was held briefly shares the open file,
+/// which would otherwise keep the lock alive until that child execs.
+fn unlock(file: &mut RwLock<File>) {
+    // Re-taking a lock this file already holds succeeds on Unix, and
+    // dropping the guard unlocks. On Windows the attempt fails and the
+    // lock is released when the handle closes.
+    if let Ok(guard) = file.try_write() {
+        drop(guard);
+    }
+}
+
+/// An exclusive lock taken for a short update of a file several meow
+/// processes change (`~/.meow/local-workspaces`). Unlike [`SessionLock`],
+/// it waits for the process that holds it, up to a limit.
+#[derive(Debug)]
+pub struct UpdateLock {
+    file: RwLock<File>,
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        unlock(&mut self.file);
+    }
+}
+
+impl UpdateLock {
+    /// Takes the lock on `path`, created private if missing, waiting at
+    /// most `wait` for whoever holds it ([`LockError::Held`] after that).
+    pub fn acquire(path: &Path, wait: std::time::Duration) -> Result<Self, LockError> {
+        let mut lock = RwLock::new(open_lock_file(path)?);
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match lock.try_write() {
+                Ok(guard) => {
+                    // Kept with the open file, as in `SessionLock`.
+                    std::mem::forget(guard);
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(LockError::Held { pid: None });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(LockError::Io(error)),
+            }
         }
+        Ok(Self { file: lock })
     }
 }
 
@@ -110,6 +159,34 @@ fn open_readonly_lock(path: &Path) -> Result<Option<File>, LockError> {
     Ok(Some(file))
 }
 
+/// Opens the lock file at `path` for writing, creating it private if it is
+/// missing. A link in its place (a workspace folder someone else prepared)
+/// is never followed: not a symbolic link, and not a second hard link to
+/// another file, as the file may be truncated and written.
+fn open_lock_file(path: &Path) -> Result<File, LockError> {
+    let _ = refuse_lock_symlink(path)?;
+    let mut options = private_open_options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(LockError::Io)?;
+    let meta = file.metadata().map_err(LockError::Io)?;
+    if !meta.is_file() {
+        return Err(refused_lock(path, "is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(refused_lock(path, "has a second hard link"));
+        }
+    }
+    Ok(file)
+}
+
 fn read_pid_from_file(file: &mut File) -> Option<u32> {
     let mut buf = String::new();
     let _ = file.seek(SeekFrom::Start(0));
@@ -127,30 +204,7 @@ impl SessionLock {
     /// Takes the exclusive lock on `path` without blocking and records this
     /// process id in the file for diagnostics.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
-        // The file is truncated and written below, so a link in its place
-        // (a workspace folder someone else prepared) is never followed: not
-        // a symbolic link, and not a second hard link to another file.
-        let _ = refuse_lock_symlink(path)?;
-        let mut options = private_open_options();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = options.open(path).map_err(LockError::Io)?;
-        let meta = file.metadata().map_err(LockError::Io)?;
-        if !meta.is_file() {
-            return Err(refused_lock(path, "is not a regular file"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.nlink() > 1 {
-                return Err(refused_lock(path, "has a second hard link"));
-            }
-        }
-        let mut lock = RwLock::new(file);
+        let mut lock = RwLock::new(open_lock_file(path)?);
         let mut acquired = false;
 
         for attempt in 0..3 {
@@ -289,6 +343,37 @@ mod tests {
             other => panic!("expected Held, got {other:?}"),
         }
         drop(held);
+    }
+
+    #[test]
+    fn an_update_lock_waits_its_turn_and_is_private() {
+        let (_dir, path) = lock_file();
+        let held = UpdateLock::acquire(&path, Duration::from_secs(5)).unwrap();
+        // Another holder waits, and gives up after its limit.
+        assert!(matches!(
+            UpdateLock::acquire(&path, Duration::from_millis(30)),
+            Err(LockError::Held { .. })
+        ));
+        let waiting = std::thread::spawn({
+            let path = path.clone();
+            move || UpdateLock::acquire(&path, Duration::from_secs(5)).map(drop)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(held);
+        assert!(waiting.join().unwrap().is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o600);
+            // Never through a link.
+            fs::remove_file(&path).unwrap();
+            let outside = path.with_file_name("outside");
+            fs::write(&outside, "keep").unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            assert!(UpdateLock::acquire(&path, Duration::from_millis(10)).is_err());
+            assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        }
     }
 
     #[test]

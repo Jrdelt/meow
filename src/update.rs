@@ -125,13 +125,31 @@ fn verify_checkout_security(dir: &Path, explicit_source: bool) -> Result<()> {
 }
 
 /// git, and then the folder's `install.sh`, are run in `dir`: it must be
-/// this user's own. A folder (or critical build/config file inside it) that
-/// another account owns or can write to could make both run that account's code.
+/// this user's own. A folder (or any file git tracks in it, or what git
+/// keeps of its history) that another account owns or can write to, also
+/// through a shared group or an access list, could make both run that
+/// account's code.
 #[cfg(unix)]
 fn ensure_own_checkout(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: these calls have no preconditions and cannot fail.
-    let (me, my_group) = unsafe { (libc::geteuid(), libc::getegid()) };
+    // SAFETY: this call has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let check = |path: &Path, meta: &std::fs::Metadata| -> Result<()> {
+        let problem = if meta.file_type().is_symlink() {
+            "is a symbolic link"
+        } else if meta.uid() != me {
+            "belongs to another user"
+        } else if crate::perms::others_can_change(path, meta) {
+            "can be changed by other users"
+        } else {
+            return Ok(());
+        };
+        bail!(
+            "{} {problem}, so nothing is run in it. Update from a meow folder of your own \
+             (clone it again and run ./install.sh there), or pass --source <folder>",
+            sanitize(&path.display().to_string(), 400)
+        );
+    };
     for (path, must_exist) in [
         (dir.to_path_buf(), true),
         (dir.join(".git"), true),
@@ -155,22 +173,75 @@ fn ensure_own_checkout(dir: &Path) -> Result<()> {
                 })
             }
         };
-        let problem = if meta.file_type().is_symlink() {
-            "is a symbolic link"
-        } else if meta.uid() != me {
-            "belongs to another user"
-        } else if meta.mode() & 0o002 != 0 || (meta.mode() & 0o020 != 0 && meta.gid() != my_group) {
-            "can be changed by other users"
-        } else {
-            continue;
-        };
-        bail!(
-            "{} {problem}, so nothing is run in it. Update from a meow folder of your own \
-             (clone it again and run ./install.sh there), or pass --source <folder>",
-            sanitize(&path.display().to_string(), 400)
-        );
+        check(&path, &meta)?;
+    }
+    // The entries above are this user's alone, so git can be asked which
+    // files it tracks.
+    for path in checkout_paths(dir)? {
+        // One deleted here is refused later, as a local change.
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            check(&path, &meta)?;
+        }
     }
     Ok(())
+}
+
+/// More entries than a meow checkout has; past this, nothing is run.
+#[cfg(unix)]
+const MAX_CHECKOUT_ENTRIES: usize = 500_000;
+
+/// Every file git tracks in `dir` and the folders they are in, and what
+/// git keeps that decides what is checked out: its index, `HEAD`,
+/// `packed-refs`, and everything under `refs` and `objects`.
+#[cfg(unix)]
+fn checkout_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    use std::collections::BTreeSet;
+    use std::os::unix::ffi::OsStrExt;
+    let listed = git_output(dir, &["ls-files", "-z"])?;
+    let mut paths = BTreeSet::new();
+    for name in listed
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        paths.extend(
+            path.ancestors()
+                .take_while(|above| above.starts_with(dir) && *above != dir)
+                .map(Path::to_path_buf),
+        );
+        if paths.len() > MAX_CHECKOUT_ENTRIES {
+            bail!(
+                "{} holds too many files to check",
+                sanitize(&dir.display().to_string(), 400)
+            );
+        }
+    }
+    let git_dir = dir.join(".git");
+    for name in ["index", "HEAD", "packed-refs"] {
+        paths.insert(git_dir.join(name));
+    }
+    let mut folders = vec![git_dir.join("refs"), git_dir.join("objects")];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        paths.insert(folder);
+        for entry in entries {
+            let entry = entry.context("cannot read the git folder")?;
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                folders.push(entry.path());
+            } else {
+                paths.insert(entry.path());
+            }
+            if paths.len() > MAX_CHECKOUT_ENTRIES {
+                bail!(
+                    "{} holds too many files to check",
+                    sanitize(&dir.display().to_string(), 400)
+                );
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 #[cfg(windows)]
@@ -230,7 +301,8 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let (me, my_group) = unsafe { (libc::geteuid(), libc::getegid()) };
+        // SAFETY: this call has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
         for ancestor in dir.ancestors().skip(1) {
             for rel in OVERRIDES {
                 let candidate = ancestor.join(rel);
@@ -239,8 +311,7 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
                 };
                 let untrusted = meta.file_type().is_symlink()
                     || (meta.uid() != me && meta.uid() != 0)
-                    || meta.mode() & 0o002 != 0
-                    || (meta.mode() & 0o020 != 0 && meta.gid() != my_group);
+                    || crate::perms::others_can_change(&candidate, &meta);
                 if untrusted {
                     bail!(
                         "refusing to build {safe_dir}: untrusted parent override {}",
@@ -532,6 +603,12 @@ fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
 
 /// Runs git in `dir` with hooks and fsmonitor disabled and returns its trimmed standard output.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = git_output(dir, args)?;
+    Ok(String::from_utf8_lossy(&output).trim().to_owned())
+}
+
+/// [`git`], returning the standard output as git wrote it.
+pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     #[cfg(windows)]
     let empty_hooks = tempfile::tempdir().context("cannot create temporary hooks folder")?;
     #[cfg(windows)]
@@ -555,7 +632,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
             sanitize_block(&String::from_utf8_lossy(&output.stderr), 2000)
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(output.stdout)
 }
 
 /// Like [`git`], but git talks to the terminal (credential prompts,
@@ -587,6 +664,39 @@ fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
         bail!("git {} failed (see the messages above)", args.join(" "));
     }
     Ok(())
+}
+
+/// A new folder of this user's alone (`0700` from the start: cargo makes
+/// what is in it with the user's umask) for cargo to build in.
+fn build_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("meow-build-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
+/// `sh install.sh --yes` in `dir`, with cargo building in `target`: a
+/// `--path` install otherwise builds in the folder's own `./target`, which
+/// git does not track, so no check covers it, and a shared group can
+/// write to it (a planted build output would be linked into meow).
+fn install_command(dir: &Path, target: &Path) -> Command {
+    let mut cmd = Command::new(resolve_sh());
+    if let Some(path) = sanitized_path_env() {
+        cmd.env("PATH", path);
+    } else {
+        cmd.env_remove("PATH");
+    }
+    cmd.arg("install.sh")
+        .arg("--yes")
+        .env("MEOW_NO_SUDO", "1")
+        .env("CARGO_TARGET_DIR", target)
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .current_dir(dir);
+    cmd
 }
 
 fn short(commit: &str) -> &str {
@@ -901,17 +1011,8 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     println!("[+] Rebuilding with install.sh");
-    let mut cmd = Command::new(resolve_sh());
-    if let Some(path) = sanitized_path_env() {
-        cmd.env("PATH", path);
-    } else {
-        cmd.env_remove("PATH");
-    }
-    let status = cmd
-        .arg("install.sh")
-        .arg("--yes")
-        .env("MEOW_NO_SUDO", "1")
-        .current_dir(&dir)
+    let build = build_dir().context("cannot make a folder to build in")?;
+    let status = install_command(&dir, build.path())
         .status()
         .context("cannot run install.sh")?;
     if !status.success() {
@@ -926,6 +1027,36 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cargo builds the update in a fresh private folder, never in the
+    /// checkout's own `./target`.
+    #[cfg(unix)]
+    #[test]
+    fn install_sh_builds_in_a_private_folder_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("clone");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::write(
+            checkout.join("install.sh"),
+            "printf '%s' \"$CARGO_TARGET_DIR\" > built-in\n",
+        )
+        .unwrap();
+        let build = build_dir().unwrap();
+        let mode = std::fs::metadata(build.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let mut command = install_command(&checkout, build.path());
+        // A target folder from the user's settings does not apply either.
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "CARGO_BUILD_TARGET_DIR" && value.is_none()));
+        assert!(command.status().unwrap().success());
+        let built_in = std::fs::read_to_string(checkout.join("built-in")).unwrap();
+        assert_eq!(built_in, build.path().display().to_string());
+    }
 
     #[test]
     fn git_remote_urls_and_local_config_keys_are_audited() {
@@ -1043,6 +1174,8 @@ mod tests {
             format!("echo \"ran $*\" >> '{}'\n", install_log.display()),
         )
         .unwrap();
+        std::fs::create_dir_all(work.join("src").join("parsers")).unwrap();
+        std::fs::write(work.join("src").join("parsers").join("mod.rs"), "\n").unwrap();
         test_git(&work, &["add", "."]);
         test_git(&work, &["commit", "-qm", "initial"]);
         test_git(tmp.path(), &["clone", "-q", "--bare", "work", "origin.git"]);
@@ -1097,6 +1230,50 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:#}").contains("can be changed by other users"));
         std::fs::set_permissions(&clone, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Group write counts unless the group is the user's alone (on
+        // macOS every user's group is staff), and so does every file git
+        // tracks, every folder it is in, and what git keeps.
+        let check_only = || {
+            run(&UpdateArgs {
+                check: true,
+                source: Some(clone.clone()),
+            })
+        };
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let refused = |what: &Path| {
+            let err = check_only().unwrap_err();
+            let expected = format!("{} can be changed by other users", what.display());
+            assert!(format!("{err:#}").contains(&expected), "{err:#}");
+        };
+        set_mode(&clone.join("install.sh"), 0o664);
+        crate::perms::with_private_group(false, || refused(&clone.join("install.sh")));
+        crate::perms::with_private_group(true, || assert!(check_only().is_ok()));
+        tighten_tree(&clone);
+        let nested = clone.join("src").join("parsers");
+        for (path, mode) in [
+            (nested.join("mod.rs"), 0o666),
+            (nested.clone(), 0o777),
+            (clone.join(".git").join("refs").join("heads"), 0o777),
+            (clone.join(".git").join("objects"), 0o777),
+            (clone.join(".git").join("index"), 0o666),
+        ] {
+            set_mode(&path, mode);
+            refused(&path);
+            tighten_tree(&clone);
+        }
+        let object_folder = std::fs::read_dir(clone.join(".git").join("objects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().len() == 2)
+            .unwrap();
+        crate::perms::with_private_group(false, || {
+            set_mode(&object_folder, 0o775);
+            refused(&object_folder);
+        });
+        tighten_tree(&clone);
 
         // Plant a post-merge git hook; hooksPath=/dev/null prevents execution.
         let hooks = clone.join(".git/hooks");
