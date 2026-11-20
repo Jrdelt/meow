@@ -1,9 +1,18 @@
-### What's New in `meow` v0.2.3
+### What's New in `meow` v0.2.4
 
-- **Fixed: `exit` could hang and recon stopped halfway.** After a mild or aggressive `meow recon` reached the `waf-cdn` stage, that stage locked up, so the later stages (tls-audit, ssh-audit, cves, crawl, js, dirs) never ran and `exit` waited for ever with the terminal left raw. Recon now runs every stage, and leaving a session always gives your shell back within a few seconds.
-- **Sessions are saved where you run meow.** A new session asks where to save it, with the current folder filled in (edit it or press Enter). Sessions live in `./meow/<name>/` there, next to your other files, with a `.gitignore` so git leaves them out. `meow <name>` still reopens a session from any folder, and `meow list` shows where each one lives. `--home` keeps the old `~/.meow/workspaces/` place; sessions made by earlier versions keep working.
-- **Each session has its own shell history.** `history`, the up arrow and `Ctrl-R` show only that session's commands, and they stay out of your normal shell history (zsh, bash, PowerShell, fish). macOS Terminal's "Saving session…" no longer runs inside meow.
-- **CVEs are shown plainly.** They are grouped by the software and version they were found from, known-exploited first, with severity and the version that fixes them — on the map, in the HUD and in the report. The confirm / false-positive steps and the Evidence tab are gone.
+A security release: a third full audit found 31 issues (none high), and all are fixed.
+
+- **Session folders.** meow refuses a folder that another account can change (a shared group such as macOS `staff`, or an access list), and checks again each time a session is opened. If a `git pull` or an unpacked archive replaced a session's files, meow says so, drops that session's shell history and asks before resuming its scans.
+- **Privacy with cloud AI.** Active Directory and NetBIOS names, and addresses written inside URLs and file names, are now masked. A reply gets back only the triaged host's own address and names; secrets and other hosts' values stay as placeholders. The "is this local server mine?" check now works on macOS and Windows.
+- **DNS.** No fixed public resolvers any more, and DNS-over-HTTPS is never asked about an internal target. The target's address is the one your system gives, as for nmap (so `/etc/hosts` counts).
+- **Imports and CVEs.** Host names in an imported nmap file can no longer move another host's notes and CVEs. CVE lookups started by terminal text are capped at 256 per session and wait behind those of `meow recon`.
+- **Map.** A crafted AI reply can no longer freeze the tab, and a page on another local port can no longer detect a running session.
+- **Updates and releases.** `meow update --source` accepts only the git settings a plain clone has and refuses submodules. Each platform's download is now checked against the job that built it.
+
+Things you may notice:
+
+- A session in a folder other accounts can write to is refused; use `meow <name> --home` or fix the folder's permissions.
+- `meow update --source` may refuse a checkout whose `.git/config` has extra settings; the message names the setting.
 
 ---
 
