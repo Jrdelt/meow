@@ -1482,7 +1482,8 @@
     }
     model.main = parts.join(' \u00b7 ');
     model.spoken = now ? model.main.replace(/^(\d+)\/(\d+)/, 'stage $1 of $2') : model.main;
-    // A run that is over keeps its bar; the stage names are in its hints.
+    // A run that is over keeps its bar and, where there is room, the
+    // names: which stages ran and which were skipped stays readable.
     model.over = entry.rank === 2;
     var settled = over + (now && now.progress.part ? now.progress.part : 0);
     model.percent = total ? Math.round(100 * settled / total) : 0;
