@@ -600,25 +600,21 @@ impl State {
         // What was left out was not asked: earlier matches for it stay.
         grounding.partial |= cut;
         let total_matches = grounding.advisories.len();
-        let (merged, first_fix, full) = {
+        let (merged, full) = {
             let mut graph = self.graph();
             let merged = cve::merge(&mut graph, address, &grounding);
-            let first_fix = graph
-                .hosts
-                .get(address)
-                .and_then(|h| cve::fix_plan(h).into_iter().next());
-            (merged, first_fix, graph.is_full())
+            (merged, graph.is_full())
         };
         self.notice_if_full(full);
         if !grounding.errors.is_empty() {
-            let shown: Vec<&str> = grounding
+            let shown: Vec<String> = grounding
                 .errors
                 .iter()
                 .take(3)
-                .map(String::as_str)
+                .map(|error| error.replace(" answered HTTP ", " error "))
                 .collect();
             self.notice(format!(
-                "CVE lookup for {address} is incomplete: {}",
+                "CVE lookup for {address} incomplete: {}",
                 shown.join("; ")
             ));
         }
@@ -632,13 +628,15 @@ impl State {
             ));
         }
         if merged.added > 0 {
-            let fix = first_fix
-                .map(|fix| format!(" Most come from one place: {}", fix.action))
-                .unwrap_or_default();
+            // What to update is on the host, in the map and the HUD.
             let noun = if merged.added == 1 { "CVE" } else { "CVEs" };
+            let exploited = match merged.kev {
+                0 => String::new(),
+                kev => format!(" \u{b7} {kev} exploited"),
+            };
             self.notice(format!(
-                "{} new {noun} for {address} ({} known exploited), found by software version.{fix}",
-                merged.added, merged.kev
+                "{} new {noun} for {address}{exploited}",
+                merged.added
             ));
         }
         Some((merged, total_matches, grounding.errors))
@@ -815,7 +813,7 @@ impl State {
             Command::State => Ok(self.snapshot()),
             Command::SetMode { mode } => {
                 lock(&self.workspace).set_mode(mode)?;
-                self.notice(format!("mode set to {mode}"));
+                self.notice(format!("Mode: {mode}"));
                 // Tasks paused by light mode continue once it is left.
                 let resumed = match mode {
                     Mode::Light => 0,
@@ -922,7 +920,7 @@ impl State {
                     ));
                 }
                 let _ = self.recon_queue.send(id);
-                self.notice(format!("recon {parsed} queued as task {id} ({mode})"));
+                self.notice(format!("Recon {parsed} queued \u{b7} {mode}"));
                 let ahead = self.unfinished_recons()?.len().saturating_sub(1);
                 Ok(
                     json!({ "task": id, "target": parsed.to_string(), "mode": mode, "ahead": ahead }),
@@ -1019,10 +1017,7 @@ impl State {
                     (graph.clone(), host)
                 };
                 if tier == Tier::Research && host.advisories.is_empty() {
-                    bail!(
-                        "[R] needs a CVE to research: none found for {} yet",
-                        host.address
-                    );
+                    bail!("Research needs a CVE: none found for {} yet", host.address);
                 }
                 {
                     let mut status = lock(&self.ai_status);
@@ -1036,12 +1031,7 @@ impl State {
                         ..AiStatus::default()
                     };
                 }
-                self.notice(format!(
-                    "[{}] {} started for {}",
-                    tier.key(),
-                    tier.label(),
-                    host.address
-                ));
+                self.notice(format!("{} asked about {}", tier.name(), host.address));
                 let state = Arc::clone(self);
                 self.handle
                     .spawn(async move { state.run_ai(tier, graph, host).await });
@@ -1083,8 +1073,8 @@ impl State {
                     (None, false) => format!("answered by {}", outcome.model),
                 };
                 let line = format!(
-                    "[{}] for {} {how}, ${:.4}, {file}",
-                    tier.key(),
+                    "{} for {}: {how} \u{b7} ${:.4} \u{b7} {file}",
+                    tier.name(),
                     host.address,
                     outcome.cost_usd
                 );
@@ -1095,7 +1085,7 @@ impl State {
                 line
             }
             Err(error) => {
-                let line = format!("[{}] for {} failed: {error:#}", tier.key(), host.address);
+                let line = format!("{} for {} failed: {error:#}", tier.name(), host.address);
                 let mut status = lock(&self.ai_status);
                 status.running = false;
                 status.error = Some(format!("{error:#}"));
@@ -3791,9 +3781,9 @@ mod tests {
                 [ids.0, ids.1, ids.2]
             );
             assert_eq!(more, 0);
-            assert!(left[1].left_line(true).starts_with(
-                "recon 192.0.2.6 stopped at dns when the last session ended; 15 of 17"
-            ));
+            assert!(left[1]
+                .left_line(true)
+                .starts_with("Recon 192.0.2.6 cut short at dns \u{b7} "));
 
             // Nothing runs, whatever the mode is set to, and not even a
             // row that is put back to waiting behind the session's back.
@@ -4471,7 +4461,7 @@ mod tests {
         // Deep research needs a CVE to research, and nothing more.
         let refused = ask(Tier::Research, "10.0.0.5").unwrap_err().to_string();
         assert!(
-            refused.contains("[R] needs a CVE to research: none found for 10.0.0.5"),
+            refused.contains("Research needs a CVE: none found for 10.0.0.5"),
             "{refused}"
         );
 
@@ -4508,7 +4498,7 @@ mod tests {
         assert_eq!(snapshot["budget"]["max_calls"], 20);
         assert!(snapshot["notices"]
             .to_string()
-            .contains("[L] for 10.0.0.5 answered by local"));
+            .contains("Local AI for 10.0.0.5: answered by local"));
 
         // With a CVE found, [R] starts. No key is set here, so it ends
         // without asking anyone.

@@ -503,22 +503,19 @@ impl TaskRow {
         // Only a target that is one is offered as a command to run.
         let again = Target::parse(&self.target)
             .filter(|_| own)
-            .map(|target| format!(" Run `meow recon {target}` to scan again."));
+            .map(|target| format!(" \u{b7} `meow recon {target}`"));
         let Some(again) = again else {
-            return format!("Dropped a scan that was queued in these files: recon {target}");
+            return format!("Dropped a scan queued in these files: recon {target}");
         };
+        // Which stages are left: the HUD and the map show them.
         let stopped = self.stages.iter().find(|s| s.status == "interrupted");
         let not_run = self.stages.iter().filter(|s| s.not_run()).count();
         let what = match stopped {
-            Some(stage) => format!("stopped at {}", stage.stage.as_str()),
-            None => "was not finished".to_owned(),
+            Some(stage) => format!("cut short at {}", stage.stage.as_str()),
+            None if not_run == self.stages.len() => "not run".to_owned(),
+            None => "not finished".to_owned(),
         };
-        let rest = match not_run {
-            0 => String::new(),
-            1 => format!("; 1 of {} stages was not run", self.stages.len()),
-            n => format!("; {n} of {} stages were not run", self.stages.len()),
-        };
-        format!("recon {target} {what} when the last session ended{rest}.{again}")
+        format!("Recon {target} {what}{again}")
     }
 }
 

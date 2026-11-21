@@ -484,20 +484,16 @@ pub fn adapt_for_privilege(flags: Vec<String>, privileged: bool) -> (Vec<String>
     let mut notices = Vec::new();
     for flag in flags {
         if flag == "-O" {
-            notices.push(
-                "not running as root: removed -O (OS detection needs raw sockets)".to_owned(),
-            );
+            notices.push("Not root: no OS detection (-O)".to_owned());
         } else if flag == "-sO" {
-            notices.push(
-                "not running as root: left out -sO (IP protocol scan needs raw sockets)".to_owned(),
-            );
+            notices.push("Not root: no IP protocol scan (-sO)".to_owned());
         } else if is_scan_technique_flag(&flag) && flag[2..].contains('U') {
             // A UDP scan needs raw sockets: nmap would refuse the whole run.
             let without_u: String = flag[2..].chars().filter(|&c| c != 'U').collect();
             let rest = to_connect(&without_u);
             notices.push(format!(
-                "not running as root: left out the UDP scan in {flag} (it needs root; scan UDP \
-                 with `sudo nmap -sU -oX udp.xml <target>` and import it with `meow add udp.xml`)"
+                "Not root: no UDP scan ({flag}) \u{b7} `sudo nmap -sU -oX udp.xml <target>`, \
+                 then `meow add udp.xml`"
             ));
             if !rest.is_empty() {
                 out.push(format!("-s{rest}"));
@@ -507,9 +503,7 @@ pub fn adapt_for_privilege(flags: Vec<String>, privileged: bool) -> (Vec<String>
             && flag[2..].chars().any(is_raw_tcp)
         {
             let replaced = format!("-s{}", to_connect(&flag[2..]));
-            notices.push(format!(
-                "not running as root: {flag} replaced with {replaced} (connect scan)"
-            ));
+            notices.push("Not root: connect scan instead of SYN scan".to_owned());
             out.push(replaced);
         } else {
             out.push(flag);

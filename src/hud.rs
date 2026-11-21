@@ -1,14 +1,16 @@
 //! `meow hud`: the companion terminal panel.
 //!
 //! It attaches to a live session over the coordinator WebSocket and shows
-//! the host list, a node and sub-path inspector, the CVEs found on each
-//! host by software version, the background queue and the notice log. A
-//! catch-up box takes operator notes. When no session is running it opens
+//! the host list, the selected host (what to update, its ports and paths),
+//! the CVEs found on it by software version, the recon queue and the
+//! notices. A catch-up box takes operator notes; `?` lists the keys. Panels
+//! with nothing in them are left out. When no session is running it opens
 //! the workspace files read-only.
 //!
 //! This is a separate process from the PTY host, so reading terminal events
 //! with crossterm is fine here.
 
+use std::cell::Cell;
 use std::io::IsTerminal;
 use std::time::{Duration, SystemTime};
 
@@ -22,7 +24,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,13 +35,13 @@ use crate::ai::{Budget, Tier};
 use crate::coordinator::{AiStatus, Command, Notice};
 use crate::cve;
 use crate::db::Db;
-use crate::evidence::sanitize;
-use crate::graph::{Advisory, Graph, Host, PathNode};
+use crate::evidence::{sanitize, Confidence, Source};
+use crate::graph::{Advisory, Fact, Graph, Host, LocalNet, PathNode, Port};
 use crate::mode::Mode;
-use crate::observer::{machine_report, MachineReport};
+use crate::observer::{active_vpns, machine_report, MachineReport};
 use crate::queue::{self, StageRow, TaskRow};
 use crate::timeutil::parse_rfc3339;
-use crate::topology::{host_headline, host_open_ports, only_mentioned};
+use crate::topology::{host_os, host_role, only_mentioned};
 use crate::workspace::Workspace;
 
 const MAX_PATH_LINES: usize = 40;
@@ -123,6 +125,10 @@ pub struct Model {
     host_index: usize,
     advisory_index: usize,
     inspector_scroll: u16,
+    /// How far the panel under it can scroll, as the last frame drew it.
+    scroll_limit: Cell<u16>,
+    /// What the status says once the session accepts the last command.
+    sent: Option<String>,
     /// The note being typed in the catch-up box, if it is open.
     pub note: Option<String>,
     pub status: String,
@@ -130,6 +136,10 @@ pub struct Model {
     pub show_ai: bool,
     /// The upper-right panel shows everything known about this machine.
     pub show_machine: bool,
+    /// The key card (`?`) is open over the panel.
+    pub help: bool,
+    /// The session this panel was attached to has ended.
+    ended: bool,
     /// How long ago the snapshot arrived: a running stage's clock goes on
     /// between two of them.
     pub age: Duration,
@@ -191,10 +201,14 @@ impl Model {
             host_index: 0,
             advisory_index: 0,
             inspector_scroll: 0,
+            scroll_limit: Cell::new(u16::MAX),
+            sent: None,
             note: None,
             status: String::new(),
             show_ai: false,
             show_machine: false,
+            help: false,
+            ended: false,
             age: Duration::ZERO,
             lead: Duration::ZERO,
             sync: ClockSync::new(),
@@ -206,7 +220,8 @@ impl Model {
     /// find them.
     pub fn session_ended(&mut self) {
         self.live = false;
-        self.status = "the session has ended; showing its last state".to_owned();
+        // The header says so.
+        self.ended = true;
         if let Some(snapshot) = &mut self.snapshot {
             queue::show_ended(&mut snapshot.tasks);
         }
@@ -253,6 +268,23 @@ impl Model {
         self.advisories().get(self.advisory_index).copied()
     }
 
+    /// The panel the arrow keys move in: the CVE list only while the
+    /// selected host has CVEs to move through.
+    pub fn focused(&self) -> Focus {
+        match self.focus {
+            Focus::Advisories if self.advisories().is_empty() => Focus::Hosts,
+            focus => focus,
+        }
+    }
+
+    /// What a key that needs the session says without one.
+    fn not_live(&self) -> String {
+        match &self.snapshot {
+            Some(snapshot) => format!("No session running: `meow {}` starts it", snapshot.session),
+            None => "No session running".to_owned(),
+        }
+    }
+
     fn clamp(&mut self) {
         self.host_index = self.host_index.min(self.hosts().len().saturating_sub(1));
         self.advisory_index = self
@@ -290,10 +322,8 @@ impl Model {
                         self.age = Duration::ZERO;
                     }
                     Err(error) => {
-                        self.status = format!(
-                            "unreadable state from the session: {}",
-                            sanitize(&error.to_string(), 200)
-                        )
+                        self.status =
+                            format!("Unreadable state: {}", sanitize(&error.to_string(), 200))
                     }
                 }
                 if let Some(address) = selected {
@@ -343,9 +373,9 @@ impl Model {
             }
             Some("result") => {
                 self.status = match message.get("ok").and_then(Value::as_bool) {
-                    Some(true) => "done".to_owned(),
+                    Some(true) => self.sent.take().unwrap_or_else(|| "Done".to_owned()),
                     _ => format!(
-                        "refused: {}",
+                        "Refused: {}",
                         sanitize(
                             message
                                 .get("error")
@@ -361,6 +391,8 @@ impl Model {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        // A CVE list that emptied hands the arrows back to the hosts.
+        self.focus = self.focused();
         let (index, len) = match self.focus {
             Focus::Hosts => (
                 &mut self.host_index,
@@ -383,7 +415,7 @@ impl Model {
 
     fn ask_ai(&mut self, tier: Tier) -> Action {
         let Some(host) = self.selected_host() else {
-            self.status = "select a host first".to_owned();
+            self.status = "Select a host first".to_owned();
             return Action::None;
         };
         let command = Command::Ai {
@@ -393,6 +425,8 @@ impl Model {
         if self.live {
             self.show_ai = true;
             self.inspector_scroll = 0;
+            // The AI panel says how it goes.
+            self.sent = Some(String::new());
         }
         Action::Send(command)
     }
@@ -456,10 +490,10 @@ impl Model {
                         return Action::None;
                     }
                     if !self.live {
-                        self.status =
-                            "read-only: no session is running for this workspace".to_owned();
+                        self.status = self.not_live();
                         return Action::None;
                     }
+                    self.sent = Some("Note saved".to_owned());
                     return Action::Send(Command::Note {
                         address: self.selected_host().map(|h| h.address.clone()),
                         text,
@@ -467,6 +501,11 @@ impl Model {
                 }
                 _ => {}
             }
+            return Action::None;
+        }
+        // The key card closes on any key, which does nothing else.
+        if self.help {
+            self.help = false;
             return Action::None;
         }
 
@@ -488,14 +527,22 @@ impl Model {
                 Action::None
             }
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
-                self.focus = match self.focus {
-                    Focus::Hosts => Focus::Advisories,
-                    Focus::Advisories => Focus::Hosts,
+                // To the CVE list only where there is one.
+                self.focus = match self.focused() {
+                    Focus::Hosts if !self.advisories().is_empty() => Focus::Advisories,
+                    _ => Focus::Hosts,
                 };
                 Action::None
             }
+            KeyCode::Char('?') => {
+                self.help = true;
+                Action::None
+            }
             KeyCode::PageDown => {
-                self.inspector_scroll = self.inspector_scroll.saturating_add(8);
+                self.inspector_scroll = self
+                    .inspector_scroll
+                    .saturating_add(8)
+                    .min(self.scroll_limit.get());
                 Action::None
             }
             KeyCode::PageUp => {
@@ -529,8 +576,17 @@ impl Model {
             _ => Action::None,
         };
         if matches!(action, Action::Send(_)) && !self.live {
-            self.status = "read-only: no session is running for this workspace".to_owned();
+            self.status = self.not_live();
             return Action::None;
+        }
+        if let Action::Send(Command::SetMode { mode }) = &action {
+            self.sent = Some(match mode {
+                Mode::Light => "Mode: light \u{b7} 0 packets to hosts".to_owned(),
+                Mode::Mild => "Mode: mild \u{b7} slow, rate-limited scans".to_owned(),
+                Mode::Aggressive => {
+                    "Mode: aggressive \u{b7} labs and authorized hosts only".to_owned()
+                }
+            });
         }
         action
     }
@@ -545,6 +601,8 @@ const GOOD: Style = Style::new().fg(Color::Green);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const BAD: Style = Style::new().fg(Color::Red);
 const TITLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+/// Between the parts of a line: `3 hosts · 8 CVEs`.
+const SEP: &str = " \u{b7} ";
 
 /// Breaks `text` into lines of at most `width` characters at spaces; a word
 /// longer than a line is split.
@@ -580,6 +638,36 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered().title(title).border_style(style)
 }
 
+/// `$0.25`, and `$1` for a whole amount.
+fn dollars(amount: f64) -> String {
+    let cents = format!("{amount:.2}");
+    match cents.strip_suffix(".00") {
+        Some(whole) => format!("${whole}"),
+        None => format!("${cents}"),
+    }
+}
+
+/// `1 host`, `3 hosts`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+/// `parts` with ` · ` between them.
+fn joined(parts: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for part in parts {
+        if !spans.is_empty() {
+            spans.push(Span::styled(SEP, DIM));
+        }
+        spans.push(part);
+    }
+    spans
+}
+
 fn path_lines(node: &PathNode, depth: usize, out: &mut Vec<Line<'static>>) {
     for (name, child) in &node.children {
         if out.len() >= MAX_PATH_LINES {
@@ -588,54 +676,209 @@ fn path_lines(node: &PathNode, depth: usize, out: &mut Vec<Line<'static>>) {
         let slash = if child.children.is_empty() { "" } else { "/" };
         let status = child.status.map(|s| format!("  {s}")).unwrap_or_default();
         out.push(Line::from(vec![
-            Span::raw(format!("{}/{name}{slash}", "  ".repeat(depth + 3))),
+            Span::raw(format!(
+                "{}/{}{slash}",
+                " ".repeat(COLUMN + 2 + 2 * depth),
+                sanitize(name, 200)
+            )),
             Span::styled(status, DIM),
         ]));
         path_lines(child, depth + 1, out);
     }
 }
 
-fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
-    // What it is in one line, then what is open on it.
-    let mut lines = vec![
-        Line::styled(sanitize(&host_headline(graph, host), 300), TITLE),
-        Line::from(vec![
-            Span::styled("Open ports  ", DIM),
-            Span::raw(sanitize(&host_open_ports(host), 300)),
-        ]),
-    ];
-    let names: Vec<&str> = host.hostnames.iter().map(String::as_str).collect();
-    if !names.is_empty() {
+/// The host panel's title in `room` columns: the address and what the
+/// host is, as far as it is known and fits: `192.0.2.10 · Server · Linux
+/// 5.4`.
+fn host_title(graph: &Graph, host: &Host, room: usize) -> String {
+    let mut parts = vec![sanitize(&host.address, 120)];
+    if !only_mentioned(host) {
+        let (role, _) = host_role(graph, host);
+        parts.push(role.title().to_owned());
+        if let Some(os) = host_os(host) {
+            let name = format!("{} {}", os.name.trim(), os.version.trim());
+            if !name.trim().is_empty() {
+                parts.push(sanitize(name.trim(), 120));
+            }
+            if os.guessed {
+                parts.push("OS from a banner".to_owned());
+            }
+        }
+    }
+    while parts.len() > 1 && Span::raw(parts.join(SEP)).width() > room {
+        parts.pop();
+    }
+    fit(&parts.join(SEP), room)
+}
+
+/// Facts about a host the panel already shows: the host is listed, its
+/// OS is in the title and its names have a row of their own.
+fn said_elsewhere(claim: &str) -> bool {
+    claim == "host is up"
+        || claim.starts_with("operating system: ")
+        || claim.starts_with("hostname ")
+}
+
+/// Facts about a port the panel already shows: what the port is and its
+/// state (`22/tcp ssh open`), its certificate names and its server.
+fn said_on_port(claim: &str, port: &Port) -> bool {
+    claim.starts_with(&format!("{} ", port.key()))
+        || claim.starts_with("TLS certificate names ")
+        || (claim.starts_with("HTTP Server header: ")
+            && port.http.as_ref().is_some_and(|h| h.server.is_some()))
+}
+
+/// A fact as the panel says it: `ssh-hostkey 3072 SHA256:… (RSA)` for
+/// `nmap script ssh-hostkey: …`, whose source says nmap.
+fn fact_text(fact: &Fact) -> String {
+    let claim = sanitize(&fact.claim, 300);
+    match claim.strip_prefix("nmap script ") {
+        Some(script) if fact.record.source == Source::NmapXml => script.replacen(": ", " ", 1),
+        _ => claim,
+    }
+}
+
+/// Where a fact came from, in a word.
+fn source_word(source: Source) -> &'static str {
+    match source {
+        Source::PtyRegex => "terminal",
+        Source::NmapXml => "nmap",
+        Source::HttpHeader => "http",
+        Source::TlsSan | Source::TlsCert => "tls",
+        Source::KatanaJsonl => "katana",
+        Source::FeroxJson => "feroxbuster",
+        Source::NvdApi => "NVD",
+        Source::OsvApi => "OSV",
+        Source::CisaKev => "CISA",
+        Source::ManualNote => "note",
+        Source::LogRegex => "log",
+        Source::GitDiff => "git diff",
+        Source::LocalNet => "this machine",
+        Source::Dns => "dns",
+        Source::Rdap => "rdap",
+        Source::AsnDns => "asn",
+        Source::CtLog => "ct log",
+        Source::SshKex => "ssh",
+        Source::WafCdn => "waf/cdn",
+        Source::Favicon => "favicon",
+        Source::Traceroute => "traceroute",
+        Source::JsScan => "js",
+    }
+}
+
+/// The width of the labels in the host panel: `Update  `.
+const COLUMN: usize = 8;
+
+/// The selected host: what to update, its names, its ports and what else
+/// was seen on it, each under a label. What it is, is in the panel's title.
+/// Sections with nothing in them are left out.
+fn inspector_lines(host: &Host, room: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if only_mentioned(host) {
+        lines.push(Line::styled(
+            "Mentioned in the shell \u{b7} not scanned",
+            DIM,
+        ));
+    }
+    let lead = |label: &str, first: bool| {
+        let label = if first { label } else { "" };
+        Span::styled(format!("{label:<COLUMN$}"), TITLE)
+    };
+    let under = || Span::raw(" ".repeat(COLUMN + 2));
+    // What to do about the CVEs: one update per piece of software.
+    let fixes = cve::fix_plan(host);
+    for (index, fix) in fixes.iter().take(5).enumerate() {
+        let update = format!(
+            "{} to {}",
+            sanitize(&fix.software, 200),
+            sanitize(&fix.target, 120)
+        );
+        let close = fix
+            .port
+            .as_ref()
+            .map(|port| format!("or close {}", sanitize(port, 80)));
+        let cves = Span::styled(count(fix.advisories, "CVE", "CVEs"), DIM);
+        let kev = (fix.kev > 0).then(|| Span::styled(format!("{} exploited", fix.kev), BAD));
+        // As the map says it, on one row where it fits.
+        let mut one = vec![lead("Update", index == 0)];
+        let what = match &close {
+            Some(close) => format!("{update}, {close}"),
+            None => update.clone(),
+        };
+        one.extend(joined(
+            [
+                vec![Span::raw(what)],
+                vec![cves.clone()],
+                kev.clone().into_iter().collect(),
+            ]
+            .concat(),
+        ));
+        if width_of(&one) <= room {
+            lines.push(Line::from(one));
+            continue;
+        }
+        // Else what is exploited stays on the first row.
+        let mut first = vec![lead("Update", index == 0)];
+        first.extend(joined(
+            [vec![Span::raw(update)], kev.into_iter().collect()].concat(),
+        ));
+        lines.push(Line::from(first));
+        let mut rest = vec![under()];
+        rest.extend(joined(
+            [
+                close
+                    .map(|close| Span::styled(close, DIM))
+                    .into_iter()
+                    .collect(),
+                vec![cves],
+            ]
+            .concat(),
+        ));
+        lines.push(Line::from(rest));
+    }
+    if fixes.len() > 5 {
         lines.push(Line::from(vec![
-            Span::styled("Names       ", DIM),
+            lead("", false),
+            Span::styled(format!("+{} more", fixes.len() - 5), DIM),
+        ]));
+    }
+    if !host.hostnames.is_empty() {
+        let names: Vec<&str> = host.hostnames.iter().map(String::as_str).collect();
+        lines.push(Line::from(vec![
+            lead("Names", true),
             Span::raw(sanitize(&names.join(", "), 300)),
         ]));
     }
-    // What to do about the CVEs: one update per piece of software.
-    let fixes = cve::fix_plan(host);
-    if !fixes.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("What to update", TITLE));
-        for fix in fixes.iter().take(5) {
-            lines.push(Line::raw(format!("  {}", sanitize(&fix.action, 300))));
-            lines.push(Line::styled(format!("      fixes {}", fix.counts()), DIM));
-        }
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled("Ports", TITLE));
-    for port in host.ports.values() {
-        let style = if port.is_open() { Style::new() } else { DIM };
-        lines.push(Line::styled(
-            format!("  {} {}", port.label(), port.state),
-            style,
-        ));
+    let mut ports: Vec<&Port> = host.ports.values().collect();
+    ports.sort_by_key(|port| (port.number, port.protocol.clone()));
+    for (index, port) in ports.iter().copied().enumerate() {
+        // Open is what a port listed here usually is; any other state is said.
+        let (state, style) = if port.is_open() {
+            (String::new(), Style::new())
+        } else {
+            (format!(" {}", sanitize(&port.state, 40)), DIM)
+        };
+        lines.push(Line::from(vec![
+            lead("Ports", index == 0),
+            Span::styled(format!("{}{state}", sanitize(&port.label(), 300)), style),
+        ]));
+        let indent = " ".repeat(COLUMN + 2);
         if let Some(server) = port.http.as_ref().and_then(|h| h.server.as_ref()) {
-            lines.push(Line::styled(format!("      Server: {server}"), DIM));
-        }
-        if !port.tls_sans.is_empty() {
-            let names: Vec<&str> = port.tls_sans.iter().map(String::as_str).collect();
             lines.push(Line::styled(
-                format!("      SAN: {}", names.join(", ")),
+                format!("{indent}server {}", sanitize(server, 200)),
+                DIM,
+            ));
+        }
+        // Names the Names row does not have already.
+        let names: Vec<&str> = port
+            .tls_sans
+            .iter()
+            .filter(|name| !host.hostnames.contains(*name))
+            .map(String::as_str)
+            .collect();
+        if !names.is_empty() {
+            lines.push(Line::styled(
+                format!("{indent}cert names {}", sanitize(&names.join(", "), 300)),
                 DIM,
             ));
         }
@@ -644,28 +887,32 @@ fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
         let truncated = paths.len() >= MAX_PATH_LINES;
         lines.extend(paths);
         if truncated {
-            lines.push(Line::styled("      ... more paths not shown", DIM));
+            lines.push(Line::styled(format!("{indent}+ more paths"), DIM));
         }
     }
-    if host.ports.is_empty() {
-        lines.push(Line::styled("  none seen", DIM));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled("Observations", TITLE));
-    let facts = host
+    let on_ports = ports.iter().flat_map(|port| {
+        port.facts
+            .iter()
+            .filter(move |fact| !said_on_port(&fact.claim, port))
+    });
+    let facts: Vec<&Fact> = host
         .facts
         .iter()
-        .chain(host.ports.values().flat_map(|p| p.facts.iter()))
-        .take(MAX_FACT_LINES);
-    for fact in facts {
+        .filter(|fact| !said_elsewhere(&fact.claim))
+        .chain(on_ports)
+        .take(MAX_FACT_LINES)
+        .collect();
+    for (index, fact) in facts.into_iter().enumerate() {
+        let unsure = if fact.record.confidence == Confidence::Low {
+            " \u{b7} unsure"
+        } else {
+            ""
+        };
         lines.push(Line::from(vec![
-            Span::raw(format!("  {} ", fact.claim)),
+            lead("Facts", index == 0),
+            Span::raw(fact_text(fact)),
             Span::styled(
-                format!(
-                    "[{} / {:?}]",
-                    fact.record.source.as_str(),
-                    fact.record.confidence
-                ),
+                format!("  {}{unsure}", source_word(fact.record.source)),
                 DIM,
             ),
         ]));
@@ -673,243 +920,616 @@ fn inspector_lines(graph: &Graph, host: &Host) -> Vec<Line<'static>> {
     lines
 }
 
-fn advisory_detail(host: &Host, advisory: &Advisory) -> Vec<Line<'static>> {
+/// `Ubuntu backports fixes: check `dpkg -l` first`, from the longer note
+/// the CVE lookups give; the note as it is if it does not read like one.
+fn short_backport_note(note: &str) -> String {
+    let distro = note.split(" backports").next().unwrap_or(note);
+    match note.split('`').nth(1) {
+        Some(command) if distro.len() < note.len() => {
+            format!("{distro} backports fixes: check `{command}` first")
+        }
+        _ => format!("{note}."),
+    }
+}
+
+/// A CVE's score, or its rating where it has no score.
+fn score_of(advisory: &Advisory) -> String {
+    match (advisory.cvss, cve::severity_word(advisory)) {
+        (Some(score), _) => format!("{score:.1}"),
+        (None, Some(word)) => word,
+        (None, None) => "unrated".to_owned(),
+    }
+}
+
+/// The selected CVE; its ID is the panel's title.
+/// `listed`: the list row shows the score and, for one known exploited,
+/// says so; the detail then does not say it again.
+fn advisory_detail(host: &Host, advisory: &Advisory, listed: bool) -> Vec<Line<'static>> {
     let style = if cve::is_serious(advisory) { BAD } else { WARN };
-    let mut head = vec![
-        Span::styled(advisory.id.clone(), TITLE),
-        Span::raw("  "),
-        Span::styled(cve::severity_label(advisory), style),
-    ];
-    if advisory.kev {
-        head.push(Span::styled("  known exploited", BAD));
+    let mut head = Vec::new();
+    match (cve::severity_word(advisory), listed) {
+        (Some(word), true) => head.push(Span::styled(word, style)),
+        _ => head.push(Span::styled(cve::severity_label(advisory), style)),
+    }
+    if advisory.kev && !listed {
+        head.push(Span::styled("exploited", BAD));
     }
     // The software and version it was found from.
     let found_from = cve::by_software(host)
         .into_iter()
         .find(|group| group.cves.iter().any(|a| a.id == advisory.id))
-        .map(|group| group.software);
+        .map(|group| group.software)
+        .unwrap_or_else(|| advisory.matched.clone());
+    let mut from = vec![Span::styled(sanitize(&found_from, 200), DIM)];
+    if let Some(port) = &advisory.port {
+        from.push(Span::styled(sanitize(port, 40), DIM));
+    }
     let mut lines = vec![
-        Line::from(head),
-        Line::raw(advisory.title.clone()),
-        Line::styled(
-            [
-                found_from.unwrap_or_else(|| advisory.matched.clone()),
-                advisory.port.clone().unwrap_or_default(),
-            ]
-            .iter()
-            .filter(|part| !part.is_empty())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("  "),
-            DIM,
-        ),
+        Line::from(joined(head)),
+        Line::raw(sanitize(&advisory.title, 400)),
+        Line::from(joined(from)),
     ];
     let fix = match (&advisory.fixed_in, &advisory.last_affected) {
         (Some(fixed), _) => Some(format!("Fixed in {fixed}")),
-        (None, Some(last)) => Some(format!("Affected up to {last}; update past it")),
+        (None, Some(last)) => Some(format!("Affected up to {last}: update past it")),
         (None, None) => None,
     };
     lines.extend(fix.map(|text| Line::styled(sanitize(&text, 120), GOOD)));
     lines.extend(
         cve::backport_note_for(host, advisory.port.as_deref())
-            .map(|note| Line::styled(format!("{note}."), DIM)),
+            .map(|note| Line::styled(short_backport_note(note), DIM)),
     );
     lines
 }
 
-/// The box at the top right: what this machine is, its open ports and its
-/// interfaces. Always in view; `m` shows the routes and neighbours too.
-fn machine_box_lines(report: &MachineReport) -> Vec<Line<'static>> {
-    let vpn = if report.vpn.is_empty() {
-        Span::styled("   no VPN", DIM)
-    } else {
-        let names: Vec<&str> = report
-            .vpn
+/// `en0  192.0.2.50/24  gateway 192.0.2.1` as its name and the rest.
+fn interface_row(line: &str) -> (String, String) {
+    let mut parts = line.split("  ").map(str::trim).filter(|p| !p.is_empty());
+    let name = parts.next().unwrap_or_default();
+    let rest: Vec<&str> = parts.collect();
+    (sanitize(name, 40), sanitize(&rest.join(SEP), 300))
+}
+
+/// This machine's open ports, on one line: `22/tcp · 631/tcp local only`.
+fn own_ports(lines: &[String]) -> Vec<Span<'static>> {
+    let mut parts = Vec::new();
+    for line in lines.iter().filter(|line| *line != "none listening") {
+        match line.strip_prefix("this machine only: ") {
+            Some(ports) => parts.push(Span::styled(
+                format!("{} local only", sanitize(ports, 300)),
+                DIM,
+            )),
+            None => parts.push(Span::raw(sanitize(line, 300))),
+        }
+    }
+    joined(parts)
+}
+
+/// `line` in at most `room` columns, its spans keeping their styles: cut
+/// with `…` where it is too long.
+fn fit_line(line: Line<'static>, room: usize) -> Line<'static> {
+    if line.width() <= room {
+        return line;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for span in line.spans {
+        let width = span.width();
+        if used + width < room {
+            used += width;
+            spans.push(span);
+            continue;
+        }
+        let cut = fit(&span.content, room - used);
+        let cut = if cut.is_empty() {
+            "\u{2026}".to_owned()
+        } else {
+            cut
+        };
+        spans.push(Span::styled(cut, span.style));
+        break;
+    }
+    Line::from(spans)
+}
+
+/// A route warning in a few words, for the box: `No route to 192.0.2.7 ·
+/// VPN down?`, `4444/tcp on eth0 · lab via tun0 · bind to 10.10.14.3 or
+/// 0.0.0.0`. The `m` view has the whole sentence.
+fn short_warning(warning: &str) -> String {
+    if let Some((target, _)) = warning
+        .strip_prefix("No route to ")
+        .and_then(|rest| rest.split_once(": no local interface"))
+    {
+        return format!("No route to {target}{SEP}VPN down?");
+    }
+    let listener = warning.strip_prefix("Listener ").and_then(|rest| {
+        let (socket, rest) = rest.split_once(" is bound to ")?;
+        let (owner, rest) = rest.split_once(", but the lab is reached via ")?;
+        let (lab, rest) = rest.split_once(": targets cannot connect back (")?;
+        let hint = rest.strip_suffix(')')?;
+        let (protocol, address) = socket.split_once('/')?;
+        let port = address.rsplit(':').next()?;
+        Some(format!(
+            "{port}/{protocol} on {owner}{SEP}lab via {lab}{SEP}{hint}"
+        ))
+    });
+    listener.unwrap_or_else(|| warning.to_owned())
+}
+
+/// What could not be read: the missing tools on one line (`ip, ss not
+/// installed`), any other note as it is.
+fn not_read(notes: &[String]) -> Vec<String> {
+    const MISSING: &str = " is not installed in the system directories";
+    let tools: Vec<&str> = notes
+        .iter()
+        .filter_map(|note| note.strip_suffix(MISSING))
+        .map(|tool| tool.trim_matches('`'))
+        .collect();
+    let mut said = Vec::new();
+    if !tools.is_empty() {
+        said.push(format!("{} not installed", tools.join(", ")));
+    }
+    said.extend(
+        notes
             .iter()
-            .filter_map(|line| line.split_whitespace().next())
-            .collect();
-        Span::styled(format!("   VPN {}", sanitize(&names.join(", "), 80)), GOOD)
+            .filter(|note| !note.ends_with(MISSING))
+            .cloned(),
+    );
+    said
+}
+
+/// What this machine is and whether a VPN is up, in `room` columns:
+/// `MacBook Pro · macOS 15.1 · VPN utun3`, or `no VPN` once the interfaces
+/// were read and none is one. Where it does not fit, the OS and then the
+/// kind of machine give way to the VPN. None before anything is read.
+fn machine_headline(local: &LocalNet, room: usize) -> Option<Line<'static>> {
+    let system = [
+        local.system.kind.trim().to_owned(),
+        format!("{} {}", local.system.os.trim(), local.system.version.trim())
+            .trim()
+            .to_owned(),
+    ];
+    let mut parts: Vec<Span> = system
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| Span::styled(sanitize(&part, 120), TITLE))
+        .collect();
+    let vpns: Vec<String> = active_vpns(local)
+        .into_iter()
+        .map(|(name, _)| sanitize(&name, 40))
+        .collect();
+    let vpn = if !vpns.is_empty() {
+        Some(Span::styled(format!("VPN {}", vpns.join(", ")), GOOD))
+    } else {
+        (!local.interfaces.is_empty()).then(|| Span::styled("no VPN", WARN))
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(sanitize(&report.headline, 200), TITLE),
-        vpn,
-    ])];
-    for section in report.sections.iter().filter(|section| section.open) {
-        let style = if section.warn { WARN } else { Style::default() };
-        let label = format!("{:<12}", section.title);
-        for (index, line) in section.lines.iter().enumerate() {
-            let label = if index == 0 {
-                label.clone()
-            } else {
-                " ".repeat(12)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(label, DIM),
-                Span::styled(sanitize(line, 300), style),
-            ]));
-        }
+    let all = |parts: &[Span<'static>]| joined([parts, vpn.as_slice()].concat());
+    while !parts.is_empty() && vpn.is_some() && width_of(&all(&parts)) > room {
+        parts.pop();
     }
-    lines
+    let line = all(&parts);
+    (!line.is_empty()).then(|| fit_line(Line::from(line), room))
 }
 
-/// Everything the observer read about this machine, section by section.
-fn machine_lines(report: &MachineReport) -> Vec<Line<'static>> {
+/// A `label  value` row; `wrap`: the value goes on under the label's
+/// column instead of being cut.
+struct Row {
+    label: String,
+    value: Vec<Span<'static>>,
+    wrap: bool,
+}
+
+fn row(label: &str, value: Vec<Span<'static>>) -> Row {
+    Row {
+        label: label.to_owned(),
+        value,
+        wrap: false,
+    }
+}
+
+/// Where the values of `rows` start: after the longest label.
+fn label_column<'a>(rows: impl Iterator<Item = &'a Row>) -> usize {
+    rows.map(|row| row.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(12)
+        + 2
+}
+
+/// Rows of `label  value` in `room` columns, the values from `column` on;
+/// a label is not repeated on the rows under it.
+fn label_rows(rows: Vec<Row>, room: usize, column: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for section in &report.sections {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
+    let mut last = String::new();
+    for row in rows {
+        let shown = if row.label == last {
+            ""
+        } else {
+            row.label.as_str()
+        };
+        let lead = Span::styled(format!("{shown:<column$}"), DIM);
+        if row.wrap {
+            let style = row.value.first().map_or(Style::new(), |span| span.style);
+            let text: String = row.value.iter().map(|span| span.content.as_ref()).collect();
+            for (index, piece) in wrap_words(&text, room.saturating_sub(column))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if index == 0 {
+                    lead.clone()
+                } else {
+                    Span::raw(" ".repeat(column))
+                };
+                lines.push(Line::from(vec![lead, Span::styled(piece, style)]));
+            }
+        } else {
+            let mut spans = vec![lead];
+            spans.extend(row.value);
+            lines.push(fit_line(Line::from(spans), room));
         }
-        lines.push(Line::styled(section.title.clone(), TITLE));
-        let style = if section.warn { WARN } else { Style::default() };
-        for line in &section.lines {
-            lines.push(Line::styled(format!("  {}", sanitize(line, 400)), style));
-        }
-    }
-    if let Some(time) = report.observed_utc.get(11..19) {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!("Read at {time} UTC (nothing sent)"),
-            DIM,
-        ));
+        last = row.label;
     }
     lines
 }
 
+/// This machine in `room` columns: what it is and its VPN, the route
+/// warnings, its open ports, the interfaces it uses and what could not be
+/// read. `short`: the warnings in a few words, as the box shows them.
+/// Also how many lines come before the ports: the box keeps those.
+fn machine_rows(
+    local: &LocalNet,
+    report: &MachineReport,
+    room: usize,
+    short: bool,
+) -> (Vec<Line<'static>>, usize) {
+    let mut lines: Vec<Line> = machine_headline(local, room).into_iter().collect();
+    let section = |title: &str| report.sections.iter().find(|s| s.title == title);
+    let mut warnings = Vec::new();
+    for warning in &local.warnings {
+        let text = if short {
+            short_warning(warning)
+        } else {
+            warning.clone()
+        };
+        warnings.push(Row {
+            wrap: true,
+            ..row("Warning", vec![Span::styled(sanitize(&text, 400), WARN)])
+        });
+    }
+    let mut rows = Vec::new();
+    if let Some(ports) = section("Open ports").map(|s| own_ports(&s.lines)) {
+        if !ports.is_empty() {
+            rows.push(row("Ports", ports));
+        }
+    }
+    // Not read yet: what could not be read says why, if it failed.
+    let interfaces = section("Interfaces").filter(|_| !local.interfaces.is_empty());
+    for line in interfaces.iter().flat_map(|s| &s.lines) {
+        if line.starts_with("not connected") {
+            rows.push(row("Network", vec![Span::styled("not connected", WARN)]));
+            continue;
+        }
+        let (name, rest) = interface_row(line);
+        // The first line says it is a VPN.
+        let rest = rest.replace(&format!("{SEP}VPN, "), SEP);
+        rows.push(row(&name, vec![Span::raw(rest)]));
+    }
+    for note in not_read(&local.notes) {
+        rows.push(Row {
+            wrap: !short,
+            ..row("Not read", vec![Span::styled(sanitize(&note, 300), WARN)])
+        });
+    }
+    // One column for all, the warnings first.
+    let column = label_column(warnings.iter().chain(&rows));
+    lines.extend(label_rows(warnings, room, column));
+    let pinned = lines.len();
+    lines.extend(label_rows(rows, room, column));
+    (lines, pinned)
+}
+
+/// Behind `m`, in place of the box: all of this machine, the warnings in
+/// full, then its routes, neighbours and other interfaces and when it was
+/// read.
+fn machine_lines(local: &LocalNet, report: &MachineReport, room: usize) -> Vec<Line<'static>> {
+    let (mut lines, _) = machine_rows(local, report, room, false);
+    let used = report
+        .sections
+        .iter()
+        .find(|s| s.title == "Interfaces")
+        .map(|s| s.lines.clone())
+        .unwrap_or_default();
+    let in_box: Vec<String> = used.iter().map(|line| interface_row(line).0).collect();
+    for section in report.sections.iter().filter(|section| !section.open) {
+        let title = section.title.split(" (").next().unwrap_or(&section.title);
+        let mut said = Vec::new();
+        for line in section.lines.iter().filter(|line| *line != "none") {
+            let line = match title {
+                // The interface's row says its gateway.
+                "Routes" if line.starts_with("default via ") => {
+                    let gateway = line["default via ".len()..].split(' ').next();
+                    match gateway {
+                        Some(gateway) if used.iter().any(|u| u.contains(gateway)) => continue,
+                        _ => line.clone(),
+                    }
+                }
+                "Routes" => match line.strip_suffix(
+                    " more left out: single hosts, multicast, link-local and idle interfaces",
+                ) {
+                    Some(left_out) => format!("+{left_out} more: host routes, multicast, idle"),
+                    None => line.replace(" (directly attached)", " \u{b7} direct"),
+                },
+                "All interfaces" => {
+                    if let Some((_, idle)) = line.split_once(" without a usable address: ") {
+                        format!("no address: {idle}")
+                    } else {
+                        let parts: Vec<&str> = line.split("  ").collect();
+                        if in_box
+                            .iter()
+                            .any(|name| Some(&name.as_str()) == parts.first())
+                        {
+                            continue;
+                        }
+                        let mut shown = vec![parts[0]];
+                        shown.extend(parts.iter().skip(3));
+                        if parts.get(2) == Some(&"down") {
+                            shown.push("down");
+                        }
+                        shown.join(" ")
+                    }
+                }
+                _ => line.clone(),
+            };
+            said.push(Line::raw(format!("  {}", sanitize(&line, 400))));
+        }
+        if said.is_empty() {
+            continue;
+        }
+        let title = match title {
+            "All interfaces" => "Other interfaces",
+            other => other,
+        };
+        lines.push(Line::styled(title.to_owned(), TITLE));
+        lines.extend(said);
+    }
+    match report.observed_utc.get(11..19) {
+        Some(time) => {
+            lines.push(Line::styled(
+                format!("Read {time} UTC \u{b7} nothing sent"),
+                DIM,
+            ));
+        }
+        None if lines.is_empty() => lines.push(Line::styled("Not read yet", DIM)),
+        None => {}
+    }
+    lines
+}
+
+/// The top line: the session, its mode and what was found, numbers first.
+/// What does not fit gives way: the host count (the list has them), the
+/// cloud AI spend, the CVE count; the session, its mode, what is exploited
+/// and the cloud AI near its daily cap stay.
 fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     let Some(snapshot) = &model.snapshot else {
         frame.render_widget(
-            Paragraph::new(" =^..^= meow hud: waiting for the session ..."),
+            Paragraph::new(Line::from(vec![
+                Span::styled(" =^..^= meow hud", TITLE),
+                Span::styled(" \u{b7} waiting for the session", DIM),
+            ])),
             area,
         );
         return;
     };
-
+    let graph = &snapshot.graph;
     let mode_style = match snapshot.mode {
         Mode::Light => GOOD,
         Mode::Mild => WARN,
         Mode::Aggressive => BAD,
     };
-    let link = if model.live {
-        Span::styled("live", GOOD)
-    } else {
-        Span::styled("read-only (no session running)", WARN)
+    let seen = graph.hosts.values().filter(|h| !only_mentioned(h)).count();
+    let cves = graph.advisory_count();
+    let exploited = graph
+        .hosts
+        .values()
+        .flat_map(|host| &host.advisories)
+        .filter(|advisory| advisory.kev)
+        .count();
+    // Which part goes first where the line is too narrow: the highest
+    // number; 0 stays.
+    let mut parts: Vec<(u8, Span<'static>)> =
+        vec![(0, Span::styled(snapshot.mode.as_str(), mode_style))];
+    if !model.live {
+        let said = if model.ended {
+            "session ended"
+        } else {
+            "no session"
+        };
+        parts.push((0, Span::styled(said, WARN)));
+    }
+    if seen > 0 {
+        parts.push((4, Span::raw(count(seen, "host", "hosts"))));
+    }
+    if cves > 0 {
+        parts.push((2, Span::raw(count(cves, "CVE", "CVEs"))));
+    }
+    if exploited > 0 {
+        parts.push((1, Span::styled(format!("{exploited} exploited"), BAD)));
+    }
+    let budget = &snapshot.budget;
+    let capped = budget.calls >= budget.max_calls || budget.spent_usd >= budget.max_usd;
+    if budget.has_key && capped {
+        // C asks local AI and R is off until tomorrow.
+        parts.push((1, Span::styled("cloud AI cap reached", BAD)));
+    } else if budget.has_key {
+        // Near the cap, the spend and the calls stay longest.
+        let near = budget.spent_usd * 4.0 >= budget.max_usd * 3.0;
+        let spent = format!(
+            "cloud AI {}/{} today",
+            dollars(budget.spent_usd),
+            dollars(budget.max_usd)
+        );
+        parts.push(match near {
+            true => (1, Span::styled(spent, WARN)),
+            false => (3, Span::styled(spent, DIM)),
+        });
+        // The calls only once they, not the spend, are near the cap.
+        if budget.calls * 4 >= budget.max_calls * 3 {
+            let calls = format!("{}/{} calls", budget.calls, budget.max_calls);
+            parts.push((1, Span::styled(calls, WARN)));
+        }
+    } else if budget.setup_unreadable {
+        parts.push((1, Span::styled("cloud AI off: ai.toml unreadable", WARN)));
+    }
+    let head = Span::styled(format!(" =^..^= {}", snapshot.session), TITLE);
+    let line = |parts: &[(u8, Span<'static>)]| {
+        let mut spans = vec![head.clone()];
+        for (_, part) in parts {
+            spans.push(Span::styled(SEP, DIM));
+            spans.push(part.clone());
+        }
+        spans
     };
-    let line = Line::from(vec![
-        Span::styled(" =^..^= meow hud ", TITLE),
-        Span::raw(format!("| {} | mode ", snapshot.session)),
-        Span::styled(snapshot.mode.as_str(), mode_style),
-        Span::raw({
-            let names = snapshot
-                .graph
-                .hosts
-                .values()
-                .filter(|host| only_mentioned(host))
-                .count();
-            let seen = snapshot.graph.hosts.len() - names;
-            let mentioned = if names > 0 {
-                format!(" ({names} names only mentioned)")
-            } else {
-                String::new()
-            };
-            format!(
-                " | {seen} hosts{mentioned} | {} CVEs | ",
-                snapshot.graph.advisory_count()
-            )
-        }),
-        link,
-        Span::styled(
-            if snapshot.budget.has_key {
-                format!(
-                    " | cloud ${:.2} of ${:.2}, {} of {} calls today",
-                    snapshot.budget.spent_usd,
-                    snapshot.budget.max_usd,
-                    snapshot.budget.calls,
-                    snapshot.budget.max_calls
-                )
-            } else if snapshot.budget.setup_unreadable {
-                " | cloud off: ai.toml cannot be read (run `meow setup`)".to_owned()
-            } else {
-                " | cloud: no API key (run `meow setup`)".to_owned()
-            },
-            DIM,
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    while width_of(&line(&parts)) > area.width as usize {
+        let Some(last) = parts.iter().map(|(keep, _)| *keep).max().filter(|k| *k > 0) else {
+            break;
+        };
+        let at = parts
+            .iter()
+            .rposition(|(keep, _)| *keep == last)
+            .expect("found");
+        parts.remove(at);
+    }
+    frame.render_widget(Paragraph::new(Line::from(line(&parts))), area);
+}
+
+/// One row of the host list in `room` columns: the host and what is on
+/// it, as much as fits (`192.0.2.10  3 ports · 4 CVEs · 1 exploited`). The
+/// ports give way first, then the name, then the CVE count; where no count
+/// fits, the address alone in the colour of the worst of it.
+fn host_row(host: &Host, room: usize) -> Line<'static> {
+    if only_mentioned(host) {
+        // A name from a URL in the terminal, not a machine seen.
+        let row = format!("{}  mentioned", host.label());
+        if Span::raw(row.as_str()).width() <= room {
+            return Line::styled(row, DIM);
+        }
+        return Line::styled(fit(&host.label(), room), DIM);
+    }
+    let style = if host.advisories.iter().any(cve::is_serious) {
+        BAD
+    } else {
+        WARN
+    };
+    let ports = host.open_ports().count();
+    let cves = host.advisories.len();
+    let exploited = host.advisories.iter().filter(|a| a.kev).count();
+    let ports = (ports > 0).then(|| Span::styled(count(ports, "port", "ports"), DIM));
+    let cves = (cves > 0).then(|| Span::styled(count(cves, "CVE", "CVEs"), style));
+    let exploited = (exploited > 0).then(|| Span::styled(format!("{exploited} exploited"), BAD));
+    let label = host.label();
+    let named = label != host.address;
+    let all = vec![ports.clone(), cves.clone(), exploited.clone()];
+    let urgent = vec![cves.clone(), exploited.clone()];
+    let mut options = Vec::new();
+    if named {
+        options.push((label.as_str(), all.clone()));
+        options.push((label.as_str(), urgent.clone()));
+    }
+    options.push((host.address.as_str(), all));
+    options.push((host.address.as_str(), urgent));
+    options.push((host.address.as_str(), vec![exploited.clone()]));
+    options.push((host.address.as_str(), vec![cves.clone()]));
+    for (label, option) in options {
+        let parts: Vec<Span<'static>> = option.into_iter().flatten().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let mut spans = vec![Span::raw(label.to_owned()), Span::raw("  ")];
+        spans.extend(joined(parts));
+        if width_of(&spans) <= room {
+            return Line::from(spans);
+        }
+    }
+    let colour = match (exploited, cves) {
+        (Some(_), _) => BAD,
+        (None, Some(_)) => style,
+        (None, None) => Style::new(),
+    };
+    if named && Span::raw(label.as_str()).width() <= room {
+        return Line::styled(label, colour);
+    }
+    Line::styled(fit(&host.address, room), colour)
 }
 
 fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model) {
+    let room = (area.width as usize).saturating_sub(2);
     let items: Vec<ListItem> = model
         .hosts()
         .iter()
-        .map(|host| {
-            if only_mentioned(host) {
-                // A name from a URL in the terminal, not a machine seen.
-                return ListItem::new(Line::styled(format!("{}  mentioned", host.label()), DIM));
-            }
-            let mut spans = vec![Span::raw(host.label())];
-            spans.push(Span::styled(
-                format!("  p:{}", host.open_ports().count()),
-                DIM,
-            ));
-            // CVEs: red when one is known exploited, critical or high.
-            let cves = host.advisories.len();
-            if cves > 0 {
-                let style = if host.advisories.iter().any(cve::is_serious) {
-                    BAD
-                } else {
-                    WARN
-                };
-                spans.push(Span::styled(format!(" cve:{cves}"), style));
-            }
-            if host.advisories.iter().any(|a| a.kev) {
-                spans.push(Span::styled(" KEV", BAD));
-            }
-            ListItem::new(Line::from(spans))
-        })
+        .map(|host| ListItem::new(host_row(host, room)))
         .collect();
     let list = List::new(items)
-        .block(panel("Hosts", model.focus == Focus::Hosts))
+        .block(panel("Hosts", model.focused() == Focus::Hosts))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(Some(model.host_index));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// The selected host's CVEs, most urgent first, and the one selected. Only
+/// drawn for a host that has CVEs.
 fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model) {
-    let [list_area, detail_area] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
     let advisories = model.advisories();
+    let row = |advisory: &Advisory, exploited: bool| {
+        let style = if cve::is_serious(advisory) { BAD } else { WARN };
+        let mut spans = vec![
+            Span::raw(advisory.id.clone()),
+            Span::styled(format!("  {}", score_of(advisory)), style),
+        ];
+        if exploited && advisory.kev {
+            spans.push(Span::styled("  exploited", BAD));
+        }
+        spans
+    };
+    // As wide as its rows need, from a third to three fifths of the panel.
+    let wanted = advisories
+        .iter()
+        .map(|advisory| width_of(&row(advisory, true)) + 2)
+        .max()
+        .unwrap_or(0) as u16;
+    let list_width = wanted.clamp(area.width / 3, area.width * 3 / 5);
+    let [list_area, detail_area] =
+        Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(area);
+    let room = (list_width as usize).saturating_sub(2);
+    let fits = |advisory: &Advisory| width_of(&row(advisory, true)) <= room;
     let items: Vec<ListItem> = advisories
         .iter()
         .map(|advisory| {
-            let style = if cve::is_serious(advisory) { BAD } else { WARN };
-            let mut spans = vec![
-                Span::raw(advisory.id.clone()),
-                Span::styled(format!(" {}", cve::severity_label(advisory)), style),
-            ];
-            if advisory.kev {
-                spans.push(Span::styled(" KEV", BAD));
-            }
-            ListItem::new(Line::from(spans))
+            // Too narrow for the word: the colour and the detail say it.
+            ListItem::new(fit_line(Line::from(row(advisory, fits(advisory))), room))
         })
         .collect();
-    let title = format!("CVEs ({})", advisories.len());
+    // How many: the host's row says it.
     let list = List::new(items)
-        .block(panel(&title, model.focus == Focus::Advisories))
+        .block(panel("CVEs", model.focused() == Focus::Advisories))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default()
         .with_selected((!advisories.is_empty()).then_some(model.advisory_index));
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    let detail = match (model.selected_host(), model.selected_advisory()) {
-        (Some(host), Some(advisory)) => advisory_detail(host, advisory),
-        _ => vec![Line::styled("No CVEs found for this host yet.", DIM)],
-    };
-    frame.render_widget(
-        Paragraph::new(detail)
-            .wrap(Wrap { trim: false })
-            .block(panel("CVE", false)),
-        detail_area,
-    );
+    if let (Some(host), Some(advisory)) = (model.selected_host(), model.selected_advisory()) {
+        frame.render_widget(
+            Paragraph::new(advisory_detail(host, advisory, fits(advisory)))
+                .wrap(Wrap { trim: false })
+                .block(panel(
+                    &fit(
+                        &sanitize(&advisory.id, 80),
+                        (detail_area.width as usize).saturating_sub(2),
+                    ),
+                    false,
+                )),
+            detail_area,
+        );
+    }
 }
 
 /// The session's clock, carried on by this panel's own since the snapshot
@@ -1168,10 +1788,11 @@ fn shown_runs(tasks: &[TaskRow]) -> Vec<Shown<'_>> {
 
 /// The progress of one task in `width` columns: its target, a bar with a
 /// cell for every stage, how many stages are over, and what it is doing
-/// now. On one line where that fits, on up to three where it does not.
+/// now. On one line where that fits, on up to three where it does not,
+/// the lines after the first indented so that only targets start a line.
 fn task_lines(run: &Shown, clock: &Clock, width: usize) -> Vec<Line<'static>> {
     let task = run.task;
-    let mut head = vec![Span::raw(format!("recon {}", sanitize(&task.target, 120)))];
+    let mut head = vec![Span::raw(sanitize(&task.target, 120))];
     let others: Vec<String> = [
         (run.queued, "queued"),
         (run.not_run, "not run"),
@@ -1198,42 +1819,50 @@ fn task_lines(run: &Shown, clock: &Clock, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut line: Vec<Span> = Vec::new();
     let mut used = 0;
-    for part in [head, bar, current_stage(task, clock, width)] {
+    // Nothing on the line yet but its indent.
+    let mut fresh = true;
+    // What it is doing may start a line of its own, after the indent.
+    let now = current_stage(task, clock, width.saturating_sub(2));
+    for part in [head, bar, now] {
         let part_width: usize = part.iter().map(Span::width).sum();
         if part_width == 0 {
             continue;
         }
-        if used > 0 && used + 2 + part_width > width {
+        if !fresh && used + 2 + part_width > width {
             lines.push(Line::from(std::mem::take(&mut line)));
             used = 0;
+            fresh = true;
+            // Indented where that fits.
+            if part_width + 2 <= width {
+                line.push(Span::raw("  "));
+                used = 2;
+            }
         }
-        if used > 0 {
+        if !fresh {
             line.push(Span::raw("  "));
             used += 2;
         }
         line.extend(part);
         used += part_width;
+        fresh = false;
     }
     lines.push(Line::from(line));
     lines
 }
 
 /// The line under a task's bar. Of a recon that the end of its session cut
-/// short: where, as on the map (the stage that was stopped, or the first
-/// one left out). Else the stages that failed, by name: the bar's marks
-/// have none. Else what the latest stage with a result said; why a stage
-/// was left out only where no stage has more to say.
+/// short: why (the row says where). Else the stages that failed, by name:
+/// the bar's marks have none. Else what the latest stage with a result
+/// said; why a stage was left out only where no stage has more to say.
 fn said_under(task: &TaskRow) -> Option<String> {
     let of =
         |stage: &StageRow| format!("{}: {}", stage.stage.as_str(), sanitize(&stage.detail, 300));
-    let stopped = |s: &&StageRow| s.status == "interrupted" && !s.live();
     let cut = task
         .stages
         .iter()
-        .find(stopped)
-        .or_else(|| task.stages.iter().find(|s| s.not_run()));
-    if let Some(stage) = cut {
-        return Some(of(stage));
+        .any(|s| (s.status == "interrupted" && !s.live()) || s.not_run());
+    if cut {
+        return Some("session ended".to_owned());
     }
     let failed: Vec<&StageRow> = task
         .stages
@@ -1298,10 +1927,7 @@ fn legend(width: usize) -> Option<Line<'static>> {
 fn queue_lines(tasks: &[TaskRow], clock: &Clock, room: usize, rows: usize) -> Vec<Line<'static>> {
     let shown = shown_runs(tasks);
     if shown.is_empty() {
-        return vec![Line::styled(
-            "No recon tasks. Queue one with `meow recon <target>`.",
-            DIM,
-        )];
+        return Vec::new();
     }
     struct Block {
         main: Vec<Line<'static>>,
@@ -1315,9 +1941,9 @@ fn queue_lines(tasks: &[TaskRow], clock: &Clock, room: usize, rows: usize) -> Ve
             main: task_lines(run, clock, room),
             under: said_under(run.task)
                 .map(|said| {
-                    wrap_words(&said, room.saturating_sub(2))
+                    wrap_words(&said, room.saturating_sub(4))
                         .into_iter()
-                        .map(|piece| Line::styled(format!("  {piece}"), DIM))
+                        .map(|piece| Line::styled(format!("    {piece}"), DIM))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1371,34 +1997,49 @@ fn queue_lines(tasks: &[TaskRow], clock: &Clock, room: usize, rows: usize) -> Ve
     lines
 }
 
+/// The recon queue and the notices, side by side; one of them alone takes
+/// the whole row. The row is left out when both are empty.
 fn draw_activity(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
-    let [queue_area, notice_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
-    let clock = Clock {
-        now: parse_rfc3339(&snapshot.now_utc).map(|now| now + model.lead),
-        age: model.age,
+    let (queue_area, notice_area) = match (snapshot.tasks.is_empty(), snapshot.notices.is_empty()) {
+        (false, false) => {
+            let [queue, notices] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(area);
+            (Some(queue), Some(notices))
+        }
+        (false, true) => (Some(area), None),
+        (true, false) => (None, Some(area)),
+        (true, true) => return,
     };
-    let lines = queue_lines(
-        &snapshot.tasks,
-        &clock,
-        (queue_area.width as usize).saturating_sub(2),
-        (queue_area.height as usize).saturating_sub(2),
-    );
-    frame.render_widget(
-        Paragraph::new(lines).block(panel("Background queue", false)),
-        queue_area,
-    );
-
+    if let Some(queue_area) = queue_area {
+        let clock = Clock {
+            now: parse_rfc3339(&snapshot.now_utc).map(|now| now + model.lead),
+            age: model.age,
+        };
+        let lines = queue_lines(
+            &snapshot.tasks,
+            &clock,
+            (queue_area.width as usize).saturating_sub(2),
+            (queue_area.height as usize).saturating_sub(2),
+        );
+        frame.render_widget(
+            Paragraph::new(lines).block(panel("Recon", false)),
+            queue_area,
+        );
+    }
+    let Some(notice_area) = notice_area else {
+        return;
+    };
     // Newest first, each one whole: a long notice continues on the next
     // line under its text instead of being cut at the border.
     let rows = notice_area.height.saturating_sub(2) as usize;
-    let room = (notice_area.width as usize).saturating_sub(2 + 9);
+    let room = (notice_area.width as usize).saturating_sub(2 + 6);
     let mut notices: Vec<Line> = Vec::new();
     for notice in snapshot.notices.iter().rev() {
         if notices.len() >= rows {
             break;
         }
-        let time = format!("{:<9}", notice.at.get(11..19).unwrap_or(""));
+        let time = format!("{:<6}", notice.at.get(11..16).unwrap_or(""));
         for (index, piece) in wrap_words(&sanitize(&notice.text, 400), room)
             .into_iter()
             .enumerate()
@@ -1406,7 +2047,7 @@ fn draw_activity(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapsh
             let lead = if index == 0 {
                 time.clone()
             } else {
-                " ".repeat(9)
+                " ".repeat(6)
             };
             notices.push(Line::from(vec![Span::styled(lead, DIM), Span::raw(piece)]));
         }
@@ -1418,52 +2059,178 @@ fn draw_activity(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapsh
     );
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, model: &Model) {
-    let [input_area, help_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let input = match &model.note {
+/// The keys that do something now, as `key action` pairs, most needed
+/// first; the rest are on the key card. What does not fit is left out,
+/// `? help` and `q quit` never.
+fn key_hints(model: &Model, scrolls: Scroll) -> Vec<(&'static str, &'static str)> {
+    if model.note.is_some() {
+        return vec![("Enter", "save"), ("Esc", "cancel"), ("Ctrl+U", "clear")];
+    }
+    if model.help {
+        return vec![("any key", "close")];
+    }
+    let Some(snapshot) = &model.snapshot else {
+        return vec![("q", "quit")];
+    };
+    let mut keys = Vec::new();
+    let moves = match model.focused() {
+        Focus::Hosts => model.hosts().len(),
+        Focus::Advisories => model.advisories().len(),
+    };
+    if moves > 1 {
+        keys.push(("\u{2191}\u{2193}", "move"));
+    }
+    match scrolls {
+        Scroll::All => {}
+        Scroll::More => keys.push(("PgDn", "more")),
+        Scroll::Scrolled => keys.push(("PgUp/PgDn", "scroll")),
+    }
+    if !model.advisories().is_empty() {
+        keys.push(match model.focused() {
+            Focus::Hosts => ("Tab", "CVEs"),
+            Focus::Advisories => ("Tab", "hosts"),
+        });
+    }
+    // Not while the AI panel lists them.
+    let ai = &snapshot.ai;
+    let listed = model.show_ai
+        && !ai.running
+        && ai.text.is_empty()
+        && ai.error.is_none()
+        && ai.summary.is_none();
+    if model.live && model.selected_host().is_some() && !listed {
+        keys.push(("L/C/R", "ask AI"));
+    }
+    if model.show_ai {
+        keys.push(("a", "back"));
+    } else if snapshot.ai.tier.is_some() {
+        keys.push(("a", "answer"));
+    }
+    // `m` and `n` are on the key card unless one is needed to go back.
+    if model.show_machine {
+        keys.push(("m", "back"));
+    }
+    keys.push(("?", "help"));
+    keys.push(("q", "quit"));
+    keys
+}
+
+/// The keys of [`key_hints`] in `width` columns: the ones before `?` give
+/// way from the end.
+fn key_line(mut keys: Vec<(&'static str, &'static str)>, width: usize) -> Line<'static> {
+    let line = |keys: &[(&'static str, &'static str)]| {
+        let mut spans = vec![Span::raw(" ")];
+        for (index, (key, action)) in keys.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(SEP, DIM));
+            }
+            spans.push(Span::raw(*key));
+            spans.push(Span::styled(format!(" {action}"), DIM));
+        }
+        spans
+    };
+    while width_of(&line(&keys)) > width && keys.len() > 2 {
+        let last = keys.len() - 3;
+        keys.remove(last);
+    }
+    Line::from(line(&keys))
+}
+
+/// The status or the note being typed, if any, over the key line.
+fn draw_footer(frame: &mut Frame, area: Rect, model: &Model, scrolls: Scroll) {
+    let [top, keys] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let said = match &model.note {
         Some(text) => {
             let target = model
                 .selected_host()
-                .map_or("workspace".to_owned(), |h| h.address.clone());
-            Line::from(vec![
-                Span::styled(format!(" note for {target}> "), TITLE),
+                .map_or("the session".to_owned(), |h| sanitize(&h.address, 120));
+            Some(Line::from(vec![
+                Span::styled(format!(" Note on {target}: "), TITLE),
                 Span::raw(text.clone()),
                 Span::styled("_", TITLE),
-            ])
+            ]))
         }
-        None => Line::styled(format!(" {}", model.status), WARN),
+        None if !model.status.is_empty() => Some(Line::styled(format!(" {}", model.status), WARN)),
+        None => None,
     };
-    frame.render_widget(Paragraph::new(input), input_area);
-    let help = if model.note.is_some() {
-        " Enter save   Esc cancel"
-    } else {
-        " ↑↓ select  Tab panel  n note  L/C/R AI  a answer  m machine  1-3 mode  PgUp/Dn  q quit"
-    };
-    frame.render_widget(Paragraph::new(Line::styled(help, DIM)), help_area);
+    if let Some(said) = said {
+        frame.render_widget(Paragraph::new(said), top);
+    }
+    let hints = key_hints(model, scrolls);
+    frame.render_widget(Paragraph::new(key_line(hints, keys.width as usize)), keys);
 }
 
-fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+/// The rows `lines` take in a panel of `area`, wrapped.
+fn rows_of(lines: &[Line], area: Rect) -> usize {
+    let room = (area.width as usize).saturating_sub(2).max(1);
+    lines
+        .iter()
+        .map(|line| line.width().div_ceil(room).max(1))
+        .sum()
+}
+
+/// Where a panel that scrolls stands, for the key line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scroll {
+    /// It shows all it has.
+    All,
+    /// It has more below and was not scrolled.
+    More,
+    /// It was scrolled.
+    Scrolled,
+}
+
+/// A panel that scrolls with PgUp/PgDn, no further than its last line.
+fn draw_scrolling(
+    frame: &mut Frame,
+    area: Rect,
+    model: &Model,
+    lines: Vec<Line<'static>>,
+    block: Block,
+) -> Scroll {
+    let rows = area.height.saturating_sub(2) as usize;
+    let limit = rows_of(&lines, area).saturating_sub(rows);
+    let limit = u16::try_from(limit).unwrap_or(u16::MAX);
+    model.scroll_limit.set(limit);
+    let scroll = model.inspector_scroll.min(limit);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(block),
+        area,
+    );
+    match (scroll, limit) {
+        (0, 0) => Scroll::All,
+        (0, _) => Scroll::More,
+        _ => Scroll::Scrolled,
+    }
+}
+
+fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) -> Scroll {
     let ai = &snapshot.ai;
     let title = match (ai.tier, &ai.address) {
-        (Some(tier), Some(address)) => format!(
-            "AI: [{}] {} for {}{}",
-            tier.key(),
-            tier.label(),
-            sanitize(address, 120),
-            if ai.running { " (running)" } else { "" }
-        ),
-        _ => "AI: press L (local), C (cloud) or R (research) on a host".to_owned(),
+        (Some(tier), Some(address)) => {
+            let mut title = format!("{}{SEP}{}", tier.name(), sanitize(address, 120));
+            if ai.running {
+                title.push_str(SEP);
+                title.push_str("running");
+            }
+            title
+        }
+        _ => "AI".to_owned(),
     };
     let mut lines: Vec<Line> = ai
         .text
         .lines()
         .map(|line| {
             let line = sanitize(line, 2000);
-            if line.starts_with('#') {
-                Line::styled(line, TITLE)
-            } else {
-                Line::raw(line)
+            // A heading without its marks.
+            match line.strip_prefix('#') {
+                Some(heading) => {
+                    Line::styled(heading.trim_start_matches('#').trim().to_owned(), TITLE)
+                }
+                None => Line::raw(line),
             }
         })
         .collect();
@@ -1474,89 +2241,221 @@ fn draw_ai(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(sanitize(summary, 400), DIM));
     }
-    if lines.is_empty() {
-        let hint = if ai.running {
-            "Waiting for the model ..."
+    if lines.is_empty() && ai.running {
+        lines.push(Line::styled("Waiting for the model\u{2026}", DIM));
+    } else if lines.is_empty() {
+        // Nothing asked yet: the keys, and what the cloud gets.
+        lines.push(Line::from(joined(vec![
+            Span::raw("L local AI"),
+            Span::raw("C cloud AI"),
+            Span::raw("R research"),
+        ])));
+        let cloud = if snapshot.budget.has_key {
+            "C and R send masked text to cloud AI"
         } else {
-            "No AI reply yet."
+            "No cloud key: C asks local AI, R is off"
         };
-        lines.push(Line::styled(hint, DIM));
+        lines.push(Line::styled(cloud, DIM));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((model.inspector_scroll, 0))
-            .block(panel(&title, true)),
-        area,
-    );
+    draw_scrolling(frame, area, model, lines, panel(&title, true))
 }
 
-/// Draws the whole panel. Pure: everything comes from `model`.
+/// What each key does, behind `?`.
+const HELP: [(&str, &str); 14] = [
+    ("\u{2191}\u{2193} j k", "move"),
+    ("Tab \u{2190} \u{2192}", "hosts or CVEs"),
+    ("PgUp PgDn", "scroll the host, AI or machine panel"),
+    ("L", "ask local AI"),
+    ("C", "ask cloud AI \u{b7} masked text \u{b7} daily cap"),
+    ("R", "CVE research \u{b7} versions only \u{b7} daily cap"),
+    ("a", "show or hide the AI answer"),
+    ("m", "show or hide all of this machine"),
+    ("n", "note on the host"),
+    ("1", "light \u{b7} 0 packets to hosts"),
+    ("2", "mild \u{b7} slow, rate-limited scans"),
+    (
+        "3",
+        "aggressive \u{b7} fast scans \u{b7} labs and authorized hosts only",
+    ),
+    ("q Esc", "quit"),
+    ("exploited", "known exploited in the wild (CISA KEV)"),
+];
+
+/// The key card, over the middle of the panel. An action too long for the
+/// card goes on under its own column; a card too tall for the terminal
+/// ends in `…`.
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let column = HELP
+        .iter()
+        .map(|(key, _)| Span::raw(*key).width())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let longest = HELP
+        .iter()
+        .map(|(_, action)| Span::raw(*action).width())
+        .max()
+        .unwrap_or(0);
+    // The border and a column of room on each side.
+    let width = ((column + longest + 4) as u16).min(area.width);
+    let room = (width as usize).saturating_sub(4 + column).max(8);
+    let mut lines: Vec<Line> = Vec::new();
+    for (key, action) in HELP {
+        for (index, piece) in wrap_words(action, room).into_iter().enumerate() {
+            let key = if index == 0 { key } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{key:<column$}"), TITLE),
+                Span::raw(piece),
+            ]));
+        }
+    }
+    let rows = area.height.saturating_sub(2) as usize;
+    if lines.len() > rows {
+        lines.truncate(rows.saturating_sub(1));
+        lines.push(Line::styled("\u{2026}", DIM));
+    }
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let card = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, card);
+    let block = panel("Keys", true).padding(Padding::horizontal(1));
+    frame.render_widget(Paragraph::new(lines).block(block), card);
+}
+
+/// The smallest terminal the panel is drawn in.
+const MIN_SIZE: (u16, u16) = (60, 12);
+
+/// Draws the whole panel. Everything comes from `model`; the frame only
+/// tells it how far the panel under the box can scroll.
 pub fn draw(frame: &mut Frame, model: &Model) {
-    // A tall terminal gives the queue and the notices more lines.
-    let activity_rows = if frame.area().height >= 40 { 12 } else { 8 };
+    let area = frame.area();
+    if area.width < MIN_SIZE.0 || area.height < MIN_SIZE.1 {
+        // Too small to show an address or a CVE whole.
+        let said = format!("Too small: {}x{} needed", MIN_SIZE.0, MIN_SIZE.1);
+        frame.render_widget(
+            Paragraph::new(Line::styled(said, WARN)).wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+    // A tall terminal gives the queue and the notices more lines; with
+    // neither, their row is left out.
+    let activity_rows = match &model.snapshot {
+        Some(s) if !s.tasks.is_empty() || !s.notices.is_empty() => {
+            if area.height >= 40 {
+                12
+            } else {
+                8
+            }
+        }
+        _ => 0,
+    };
+    // A row for the status or the note only when there is one.
+    let footer_rows = 1 + u16::from(model.note.is_some() || !model.status.is_empty());
+    // Not without a line inside its border.
+    let activity_rows = match area.height.saturating_sub(1 + 8 + footer_rows) {
+        free if free < 3 => 0,
+        free => activity_rows.min(free),
+    };
     let [header, body, activity, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(8),
         Constraint::Length(activity_rows),
-        Constraint::Length(2),
+        Constraint::Length(footer_rows),
     ])
-    .areas(frame.area());
+    .areas(area);
     draw_header(frame, header, model);
-    draw_footer(frame, footer, model);
     let Some(snapshot) = &model.snapshot else {
+        draw_footer(frame, footer, model, Scroll::All);
         return;
     };
+    // Wide enough for `192.0.2.10  1 exploited`, but not more than 2/5.
+    let list = (body.width * 28)
+        .div_ceil(100)
+        .max(25)
+        .min(body.width * 2 / 5);
     let [hosts, right] =
-        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(body);
+        Layout::horizontal([Constraint::Length(list), Constraint::Min(0)]).areas(body);
     // Top right: this machine, as tall as it needs but never crowding out
-    // the host panels below it.
-    let report = machine_report(&snapshot.graph.local);
-    let machine_lines_top = machine_box_lines(&report);
-    let wanted = (machine_lines_top.len() as u16 + 2)
-        .min(right.height / 3)
-        .max(3);
-    let [machine, right] =
-        Layout::vertical([Constraint::Length(wanted), Constraint::Min(0)]).areas(right);
-    frame.render_widget(
-        Paragraph::new(machine_lines_top)
-            .block(panel("This machine (m: routes, neighbours)", false)),
-        machine,
-    );
-    let [inspector, advisories] =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
-    draw_hosts(frame, hosts, model);
-    if model.show_ai {
-        draw_ai(frame, inspector, model, snapshot);
-    } else if model.show_machine {
-        frame.render_widget(
-            Paragraph::new(machine_lines(&report))
-                .wrap(Wrap { trim: false })
-                .scroll((model.inspector_scroll, 0))
-                .block(panel(
-                    "This machine in full: ports, interfaces, routes, neighbours",
-                    true,
-                )),
-            inspector,
-        );
-    } else {
-        let lines = match model.selected_host() {
-            Some(host) => inspector_lines(&snapshot.graph, host),
-            None => vec![Line::styled(
-                "No hosts yet: `meow add <file>` or work in the shell.",
-                DIM,
-            )],
-        };
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((model.inspector_scroll, 0))
-                .block(panel("Inspector: node, ports and sub-paths", false)),
-            inspector,
-        );
+    // the host panels below it; left out until something is known, and
+    // while `m` shows all of it.
+    let local = &snapshot.graph.local;
+    let report = machine_report(local);
+    let room = (right.width as usize).saturating_sub(2);
+    let (mut machine_top, pinned) = machine_rows(local, &report, room, true);
+    if model.show_machine {
+        machine_top.clear();
     }
-    draw_advisories(frame, advisories, model);
-    draw_activity(frame, activity, model, snapshot);
+    let right = if machine_top.is_empty() {
+        right
+    } else {
+        // Room for the first line, the warnings and a line to say what
+        // more there is, up to half the column.
+        let most = (right.height / 3)
+            .max(pinned as u16 + 3)
+            .min(right.height / 2);
+        let wanted = (machine_top.len() as u16 + 2).min(most).max(3);
+        let rows = wanted as usize - 2;
+        if machine_top.len() > rows {
+            let hidden = machine_top.len() - rows.saturating_sub(1);
+            machine_top.truncate(rows.saturating_sub(1));
+            machine_top.push(Line::styled(
+                format!("+{hidden} more \u{b7} m shows all"),
+                DIM,
+            ));
+        }
+        let [machine, rest] =
+            Layout::vertical([Constraint::Length(wanted), Constraint::Min(0)]).areas(right);
+        frame.render_widget(
+            Paragraph::new(machine_top).block(panel("This machine", false)),
+            machine,
+        );
+        rest
+    };
+    // The CVE panels only for a host that has CVEs.
+    let has_cves = !model.advisories().is_empty();
+    let [inspector, advisories] = if has_cves {
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right)
+    } else {
+        [right, Rect::default()]
+    };
+    draw_hosts(frame, hosts, model);
+    let room = (inspector.width as usize).saturating_sub(2);
+    let scrolls = if model.show_ai {
+        draw_ai(frame, inspector, model, snapshot)
+    } else if model.show_machine {
+        let lines = machine_lines(local, &report, room);
+        draw_scrolling(frame, inspector, model, lines, panel("This machine", true))
+    } else {
+        let (lines, title) = match model.selected_host() {
+            Some(host) => (
+                inspector_lines(host, room),
+                host_title(&snapshot.graph, host, room),
+            ),
+            None => (
+                vec![Line::styled(
+                    "No hosts yet: scan in the shell or `meow add <file>`",
+                    DIM,
+                )],
+                "Host".to_owned(),
+            ),
+        };
+        draw_scrolling(frame, inspector, model, lines, panel(&title, false))
+    };
+    if has_cves {
+        draw_advisories(frame, advisories, model);
+    }
+    if activity_rows > 0 {
+        draw_activity(frame, activity, model, snapshot);
+    }
+    draw_footer(frame, footer, model, scrolls);
+    if model.help {
+        draw_help(frame, area);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,8 +2531,7 @@ async fn event_loop(
                         let text = serde_json::to_string(&command)?;
                         if live.send(Message::Text(text.into())).await.is_err() {
                             socket = None;
-                            model.live = false;
-                            model.status = "the session has ended".to_owned();
+                            model.session_ended();
                         }
                     }
                 }
@@ -1702,7 +2600,7 @@ pub fn run(workspace: &Workspace) -> Result<()> {
 mod tests {
     use super::*;
     use crate::evidence::{Confidence, EvidenceRecord, Source};
-    use crate::graph::{Interface, Listener, Observation, Route, SystemInfo};
+    use crate::graph::{Interface, Listener, Neighbor, Observation, Route, SystemInfo};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;
@@ -1764,6 +2662,14 @@ mod tests {
                 },
             );
         }
+        graph.apply(Observation::Script {
+            address: "10.10.10.5".into(),
+            port: Some(22),
+            protocol: "tcp".into(),
+            id: "ssh-hostkey".into(),
+            output: "2048 aa:bb (RSA)".into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
         graph
     }
 
@@ -1815,33 +2721,45 @@ mod tests {
         let model = model();
         let text = screen(&model, 160, 64);
         for expected in [
-            "meow hud",
-            "| acme | mode mild | 2 hosts | 3 CVEs | live",
-            "Hosts",
-            "10.10.10.5  p:2 cve:3 KEV",
-            "10.10.10.9  p:1",
-            "Inspector: node, ports and sub-paths",
-            "80/tcp svc nginx 1.18.0 open",
+            " =^..^= acme · mild · 2 hosts · 3 CVEs · 1 exploited · cloud AI $0.25/$1 today ",
+            "┌Hosts─",
+            "10.10.10.5  2 ports · 3 CVEs · 1 exploited",
+            "10.10.10.9  1 port",
+            "┌10.10.10.5 · Server─",
+            "│Update  cpe:2.3:a:nginx:nginx:1.18.0 to its newest release, or close 80/tcp \u{b7} \
+             3 CVEs \u{b7} 1 exploited ",
+            "│Ports   22/tcp svc OpenSSH 8.2p1 ",
+            "│        80/tcp svc nginx 1.18.0 ",
             "/portal/",
             "/config  200",
             "/login.php  200",
-            "Observations",
-            "[nmap_xml / High]",
-            "CVEs (3)",
-            "CVE-2020-0002 High 4.0 KEV",
-            "CVE-2021-23017 High 7.7",
-            "CVE-2020-0002  High 4.0  known exploited",
+            "│Facts   ssh-hostkey 2048 aa:bb (RSA)  nmap",
+            "┌CVEs─",
+            "CVE-2020-0002  4.0  exploited",
+            "CVE-2021-23017  7.7 ",
+            "┌CVE-2020-0002─",
+            // The list row says the score and that it is exploited.
+            "│High   ",
             "title of CVE-2020-0002",
-            "cpe:2.3:a:nginx:nginx:1.18.0  80/tcp",
-            "Background queue",
-            "recon 10.10.10.0/23  █>·· 1/4  services",
+            "cpe:2.3:a:nginx:nginx:1.18.0 · 80/tcp",
+            "┌Recon─",
+            "10.10.10.0/23  █>·· 1/4  services",
             "  ports: 2 hosts up",
-            "Notices",
-            "09:41:00 not running as root: -sS replaced with -sT (connect scan)",
-            "n note  L/C/R AI",
-            "| cloud $0.25 of $1.00, 3 of 20 calls today",
+            "┌Notices─",
+            "09:41 not running as root: -sS replaced with -sT (connect scan)",
+            " ↑↓ move · Tab CVEs · L/C/R ask AI · ? help · q quit",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        // Where the list is too narrow to say it, the detail does.
+        let narrow = screen(&model, 66, 30);
+        assert!(narrow.contains("│CVE-2020-0002  4.0 "), "{narrow}");
+        assert!(narrow.contains("│High 4.0 ·"), "{narrow}");
+        assert!(narrow.contains("│exploited"), "{narrow}");
+        // Each fact once, and nothing that only says it is not known: the
+        // port's own fact is its line under Ports, the host has no OS.
+        for unwanted in ["svc nginx 1.18.0 open", "not known", "->", "unknown"] {
+            assert!(!text.contains(unwanted), "{unwanted:?} in:\n{text}");
         }
     }
 
@@ -1863,19 +2781,30 @@ mod tests {
 
         let text = screen(&model, 160, 54);
         for expected in [
-            "What to update",
-            "Update cpe:2.3:a:nginx:nginx:1.18.0 to 1.20.1 or later, or close 80/tcp if the service",
-            "fixes 3 CVEs, 1 known exploited",
+            "│Update  cpe:2.3:a:nginx:nginx:1.18.0 to 1.20.1 or later, or close 80/tcp · 3 CVEs · \
+             1 exploited ",
             "Fixed in 1.20.1",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        // Where the line is too narrow, what is exploited stays on it and
+        // the rest goes under it.
+        let narrow = screen(&model, 100, 40);
+        for expected in [
+            "│Update  cpe:2.3:a:nginx:nginx:1.18.0 to 1.20.1 or later · 1 exploited ",
+            "│          or close 80/tcp · 3 CVEs ",
+        ] {
+            assert!(
+                narrow.contains(expected),
+                "missing {expected:?} in:\n{narrow}"
+            );
         }
 
         // On a narrow screen the notice continues under its own text.
         let narrow = screen(&model, 100, 30);
         for expected in [
-            "09:41:00 3 new CVEs for",
-            "         80/tcp if the service is not needed.",
+            "09:41 3 new CVEs for",
+            "      if the service is not needed.",
         ] {
             assert!(
                 narrow.contains(expected),
@@ -1930,10 +2859,15 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let top = lines
             .iter()
-            .position(|line| line.contains("Background queue"))
+            .position(|line| line.contains("┌Recon─"))
             .expect("the queue panel");
+        let bottom = top
+            + lines[top..]
+                .iter()
+                .position(|line| line.starts_with('└'))
+                .expect("its foot");
         let inner = (width / 2) as usize - 2;
-        lines[top + 1..lines.len() - 3]
+        lines[top + 1..bottom]
             .iter()
             .map(|line| line.chars().skip(1).take(inner).collect::<String>())
             .map(|row| row.trim_end().to_owned())
@@ -1957,7 +2891,7 @@ mod tests {
         let rows = queue_rows(&model, 200, 40);
         assert_eq!(
             rows[0],
-            "recon 192.0.2.10 (+1 queued, +1 earlier)  ████████>········ 8/17  services 0:42"
+            "192.0.2.10 (+1 queued, +1 earlier)  ████████>········ 8/17  services 0:42"
         );
         // One row for the target, and nothing says it waits.
         assert!(rows[1..9].iter().all(String::is_empty), "{rows:?}");
@@ -1973,7 +2907,7 @@ mod tests {
         let rows = queue_rows(&shown(&message), 160, 40);
         assert_eq!(
             rows[0],
-            "recon 192.0.2.10 (+1 queued)  ████████!········ 8/17  services stopped"
+            "192.0.2.10 (+1 queued)  ████████!········ 8/17  services stopped"
         );
         // Nothing left to do in any of them: the newest.
         let mut failed = ["done"; 17];
@@ -1983,8 +2917,8 @@ mod tests {
         assert_eq!(
             rows[..2],
             [
-                "recon 192.0.2.10 (+1 earlier)  ████████████████x 17/17",
-                "  dirs failed"
+                "192.0.2.10 (+1 earlier)  ████████████████x 17/17",
+                "    dirs failed"
             ]
         );
         // The session was closed: the run it stopped is shown, not the
@@ -2002,10 +2936,10 @@ mod tests {
         assert_eq!(
             rows[..4],
             [
-                "recon 192.0.2.10 (+1 not run)  ████████!-------- 8/17  services stopped",
-                "  services: stopped: the session was closed",
-                "recon 192.0.2.11  ----------------- 0/17  not run",
-                "  lan: not run: the session was closed",
+                "192.0.2.10 (+1 not run)  ████████!-------- 8/17  services stopped",
+                "    session ended",
+                "192.0.2.11  ----------------- 0/17  not run",
+                "    session ended",
             ]
         );
     }
@@ -2041,15 +2975,15 @@ mod tests {
         assert_eq!(
             rows[..9],
             [
-                "recon 192.0.2.31  -----█>·········· 6/17",
-                "ports 0:42 · SYN Stealth Scan 11% (36s left)",
-                "  trace: 12 hops",
-                "recon 192.0.2.32  ················· 0/17  waiting",
-                "recon 192.0.2.33  ················· 0/17  waiting",
-                "recon 192.0.2.34  ················· 0/17  waiting",
-                "recon 192.0.2.35  ················· 0/17  waiting",
-                "recon 192.0.2.36  ················· 0/17  waiting",
-                "recon 192.0.2.30  █████████████████ 17/17",
+                "192.0.2.31  -----█>·········· 6/17",
+                "  ports 0:42 · SYN Stealth Scan 11% (36s left)",
+                "    trace: 12 hops",
+                "192.0.2.32  ················· 0/17  waiting",
+                "192.0.2.33  ················· 0/17  waiting",
+                "192.0.2.34  ················· 0/17  waiting",
+                "192.0.2.35  ················· 0/17  waiting",
+                "192.0.2.36  ················· 0/17  waiting",
+                "192.0.2.30  █████████████████ 17/17",
             ],
         );
         // A row is free at the foot: what the marks stand for.
@@ -2064,11 +2998,11 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "recon 192.0.2.31  -----█>·········· 6/17",
-                "ports 0:42 · SYN Stealth Scan 11% (36s left)",
-                "  trace: 12 hops",
-                "recon 192.0.2.32  ················· 0/17  waiting",
-                "recon 192.0.2.33  ················· 0/17  waiting",
+                "192.0.2.31  -----█>·········· 6/17",
+                "  ports 0:42 · SYN Stealth Scan 11% (36s left)",
+                "    trace: 12 hops",
+                "192.0.2.32  ················· 0/17  waiting",
+                "192.0.2.33  ················· 0/17  waiting",
                 "+4 more",
             ]
         );
@@ -2078,12 +3012,12 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "recon 192.0.2.31",
-                "-----█>·········· 6/17",
-                "ports 0:42 · SYN Stealth Scan 11%",
-                "  trace: 12 hops",
-                "+6 more",
-                "",
+                "192.0.2.31  -----█>·········· 6/17",
+                "  ports 0:42 · SYN Stealth Scan 11%",
+                "    trace: 12 hops",
+                "192.0.2.32  ················· 0/17",
+                "  waiting",
+                "+5 more",
             ]
         );
         // Only waiting ones are left out: said so. What the others say
@@ -2095,33 +3029,33 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "recon 192.0.2.31  -----█>·········· 6/17  ports 0:42",
-                "recon 192.0.2.32  -················ 1/17  dns waiting",
-                "recon 192.0.2.33  ················· 0/17  waiting",
-                "recon 192.0.2.34  ················· 0/17  waiting",
-                "recon 192.0.2.35  ················· 0/17  waiting",
-                "recon 192.0.2.36  ················· 0/17  waiting",
+                "192.0.2.31  -----█>·········· 6/17  ports 0:42",
+                "192.0.2.32  -················ 1/17  dns waiting",
+                "192.0.2.33  ················· 0/17  waiting",
+                "192.0.2.34  ················· 0/17  waiting",
+                "192.0.2.35  ················· 0/17  waiting",
+                "192.0.2.36  ················· 0/17  waiting",
             ]
         );
         let rows = queue_rows(&shown(&waiting), 80, 24);
         assert_eq!(
             rows,
             [
-                "recon 192.0.2.31",
-                "-----█>·········· 6/17  ports 0:42",
-                "recon 192.0.2.32",
-                "-················ 1/17  dns waiting",
+                "192.0.2.31  -----█>·········· 6/17",
+                "  ports 0:42",
+                "192.0.2.32  -················ 1/17",
+                "  dns waiting",
                 "+4 waiting",
                 "",
             ]
         );
-        // No recon: no legend either.
-        let none = queue_rows(&shown(&runs_message(&[])), 160, 40);
-        assert_eq!(
-            none[0],
-            "No recon tasks. Queue one with `meow recon <target>`."
+        // No recon: no panel for it, and the notices take the row.
+        let none = screen(&shown(&runs_message(&[])), 160, 40);
+        assert!(!none.contains("Recon"), "{none}");
+        assert!(
+            none.contains(&format!("┌Notices{}┐", "─".repeat(151))),
+            "{none}"
         );
-        assert!(none[1..].iter().all(String::is_empty), "{none:?}");
     }
 
     /// While a tool counts its results the session sends only how far the
@@ -2187,12 +3121,10 @@ mod tests {
         message["state"]["tasks"] = json!([run(3, "running"), run(2, "done"), run(1, "done")]);
         let mut model = Model::new(true);
         model.apply_message(&message.to_string());
-        let text = screen(&model, 160, 64);
-        assert!(
-            text.contains("recon 10.10.10.5 (+2 earlier)  > 0/1  ports"),
-            "{text}"
-        );
-        assert_eq!(text.matches("recon 10.10.10.5").count(), 1, "{text}");
+        let rows = queue_rows(&model, 160, 64);
+        assert_eq!(rows[0], "10.10.10.5 (+2 earlier)  > 0/1  ports");
+        let shown = rows.iter().filter(|row| row.contains("10.10.10.5"));
+        assert_eq!(shown.count(), 1, "{rows:?}");
     }
 
     /// A state with one recon task whose stages have `statuses`, in order.
@@ -2243,25 +3175,23 @@ mod tests {
         let wide = screen(&model, 200, 40);
         assert!(
             wide.contains(
-                "recon 192.0.2.5  ██-█x█>·········· 6/17  ports 0:42 · SYN Stealth Scan 12% (56s left)"
+                "192.0.2.5  ██-█x█>·········· 6/17  ports 0:42 · SYN Stealth Scan 12% (56s left)"
             ),
             "{wide}"
         );
         // Where that is too long, what it is doing has a line of its own.
         let wide = screen(&model, 160, 40);
         for expected in [
-            "│recon 192.0.2.5  ██-█x█>·········· 6/17 ",
-            "│ports 0:42 · SYN Stealth Scan 12% (56s left) ",
+            "│192.0.2.5  ██-█x█>·········· 6/17 ",
+            "│  ports 0:42 · SYN Stealth Scan 12% (56s left) ",
         ] {
             assert!(wide.contains(expected), "missing {expected:?} in:\n{wide}");
         }
-        // In 80 columns the same, on lines of its own; the time left is
-        // the first to give way.
+        // In 80 columns the same; the time left is the first to give way.
         let narrow = screen(&model, 80, 24);
         for expected in [
-            "│recon 192.0.2.5 ",
-            "│██-█x█>·········· 6/17 ",
-            "│ports 0:42 · SYN Stealth Scan 12% ",
+            "│192.0.2.5  ██-█x█>·········· 6/17 ",
+            "│  ports 0:42 · SYN Stealth Scan 12% ",
         ] {
             assert!(
                 narrow.contains(expected),
@@ -2288,7 +3218,7 @@ mod tests {
         model.age = Duration::from_secs(3600);
         let late = screen(&model, 160, 40);
         assert!(
-            late.contains("ports 1:00:42 · SYN Stealth Scan 12% │"),
+            late.contains("6/17  ports 1:00:42 · SYN Stealth Scan 12%  "),
             "{late}"
         );
         assert!(!late.contains("left)"), "{late}");
@@ -2353,9 +3283,9 @@ mod tests {
         assert!(!model.live && !model.has_running_stage());
         let text = screen(&model, 160, 40);
         for expected in [
-            "the session has ended; showing its last state",
-            "recon 192.0.2.5  ██-█x█!---------- 6/17  ports stopped",
-            "  ports: stopped: the session was closed",
+            " =^..^= acme · mild · session ended · ",
+            "192.0.2.5  ██-█x█!---------- 6/17  ports stopped",
+            "    session ended",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
@@ -2380,14 +3310,11 @@ mod tests {
         model.session_ended();
         let text = screen(&model, 160, 40);
         assert!(
-            text.contains("recon 192.0.2.5  ----------------- 0/17  not run"),
+            text.contains("192.0.2.5  ----------------- 0/17  not run"),
             "{text}"
         );
-        // The line under the bar says where it was cut, as the map does.
-        assert!(
-            text.contains("  lan: not run: the session was closed"),
-            "{text}"
-        );
+        // The line under the bar says why.
+        assert!(text.contains("│    session ended "), "{text}");
         // One that was cut after results: the first stage left out, not
         // the last, and not the result before it.
         let mut message = recon_message(&["pending"; 17], json!({}));
@@ -2399,13 +3326,10 @@ mod tests {
         model.session_ended();
         let text = screen(&model, 160, 40);
         assert!(
-            text.contains("recon 192.0.2.5  ███-------------- 3/17  stopped"),
+            text.contains("192.0.2.5  ███-------------- 3/17  stopped"),
             "{text}"
         );
-        assert!(
-            text.contains("  subdomains: not run: the session was closed"),
-            "{text}"
-        );
+        assert!(text.contains("│    session ended "), "{text}");
         // Nothing to show yet: nothing to change.
         Model::new(true).session_ended();
     }
@@ -2444,12 +3368,12 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let text = screen(&model, 160, 40);
         assert!(
-            text.contains("recon 192.0.2.5  ██-█x█!·········· 6/17  ports stopped"),
+            text.contains("192.0.2.5  ██-█x█!·········· 6/17  ports stopped"),
             "{text}"
         );
         let row = text
             .lines()
-            .position(|line| line.contains("recon 192.0.2.5"))
+            .position(|line| line.contains("192.0.2.5"))
             .unwrap();
         let line = text.lines().nth(row).unwrap();
         let start = line.chars().position(|c| c == '█').unwrap();
@@ -2469,7 +3393,7 @@ mod tests {
         let over = shown(&recon_message(&["done"; 17], json!({})));
         let text = screen(&over, 160, 40);
         assert!(
-            text.contains("recon 192.0.2.5  █████████████████ 17/17  "),
+            text.contains("192.0.2.5  █████████████████ 17/17  "),
             "{text}"
         );
         // One that has not begun.
@@ -2602,20 +3526,20 @@ mod tests {
         };
         assert_eq!(
             plain(task_lines(&run(task, 0), &clock, 21)),
-            ["recon 192.0.2.5  6/17", "ports 0:42 · 12%"]
+            ["192.0.2.5  6/17", "  ports 0:42 · 12%"]
         );
         assert_eq!(
             plain(task_lines(&run(task, 2), &clock, 38)),
             [
-                "recon 192.0.2.5 (+2 earlier)",
-                "██-█x█>·········· 6/17",
-                "ports 0:42 · 12% (56s left)"
+                "192.0.2.5 (+2 earlier)",
+                "  ██-█x█>·········· 6/17",
+                "  ports 0:42 · 12% (56s left)"
             ]
         );
         // No room at all: the time, whole.
         assert_eq!(
             plain(task_lines(&run(task, 0), &clock, 0)),
-            ["recon 192.0.2.5", "6/17", "0:42"]
+            ["192.0.2.5", "6/17", "0:42"]
         );
 
         // Words from a tool give way to the clock where the panel is
@@ -2630,21 +3554,23 @@ mod tests {
         assert_eq!(
             plain(task_lines(&run(wordy_task, 0), &clock, 38)),
             [
-                "recon 192.0.2.5",
-                "██-█x█>·········· 6/17",
-                "ports 0:42 · site 1 of 3, 3 results s…"
+                "192.0.2.5  ██-█x█>·········· 6/17",
+                "  ports 0:42 · site 1 of 3, 3 results…"
             ]
         );
         let last = |width: usize| plain(task_lines(&run(wordy_task, 0), &clock, width)).pop();
         assert_eq!(
-            last(42).as_deref(),
-            Some("ports 0:42 · site 1 of 3, 3 results so far")
+            last(44).as_deref(),
+            Some("  ports 0:42 · site 1 of 3, 3 results so far")
         );
-        assert_eq!(last(17).as_deref(), Some("ports 0:42 · sit…"));
+        assert_eq!(last(19).as_deref(), Some("  ports 0:42 · sit…"));
         // No room for even a few letters: the name and the clock.
-        assert_eq!(last(16).as_deref(), Some("6/17  ports 0:42"));
-        assert_eq!(last(10).as_deref(), Some("ports 0:42"));
-        assert_eq!(last(9).as_deref(), Some("0:42"));
+        assert_eq!(
+            plain(task_lines(&run(wordy_task, 0), &clock, 16)),
+            ["192.0.2.5  6/17", "  ports 0:42"]
+        );
+        assert_eq!(last(12).as_deref(), Some("  ports 0:42"));
+        assert_eq!(last(11).as_deref(), Some("  0:42"));
         assert_eq!(fit("résultats so far", 9), "résultat…");
         assert_eq!(fit("so far", 6), "so far");
         assert_eq!(fit("so far", 3), "");
@@ -2654,16 +3580,16 @@ mod tests {
         let both_task = &both.snapshot.as_ref().unwrap().tasks[0];
         let last = |width: usize| plain(task_lines(&run(both_task, 0), &clock, width)).pop();
         assert_eq!(
-            last(53).as_deref(),
-            Some("ports 0:42 · site 1 of 3, 3 results so far (10m left)")
+            last(55).as_deref(),
+            Some("  ports 0:42 · site 1 of 3, 3 results so far (10m left)")
         );
         assert_eq!(
-            last(52).as_deref(),
-            Some("ports 0:42 · site 1 of 3, 3 results so far")
+            last(54).as_deref(),
+            Some("  ports 0:42 · site 1 of 3, 3 results so far")
         );
         assert_eq!(
-            last(38).as_deref(),
-            Some("ports 0:42 · site 1 of 3, 3 results s…")
+            last(40).as_deref(),
+            Some("  ports 0:42 · site 1 of 3, 3 results s…")
         );
 
         // A long-running stage with every figure, in panels from 40
@@ -2689,22 +3615,22 @@ mod tests {
         }
         assert_eq!(
             [
-                last(18),
-                last(19),
-                last(24),
-                last(28),
-                last(33),
-                last(37),
-                last(49)
+                last(20),
+                last(21),
+                last(26),
+                last(30),
+                last(35),
+                last(39),
+                last(51)
             ],
             [
-                "ports 1:02:03",
-                "ports 1:02:03 · 42%",
-                "ports 1:02:03 · Ser… 42%",
-                "ports 1:02:03 · Service… 42%",
-                "ports 1:02:03 · Service scan 42%",
-                "ports 1/4 1:02:03 · Service scan 42%",
-                "ports 1/4 1:02:03 · Service scan 42% (1h05m left)",
+                "  ports 1:02:03",
+                "  ports 1:02:03 · 42%",
+                "  ports 1:02:03 · Ser… 42%",
+                "  ports 1:02:03 · Service… 42%",
+                "  ports 1:02:03 · Service scan 42%",
+                "  ports 1/4 1:02:03 · Service scan 42%",
+                "  ports 1/4 1:02:03 · Service scan 42% (1h05m left)",
             ]
         );
 
@@ -2860,11 +3786,30 @@ mod tests {
         }
         assert!(model.show_ai, "asking switches to the AI view");
         let text = screen(&model, 160, 46);
+        // Nothing back yet: the keys, and what the cloud gets.
+        for expected in [
+            "┌AI─",
+            "│L local AI · C cloud AI · R research ",
+            "│C and R send masked text to cloud AI ",
+            " a back ",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        // Without a key the cloud keys say what they do instead.
+        let mut keyless: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        keyless["state"]["budget"]["has_key"] = json!(false);
+        let mut without = Model::new(true);
+        without.apply_message(&keyless.to_string());
+        without.on_key(key(KeyCode::Char('a')));
+        let text = screen(&without, 160, 46);
         assert!(
-            text.contains("AI: press L (local), C (cloud) or R (research) on a host"),
+            text.contains("No cloud key: C asks local AI, R is off"),
             "{text}"
         );
-        assert!(text.contains("No AI reply yet."), "{text}");
+        assert!(
+            !text.contains("cloud AI $"),
+            "no spend without a key: {text}"
+        );
 
         // The reply streams in through state updates.
         let mut state: Value = serde_json::from_str(&state_message(&graph())).unwrap();
@@ -2874,11 +3819,10 @@ mod tests {
         });
         model.apply_message(&state.to_string());
         let text = screen(&model, 160, 46);
-        assert!(
-            text.contains("AI: [C] Cloud triage for 10.10.10.5 (running)"),
-            "{text}"
-        );
-        assert!(text.contains("## 1. Evidence-Backed Risk"), "{text}");
+        assert!(text.contains("┌Cloud AI · 10.10.10.5 · running─"), "{text}");
+        // A heading without its marks.
+        assert!(text.contains("│1. Evidence-Backed Risk "), "{text}");
+        assert!(!text.contains("##"), "{text}");
         assert!(text.contains("Upgrade nginx[2J on 10.10.10.5"), "{text}");
 
         state["state"]["ai"]["running"] = json!(false);
@@ -2889,23 +3833,26 @@ mod tests {
         );
         model.apply_message(&state.to_string());
         let text = screen(&model, 160, 46);
-        assert!(!text.contains("(running)"), "{text}");
+        assert!(text.contains("┌Cloud AI · 10.10.10.5─"), "{text}");
+        assert!(!text.contains("· running"), "{text}");
         assert!(text.contains("HTTP 402: Insufficient credits"), "{text}");
         assert!(text.contains("saved to chats/10.10.10.5.md"), "{text}");
 
         // `a` goes back to the inspector.
         model.on_key(key(KeyCode::Char('a')));
-        assert!(screen(&model, 160, 46).contains("Inspector: node, ports and sub-paths"));
+        let text = screen(&model, 160, 46);
+        assert!(text.contains("┌10.10.10.5 · Server─"), "{text}");
+        assert!(text.contains(" a answer "), "{text}");
 
         // Without a session nothing is sent, and without a host nothing is asked.
         let mut offline = Model::new(false);
         offline.apply_message(&state_message(&graph()));
         assert_eq!(offline.on_key(key(KeyCode::Char('C'))), Action::None);
-        assert!(offline.status.starts_with("read-only"));
+        assert_eq!(offline.status, "No session running: `meow acme` starts it");
         let mut empty = Model::new(true);
         empty.apply_message(&state_message(&Graph::default()));
         assert_eq!(empty.on_key(key(KeyCode::Char('L'))), Action::None);
-        assert_eq!(empty.status, "select a host first");
+        assert_eq!(empty.status, "Select a host first");
     }
 
     #[test]
@@ -2918,7 +3865,16 @@ mod tests {
             assert_eq!(model.on_key(key(KeyCode::Char(ch))), Action::None);
         }
         model.on_key(key(KeyCode::Backspace));
-        assert!(screen(&model, 120, 40).contains("note for 10.10.10.5> qc pkg:npm/lodash@4.17.20_"));
+        let text = screen(&model, 120, 40);
+        assert!(
+            text.contains(" Note on 10.10.10.5: qc pkg:npm/lodash@4.17.20_"),
+            "{text}"
+        );
+        // Only the keys that work while typing.
+        assert!(
+            text.contains(" Enter save · Esc cancel · Ctrl+U clear"),
+            "{text}"
+        );
         assert_eq!(
             model.on_key(key(KeyCode::Enter)),
             Action::Send(Command::Note {
@@ -2997,12 +3953,12 @@ mod tests {
         model.apply_message(
             r#"{"type":"result","ok":false,"error":"light mode sends no packets\u001b[2J"}"#,
         );
-        assert_eq!(model.status, "refused: light mode sends no packets[2J");
+        assert_eq!(model.status, "Refused: light mode sends no packets[2J");
         model.apply_message(r#"{"type":"result","ok":true,"result":{}}"#);
-        assert_eq!(model.status, "done");
+        assert_eq!(model.status, "Done");
         model.apply_message("not json");
         model.apply_message(r#"{"type":"state","state":{"session":5}}"#);
-        assert!(model.status.starts_with("unreadable state"));
+        assert!(model.status.starts_with("Unreadable state"));
         assert_eq!(
             model.hosts().len(),
             3,
@@ -3024,17 +3980,25 @@ mod tests {
         let mut model = Model::new(false);
         model.snapshot = Some(Snapshot::offline(&workspace).unwrap());
         let text = screen(&model, 140, 40);
-        assert!(text.contains("read-only (no session running)"), "{text}");
+        assert!(
+            text.contains(" =^..^= acme · light · no session · "),
+            "{text}"
+        );
         assert!(text.contains("10.10.10.5"), "{text}");
+        // Only the keys that do something without a session.
+        assert!(
+            text.contains(" ↑↓ move · Tab CVEs · ? help · q quit"),
+            "{text}"
+        );
         // No session is open: what one left waiting is over.
         assert!(
-            text.contains("recon 10.10.10.0/23  ----------------- 0/17  not run"),
+            text.contains("10.10.10.0/23  ----------------- 0/17  not run"),
             "{text}"
         );
 
         model.on_key(key(KeyCode::Tab));
         assert_eq!(model.on_key(key(KeyCode::Char('2'))), Action::None);
-        assert!(model.status.starts_with("read-only"));
+        assert_eq!(model.status, "No session running: `meow acme` starts it");
         model.on_key(key(KeyCode::Char('n')));
         model.on_key(key(KeyCode::Char('x')));
         assert_eq!(model.on_key(key(KeyCode::Enter)), Action::None);
@@ -3072,15 +4036,18 @@ mod tests {
             address: "127.0.0.1".into(),
             port: 631,
         });
-        // Nothing read yet: the box says so instead of showing nothing.
+        for last in 2..=7 {
+            graph.local.neighbors.push(Neighbor {
+                address: format!("10.44.8.{last}"),
+                mac: Some(format!("02:00:5e:00:53:0{last}")),
+                interface: "en0".into(),
+            });
+        }
+        // Nothing read yet: no box, and nothing that only says so.
         let text = screen(&model(), 160, 50);
-        for expected in [
-            "This machine (m: routes, neighbours)",
-            "no address -> computer -> OS not known -> version not known   no VPN",
-            "Open ports  none listening",
-            "Interfaces  unknown: the network tables could not be read",
-        ] {
-            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        assert!(!text.contains("This machine"), "{text}");
+        for unwanted in ["no address", "not known", "none listening", "unknown"] {
+            assert!(!text.contains(unwanted), "{unwanted:?} in:\n{text}");
         }
 
         let mut model = Model::new(true);
@@ -3089,38 +4056,62 @@ mod tests {
         // An idle tunnel with only a link-local address is not a VPN, and
         // is not listed as an interface in use.
         for expected in [
-            "10.44.8.20 -> MacBook Pro -> macOS -> 15.1   no VPN",
-            "Open ports  this machine only: 631/tcp",
-            "Interfaces  en0 10.44.8.20/22 gateway 10.44.8.1",
-            "m machine",
-            // The selected host gets the same one-line answer.
-            "10.10.10.5 -> Server -> OS not known -> version not known",
-            "Open ports  22/tcp svc, 80/tcp svc",
+            "┌This machine─",
+            // No VPN is something to know before scanning.
+            "│MacBook Pro · macOS 15.1 · no VPN ",
+            "│Ports  631/tcp local only ",
+            "│en0    10.44.8.20/22 · gateway 10.44.8.1 ",
+            // The selected host is said the same way.
+            "┌10.10.10.5 · Server─",
+            "│Ports   22/tcp svc OpenSSH 8.2p1 ",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
-        assert!(!text.contains("utun0"), "{text}");
-        assert!(!text.contains("Routes ("), "the tables stay out of the way");
+        for unwanted in ["utun0", "Routes", "Neighbours"] {
+            assert!(
+                !text.contains(unwanted),
+                "{unwanted:?}: the tables stay out of the way"
+            );
+        }
 
-        // `m` swaps the inspector for the full report; `m` again swaps back.
+        // `m` swaps the box and the inspector for all of this machine;
+        // `m` again swaps back. Each thing once: the gateway is on its
+        // interface's row, not again as a route.
         assert_eq!(model.on_key(key(KeyCode::Char('m'))), Action::None);
         let text = screen(&model, 160, 50);
         for expected in [
-            "This machine in full: ports, interfaces, routes, neighbours",
-            "Routes (1 of 2)",
-            "  default via 10.44.8.1 on en0",
-            "Neighbours (0)",
+            "┌This machine─",
+            "│MacBook Pro · macOS 15.1 · no VPN ",
+            "│Routes ",
+            "│  +1 more: host routes, multicast, idle ",
+            "│Neighbours ",
+            "│  10.44.8.2 02:00:5e:00:53:02 en0 ",
+            " m back ",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
-        assert!(!text.contains("Inspector: node, ports and sub-paths"));
-        // The report scrolls like the inspector does.
-        model.on_key(key(KeyCode::PageDown));
-        let scrolled = screen(&model, 160, 50);
-        assert!(scrolled.contains("All interfaces (2)"), "{scrolled}");
-        assert!(scrolled.contains("Read at 09:40:00 UTC"), "{scrolled}");
+        assert!(!text.contains("┌10.10.10.5"), "{text}");
+        assert!(!text.contains("default via"), "{text}");
+        assert_eq!(text.matches("10.44.8.20/22").count(), 1, "{text}");
+        assert_eq!(text.matches("This machine").count(), 1, "{text}");
+        // It scrolls like the inspector does, and no further than its end.
+        let short = screen(&model, 160, 30);
+        assert!(short.contains(" PgDn more "), "{short}");
+        for _ in 0..5 {
+            model.on_key(key(KeyCode::PageDown));
+        }
+        let scrolled = screen(&model, 160, 30);
+        assert!(!scrolled.contains("│MacBook Pro"), "{scrolled}");
+        assert!(scrolled.contains("│Other interfaces "), "{scrolled}");
+        assert!(
+            scrolled.contains("│Read 09:40:00 UTC · nothing sent "),
+            "{scrolled}"
+        );
+        assert!(scrolled.contains(" PgUp/PgDn scroll "), "{scrolled}");
+        model.on_key(key(KeyCode::PageUp));
+        assert!(screen(&model, 160, 30).contains("│MacBook Pro"));
         model.on_key(key(KeyCode::Char('m')));
-        assert!(screen(&model, 160, 50).contains("Inspector: node, ports and sub-paths"));
+        assert!(screen(&model, 160, 50).contains("┌10.10.10.5 · Server─"));
 
         // A tunnel with a real address is reported as the VPN it is.
         graph.local.interfaces[1]
@@ -3128,9 +4119,12 @@ mod tests {
             .push("10.10.14.3/23".into());
         model.apply_message(&state_message(&graph));
         let text = screen(&model, 160, 50);
-        assert!(text.contains("-> macOS -> 15.1   VPN utun0"), "{text}");
         assert!(
-            text.contains("utun0 10.10.14.3/23 VPN, no route uses it"),
+            text.contains("│utun0  10.10.14.3/23 · no route uses it "),
+            "{text}"
+        );
+        assert!(
+            text.contains("│MacBook Pro · macOS 15.1 · VPN utun0 "),
             "{text}"
         );
         // The AI view and the machine view replace each other.
@@ -3141,16 +4135,273 @@ mod tests {
         assert!(model.show_machine && !model.show_ai);
     }
 
+    /// What must be acted on stays in sight in 80 columns: the VPN state
+    /// on the box's first line, then the route warnings in a few words;
+    /// what does not fit is counted, and `m` shows it, the warnings whole.
+    #[test]
+    fn route_warnings_and_the_vpn_stay_in_sight_in_80_columns() {
+        let mut graph = graph();
+        graph.local.system = SystemInfo {
+            kind: "Linux machine".into(),
+            os: "Ubuntu".into(),
+            version: "24.04".into(),
+        };
+        graph.local.interfaces = vec![Interface {
+            name: "eth0".into(),
+            kind: "ethernet".into(),
+            up: true,
+            addresses: vec!["192.0.2.50/24".into()],
+        }];
+        graph.local.warnings = vec![
+            "No route to 198.51.100.77: no local interface or route covers it (is the VPN up?)"
+                .into(),
+        ];
+        graph.local.notes = vec![
+            "`ip` is not installed in the system directories".into(),
+            "`ss` is not installed in the system directories".into(),
+        ];
+        let mut model = Model::new(true);
+        model.apply_message(&state_message(&graph));
+        let text = screen(&model, 80, 24);
+        for expected in [
+            "│Linux machine · Ubuntu 24.04 · no VPN ",
+            "│Warning   No route to 198.51.100.77 · VPN down? ",
+            " more · m shows all ",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        model.on_key(key(KeyCode::Char('m')));
+        let text = screen(&model, 120, 40);
+        for expected in [
+            "│Warning   No route to 198.51.100.77: no local interface or route covers it (is the ",
+            "│          VPN up?) ",
+            "│Not read  ip, ss not installed ",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert_eq!(
+            short_warning(
+                "Listener tcp/192.0.2.50:4444 is bound to eth0, but the lab is reached via \
+                 tun0: targets cannot connect back (bind to 10.10.14.3 or 0.0.0.0)"
+            ),
+            "4444/tcp on eth0 · lab via tun0 · bind to 10.10.14.3 or 0.0.0.0"
+        );
+        assert_eq!(short_warning("something else"), "something else");
+    }
+
+    /// A host's row keeps its name before its port count, and where no
+    /// count fits, the address says in its colour what is on it.
+    #[test]
+    fn a_host_row_keeps_the_name_and_the_colour_of_what_is_on_it() {
+        let mut graph = graph();
+        let host = graph.hosts.get_mut("10.10.10.5").unwrap();
+        host.hostnames.insert("example.com".into());
+        let host = graph.hosts["10.10.10.5"].clone();
+        let plain = |line: Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(
+            plain(host_row(&host, 50)),
+            "10.10.10.5 (example.com)  3 CVEs · 1 exploited"
+        );
+        assert_eq!(
+            plain(host_row(&host, 44)),
+            "10.10.10.5  2 ports · 3 CVEs · 1 exploited"
+        );
+        assert_eq!(
+            plain(host_row(&host, 34)),
+            "10.10.10.5  3 CVEs · 1 exploited"
+        );
+        assert_eq!(plain(host_row(&host, 23)), "10.10.10.5  1 exploited");
+        let bare = host_row(&host, 12);
+        assert_eq!(plain(bare.clone()), "10.10.10.5");
+        assert_eq!(bare.style.fg, Some(Color::Red), "{bare:?}");
+        // Never cut into another address that looks whole.
+        assert_eq!(plain(host_row(&host, 8)), "10.10.1…");
+    }
+
+    /// The status says what the session accepted, not just that it did.
+    #[test]
+    fn the_status_says_what_was_done() {
+        let mut model = model();
+        assert!(matches!(
+            model.on_key(key(KeyCode::Char('3'))),
+            Action::Send(_)
+        ));
+        model.apply_message(r#"{"type":"result","ok":true}"#);
+        assert_eq!(
+            model.status,
+            "Mode: aggressive · labs and authorized hosts only"
+        );
+        model.on_key(key(KeyCode::Char('n')));
+        model.on_paste("seen by hand");
+        assert!(matches!(model.on_key(key(KeyCode::Enter)), Action::Send(_)));
+        model.apply_message(r#"{"type":"result","ok":true}"#);
+        assert_eq!(model.status, "Note saved");
+        // Too small to show an address or a CVE whole: said instead.
+        assert!(screen(&model, 59, 30).starts_with("Too small: 60x12 needed"));
+        assert!(screen(&model, 80, 11).starts_with("Too small: 60x12 needed"));
+    }
+
     #[test]
     fn small_and_empty_screens_do_not_panic() {
         let mut empty = Model::new(true);
-        assert!(screen(&empty, 80, 24).contains("waiting for the session"));
+        let text = screen(&empty, 80, 24);
+        assert!(
+            text.contains(" =^..^= meow hud · waiting for the session"),
+            "{text}"
+        );
+        assert!(text.contains(" q quit"), "{text}");
         empty.apply_message(&state_message(&Graph::default()));
         let text = screen(&empty, 80, 24);
-        assert!(text.contains("No hosts yet"), "{text}");
-        for (width, height) in [(20, 5), (1, 1), (200, 60)] {
-            screen(&model(), width, height);
+        assert!(
+            text.contains("│No hosts yet: scan in the shell or `meow add <file>`"),
+            "{text}"
+        );
+        // Nothing found: no counts of nothing, and no CVE panels.
+        assert!(text.contains(" =^..^= acme · mild · cloud AI "), "{text}");
+        assert!(!text.contains("CVE") && !text.contains("0 hosts"), "{text}");
+        for (width, height) in [(20, 5), (1, 1), (200, 60), (200, 12), (60, 20), (40, 14)] {
+            let mut model = model();
+            screen(&model, width, height);
+            model.on_key(key(KeyCode::Char('?')));
+            screen(&model, width, height);
         }
+        // Too short for the queue and the notices: their row is left out
+        // rather than drawn as two empty borders.
+        let short = screen(&model(), 200, 12);
+        assert!(!short.contains("Notices"), "{short}");
+    }
+
+    /// The header says the most with the fewest words, and fits 80
+    /// columns: what does not fit gives way, the calls first.
+    #[test]
+    fn the_header_puts_numbers_first_and_fits_its_width() {
+        let model = model();
+        let line = |width: u16| {
+            screen(&model, width, 30)
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        };
+        assert_eq!(
+            line(120),
+            " =^..^= acme · mild · 2 hosts · 3 CVEs · 1 exploited · cloud AI $0.25/$1 today"
+        );
+        assert_eq!(line(80), line(120), "it fits 80 columns");
+        assert_eq!(line(60), " =^..^= acme · mild · 3 CVEs · 1 exploited");
+        // Too narrow for an address or a CVE whole: said instead.
+        assert_eq!(line(40), "Too small: 60x12 needed");
+        assert_eq!(dollars(0.25), "$0.25");
+        assert_eq!(dollars(1.0), "$1");
+        assert_eq!(dollars(12.5), "$12.50");
+        // The calls are said once they, not the spend, near the cap.
+        let mut near: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        near["state"]["budget"]["calls"] = json!(15);
+        let mut busy = Model::new(true);
+        busy.apply_message(&near.to_string());
+        let text = screen(&busy, 120, 30);
+        assert!(
+            text.contains(" · cloud AI $0.25/$1 today · 15/20 calls"),
+            "{text}"
+        );
+        // Near the cap the calls outrank the counts, even in 80 columns.
+        let text = screen(&busy, 80, 24);
+        assert!(text.contains(" · 15/20 calls"), "{text}");
+        // At the cap C asks local AI and R is off: said in red.
+        near["state"]["budget"]["calls"] = json!(20);
+        busy.apply_message(&near.to_string());
+        let text = screen(&busy, 80, 24);
+        assert!(text.contains(" · cloud AI cap reached"), "{text}");
+        assert!(!text.contains("calls"), "{text}");
+        // A setup that cannot be read is said; a missing key is not.
+        let mut message: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        message["state"]["budget"]["has_key"] = json!(false);
+        message["state"]["budget"]["setup_unreadable"] = json!(true);
+        let mut unreadable = Model::new(true);
+        unreadable.apply_message(&message.to_string());
+        let text = screen(&unreadable, 120, 30);
+        assert!(
+            text.contains(" · cloud AI off: ai.toml unreadable"),
+            "{text}"
+        );
+        message["state"]["budget"]["setup_unreadable"] = json!(false);
+        let mut keyless = Model::new(true);
+        keyless.apply_message(&message.to_string());
+        let text = screen(&keyless, 120, 30);
+        assert!(!text.contains("cloud AI"), "{text}");
+    }
+
+    /// `?` shows every key; any key closes it and does nothing else.
+    #[test]
+    fn question_mark_shows_the_keys_and_any_key_closes_them() {
+        let mut model = model();
+        assert_eq!(model.on_key(key(KeyCode::Char('?'))), Action::None);
+        assert!(model.help);
+        let text = screen(&model, 120, 40);
+        for expected in [
+            "┌Keys─",
+            "│ C          ask cloud AI · masked text · daily cap ",
+            "│ 3          aggressive · fast scans · labs and authorized hosts only │",
+            "│ exploited  known exploited in the wild (CISA KEV) ",
+            " any key close",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        // Narrow: a long action goes on under its column, never cut.
+        let narrow = screen(&model, 60, 30);
+        for expected in [
+            "│ 3          aggressive · fast scans · labs and authorized ",
+            "│            hosts only ",
+            "│ q Esc      quit ",
+        ] {
+            assert!(
+                narrow.contains(expected),
+                "missing {expected:?} in:\n{narrow}"
+            );
+        }
+        // Short: the card ends in `…`.
+        assert!(screen(&model, 60, 16).contains("│ …"));
+        // A key that would ask the cloud or change the mode only closes it.
+        for code in [KeyCode::Char('C'), KeyCode::Char('3'), KeyCode::Esc] {
+            assert!(model.help);
+            assert_eq!(model.on_key(key(code)), Action::None, "{code:?}");
+            assert!(!model.help);
+            model.on_key(key(KeyCode::Char('?')));
+        }
+        assert_eq!(
+            model.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        );
+        // In the note box `?` is text.
+        let mut typing = self::model();
+        typing.on_key(key(KeyCode::Char('n')));
+        typing.on_key(key(KeyCode::Char('?')));
+        assert!(!typing.help);
+        assert_eq!(typing.note.as_deref(), Some("?"));
+    }
+
+    /// Tab goes to the CVE list only where there is one; a host without
+    /// CVEs has no CVE panels, and the arrows stay on the hosts.
+    #[test]
+    fn a_host_without_cves_keeps_the_arrows_on_the_hosts() {
+        let mut model = model();
+        model.on_key(key(KeyCode::Down));
+        assert_eq!(model.selected_host().unwrap().address, "10.10.10.9");
+        let text = screen(&model, 160, 50);
+        assert!(!text.contains("CVEs─") && !text.contains("Tab "), "{text}");
+        model.on_key(key(KeyCode::Tab));
+        assert_eq!(model.focused(), Focus::Hosts);
+        model.on_key(key(KeyCode::Up));
+        assert_eq!(model.selected_host().unwrap().address, "10.10.10.5");
+        model.on_key(key(KeyCode::Tab));
+        assert_eq!(model.focused(), Focus::Advisories);
+        assert!(screen(&model, 160, 50).contains(" Tab hosts "));
     }
 
     #[test]

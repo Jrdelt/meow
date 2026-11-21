@@ -2082,9 +2082,36 @@ pub fn by_software(host: &Host) -> Vec<CveGroup<'_>> {
 }
 
 /// Groups a host's CVEs by the software they were found from: one update
-/// usually answers all of them. In the order of [`by_software`].
+/// usually answers all of them. In the order of [`by_software`], with the
+/// same software on several ports as one update: `nginx 1.18.0` on 80/tcp
+/// and 443/tcp is one program to update, to the release that fixes all.
 pub fn fix_plan(host: &Host) -> Vec<FixItem> {
-    by_software(host)
+    let mut merged: Vec<CveGroup> = Vec::new();
+    for group in by_software(host) {
+        match merged.iter_mut().find(|m| m.software == group.software) {
+            Some(first) => {
+                first.port = match (first.port.take(), group.port) {
+                    (Some(ports), Some(port)) => Some(format!("{ports}, {port}")),
+                    // Seen without a port too: closing ports would not do.
+                    _ => None,
+                };
+                first.cves.extend(group.cves);
+            }
+            None => merged.push(group),
+        }
+    }
+    for group in &mut merged {
+        if let Some(ports) = &group.port {
+            let mut list: Vec<&str> = ports.split(", ").collect();
+            list.sort_by_key(|port| {
+                let number = port.split('/').next().and_then(|n| n.parse::<u32>().ok());
+                (number.unwrap_or(u32::MAX), port.to_string())
+            });
+            list.dedup();
+            group.port = Some(list.join(", "));
+        }
+    }
+    merged
         .into_iter()
         .map(|group| {
             let target = group.target();
@@ -2799,6 +2826,30 @@ mod tests {
         // No release is named as fixed past the last affected one.
         host.advisories[2].last_affected = Some("1.21.0".into());
         assert_eq!(fix_plan(&host)[0].target, "a release newer than 1.21.0");
+    }
+
+    #[test]
+    fn one_program_on_two_ports_is_one_update_to_the_release_that_fixes_all() {
+        let mut host = sample_host();
+        host.advisories = vec![
+            Advisory {
+                port: Some("443/tcp".into()),
+                cvss: Some(7.5),
+                ..matched("CVE-2023-44487", true, Some("1.25.3"), None)
+            },
+            matched("CVE-2021-23017", false, Some("1.20.1"), None),
+            matched("CVE-2019-20372", false, Some("1.17.7"), None),
+        ];
+        let plan = fix_plan(&host);
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert_eq!(plan[0].target, "1.25.3 or later");
+        assert_eq!(plan[0].port.as_deref(), Some("80/tcp, 443/tcp"));
+        assert_eq!((plan[0].advisories, plan[0].kev), (3, 1));
+        assert_eq!(
+            plan[0].action,
+            "Update nginx 1.18.0 to 1.25.3 or later, or close 80/tcp, 443/tcp if the service \
+             is not needed."
+        );
     }
 
     #[test]

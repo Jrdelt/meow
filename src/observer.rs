@@ -1191,41 +1191,56 @@ pub fn active_vpns(local: &LocalNet) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// One summary line for the session banner.
+/// One line for the start of a session, numbers first and only what was
+/// read: `2 interfaces · gateway 192.0.2.1 (en0) · VPN utun3 198.51.100.2 ·
+/// 3 neighbours · 2 open ports`. Empty when nothing was.
 pub fn summary(local: &LocalNet) -> String {
-    let up = local
-        .interfaces
-        .iter()
-        .filter(|i| {
-            i.up && !matches!(i.kind.as_str(), "loopback" | "virtual") && has_routable_address(i)
-        })
-        .count();
-    let gateway = local
+    let count =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if !local.interfaces.is_empty() {
+        let up = local
+            .interfaces
+            .iter()
+            .filter(|i| {
+                i.up && !matches!(i.kind.as_str(), "loopback" | "virtual")
+                    && has_routable_address(i)
+            })
+            .count();
+        parts.push(match up {
+            0 => "not connected".to_owned(),
+            up => count(up, "interface", "interfaces"),
+        });
+    }
+    if let Some((gateway, interface)) = local
         .routes
         .iter()
         .find(|r| r.destination == "0.0.0.0/0")
-        .and_then(|r| {
-            r.gateway
-                .as_ref()
-                .map(|g| format!(", gateway {g} via {}", r.interface))
-        })
-        .unwrap_or_default();
+        .and_then(|r| Some((r.gateway.as_ref()?, &r.interface)))
+    {
+        parts.push(format!("gateway {gateway} ({interface})"));
+    }
     let vpn: Vec<String> = local
         .interfaces
         .iter()
         .filter(|i| is_active_vpn(i))
         .map(|i| format!("{} {}", i.name, routable_address(i).unwrap_or_default()))
         .collect();
-    let vpn = if vpn.is_empty() {
-        String::new()
-    } else {
-        format!(", VPN {}", vpn.join(", "))
-    };
-    format!(
-        "{up} interfaces up{gateway}{vpn}, {} neighbours, {} listeners",
-        local.neighbors.len(),
-        local.listeners.len()
-    )
+    if !vpn.is_empty() {
+        parts.push(format!("VPN {}", vpn.join(", ")));
+    }
+    if !local.neighbors.is_empty() {
+        parts.push(count(local.neighbors.len(), "neighbour", "neighbours"));
+    }
+    let ports: std::collections::BTreeSet<(u16, &str)> = local
+        .listeners
+        .iter()
+        .map(|l| (l.port, l.protocol.as_str()))
+        .collect();
+    if !ports.is_empty() {
+        parts.push(count(ports.len(), "open port", "open ports"));
+    }
+    parts.join(" \u{b7} ")
 }
 
 // ---------------------------------------------------------------------------
@@ -2754,7 +2769,7 @@ mod tests {
         assert_eq!(local.interfaces.len(), 11);
         assert_eq!(
             summary(&local),
-            "1 interfaces up, gateway 172.30.47.1 via en0, 0 neighbours, 0 listeners"
+            "1 interface \u{b7} gateway 172.30.47.1 (en0)"
         );
         // Idle tunnels are not mistaken for the lab, so nothing is flagged.
         local.listeners.push(Listener {
@@ -2771,7 +2786,7 @@ mod tests {
             up: true,
             addresses: vec!["fe80::1/64".into(), "10.10.14.3/23".into()],
         });
-        assert!(summary(&local).contains("2 interfaces up"));
+        assert!(summary(&local).contains("2 interfaces"));
         assert!(summary(&local).contains("VPN utun9 10.10.14.3/23"));
         assert_eq!(route_warnings(&local, &[]).len(), 1);
     }
@@ -3235,13 +3250,20 @@ mod tests {
 
     #[test]
     fn summary_line_names_gateway_and_vpn() {
+        // Numbers first; a port open on IPv4 and IPv6 is one port.
         assert_eq!(
             summary(&linux_fixture()),
-            "2 interfaces up, gateway 192.168.1.1 via eth0, VPN tun0 10.10.14.3/23, 2 neighbours, 8 listeners"
+            "2 interfaces \u{b7} gateway 192.168.1.1 (eth0) \u{b7} VPN tun0 10.10.14.3/23 \u{b7} \
+             2 neighbours \u{b7} 7 open ports"
         );
-        assert_eq!(
-            summary(&LocalNet::default()),
-            "0 interfaces up, 0 neighbours, 0 listeners"
+        // Nothing read: nothing said, rather than counts of nothing.
+        assert_eq!(summary(&LocalNet::default()), "");
+        let mut offline = linux_fixture();
+        offline.interfaces.retain(|i| i.kind == "loopback");
+        assert!(
+            summary(&offline).starts_with("not connected"),
+            "{}",
+            summary(&offline)
         );
     }
 

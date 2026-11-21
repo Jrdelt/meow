@@ -112,7 +112,7 @@ A new session asks where to save it. Press Enter to keep the folder you are in, 
 
 Sessions saved in the same folder share one `meow/` folder there (`meow/acme/`, `meow/beta/`). It is private, and the `.gitignore` files in it keep it out of git; a running session puts them back if a pull changes them, and warns if git tracks files there. If a pull or an unpacked archive replaces files in it, meow says so and drops that session's shell history. A scan queued in such files never runs. `meow acme` reopens the same session from any folder.
 
-Then your normal shell opens inside the session. Your prompt is prefixed with `(meow:acme:light)` (reflecting the active session and mode) so you always know a session is active, and `meow` prints the localhost URL for the live topology map.
+Then your normal shell opens inside the session. Your prompt is prefixed with `(meow:acme:light)` (reflecting the active session and mode) so you always know a session is active. `meow` says where the session is saved and how to watch it live: `meow map` or `meow hud`.
 
 - `meow acme --local` saves in `./meow/acme/` here without asking.
 - `meow acme --home` saves in `~/.meow/workspaces/acme/` without asking. Sessions made there (and old `./.meow/` ones) by earlier versions keep working.
@@ -145,7 +145,7 @@ From inside the session (or from another terminal window):
 
 ```sh
 meow map          # opens the live topology map in your browser
-meow hud          # opens the terminal TUI companion panel
+meow hud          # the same, live, in this terminal (? lists its keys)
 ```
 
 ### 4. Generate the audit report
@@ -173,7 +173,7 @@ This writes `REPORT.md` inside the session folder (for example `./meow/acme/REPO
 | `meow mode <light\|mild\|aggressive>` | Switch the discovery rate/load profile of the session |
 | `meow recon <target> [-- <nmap_flags>...]` | Queue the 17-stage OSINT & service inventory for a host, domain, IP, or CIDR |
 | `meow map [--no-open]` | Open the live topology map in your browser (or print the URL with `--no-open`) |
-| `meow hud` | Attach the terminal TUI companion panel (`Tab` panels, `a` AI view, `m` machine view, `1`/`2`/`3` mode) |
+| `meow hud` | Watch the session in the terminal: hosts, what to update, CVEs, recon progress, notices. `?` lists the keys (`Tab` CVEs, `L`/`C`/`R` ask AI, `a` answer, `m` this machine, `n` note, `1`/`2`/`3` mode) |
 | `meow add <file> [--no-cve]` | Import an Nmap XML, katana/feroxbuster JSONL, log, or `git diff` file |
 | `meow report` | Compile the workspace into `REPORT.md` |
 | `meow setup` | Open the interactive Cat Setup GUI (or pass flags for scriptable setup) |

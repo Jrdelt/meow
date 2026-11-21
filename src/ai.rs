@@ -80,6 +80,15 @@ impl Tier {
         }
     }
 
+    /// What the HUD and the notices call it: `Cloud AI`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Local => "Local AI",
+            Tier::Cloud => "Cloud AI",
+            Tier::Research => "Research",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tier::Local => "Local triage",
@@ -2400,12 +2409,15 @@ impl AiEngine {
         let unavailable = |reason: &str| -> Result<Option<String>> {
             match tier {
                 // Research needs web search; there is no local equivalent.
-                Tier::Research => bail!("[R] is not available: {reason}"),
+                Tier::Research => bail!("Research is off: {reason}"),
                 _ => Ok(Some(reason.to_owned())),
             }
         };
         let settings = self.settings.effective();
         let Some(api_key) = settings.api_key() else {
+            if tier == Tier::Research && settings.setup_error.is_none() {
+                bail!("No cloud key: research is off \u{b7} `meow setup` adds one");
+            }
             let reason = unavailable(settings.setup_error.as_deref().unwrap_or(
                 "no cloud API key yet (run `meow setup` to add yours, or to choose a local model)",
             ))?;
@@ -4276,7 +4288,7 @@ mod tests {
         assert!(refused
             .unwrap_err()
             .to_string()
-            .contains("[R] is not available"));
+            .contains("No cloud key: research is off"));
 
         // With a key: the cap is $0.01. One call at $0.0042 fits...
         let (engine, _) = engine(&base, Some("sk-or-test"));

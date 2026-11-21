@@ -60,19 +60,19 @@ pub fn session_header(name: &str, mode: Mode, created: bool) -> String {
     let verb = if created { "new" } else { "resumed" };
     match mode {
         Mode::Light => format!(
-            "   |\\__/,|   (`\\   meow :: {safe_name} ({verb}, light mode)\n\
-             \x20_.| -.- |_   ) )  passive triage shell -- 0 outbound packets unless you run a command\n\
+            "   |\\__/,|   (`\\   meow :: {safe_name} ({verb}, light)\n\
+             \x20_.| -.- |_   ) )  0 packets unless you run a command\n\
              -(((---(((--------\n"
         ),
         Mode::Mild => format!(
-            "   /\\_/\\     _     meow :: {safe_name} ({verb}, mild mode)\n\
-             \x20 ( o.o )  _//     polite recon shell -- rate-limited discovery & live topology map\n\
-             \x20  > ^ <  (_/      -----------------------------------------------------------------\n"
+            "   /\\_/\\     _     meow :: {safe_name} ({verb}, mild)\n\
+             \x20 ( o.o )  _//     slow, rate-limited scans\n\
+             \x20  > ^ <  (_/      ------------------------------------\n"
         ),
         Mode::Aggressive => format!(
-            "  /\\___/\\   /      meow :: {safe_name} ({verb}, aggressive mode)\n\
-             \x20( >'w'< ) //      lab-speed recon shell -- fast Nmap & auto-tuned web discovery\n\
-             \x20 /     \\ V        -----------------------------------------------------------------\n"
+            "  /\\___/\\   /      meow :: {safe_name} ({verb}, aggressive)\n\
+             \x20( >'w'< ) //      fast scans \u{b7} labs and authorized hosts only\n\
+             \x20 /     \\ V        ------------------------------------\n"
         ),
     }
 }

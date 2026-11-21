@@ -462,15 +462,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .unwrap_or(false);
             if opened {
                 println!(
-                    "[+] Opened the topology map of '{}' in your browser (127.0.0.1:{})",
+                    "[+] Map of '{}' opened (127.0.0.1:{}) \u{b7} no tab? `meow map --no-open`",
                     sanitize_terminal_line(&workspace.name, 64),
                     info.port
                 );
-                println!(
-                    "[+] No browser tab? `meow map --no-open` prints the address to open by hand."
-                );
             } else {
-                println!("[+] Open this URL in a browser on this machine (it contains the session token):");
+                println!("[+] Map URL \u{b7} this machine only \u{b7} holds the session token:");
                 println!("    {url}");
             }
             Ok(ExitCode::SUCCESS)
@@ -639,10 +636,7 @@ fn start_session(
     // no session runs what it did not queue itself.)
     let files_changed = !created && !foreign && workspace.files_changed(home);
     if files_changed {
-        println!(
-            "[!] Files in this session changed outside meow (a git pull or an unpacked archive?): \
-             its shell history and last folder are not used"
-        );
+        println!("[!] Files changed outside meow: shell history and last folder not used");
         workspace.drop_carried_files();
     }
     // Session files a pull made git track, or let in.
@@ -683,19 +677,22 @@ fn start_session(
         let said = sanitize_terminal_block(&format!("{error:#}"), 1000);
         println!("[!] Could not offer the extras: {said}");
     }
+    // On a terminal the header says the name, new or not, and the mode.
     if std::io::stdout().is_terminal() {
         print!(
             "{}",
             wizard::session_header(&workspace.name, workspace.profile.mode, created)
         );
+        println!("[+] Saved in {}", sanitize_path_display(&workspace.dir));
+    } else {
+        println!(
+            "[+] {} '{}' \u{b7} {} \u{b7} {}",
+            if created { "New session" } else { "Session" },
+            sanitize_terminal_line(&workspace.name, 64),
+            workspace.profile.mode,
+            sanitize_path_display(&workspace.dir),
+        );
     }
-    println!(
-        "[+] {} workspace '{}' at {} (mode: {})",
-        if created { "Created" } else { "Resumed" },
-        sanitize_terminal_line(&workspace.name, 64),
-        sanitize_path_display(&workspace.dir),
-        workspace.profile.mode
-    );
 
     // The coordinator owns the graph, the database and the loopback server
     // for as long as the shell runs.
@@ -710,20 +707,28 @@ fn start_session(
         Some(records),
     )?;
     let state = coordinator.state();
-    println!(
-        "[+] Coordinator on 127.0.0.1:{} (`meow map`, `meow hud`)",
-        state.port
-    );
     {
         // Passive, zero-packet look at the local network tables.
         let graph = state.graph();
-        println!(
-            "[+] Local network: {}",
-            sanitize_terminal_line(&observer::summary(&graph.local), 300)
-        );
-        for note in &graph.local.notes {
+        let summary = observer::summary(&graph.local);
+        if !summary.is_empty() {
+            println!("[+] Network: {}", sanitize_terminal_line(&summary, 300));
+        }
+        // The tools that are missing on one line; any other note on its own.
+        const MISSING: &str = " is not installed in the system directories";
+        let (missing, other): (Vec<&String>, Vec<&String>) = graph
+            .local
+            .notes
+            .iter()
+            .partition(|note| note.ends_with(MISSING));
+        let tools: Vec<&str> = missing
+            .iter()
+            .map(|note| note.trim_end_matches(MISSING))
+            .collect();
+        let said = (!tools.is_empty()).then(|| format!("{} not installed", tools.join(", ")));
+        for note in said.iter().chain(other) {
             println!(
-                "[!] Local network not fully read: {}",
+                "[!] Network partly read: {}",
                 sanitize_terminal_line(note, 300)
             );
         }
@@ -731,15 +736,18 @@ fn start_session(
             println!("[!] {}", sanitize_terminal_line(warning, 300));
         }
     }
+    println!("[+] Live view: `meow map` \u{b7} `meow hud`");
+    let shell = Path::new(&spec.program)
+        .file_name()
+        .map_or(spec.program.clone(), |name| {
+            name.to_string_lossy().into_owned()
+        });
     println!(
-        "[+] Session shell: {} (exit the shell to leave)",
-        sanitize_terminal_line(&spec.program, 200)
+        "[+] Shell: {} \u{b7} `exit` to leave",
+        sanitize_terminal_line(&shell, 200)
     );
     if !launch.hooked() {
-        println!(
-            "[!] No replay hooks for this shell (only zsh, bash and PowerShell): \
-             commands will not be logged to replay.sh"
-        );
+        println!("[!] No replay hooks for this shell: replay.sh stays empty");
     }
 
     say_left_recons(&coordinator, !doubtful);
@@ -934,7 +942,7 @@ fn say_left_recons(coordinator: &Coordinator, own: bool) {
         println!("[!] {}", sanitize_terminal_line(&task.left_line(own), 300));
     }
     if more > 0 {
-        println!("[!] {more} more recon(s) were not finished either");
+        println!("[!] +{more} more recons cut short");
     }
 }
 

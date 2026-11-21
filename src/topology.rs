@@ -83,7 +83,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Role::Internet => "Internet",
             Role::You => "You",
