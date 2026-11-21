@@ -27,7 +27,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 ipnetwork = "0.21"
 maxminddb = "0.33"
-petgraph = "0.7"
+petgraph = "0.8"
 portable-pty = "0.9"
 # Terminal control is used through the `ratatui::crossterm` re-export.
 ratatui = "0.30"
