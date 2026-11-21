@@ -1357,7 +1357,9 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     }
     let budget = &snapshot.budget;
     let capped = budget.calls >= budget.max_calls || budget.spent_usd >= budget.max_usd;
-    if budget.has_key && capped {
+    if budget.has_key && budget.usage_unreadable {
+        parts.push((1, Span::styled("cloud AI off: ai-usage unreadable", WARN)));
+    } else if budget.has_key && capped {
         // C asks local AI and R is off until tomorrow.
         parts.push((1, Span::styled("cloud AI cap reached", BAD)));
     } else if budget.has_key {
@@ -4319,6 +4321,14 @@ mod tests {
         let text = screen(&busy, 80, 24);
         assert!(text.contains(" · cloud AI cap reached"), "{text}");
         assert!(!text.contains("calls"), "{text}");
+        // So is a day's record of all sessions that cannot be read.
+        near["state"]["budget"]["usage_unreadable"] = json!(true);
+        busy.apply_message(&near.to_string());
+        let text = screen(&busy, 120, 30);
+        assert!(
+            text.contains(" · cloud AI off: ai-usage unreadable"),
+            "{text}"
+        );
         // A setup that cannot be read is said; a missing key is not.
         let mut message: Value = serde_json::from_str(&state_message(&graph())).unwrap();
         message["state"]["budget"]["has_key"] = json!(false);

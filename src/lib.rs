@@ -35,6 +35,7 @@ pub mod timeutil;
 pub mod tools;
 pub mod topology;
 pub mod update;
+pub mod usage;
 pub mod vault;
 pub mod webfp;
 pub mod webui;
