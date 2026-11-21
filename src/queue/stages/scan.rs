@@ -9,7 +9,6 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     let target = cx.target;
     let stage = cx.stage;
     let settings = cx.settings.clone();
-    let same_mode = || cx.same_mode();
     let preset = cx.preset.clone();
     let limits = cx.limits;
     let privileged = cx.privileged;
@@ -25,7 +24,9 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     for notice in notices {
         state.notice(notice);
     }
-    let outcome = run_tool_while(&command, limits, same_mode).await;
+    let outcome = cx
+        .run_tool(&command, OutputKind::NmapXml, |seen| seen)
+        .await;
     if outcome == RunOutcome::Stopped {
         remove_regular_file(&command.output);
         return Ok(StageEnd::ModeChanged);
@@ -56,7 +57,6 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
     let target = cx.target;
     let settings = cx.settings.clone();
     let mode = cx.mode;
-    let same_mode = || cx.same_mode();
     let limits = cx.limits;
     let privileged = cx.privileged;
     let out = |suffix: &str| cx.out(suffix);
@@ -90,7 +90,9 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
         Target::Network(network) => network.is_ipv6(),
     };
     let command = udp_command(&settings, &targets, ipv6, &out(".xml"));
-    let outcome = run_tool_while(&command, limits, same_mode).await;
+    let outcome = cx
+        .run_tool(&command, OutputKind::NmapXml, |seen| seen)
+        .await;
     if outcome == RunOutcome::Stopped {
         remove_regular_file(&command.output);
         return Ok(StageEnd::ModeChanged);
@@ -151,7 +153,6 @@ pub(crate) async fn services(cx: &Ctx<'_>) -> Result<StageEnd> {
     let target = cx.target;
     let stage = cx.stage;
     let settings = cx.settings.clone();
-    let same_mode = || cx.same_mode();
     let preset = cx.preset.clone();
     let limits = cx.limits;
     let privileged = cx.privileged;
@@ -184,7 +185,18 @@ pub(crate) async fn services(cx: &Ctx<'_>) -> Result<StageEnd> {
                 state.notice(notice);
             }
         }
-        let outcome = run_tool_while(&command, limits, same_mode).await;
+        // One scan per host: which host it is on, and how far nmap says
+        // that scan is.
+        let of_hosts = |seen: Progress| match hosts.len() {
+            1 => seen,
+            total => Progress {
+                done: Some(index as u64),
+                total: Some(total as u64),
+                ..seen
+            },
+        };
+        cx.report(of_hosts(Progress::default()));
+        let outcome = cx.run_tool(&command, OutputKind::NmapXml, of_hosts).await;
         if outcome == RunOutcome::Stopped {
             remove_regular_file(&command.output);
             return Ok(StageEnd::ModeChanged);
@@ -276,13 +288,15 @@ pub(crate) async fn cves(cx: &Ctx<'_>) -> Result<StageEnd> {
     }
     let (mut changed, _) = record(state, backport_obs, None);
     let mut added_total = 0usize;
-    for (addr, ports) in versioned_hosts
+    let own_hosts: Vec<(&String, &BTreeSet<String>)> = versioned_hosts
         .iter()
         .filter_map(|addr| Some((addr, own.get(addr)?)))
-    {
+        .collect();
+    for (index, (addr, ports)) in own_hosts.iter().copied().enumerate() {
         if !same_mode() {
             return Ok(StageEnd::ModeChanged);
         }
+        cx.progress(index, own_hosts.len());
         let asked = crate::cve::Asked::Recon(ports.clone());
         if let Some((merged, _kev, _errs)) = state.ground_host_for(addr, asked).await {
             added_total += merged.added;

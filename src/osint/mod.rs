@@ -27,6 +27,7 @@ use crate::endpoint::{HostAddr, Target};
 use crate::evidence::{sanitize, Confidence, EvidenceRecord, Source};
 use crate::geoip::GeoDb;
 use crate::graph::{HttpInfo, Observation};
+use crate::procs::{Group, Tracker};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -76,36 +77,22 @@ fn configure_osint_command(cmd: &mut tokio::process::Command) {
             .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
         cmd.env("SystemRoot", sys_root);
     }
-    #[cfg(unix)]
-    cmd.process_group(0);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
 }
 
-#[cfg(unix)]
-struct OsintGroupGuard(Option<u32>);
-
-#[cfg(unix)]
-impl Drop for OsintGroupGuard {
-    fn drop(&mut self) {
-        if let Some(pid) = self.0.filter(|&p| p > 1 && p <= i32::MAX as u32) {
-            // SAFETY: negative pid signals the dedicated process group started with process_group(0).
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-    }
-}
-
+/// Reads what a program started with [`Tracker::spawn`] prints, up to
+/// `max_bytes` and for at most `timeout`. The program and everything it
+/// started end with this call, however it ends: `group` is dropped here.
 async fn wait_bounded_stdout(
     mut child: tokio::process::Child,
+    group: Group,
     max_bytes: usize,
     timeout: Duration,
 ) -> Option<String> {
-    #[cfg(unix)]
-    let _group = OsintGroupGuard(child.id());
+    let _group = group;
     let mut stdout = child.stdout.take()?;
     let fut = async move {
         let mut buf = Vec::with_capacity(max_bytes.min(8192));

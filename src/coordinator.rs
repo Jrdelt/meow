@@ -44,6 +44,7 @@ use crate::location::{self, Location};
 use crate::mode::Mode;
 use crate::observer;
 use crate::parsers::text::TextParser;
+use crate::procs::Tracker;
 use crate::pty::LineSink;
 use crate::queue;
 use crate::tiles::{MapView, Picture};
@@ -81,6 +82,13 @@ const GIT_GUARD_EVERY: Duration = Duration::from_secs(2);
 const LOCATE_EVERY: Duration = Duration::from_secs(30);
 const LOCATE_RETRY: Duration = Duration::from_secs(15 * 60);
 const WS_MIN_INTERVAL: Duration = Duration::from_millis(400);
+/// How often, at most, the progress of a running stage is pushed.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+/// How many recon tasks the state carries.
+const SHOWN_TASKS: usize = 20;
+/// How often the session looks whether its guard still runs.
+#[cfg(unix)]
+const GUARD_CHECK_EVERY: Duration = Duration::from_secs(2);
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// Leaving a session waits at most this long for the tap's last lines, for
 /// the background tasks to stop, and for a lock the final save needs.
@@ -185,8 +193,6 @@ pub enum Command {
         /// Extra nmap flags, given after `--`.
         flags: Vec<String>,
     },
-    /// Puts unfinished tasks back on the queue.
-    Resume,
     /// Starts an AI request for a host (`[L]`, `[C]` or `[R]`).
     Ai {
         tier: Tier,
@@ -291,6 +297,17 @@ pub struct State {
     /// Lookups text asked for were left out, and the user was told.
     ground_cut_noticed: AtomicBool,
     recon_queue: mpsc::UnboundedSender<i64>,
+    /// The newest task the database held when this session started.
+    recon_floor: i64,
+    /// How far each running stage is, by task and stage. Never stored: a
+    /// stage that is not running has none.
+    progress: Mutex<std::collections::HashMap<(i64, queue::Stage), Reported>>,
+    progress_wake: tokio::sync::Notify,
+    /// Bumped when only the progress changed: WebSocket clients then get
+    /// that alone, not the whole state again.
+    progress_revision: watch::Sender<u64>,
+    /// Every program recon starts, so that none outlives the session.
+    tools: Tracker,
     cve: Option<CveClient>,
     vault: Mutex<Vault>,
     ai: AiEngine,
@@ -379,9 +396,72 @@ impl State {
         lock(&self.workspace).profile.recon.clone()
     }
 
-    /// Puts every unfinished task back on the queue; returns how many.
+    /// The programs this session started and still runs.
+    pub fn tools(&self) -> &Tracker {
+        &self.tools
+    }
+
+    /// The session is ending: its scanners were stopped and nothing new
+    /// starts.
+    pub fn is_closing(&self) -> bool {
+        self.tools.is_closed()
+    }
+
+    /// Records how far a running stage is. Shown at the next progress
+    /// push, which follows at once or, after another one, within about a
+    /// second.
+    pub fn set_progress(&self, task: i64, stage: queue::Stage, progress: queue::Progress) {
+        let progress = progress.checked();
+        let changed = {
+            let mut known = lock(&self.progress);
+            if progress == queue::Progress::default() {
+                known.remove(&(task, stage)).is_some()
+            } else if known
+                .get(&(task, stage))
+                .is_some_and(|said| said.progress == progress)
+            {
+                false
+            } else {
+                let at = Instant::now();
+                known.insert((task, stage), Reported { progress, at });
+                true
+            }
+        };
+        if changed {
+            self.progress_wake.notify_one();
+        }
+    }
+
+    /// Forgets how far a stage was: it ended, or starts again.
+    pub fn clear_progress(&self, task: i64, stage: queue::Stage) {
+        lock(&self.progress).remove(&(task, stage));
+    }
+
+    /// Says once what happened to the guard that would stop scans after a
+    /// hard end of meow: it was started again, or it is gone.
+    pub fn notice_tool_fault(&self) {
+        if let Some(fault) = self.tools.take_fault() {
+            self.notice(fault);
+        }
+    }
+
+    /// A recon this session queued. Whatever the database held when the
+    /// session started belongs to a session that is over, and never runs.
+    pub fn owns_recon(&self, task: i64) -> bool {
+        task > self.recon_floor
+    }
+
+    /// This session's recons that still have work to do, oldest first.
+    pub fn unfinished_recons(&self) -> Result<Vec<queue::TaskRow>> {
+        let mut unfinished = queue::unfinished(&self.db_lock())?;
+        unfinished.retain(|task| self.owns_recon(task.id));
+        Ok(unfinished)
+    }
+
+    /// Puts this session's unfinished recons back on the queue (light mode
+    /// had stopped them); returns how many.
     pub fn resume_unfinished(&self) -> Result<usize> {
-        let unfinished = queue::unfinished(&self.db_lock())?;
+        let unfinished = self.unfinished_recons()?;
         for task in &unfinished {
             let _ = self.recon_queue.send(task.id);
         }
@@ -599,11 +679,43 @@ impl State {
         *lock(&self.grounds) = cve::GroundQueue::new(questions);
     }
 
+    /// How far the running stages are, as a message of its own: a tool
+    /// that counts its results changes this every second, and nothing else
+    /// of the state. `now_utc` is the clock the time left counts from.
+    pub fn progress_snapshot(&self) -> Value {
+        let now = Instant::now();
+        let mut running: Vec<(i64, queue::Stage, queue::Progress)> = lock(&self.progress)
+            .iter()
+            .map(|((task, stage), said)| (*task, *stage, said.as_of(now)))
+            .collect();
+        running.sort_by_key(|(task, stage, _)| (*task, stage.as_str()));
+        let running: Vec<Value> = running
+            .into_iter()
+            .map(|(task, stage, progress)| json!({ "task": task, "stage": stage, "progress": progress }))
+            .collect();
+        json!({ "now_utc": now_rfc3339(), "running": running })
+    }
+
     /// The snapshot sent to the HUD and the browser map.
     /// Acquires each mutex individually so graph serialization and topology
     /// construction never block PTY/IPC writers or invert lock ordering.
     pub fn snapshot(&self) -> Value {
-        let tasks = queue::tasks(&self.db_lock(), 20).unwrap_or_default();
+        // Every recon of this session that has work to do, however many
+        // were queued after it, and the newest of the others.
+        let mut tasks =
+            queue::shown(&self.db_lock(), self.recon_floor, SHOWN_TASKS).unwrap_or_default();
+        {
+            // Only a stage that is running is somewhere on its way.
+            let progress = lock(&self.progress);
+            let now = Instant::now();
+            for task in &mut tasks {
+                for stage in task.stages.iter_mut().filter(|s| s.status == "running") {
+                    stage.progress = progress
+                        .get(&(task.id, stage.stage))
+                        .map(|said| said.as_of(now));
+                }
+            }
+        }
         let mode = self.mode();
         let revision = *self.revision.borrow();
         let graph = self.graph().clone();
@@ -677,6 +789,9 @@ impl State {
             "mode": mode,
             "port": self.port,
             "revision": revision,
+            // The clock the stage times were written with: what a client
+            // counts elapsed time from, whatever its own clock says.
+            "now_utc": now_rfc3339(),
             "graph": shown,
             "cves": cves,
             "cve_lookups": self.cve.is_some(),
@@ -808,12 +923,11 @@ impl State {
                 }
                 let _ = self.recon_queue.send(id);
                 self.notice(format!("recon {parsed} queued as task {id} ({mode})"));
-                let ahead = queue::unfinished(&self.db_lock())?.len().saturating_sub(1);
+                let ahead = self.unfinished_recons()?.len().saturating_sub(1);
                 Ok(
                     json!({ "task": id, "target": parsed.to_string(), "mode": mode, "ahead": ahead }),
                 )
             }
-            Command::Resume => Ok(json!({ "resumed": self.resume_unfinished()? })),
             Command::Locate => {
                 if !self.locating.swap(true, Ordering::SeqCst) {
                     self.handle.spawn(location_loop(Arc::clone(self)));
@@ -1227,13 +1341,15 @@ async fn websocket(AxumState(state): AxumState<Shared>, upgrade: WebSocketUpgrad
 }
 
 /// Pushes a state snapshot on connect and after every change (rate-limited),
-/// and executes commands the client sends without blocking incoming frames.
+/// the progress of the running stages alone when only that changed, and
+/// executes commands the client sends without blocking incoming frames.
 async fn serve_socket(
     state: Shared,
     mut socket: WebSocket,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let mut revision = state.revision.subscribe();
+    let mut progress = state.progress_revision.subscribe();
     let send_state = |state: &Shared| {
         Message::Text(
             json!({ "type": "state", "key": state.page_key, "state": state.snapshot() })
@@ -1261,7 +1377,23 @@ async fn serve_socket(
             () = &mut throttle, if pending_push => {
                 pending_push = false;
                 let _ = revision.borrow_and_update();
+                // The state says how far the stages are, too.
+                let _ = progress.borrow_and_update();
                 if socket.send(send_state(&state)).await.is_err() {
+                    break;
+                }
+            }
+            // Only the progress changed: that alone is sent (the loop
+            // that says so keeps it to once a second).
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let _ = progress.borrow_and_update();
+                let mut message = state.progress_snapshot();
+                message["type"] = json!("progress");
+                message["key"] = json!(state.page_key);
+                if socket.send(Message::Text(message.to_string().into())).await.is_err() {
                     break;
                 }
             }
@@ -1573,6 +1705,54 @@ async fn saver(state: Shared) {
     }
 }
 
+/// How far a stage said it is, and when it said so.
+struct Reported {
+    progress: queue::Progress,
+    at: Instant,
+}
+
+impl Reported {
+    /// The progress as it stands at `now`: the time left has been running
+    /// out since it was reported, so `eta_s` is always the time left at the
+    /// state's `now_utc`. One that has run out is no longer known.
+    fn as_of(&self, now: Instant) -> queue::Progress {
+        let since = now.saturating_duration_since(self.at).as_secs();
+        queue::Progress {
+            eta_s: self
+                .progress
+                .eta_s
+                .and_then(|left| left.checked_sub(since))
+                .filter(|left| *left > 0),
+            ..self.progress.clone()
+        }
+    }
+}
+
+/// Pushes how far the running stage is: as soon as that changes, and then
+/// at most once every [`PROGRESS_EVERY`]. Nothing is pushed while nothing
+/// changes. Only the progress is pushed, not the state.
+async fn progress_loop(state: Shared) {
+    loop {
+        state.progress_wake.notified().await;
+        state.progress_revision.send_modify(|rev| *rev += 1);
+        tokio::time::sleep(PROGRESS_EVERY).await;
+    }
+}
+
+/// Looks after the guard: one that was killed is started again within
+/// [`GUARD_CHECK_EVERY`], also while a long scan runs, and that is said.
+#[cfg(unix)]
+async fn guard_watch(state: Shared) {
+    loop {
+        tokio::time::sleep(GUARD_CHECK_EVERY).await;
+        if state.is_closing() {
+            return;
+        }
+        state.tools.check_guard();
+        state.notice_tool_fault();
+    }
+}
+
 /// Keeps git out of the session folder while the session runs, whether or
 /// not anything else changes: a pull can change what git ignores at any
 /// time.
@@ -1604,10 +1784,16 @@ async fn observe_loop(state: Shared) {
     loop {
         tokio::time::sleep(OBSERVE_EVERY).await;
         let targets = state.graph().target_ips();
-        let Ok(local) = tokio::task::spawn_blocking(move || observer::observe(&targets)).await
+        let tools = state.tools.clone();
+        let Ok(local) =
+            tokio::task::spawn_blocking(move || observer::observe_with(&tools, &targets)).await
         else {
             continue;
         };
+        if state.is_closing() {
+            // Cut short with the session: not what the tables hold.
+            return;
+        }
         let new_warnings: Vec<String> = {
             let mut graph = state.graph();
             if same_tables(&graph.local, &local) {
@@ -1800,6 +1986,10 @@ pub struct Coordinator {
     /// task ends once this is dropped, whoever still has a sink.
     tap: Option<Arc<mpsc::Sender<String>>>,
     tap_task: Option<tokio::task::JoinHandle<()>>,
+    /// The recon queue's worker, which runs one stage at a time.
+    recon_task: Option<tokio::task::JoinHandle<()>>,
+    /// See [`Coordinator::left_recons`].
+    left_recons: (Vec<queue::TaskRow>, usize),
     /// Kept from the start: the workspace lock may be held when it ends.
     graph_path: PathBuf,
     tmp_dir: PathBuf,
@@ -1866,6 +2056,30 @@ async fn serve(
 impl Coordinator {
     /// Starts the coordinator for an opened (and locked) workspace.
     pub fn start(workspace: Workspace, config: Config) -> Result<Self> {
+        Self::start_with(workspace, config, None)
+    }
+
+    /// [`Coordinator::start`] by the `meow` program itself, found at
+    /// `program`: on Unix it is started a second time as the session's
+    /// guard, which stops the scanners if this process is killed outright,
+    /// and the tools that run are written down in `records` for the next
+    /// start to stop if the guard is killed too (see [`crate::procs`]).
+    /// Without the guard everything else works, and a notice says what
+    /// does not.
+    pub fn start_guarded(
+        workspace: Workspace,
+        config: Config,
+        program: std::io::Result<PathBuf>,
+        records: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::start_with(workspace, config, Some((program, records)))
+    }
+
+    fn start_with(
+        workspace: Workspace,
+        config: Config,
+        guard: Option<(std::io::Result<PathBuf>, Option<PathBuf>)>,
+    ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("meow-coordinator")
@@ -1905,8 +2119,18 @@ impl Coordinator {
 
         let (revision, _) = watch::channel(0u64);
         let (recon_queue, recon_rx) = mpsc::unbounded_channel();
-        // Stages left "running" belong to a session that ended mid-run.
-        queue::mark_running_interrupted(&lock(&db))?;
+        // What the database holds of recons belongs to sessions that are
+        // over. One that was killed left its stages as they were: they are
+        // marked now as a session that ends in order marks them, before
+        // anything else reads the queue. None of them runs again.
+        let (left_recons, recon_floor) = {
+            let db = lock(&db);
+            queue::end_session(&db, queue::SessionEnd::Lost)?;
+            (queue::take_left(&db)?, queue::newest_id(&db)?)
+        };
+        // What its tool was writing goes too: no tool of this session runs
+        // yet.
+        queue::clear_tool_leftovers(&tmp_dir);
         let (tap, tap_rx) = mpsc::channel(TAP_QUEUE);
         // The location database for scanned servers (never falls back to CWD).
         let geo_dir = if config.location.database.trim().is_empty() {
@@ -1945,6 +2169,11 @@ impl Coordinator {
             ground_wake: tokio::sync::Notify::new(),
             ground_cut_noticed: AtomicBool::new(false),
             recon_queue,
+            recon_floor,
+            progress: Mutex::new(std::collections::HashMap::new()),
+            progress_wake: tokio::sync::Notify::new(),
+            progress_revision: watch::channel(0u64).0,
+            tools: Tracker::new(),
             cve,
             vault: Mutex::new(vault),
             ai: engine,
@@ -1963,6 +2192,25 @@ impl Coordinator {
             handle: runtime.handle().clone(),
         });
 
+        #[cfg(unix)]
+        if let Some((program, records)) = guard {
+            if let Err(error) = program.and_then(|program| state.tools.watch(&program)) {
+                state.notice(format!(
+                    "the scan guard did not start ({error}): {}",
+                    crate::procs::UNGUARDED
+                ));
+            }
+            // The second list, for a session killed with its guard. Where
+            // it cannot be kept, the guard is the only one.
+            if let Some(dir) = records {
+                let _ = state.tools.record_in(&dir);
+            }
+            runtime.spawn(guard_watch(Arc::clone(&state)));
+        }
+        // Windows needs neither: a Job Object closes with the process.
+        #[cfg(not(unix))]
+        drop(guard);
+
         let app = router(Arc::clone(&state));
         runtime.spawn(serve(
             listener,
@@ -1975,7 +2223,8 @@ impl Coordinator {
         runtime.spawn(git_guard(Arc::clone(&state)));
         let tap_task = runtime.spawn(tap_loop(Arc::clone(&state), tap_rx));
         runtime.spawn(grounding_loop(Arc::clone(&state)));
-        runtime.spawn(queue::worker(Arc::clone(&state), recon_rx));
+        runtime.spawn(progress_loop(Arc::clone(&state)));
+        let recon_task = runtime.spawn(queue::worker(Arc::clone(&state), recon_rx));
         let cleaned = std::mem::take(&mut state.graph().cleaned);
         if !cleaned.is_empty() {
             state.mark_dirty();
@@ -1993,10 +2242,19 @@ impl Coordinator {
             runtime: Some(runtime),
             tap: Some(Arc::new(tap)),
             tap_task: Some(tap_task),
+            recon_task: Some(recon_task),
+            left_recons,
             graph_path,
             tmp_dir,
             _runtime_file: runtime_file,
         })
+    }
+
+    /// The recons that the end of an earlier session cut short and that
+    /// were not yet said to the user (the newest of them, and how many
+    /// more). Each is here once: at the first start after that session.
+    pub fn left_recons(&self) -> (&[queue::TaskRow], usize) {
+        (&self.left_recons.0, self.left_recons.1)
     }
 
     pub fn state(&self) -> Shared {
@@ -2053,9 +2311,26 @@ impl Coordinator {
 
     fn stop(&mut self) -> Vec<&'static str> {
         let mut skipped = Vec::new();
+        // The scanners first, and by their process groups: nothing below
+        // has to go well for them to be gone, and no stage starts another.
+        let tool_ran = self.state.tools.running() > 0;
+        self.state.tools.close();
         let Some(runtime) = self.runtime.take() else {
             return skipped;
         };
+        // The stage whose tool was just killed puts the tool's unfinished
+        // file away: moments, and waited for no longer. It is marked
+        // stopped below, with the rest of the queue. The worker ends at
+        // the next task it is handed, which this is.
+        let _ = self.state.recon_queue.send(0);
+        if let Some(task) = self.recon_task.take().filter(|_| tool_ran) {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            runtime.spawn(async move {
+                let _ = task.await;
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(STOP_STEP / 2);
+        }
         // Let the tap finish the lines it already has: with the last sender
         // gone the task ends by itself. Waited for on a std channel, as the
         // runtime's own timers stop if both its workers are stuck.
@@ -2078,10 +2353,12 @@ impl Coordinator {
         if !self.state.save_on_exit(&self.graph_path, deadline) {
             skipped.push("saving graph.json");
         }
-        // A tool that was running has just been killed with the runtime.
-        // If the database is stuck, the next session does this as it starts.
+        // The recons end with the session: the stage whose tool was just
+        // killed is marked stopped and the stages after it are left out;
+        // finished stages keep their results. If the database is stuck,
+        // the next session does this as it starts.
         if let Some(db) = lock_until(&self.state.db, deadline) {
-            let _ = queue::mark_running_interrupted(&db);
+            let _ = queue::end_session(&db, queue::SessionEnd::Closed);
         }
         // Clean up any browser bootstrap file containing the session token.
         let _ = std::fs::remove_file(self.tmp_dir.join(webui::OPENER_FILE));
@@ -3347,6 +3624,678 @@ mod tests {
         assert!(took < STOP_STEP, "{took:?}");
         // Lines after that go nowhere, without an error.
         sink("80/tcp   open  http    nginx 1.18.0");
+    }
+
+    /// How far a running stage is goes out with the state, beside the
+    /// stage's times and the session's clock, and is never stored.
+    #[test]
+    fn a_running_stage_carries_its_progress_in_the_state() {
+        use queue::{Progress, Stage};
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        let id = {
+            let db = state.db_lock();
+            let id = queue::enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+            queue::set_stage(&db, id, Stage::Lan, "running", "").unwrap();
+            queue::set_stage(&db, id, Stage::Lan, "done", "3 neighbours").unwrap();
+            queue::set_stage(&db, id, Stage::Ports, "running", "").unwrap();
+            id
+        };
+        let stage = |name: &str| -> Value {
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot["tasks"][0]["id"], id);
+            let stages = snapshot["tasks"][0]["stages"].as_array().unwrap();
+            assert_eq!(stages.len(), queue::STAGES.len());
+            stages.iter().find(|s| s["stage"] == name).unwrap().clone()
+        };
+        let is_time = |value: &Value| {
+            value
+                .as_str()
+                .is_some_and(|text| crate::timeutil::parse_rfc3339(text).is_some())
+        };
+        // The session's clock, and each stage's times where it has them.
+        assert!(is_time(&state.snapshot()["now_utc"]));
+        let lan = stage("lan");
+        assert!(is_time(&lan["started_utc"]) && is_time(&lan["finished_utc"]));
+        assert_eq!(
+            stage("services"),
+            json!({ "stage": "services", "status": "pending", "detail": "" })
+        );
+        let ports = stage("ports");
+        assert!(is_time(&ports["started_utc"]), "{ports}");
+        let keys: Vec<&String> = ports.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["detail", "stage", "started_utc", "status"]);
+
+        // What a tool reports is bounded and cleaned before it is kept.
+        state.set_progress(
+            id,
+            Stage::Ports,
+            Progress {
+                percent: Some(250),
+                eta_s: Some(u64::MAX),
+                note: Some(format!("\u{1b}[31mSYN\u{7} scan {}", "A".repeat(500))),
+                ..Progress::default()
+            },
+        );
+        let progress = stage("ports")["progress"].clone();
+        assert_eq!(progress["percent"], 100);
+        assert_eq!(progress["eta_s"], 7 * 24 * 3600);
+        let note = progress["note"].as_str().unwrap();
+        assert!(note.starts_with("[31mSYN scan AAAA"), "{note}");
+        assert_eq!(note.len(), queue::PROGRESS_NOTE_MAX);
+        let keys: Vec<&String> = progress.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["eta_s", "note", "percent"]);
+        // Items, as meow's own probes count them.
+        state.set_progress(id, Stage::Ports, Progress::items(3, 9));
+        assert_eq!(stage("ports")["progress"], json!({ "done": 3, "total": 9 }));
+
+        // Only a running stage is on its way, whatever was said of another.
+        state.set_progress(id, Stage::Services, Progress::items(1, 2));
+        state.set_progress(id + 1, Stage::Ports, Progress::items(1, 2));
+        assert!(stage("services").get("progress").is_none());
+        assert!(stage("lan").get("progress").is_none());
+        // Nothing to say is nothing kept.
+        state.set_progress(id, Stage::Ports, Progress::default());
+        assert!(stage("ports").get("progress").is_none());
+        assert!(!lock(&state.progress).contains_key(&(id, Stage::Ports)));
+
+        // The stage ends: its progress is not shown, and is gone before
+        // the stage runs again.
+        state.set_progress(id, Stage::Ports, Progress::items(8, 9));
+        queue::set_stage(&state.db_lock(), id, Stage::Ports, "done", "3 open").unwrap();
+        let ports = stage("ports");
+        assert!(ports.get("progress").is_none(), "{ports}");
+        assert!(is_time(&ports["finished_utc"]));
+        state.clear_progress(id, Stage::Ports);
+        queue::set_stage(&state.db_lock(), id, Stage::Ports, "running", "").unwrap();
+        let ports = stage("ports");
+        assert!(ports.get("progress").is_none() && ports.get("finished_utc").is_none());
+        // The database never holds any of it.
+        let stored = queue::task(&state.db_lock(), id).unwrap().unwrap();
+        assert!(stored.stages.iter().all(|s| s.progress.is_none()));
+        fx.coordinator.shutdown();
+    }
+
+    /// A workspace whose database holds recons, as a killed session, a
+    /// stale copy or someone else's files would: a new session.
+    fn session_over(
+        tmp: &tempfile::TempDir,
+        mode: Mode,
+        plant: impl FnOnce(&crate::db::Db),
+    ) -> (SessionLock, Coordinator) {
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let (mut workspace, _) =
+            Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+        workspace.set_mode(mode).unwrap();
+        plant(&crate::db::Db::open(&workspace.state_db_path()).unwrap());
+        let lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        // Were a stage ever to start, it would say so and send nothing.
+        config.recon.skip = queue::STAGES
+            .iter()
+            .map(|stage| stage.as_str().to_owned())
+            .collect();
+        (lock, Coordinator::start(workspace, config).unwrap())
+    }
+
+    /// A queue that is in the database when a session starts never runs:
+    /// not by itself, and not when the mode is set. Its stages are marked
+    /// as the end of a session marks them, and the user is told once.
+    #[test]
+    fn a_session_never_runs_what_it_did_not_queue() {
+        use queue::Stage;
+        for mode in [Mode::Mild, Mode::Aggressive] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ids = (0, 0, 0);
+            let (held, coordinator) = session_over(&tmp, mode, |db| {
+                // Waiting whole; cut while a stage ran; stopped by light mode.
+                ids.0 = queue::enqueue(db, "192.0.2.5", mode, &[]).unwrap();
+                ids.1 = queue::enqueue(db, "192.0.2.6", mode, &[]).unwrap();
+                queue::set_stage(db, ids.1, Stage::Lan, "done", "3 neighbours").unwrap();
+                queue::set_stage(db, ids.1, Stage::Dns, "running", "").unwrap();
+                ids.2 = queue::enqueue(db, "192.0.2.7", mode, &[]).unwrap();
+                queue::set_stage(db, ids.2, Stage::Lan, "interrupted", queue::LIGHT_DETAIL)
+                    .unwrap();
+            });
+            let state = coordinator.state();
+            let rows = |id: i64| -> Vec<(String, String)> {
+                queue::task(&state.db_lock(), id)
+                    .unwrap()
+                    .unwrap()
+                    .stages
+                    .into_iter()
+                    .map(|stage| (stage.status, stage.detail))
+                    .collect()
+            };
+            let not_run = ("skipped".to_owned(), queue::NOT_RUN_ENDED.to_owned());
+            let found = [rows(ids.0), rows(ids.1), rows(ids.2)];
+            assert!(found[0].iter().all(|row| *row == not_run), "{found:?}");
+            assert_eq!(
+                found[1][..2],
+                [
+                    ("done".to_owned(), "3 neighbours".to_owned()),
+                    ("interrupted".to_owned(), queue::CLOSED_DETAIL.to_owned())
+                ]
+            );
+            assert!(found[1][2..].iter().all(|row| *row == not_run));
+            assert!(found[2].iter().all(|row| *row == not_run), "{found:?}");
+            for id in [ids.0, ids.1, ids.2] {
+                assert!(!state.owns_recon(id));
+            }
+
+            // Told once, as plain lines.
+            let (left, more) = coordinator.left_recons();
+            assert_eq!(
+                left.iter().map(|task| task.id).collect::<Vec<_>>(),
+                [ids.0, ids.1, ids.2]
+            );
+            assert_eq!(more, 0);
+            assert!(left[1].left_line(true).starts_with(
+                "recon 192.0.2.6 stopped at dns when the last session ended; 15 of 17"
+            ));
+
+            // Nothing runs, whatever the mode is set to, and not even a
+            // row that is put back to waiting behind the session's back.
+            state
+                .db_lock()
+                .conn()
+                .execute(
+                    "UPDATE task_stages SET status = 'pending', detail = '' WHERE task_id = ?1",
+                    [ids.0],
+                )
+                .unwrap();
+            for set in [Mode::Light, Mode::Mild, Mode::Aggressive, mode] {
+                let result = state.execute(Command::SetMode { mode: set }).unwrap();
+                assert_eq!(result["resumed"], 0, "{set}");
+            }
+            assert!(state.unfinished_recons().unwrap().is_empty());
+            state.recon_queue.send(ids.0).unwrap();
+            state.recon_queue.send(ids.1).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(rows(ids.0).iter().all(|row| row.0 == "pending"));
+            assert_eq!(rows(ids.1), found[1]);
+            assert_eq!(rows(ids.2), found[2]);
+            assert!(
+                !lock(&state.notices)
+                    .iter()
+                    .any(|notice| notice.text.contains("started")),
+                "{:?}",
+                lock(&state.notices)
+            );
+
+            // What this session queues is its own.
+            let own = state
+                .execute(Command::Recon {
+                    target: "192.0.2.9".to_owned(),
+                    flags: Vec::new(),
+                })
+                .unwrap();
+            assert_eq!(own["ahead"], 0, "nothing of before is ahead of it");
+            let own = own["task"].as_i64().unwrap();
+            assert!(state.owns_recon(own));
+            // (Every stage is turned off here: it is over in a moment.)
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while queue::task(&state.db_lock(), own)
+                .unwrap()
+                .unwrap()
+                .unfinished()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the session's own recon did not run"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            coordinator.shutdown();
+            drop(held);
+
+            // The next start says nothing of them again, and still runs none.
+            let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+            let (workspace, _) =
+                Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+            let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+            let mut config = Config::default();
+            config.cve.enabled = false;
+            let again = Coordinator::start(workspace, config).unwrap();
+            let (left, more) = again.left_recons();
+            assert!(
+                left.iter().all(|task| task.id == ids.0) && more == 0,
+                "only the row that was put back: {left:?}"
+            );
+            assert!(again.state().unfinished_recons().unwrap().is_empty());
+            again.shutdown();
+        }
+    }
+
+    /// A session that is closed ends its recons, and whoever watches is
+    /// not left with a stage that looks as if it will go on.
+    #[test]
+    fn closing_a_session_ends_its_recons_and_the_next_start_says_so_once() {
+        use queue::Stage;
+        let tmp = tempfile::tempdir().unwrap();
+        let (held, coordinator) = session_over(&tmp, Mode::Mild, |_| {});
+        assert_eq!(coordinator.left_recons(), (&[][..], 0));
+        let state = coordinator.state();
+        let id = {
+            let db = state.db_lock();
+            let id = queue::enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+            queue::set_stage(&db, id, Stage::Lan, "done", "3 neighbours").unwrap();
+            queue::set_stage(&db, id, Stage::Dns, "running", "").unwrap();
+            id
+        };
+        assert!(state.owns_recon(id));
+        coordinator.shutdown();
+        let stored = queue::task(&state.db_lock(), id).unwrap().unwrap();
+        let said: Vec<(&str, &str)> = stored
+            .stages
+            .iter()
+            .map(|stage| (stage.status.as_str(), stage.detail.as_str()))
+            .collect();
+        assert_eq!(
+            said[..3],
+            [
+                ("done", "3 neighbours"),
+                ("interrupted", "stopped: the session was closed"),
+                ("skipped", "not run: the session was closed")
+            ]
+        );
+        assert!(said[2..].iter().all(|row| *row == said[2]), "{said:?}");
+        drop(state);
+        drop(held);
+
+        let (held, second) = session_over(&tmp, Mode::Mild, |_| {});
+        let (left, more) = second.left_recons();
+        assert_eq!((left, more), (std::slice::from_ref(&stored), 0));
+        // Shown as it was left: done, stopped, the rest left out.
+        let shown = second.state().snapshot();
+        let statuses: Vec<&str> = shown["tasks"][0]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses[..3], ["done", "interrupted", "skipped"]);
+        assert!(!second.state().owns_recon(id));
+        second.shutdown();
+        drop(held);
+
+        let (_lock, third) = session_over(&tmp, Mode::Mild, |_| {});
+        assert_eq!(third.left_recons(), (&[][..], 0));
+        assert_eq!(
+            queue::task(&third.state().db_lock(), id).unwrap().unwrap(),
+            stored
+        );
+        third.shutdown();
+    }
+
+    /// The time left is the time left when the state is made, not when
+    /// the tool last said it.
+    #[test]
+    fn the_time_left_runs_out_between_two_reports() {
+        use queue::Progress;
+        let at = Instant::now();
+        let said = Reported {
+            progress: Progress {
+                percent: Some(40),
+                eta_s: Some(44),
+                note: Some("SYN Stealth Scan".to_owned()),
+                ..Progress::default()
+            },
+            at,
+        };
+        let later = |secs: u64| said.as_of(at + Duration::from_secs(secs));
+        assert_eq!(later(0), said.progress);
+        assert_eq!(later(4).eta_s, Some(40));
+        assert_eq!(later(43).eta_s, Some(1));
+        // Run out: no longer known, never below nothing. The rest stays.
+        let unknown = Progress {
+            eta_s: None,
+            ..said.progress.clone()
+        };
+        for secs in [44, 45, 3600] {
+            assert_eq!(later(secs), unknown, "{secs}");
+        }
+        // A reading from before it was said changes nothing.
+        if let Some(earlier) = at.checked_sub(Duration::from_secs(5)) {
+            assert_eq!(said.as_of(earlier), said.progress);
+        }
+        // Nothing to count down: as it was said.
+        let items = Reported {
+            progress: Progress::items(3, 9),
+            at,
+        };
+        assert_eq!(
+            items.as_of(at + Duration::from_secs(60)),
+            Progress::items(3, 9)
+        );
+    }
+
+    /// A change of progress is pushed at once, further ones about a second
+    /// later in one push, and none while nothing changes. Only the progress
+    /// is pushed: the state is not sent again for it.
+    #[test]
+    fn progress_is_pushed_when_it_changes_and_at_most_once_a_second() {
+        use queue::{Progress, Stage};
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        let revision = || *state.progress_revision.borrow();
+        let changed_within = |from: u64, limit: Duration| {
+            let deadline = Instant::now() + limit;
+            while revision() == from && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            revision() != from
+        };
+        // What starting the session itself pushes is over.
+        let state_revision = || *state.revision.borrow();
+        let mut whole = state_revision();
+        loop {
+            std::thread::sleep(Duration::from_millis(400));
+            if state_revision() == whole {
+                break;
+            }
+            whole = state_revision();
+        }
+        let quiet = revision();
+        assert_eq!(quiet, 0, "nothing has said how far it is");
+
+        state.set_progress(1, Stage::Ports, Progress::items(1, 50));
+        assert!(changed_within(quiet, Duration::from_secs(5)), "not pushed");
+        let pushed = Instant::now();
+        let first = revision();
+        assert_eq!(first, quiet + 1);
+        for done in 2..=20 {
+            state.set_progress(1, Stage::Ports, Progress::items(done, 50));
+        }
+        if pushed.elapsed() < PROGRESS_EVERY / 2 {
+            assert_eq!(revision(), first, "pushed again at once");
+        }
+        assert!(changed_within(first, Duration::from_secs(5)), "not pushed");
+        assert!(
+            pushed.elapsed() >= PROGRESS_EVERY * 4 / 5,
+            "{:?}",
+            pushed.elapsed()
+        );
+        assert_eq!(revision(), first + 1, "one push for all of them");
+
+        // The same again is no change: nothing is pushed.
+        state.set_progress(1, Stage::Ports, Progress::items(20, 50));
+        assert!(!changed_within(
+            first + 1,
+            PROGRESS_EVERY + Duration::from_millis(300)
+        ));
+        assert_eq!(state_revision(), whole, "the state was not sent again");
+        assert_eq!(
+            state.progress_snapshot()["running"],
+            json!([{ "task": 1, "stage": "ports", "progress": { "done": 20, "total": 50 } }])
+        );
+        fx.coordinator.shutdown();
+    }
+
+    /// What a client is sent while a stage counts its results: a small
+    /// message with the progress alone, never the whole state.
+    #[test]
+    fn a_progress_tick_is_a_small_message_and_not_the_state() {
+        use queue::{Progress, Stage};
+        let fx = fixture();
+        let info = fx.coordinator.info();
+        let state = fx.coordinator.state();
+        let id = {
+            let db = state.db_lock();
+            let id = queue::enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+            queue::set_stage(&db, id, Stage::Ports, "running", "").unwrap();
+            id
+        };
+        block_on(async {
+            let url = format!("ws://127.0.0.1:{}/ws?token={}", info.port, info.token);
+            let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let mut next = async |limit: Duration| -> Option<(Value, usize)> {
+                loop {
+                    let message = tokio::time::timeout(limit, socket.next()).await.ok()?;
+                    if let WsMessage::Text(text) = message.unwrap().unwrap() {
+                        return Some((serde_json::from_str(&text).unwrap(), text.len()));
+                    }
+                }
+            };
+            let patient = Duration::from_secs(10);
+            let (first, whole) = next(patient).await.unwrap();
+            assert_eq!(first["type"], "state");
+            // Whatever starting the session still pushes is over.
+            while next(Duration::from_millis(900)).await.is_some() {}
+
+            let said = Progress {
+                percent: Some(42),
+                eta_s: Some(90),
+                note: Some("SYN Stealth Scan".to_owned()),
+                ..Progress::default()
+            };
+            state.set_progress(id, Stage::Ports, said);
+            let (tick, size) = next(patient).await.unwrap();
+            assert_eq!(tick["type"], "progress");
+            assert_eq!(tick["key"], json!(state.page_key));
+            let now = tick["now_utc"].as_str().unwrap_or_default();
+            assert!(crate::timeutil::parse_rfc3339(now).is_some(), "{tick}");
+            let running = tick["running"].as_array().unwrap();
+            assert_eq!(running.len(), 1, "{tick}");
+            assert_eq!(
+                (&running[0]["task"], &running[0]["stage"]),
+                (&json!(id), &json!("ports"))
+            );
+            assert_eq!(running[0]["progress"]["percent"], 42);
+            assert_eq!(running[0]["progress"]["note"], "SYN Stealth Scan");
+            assert!(running[0]["progress"]["eta_s"].as_u64().unwrap() <= 90);
+            assert!(tick.get("state").is_none() && tick.get("graph").is_none());
+            assert!(size < 400 && size < whole, "{size} of {whole} bytes");
+
+            // More of it: progress messages only, at most one a second.
+            for done in 43..=60 {
+                let more = Progress {
+                    percent: Some(done),
+                    ..Progress::default()
+                };
+                state.set_progress(id, Stage::Ports, more);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let mut ticks = 0;
+            while let Some((message, _)) = next(Duration::from_millis(1500)).await {
+                assert_eq!(message["type"], "progress", "{message}");
+                ticks += 1;
+            }
+            assert!((1..=3).contains(&ticks), "{ticks} messages in 1.8 s");
+
+            // The stage ends: that is a change of the state, which no
+            // longer says how far the stage was; neither does a tick.
+            queue::set_stage(&state.db_lock(), id, Stage::Ports, "done", "2 open ports").unwrap();
+            state.clear_progress(id, Stage::Ports);
+            state.touch();
+            let (ended, _) = next(patient).await.unwrap();
+            assert_eq!(ended["type"], "state");
+            let ports = &ended["state"]["tasks"][0]["stages"][6];
+            assert_eq!(
+                (&ports["stage"], &ports["status"]),
+                (&json!("ports"), &json!("done"))
+            );
+            assert!(ports.get("progress").is_none());
+            assert_eq!(state.progress_snapshot()["running"], json!([]));
+        });
+        fx.coordinator.shutdown();
+    }
+
+    /// The state carries every recon of this session that has work to do,
+    /// however many were queued after it: they run oldest first, so the
+    /// newest alone would leave out the one that is running.
+    #[test]
+    fn the_state_carries_every_unfinished_recon_and_the_newest_of_the_rest() {
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        let ids: Vec<i64> = {
+            let db = state.db_lock();
+            (0..SHOWN_TASKS + 6)
+                .map(|n| queue::enqueue(&db, &format!("192.0.2.{n}"), Mode::Mild, &[]).unwrap())
+                .collect()
+        };
+        let shown = |state: &State| -> Vec<i64> {
+            state.snapshot()["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect()
+        };
+        let newest_first = |ids: &[i64]| ids.iter().rev().copied().collect::<Vec<_>>();
+        // All of them wait: all of them are there, the first one too.
+        assert_eq!(shown(&state), newest_first(&ids));
+        {
+            let db = state.db_lock();
+            queue::set_stage(&db, ids[0], queue::Stage::Lan, "running", "").unwrap();
+        }
+        let first = state.snapshot()["tasks"][ids.len() - 1].clone();
+        assert_eq!(
+            (&first["id"], &first["stages"][0]["status"]),
+            (&json!(ids[0]), &json!("running"))
+        );
+        // Finished ones fill what room is left, the newest of them.
+        let finish = |id: i64| {
+            let db = state.db_lock();
+            for stage in queue::STAGES {
+                queue::set_stage(&db, id, stage, "done", "").unwrap();
+            }
+        };
+        let (done, waiting) = ids.split_at(ids.len() - 4);
+        for id in done.iter().skip(1) {
+            finish(*id);
+        }
+        let mut expected = newest_first(waiting);
+        expected.extend(newest_first(done).into_iter().take(SHOWN_TASKS - 5));
+        expected.push(ids[0]);
+        assert_eq!(shown(&state), expected);
+        // With nothing left to do: the newest.
+        finish(ids[0]);
+        for id in waiting {
+            finish(*id);
+        }
+        assert_eq!(shown(&state), newest_first(&ids)[..SHOWN_TASKS]);
+        fx.coordinator.shutdown();
+    }
+
+    /// Leaving ends the scanners before anything else: the whole tree of
+    /// a running tool is gone, its stage is marked stopped, what was
+    /// finished stays as it is and what had not started is left out.
+    #[cfg(unix)]
+    #[test]
+    fn leaving_kills_what_recon_started_and_keeps_what_is_done() {
+        use crate::procs::tests::{started, tool, wait_gone};
+        use queue::Stage;
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        let id = {
+            let db = state.db_lock();
+            let id = queue::enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+            queue::set_stage(&db, id, Stage::Lan, "done", "3 neighbours").unwrap();
+            queue::set_stage(&db, id, Stage::Dns, "failed", "no answer").unwrap();
+            queue::set_stage(&db, id, Stage::Ports, "running", "").unwrap();
+            id
+        };
+        state.set_progress(id, Stage::Ports, queue::Progress::items(1, 2));
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let (mut child, group) = state
+            .tools()
+            .spawn_std(&mut tool(dir.path(), &pids))
+            .unwrap();
+        let ids = started(&pids);
+        assert!(!state.is_closing());
+
+        let (skipped, took) =
+            shutdown_within(fx.coordinator, STOP_LIMIT).expect("leaving the session took too long");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(took < STOP_STEP, "{took:?}");
+        assert!(state.is_closing());
+        let _ = child.wait();
+        for pid in ids {
+            wait_gone(pid);
+        }
+        drop(group);
+        // Nothing new starts in a session that is over.
+        assert!(state
+            .tools()
+            .spawn_std(&mut tool(dir.path(), &pids))
+            .is_err());
+
+        let task = queue::task(&state.db_lock(), id).unwrap().unwrap();
+        let of = |stage: Stage| task.stages.iter().find(|s| s.stage == stage).unwrap();
+        assert_eq!(
+            (
+                of(Stage::Lan).status.as_str(),
+                of(Stage::Lan).detail.as_str()
+            ),
+            ("done", "3 neighbours")
+        );
+        assert_eq!(of(Stage::Dns).status, "failed");
+        let ports = of(Stage::Ports);
+        assert_eq!(
+            (ports.status.as_str(), ports.detail.as_str()),
+            ("interrupted", "stopped: the session was closed")
+        );
+        assert!(ports.started_utc.is_some() && ports.finished_utc.is_some());
+        // What had not started is left out: nothing waits for a later
+        // session.
+        for waiting in [Stage::Asn, Stage::Services, Stage::Dirs] {
+            let stage = of(waiting);
+            assert_eq!(
+                (stage.status.as_str(), stage.detail.as_str()),
+                ("skipped", "not run: the session was closed")
+            );
+        }
+        assert!(!task.unfinished());
+        // Shown without the progress it had.
+        let shown = state.snapshot();
+        assert!(shown["tasks"][0]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stage| stage.get("progress").is_none()));
+    }
+
+    /// The guard is an extra: a session that cannot start it runs all the
+    /// same, and says once what that means.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_without_its_guard_runs_and_says_so_once() {
+        for program in [
+            Ok(PathBuf::from("/nonexistent/meow")),
+            Err(std::io::Error::other("no path to this program")),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+            let (workspace, _) =
+                Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
+            let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+            let mut config = Config::default();
+            config.cve.enabled = false;
+            let coordinator = Coordinator::start_guarded(workspace, config, program, None).unwrap();
+            let state = coordinator.state();
+            assert_eq!(state.tools().guard_pid(), None);
+            state.notice_tool_fault();
+            let said: Vec<String> = lock(&state.notices)
+                .iter()
+                .filter(|notice| notice.text.contains("guard"))
+                .map(|notice| notice.text.clone())
+                .collect();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with("the scan guard did not start (")
+                    && said[0].ends_with("would keep running if meow itself were killed"),
+                "{said:?}"
+            );
+            // Its tools still start, and still end with it.
+            let mut sleep = std::process::Command::new("sleep");
+            sleep.arg("300");
+            let (mut child, _group) = state.tools().spawn_std(&mut sleep).unwrap();
+            assert!(coordinator.shutdown().is_empty());
+            assert!(!child.wait().unwrap().success());
+        }
     }
 
     /// A stand-in for a local OpenAI-compatible server, on its own thread.

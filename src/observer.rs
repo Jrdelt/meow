@@ -1776,8 +1776,20 @@ fn run_from_with_timeout(
     }
     let command = format!("{program} {}", args.join(" "));
     let command = command.trim();
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    // For a session, as one of its programs: none is left running when the
+    // session ends, however it ends.
+    let tools = TOOLS.with(|session| session.borrow().clone());
+    let spawned = match &tools {
+        Some(tools) => tools
+            .spawn_std(&mut cmd)
+            .map(|(child, group)| (child, Some(group))),
+        None => cmd.spawn().map(|child| (child, None)),
+    };
+    let (mut child, _group) = match spawned {
+        Ok(started) => started,
+        // The session is closing: nothing is read any more, and nobody is
+        // left to tell.
+        Err(_) if tools.is_some_and(|tools| tools.is_closed()) => return String::new(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             push_note(
                 notes,
@@ -2010,6 +2022,26 @@ fn macos_hardware_ports_cached(notes: &mut Vec<String>) -> String {
         let _ = PORTS.set(output.clone());
     }
     output
+}
+
+thread_local! {
+    /// The session this thread reads the tables for, while it does.
+    static TOOLS: std::cell::RefCell<Option<crate::procs::Tracker>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`observe`] for a running session: the system tools it asks are started
+/// as the session's own (`tools`), so they end with it.
+pub fn observe_with(tools: &crate::procs::Tracker, targets: &[IpAddr]) -> LocalNet {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            TOOLS.with(|session| session.borrow_mut().take());
+        }
+    }
+    TOOLS.with(|session| *session.borrow_mut() = Some(tools.clone()));
+    let _leave = Leave;
+    observe(targets)
 }
 
 /// Reads the local tables once. `targets` are the known lab hosts, used for

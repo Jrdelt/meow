@@ -68,7 +68,10 @@ pub fn parse_openssl_cert_output(text: &str) -> TlsAuditResult {
 }
 
 /// Inspects the peer TLS certificate and protocol versions on `(address, port)`.
+/// The `openssl` it runs is one of the session's `tools`: it ends with the
+/// session.
 pub async fn run_tls_audit(
+    tools: &Tracker,
     address: &str,
     hostname: Option<&str>,
     port: u16,
@@ -105,10 +108,10 @@ pub async fn run_tls_audit(
         s_client.args(["s_client", "-connect", &connect_target, "-servername", sni]);
         configure_osint_command(&mut s_client);
 
-        if let Ok(child) = s_client.spawn() {
+        if let Ok((child, group)) = tools.spawn(&mut s_client) {
             openssl_available = true;
             if let Some(stdout) =
-                wait_bounded_stdout(child, 128 * 1024, Duration::from_secs(6)).await
+                wait_bounded_stdout(child, group, 128 * 1024, Duration::from_secs(6)).await
             {
                 result = parse_openssl_cert_output(&stdout);
 
@@ -131,13 +134,17 @@ pub async fn run_tls_audit(
                             ]);
                             configure_osint_command(&mut x509);
                             x509.stdin(Stdio::piped());
-                            if let Ok(mut xchild) = x509.spawn() {
+                            if let Ok((mut xchild, xgroup)) = tools.spawn(&mut x509) {
                                 if let Some(mut stdin) = xchild.stdin.take() {
                                     let _ = stdin.write_all(pem_block.as_bytes()).await;
                                 }
-                                if let Some(xtext) =
-                                    wait_bounded_stdout(xchild, 32 * 1024, Duration::from_secs(3))
-                                        .await
+                                if let Some(xtext) = wait_bounded_stdout(
+                                    xchild,
+                                    xgroup,
+                                    32 * 1024,
+                                    Duration::from_secs(3),
+                                )
+                                .await
                                 {
                                     let parsed_x509 = parse_openssl_cert_output(&xtext);
                                     if parsed_x509.subject.is_some() {
@@ -185,9 +192,9 @@ pub async fn run_tls_audit(
                     flag,
                 ]);
                 configure_osint_command(&mut probe);
-                if let Ok(child) = probe.spawn() {
+                if let Ok((child, group)) = tools.spawn(&mut probe) {
                     if let Some(text) =
-                        wait_bounded_stdout(child, 64 * 1024, Duration::from_secs(4)).await
+                        wait_bounded_stdout(child, group, 64 * 1024, Duration::from_secs(4)).await
                     {
                         if (text.contains("BEGIN CERTIFICATE")
                             || (text.contains("Cipher is ") && !text.contains("Cipher is (NONE)")))

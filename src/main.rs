@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use meow::cli::{Cli, Command};
-use meow::coordinator::{self, Command as Request, Coordinator};
+use meow::coordinator::{Command as Request, Coordinator};
 use meow::cve::{self, CveClient, CveSettings};
 use meow::db::Db;
 use meow::graph::Graph;
@@ -22,7 +22,6 @@ use meow::mode::Mode;
 use meow::observer;
 use meow::parsers;
 use meow::pty::{self, LineSink, SessionSpec};
-use meow::queue;
 use meow::report;
 use meow::setup;
 use meow::shims;
@@ -78,6 +77,10 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     harden_windows_dll_search_path();
     let cli = Cli::parse();
+    // Before anything is read or made: the guard only watches its pipe.
+    if matches!(cli.command, Some(Command::Guard)) {
+        return ExitCode::from(meow::procs::guard_main());
+    }
     match run(cli) {
         Ok(code) => code,
         Err(error) => {
@@ -85,7 +88,8 @@ fn main() -> ExitCode {
             // of an error is printed as text: no control characters, no
             // characters that hide or reorder what follows.
             let said = sanitize_terminal_block(&format!("{error:#}"), 4000);
-            eprintln!("[!] {said}");
+            // Not `eprintln!`: with the terminal gone that would panic.
+            let _ = writeln!(std::io::stderr().lock(), "[!] {said}");
             ExitCode::from(1)
         }
     }
@@ -94,6 +98,7 @@ fn main() -> ExitCode {
 /// `meow list` and a bare `meow`: every session, wherever it is saved, and
 /// which of them have a session open right now.
 fn print_listing(home: &MeowHome, cwd: &Path, env: &SessionEnv) -> Result<ExitCode> {
+    say_swept(&home.root().join(meow::procs::RUN_DIR));
     let mut workspaces = list_workspaces(home, cwd)?;
     for workspace in &mut workspaces {
         workspace.state = if workspace.state == SessionState::NotYours {
@@ -286,7 +291,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         | Command::Delete { .. }
         | Command::Setup { .. }
         | Command::Update { .. }
-        | Command::Tools { .. } => {
+        | Command::Tools { .. }
+        | Command::Guard => {
             unreachable!(
                 "`list`, `delete`, `setup`, `tools` and `update` are not session helpers and returned above"
             )
@@ -629,7 +635,8 @@ fn start_session(
         LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
     })?;
     // Files a pull or an unpacked archive replaced are not the user's: no
-    // planted history or start folder, and no scan resumes without a yes.
+    // planted history or start folder. (A scan queued in them never runs:
+    // no session runs what it did not queue itself.)
     let files_changed = !created && !foreign && workspace.files_changed(home);
     if files_changed {
         println!(
@@ -692,7 +699,16 @@ fn start_session(
 
     // The coordinator owns the graph, the database and the loopback server
     // for as long as the shell runs.
-    let coordinator = Coordinator::start(workspace.clone(), config)?;
+    let records = home.root().join(meow::procs::RUN_DIR);
+    // Before this session runs or clears anything: what a session that was
+    // killed with its guard left running is stopped.
+    say_swept(&records);
+    let coordinator = Coordinator::start_guarded(
+        workspace.clone(),
+        config,
+        std::env::current_exe(),
+        Some(records),
+    )?;
     let state = coordinator.state();
     println!(
         "[+] Coordinator on 127.0.0.1:{} (`meow map`, `meow hud`)",
@@ -726,7 +742,7 @@ fn start_session(
         );
     }
 
-    offer_resume(&state, doubtful)?;
+    say_left_recons(&coordinator, !doubtful);
 
     let sink = tee_sink(coordinator.tap_sink(), debug_tap_log()?);
     files.started();
@@ -735,16 +751,29 @@ fn start_session(
     // The database closes with its last handle; then the files are recorded.
     drop(state);
     drop(files);
+    // The window may be gone by now (it was closed): then nobody is told,
+    // and that is no error.
     if !skipped.is_empty() {
-        println!("[!] Skipped on exit (stuck): {}", skipped.join(", "));
+        say_if_possible(&format!(
+            "[!] Skipped on exit (stuck): {}",
+            skipped.join(", ")
+        ));
     }
     let outcome = outcome?;
 
-    println!(
+    say_if_possible(&format!(
         "[+] Session '{}' closed",
         sanitize_terminal_line(&workspace.name, 64)
-    );
+    ));
     Ok(ExitCode::from(u8::try_from(outcome.exit_code).unwrap_or(1)))
+}
+
+/// Prints a line where there may be no terminal left to print on: unlike
+/// `println!`, a failed write is not a panic.
+fn say_if_possible(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// Looks up CVEs for every host with versioned software and adds them to
@@ -849,9 +878,7 @@ fn accept_foreign_workspace(
             );
         }
     }
-    println!(
-        "    Queued scans would run against targets its author chose once you leave light mode."
-    );
+    println!("    Scans queued in it are dropped: none of them runs.");
     // Only a command that leads back to this folder: `meow delete <name>`
     // finds the user's own session of that name first.
     let (remove, removes) =
@@ -883,63 +910,32 @@ fn accept_foreign_workspace(
     workspace.adopt(home, default_mode)
 }
 
-/// Background tasks left unfinished by an earlier session: ask whether to
-/// resume them. Without a terminal nothing is started unattended. When the
-/// tasks may not be the user's own (`doubtful`: a session that came with a
-/// folder, or files changed outside meow), only an explicit yes resumes
-/// them, and without a terminal they are declined.
-fn offer_resume(state: &coordinator::State, doubtful: bool) -> Result<()> {
-    let unfinished = queue::unfinished(&state.db_lock())?;
-    if unfinished.is_empty() {
-        return Ok(());
-    }
-    println!("[!] {} unfinished background task(s):", unfinished.len());
-    for task in &unfinished {
-        println!("      {}", sanitize_terminal_line(&task.describe(), 200));
-    }
-    let decline = |why: &str| -> Result<()> {
-        for task in &unfinished {
-            queue::decline(&state.db_lock(), task.id)?;
-        }
-        println!("[+] Not resumed{why}; the remaining stages are marked skipped");
-        Ok(())
+/// Stops the scans a session left running when it and its guard were
+/// killed together, and says so in one line.
+fn say_swept(records: &Path) {
+    let stopped = meow::procs::sweep(records);
+    let what = match stopped.len() {
+        0 => return,
+        1 => "a scan".to_owned(),
+        n => format!("{n} scans"),
     };
-    if !std::io::stdin().is_terminal() {
-        if doubtful {
-            return decline(" (no terminal to ask on)");
-        }
-        println!(
-            "[!] Not resumed (no terminal to ask on); they continue when the mode \
-             is set to mild or aggressive"
-        );
-        return Ok(());
+    println!(
+        "[!] Stopped {what} left running by a session that was killed ({})",
+        sanitize_terminal_line(&stopped.join(", "), 200)
+    );
+}
+
+/// Says once what the end of the last session did to its recons: the
+/// running stage was stopped and the rest left out. Nothing of them runs
+/// again by itself. `own`: the session's files are the user's own.
+fn say_left_recons(coordinator: &Coordinator, own: bool) {
+    let (left, more) = coordinator.left_recons();
+    for task in left {
+        println!("[!] {}", sanitize_terminal_line(&task.left_line(own), 300));
     }
-    print!("[?] Resume? {} ", if doubtful { "[y/N]" } else { "[Y/n]" });
-    std::io::stdout().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .context("cannot read the answer")?;
-    let answer = answer.trim().to_ascii_lowercase();
-    let resume = if doubtful {
-        answer.starts_with('y')
-    } else {
-        !answer.starts_with('n')
-    };
-    if !resume {
-        decline("")?;
-    } else {
-        state.resume_unfinished()?;
-        if state.mode() == Mode::Light {
-            println!(
-                "[!] Light mode sends no packets: the tasks stay paused until \
-                 `meow mode mild` (or aggressive)"
-            );
-        } else {
-            println!("[+] Resumed in the background");
-        }
+    if more > 0 {
+        println!("[!] {more} more recon(s) were not finished either");
     }
-    Ok(())
 }
 
 /// Sends every tap line to both sinks.

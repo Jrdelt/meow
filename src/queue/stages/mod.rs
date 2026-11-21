@@ -53,10 +53,41 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Whether the mode is still the one the stage started in: asked
-    /// before every tool and while one runs.
+    /// Whether the stage may go on: the session is open and the mode is
+    /// still the one the stage started in. Asked before every tool and
+    /// while one runs.
     pub fn same_mode(&self) -> bool {
-        running_mode(self.state, self.task) == self.mode
+        !self.state.is_closing() && running_mode(self.state, self.task) == self.mode
+    }
+
+    /// Runs one of the stage's tools until it ends, the mode changes or the
+    /// session closes. What its output file says about how far it is goes
+    /// through `shape`, where the stage adds what it knows itself.
+    pub async fn run_tool(
+        &self,
+        command: &ToolCommand,
+        output: OutputKind,
+        shape: impl Fn(Progress) -> Progress,
+    ) -> RunOutcome {
+        run_tool_watched(
+            command,
+            self.limits,
+            self.state.tools(),
+            || self.same_mode(),
+            output,
+            |progress| self.report(shape(progress)),
+        )
+        .await
+    }
+
+    /// Says how far the stage is, for the map and the HUD.
+    pub fn report(&self, progress: Progress) {
+        self.state.set_progress(self.task.id, self.stage, progress);
+    }
+
+    /// Says that `done` of the stage's `total` items are handled.
+    pub fn progress(&self, done: usize, total: usize) {
+        self.report(Progress::items(done, total));
     }
 
     /// A file for this stage's tool output in the workspace's `tmp/`.

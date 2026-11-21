@@ -1,11 +1,20 @@
 //! Running one tool: in its own process group, with `stdin` closed, under a
-//! wall-clock limit and an output cap, and stopped when the mode changes.
+//! wall-clock limit and an output cap, and stopped when the mode changes or
+//! the session closes.
 
+use super::progress::OutputWatch;
 use super::*;
+use crate::procs::Tracker;
+
+pub use super::progress::OutputKind;
 
 // ---------------------------------------------------------------------------
 // Running one tool
 // ---------------------------------------------------------------------------
+
+/// How the private folder a tool runs in is named, in the workspace's
+/// `tmp/`.
+pub(super) const RUN_DIR_PREFIX: &str = "run-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunLimits {
@@ -21,92 +30,9 @@ pub enum RunOutcome {
     OutputCapExceeded,
     NotInstalled,
     Failed(String),
-    /// Stopped by meow because it may no longer run (the mode changed).
+    /// Stopped by meow because it may no longer run (the mode changed or
+    /// the session closed).
     Stopped,
-}
-
-/// Kills the whole process group when dropped, so a cancelled stage or a
-/// closing session never leaves scanners running.
-#[cfg(unix)]
-struct GroupGuard(Option<u32>);
-
-#[cfg(unix)]
-impl GroupGuard {
-    fn kill_all(&self) {
-        if let Some(pid) = self.0 {
-            // SAFETY: plain syscall; the child was started as the leader of
-            // its own process group, so this cannot signal our own group.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        self.kill_all();
-    }
-}
-
-/// A Job Object with kill-on-close: closing the handle ends every process
-/// the tool started.
-#[cfg(windows)]
-struct GroupGuard(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-// SAFETY: a job handle may be used and closed from any thread.
-unsafe impl Send for GroupGuard {}
-
-#[cfg(windows)]
-impl GroupGuard {
-    fn attach(process: std::os::windows::io::RawHandle) -> Option<Self> {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        // SAFETY: all pointers are valid for the duration of each call and
-        // the structure is plain data that may be zero-initialised.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return None;
-            }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&info).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) != 0;
-            if !configured || AssignProcessToJobObject(job, process as _) == 0 {
-                CloseHandle(job);
-                return None;
-            }
-            Some(Self(job))
-        }
-    }
-
-    fn kill_all(&self) {
-        // SAFETY: self.0 is a valid Job Object handle owned by this guard.
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        // SAFETY: the handle is owned by this guard and closed exactly once.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
 }
 
 /// Environment variables that hold credentials or dangerous dynamic-linker /
@@ -155,6 +81,21 @@ pub async fn run_tool_while(
     limits: RunLimits,
     may_run: impl Fn() -> bool,
 ) -> RunOutcome {
+    let alone = Tracker::new();
+    run_tool_watched(command, limits, &alone, may_run, OutputKind::Other, |_| {}).await
+}
+
+/// [`run_tool_while`] for a session: the tool is one of `tools`, so it ends
+/// with the session however that ends, and `report` is told how far the
+/// tool is whenever its output file says something new.
+pub async fn run_tool_watched(
+    command: &ToolCommand,
+    limits: RunLimits,
+    tools: &Tracker,
+    may_run: impl Fn() -> bool,
+    output: OutputKind,
+    report: impl Fn(Progress),
+) -> RunOutcome {
     if !may_run() {
         return RunOutcome::Stopped;
     }
@@ -174,7 +115,7 @@ pub async fn run_tool_while(
     }
     let scratch = command.output.parent().and_then(|dir| {
         let mut builder = tempfile::Builder::new();
-        builder.prefix("run-");
+        builder.prefix(RUN_DIR_PREFIX);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -219,11 +160,12 @@ pub async fn run_tool_while(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    process.process_group(0);
 
-    let mut child = match process.spawn() {
-        Ok(child) => child,
+    // In a group of its own, which is killed whole when `group` is dropped
+    // (a cancelled stage) or the session closes.
+    let (mut child, group) = match tools.spawn(&mut process) {
+        Ok(started) => started,
+        Err(_) if tools.is_closed() => return RunOutcome::Stopped,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return RunOutcome::NotInstalled
         }
@@ -231,14 +173,17 @@ pub async fn run_tool_while(
             return RunOutcome::Failed(format!("cannot start {}: {error}", command.program))
         }
     };
-    #[cfg(unix)]
-    let _group = GroupGuard(child.id());
-    #[cfg(windows)]
-    let _group = child.raw_handle().and_then(GroupGuard::attach);
 
     let deadline = tokio::time::sleep(limits.timeout);
     tokio::pin!(deadline);
     let mut poll = tokio::time::interval(CAP_POLL);
+    let mut watch = OutputWatch::new(output);
+    let size_now = || async {
+        tokio::fs::metadata(&command.output)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
     let outcome = loop {
         tokio::select! {
             status = child.wait() => break match status {
@@ -250,21 +195,29 @@ pub async fn run_tool_while(
                 if !may_run() {
                     break RunOutcome::Stopped;
                 }
-                let size = tokio::fs::metadata(&command.output).await.map(|m| m.len()).unwrap_or(0);
+                let size = size_now().await;
                 if size > limits.cap_bytes {
                     break RunOutcome::OutputCapExceeded;
+                }
+                if let Some(progress) = watch.look(&command.output, size) {
+                    report(progress);
                 }
             }
         }
     };
+    // A session that closed killed the tool: how it ended says nothing.
+    let outcome = if tools.is_closed() {
+        RunOutcome::Stopped
+    } else {
+        outcome
+    };
     if !matches!(outcome, RunOutcome::Exited(_)) {
-        #[cfg(unix)]
-        _group.kill_all();
-        #[cfg(windows)]
-        if let Some(group) = &_group {
-            group.kill_all();
-        }
+        group.kill();
         let _ = child.kill().await;
+    }
+    // What the tool wrote between the last look and its end.
+    if let Some(progress) = watch.look(&command.output, size_now().await) {
+        report(progress);
     }
     outcome
 }

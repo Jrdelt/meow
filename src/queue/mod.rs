@@ -6,8 +6,9 @@
 //! a time. External tools (`nmap`, `katana`, `feroxbuster`, `traceroute`,
 //! `openssl`) run with `stdin` closed, under a wall-clock timeout and an output
 //! size cap, and write structured files to `<workspace>/tmp/` that are parsed
-//! and then deleted. Stage status is kept in `state.db` so an interrupted task
-//! can be resumed when the session is reopened.
+//! and then deleted. Stage status is kept in `state.db`. A recon belongs to
+//! the session that queued it: when that session ends, the running stage is
+//! stopped, the stages after it are left out, and nothing of it runs later.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -329,6 +330,7 @@ fn install_hint(program: &str) -> String {
 }
 
 mod commands;
+mod progress;
 mod runner;
 mod stages;
 
@@ -339,12 +341,132 @@ pub use runner::*;
 // Persistence
 // ---------------------------------------------------------------------------
 
+/// How far a running stage is, as far as it can tell. Kept in memory only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Progress {
+    /// 0 to 100, when the tool itself reports one (nmap, for the scan
+    /// named in `note`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    /// Items handled so far (endpoints, hosts, results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<u64>,
+    /// Items in all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// Seconds the tool expects to need still.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_s: Option<u64>,
+    /// A few plain words, such as `SYN Stealth Scan` or `412 results so far`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The longest note a stage's progress carries.
+pub const PROGRESS_NOTE_MAX: usize = 80;
+/// The longest time left that is believed: a week.
+const MAX_ETA_SECS: u64 = 7 * 24 * 3600;
+
+impl Progress {
+    /// `done` of `total` items.
+    pub fn items(done: usize, total: usize) -> Self {
+        Self {
+            done: Some(done as u64),
+            total: Some(total as u64),
+            ..Self::default()
+        }
+    }
+
+    /// Within bounds and as plain text, whoever made it: part of it comes
+    /// from a tool's output file.
+    pub fn checked(mut self) -> Self {
+        self.percent = self.percent.map(|percent| percent.min(100));
+        self.eta_s = self.eta_s.map(|secs| secs.min(MAX_ETA_SECS));
+        self.note = self
+            .note
+            .map(|note| crate::evidence::sanitize(&note, PROGRESS_NOTE_MAX))
+            .filter(|note| !note.is_empty());
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageRow {
     pub stage: Stage,
     /// `pending`, `running`, `interrupted`, `done`, `skipped` or `failed`.
     pub status: String,
     pub detail: String,
+    /// When the stage last started and ended (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_utc: Option<String>,
+    /// Only while the stage runs in a live session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
+}
+
+/// A stage's status in the words shown to the user.
+pub fn status_word(status: &str) -> &str {
+    match status {
+        "pending" => "waiting",
+        "interrupted" => "stopped",
+        other => other,
+    }
+}
+
+/// What a stage says once the session it ran in is gone. It is not run
+/// again.
+pub const CLOSED_DETAIL: &str = "stopped: the session was closed";
+/// ... and of one that light mode stopped: it goes on in mild or aggressive,
+/// in the same session.
+pub const LIGHT_DETAIL: &str = "stopped: the session is in light mode";
+/// What meow 0.2.3 and earlier said of the same stage.
+const CLOSED_DETAIL_BEFORE: &str = "the session ended while this stage was running";
+/// How the reason starts for a stage whose turn never came because its
+/// session ended. The map and the HUD tell such a stage from one that was
+/// turned off by it.
+pub const NOT_RUN: &str = "not run: ";
+/// ... when the session was closed in order,
+pub const NOT_RUN_CLOSED: &str = "not run: the session was closed";
+/// ... and when it was found gone at the next start.
+pub const NOT_RUN_ENDED: &str = "not run: the session ended";
+
+impl StageRow {
+    /// Has work to do in the session that queued it: waiting, running, or
+    /// stopped by light mode.
+    pub fn live(&self) -> bool {
+        match self.status.as_str() {
+            "pending" | "running" => true,
+            "interrupted" => self.detail != CLOSED_DETAIL,
+            _ => false,
+        }
+    }
+
+    /// Left out because the session ended before its turn.
+    pub fn not_run(&self) -> bool {
+        self.status == "skipped" && self.detail.starts_with(NOT_RUN)
+    }
+}
+
+/// Shows `tasks` as the end of their session leaves them: the running
+/// stage stopped, the ones that had not started left out. For a view of a
+/// session that is gone; nothing is stored.
+pub fn show_ended(tasks: &mut [TaskRow]) {
+    for stage in tasks.iter_mut().flat_map(|task| &mut task.stages) {
+        // A stage meow 0.2.3 had stopped and kept for a resume is one this
+        // version stopped, as `end_session` stores it.
+        let stopped_before = stage.status == "interrupted" && stage.detail == CLOSED_DETAIL_BEFORE;
+        if stage.status == "running" || stopped_before {
+            stage.status = "interrupted".to_owned();
+            stage.detail = CLOSED_DETAIL.to_owned();
+        } else if stage.live() {
+            stage.status = "skipped".to_owned();
+            stage.detail = NOT_RUN_CLOSED.to_owned();
+        }
+        stage.progress = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,28 +480,45 @@ pub struct TaskRow {
 }
 
 impl TaskRow {
-    /// Still has work to do (now or after a resume).
+    /// Still has work to do in the session that queued it.
     pub fn unfinished(&self) -> bool {
-        self.stages
-            .iter()
-            .any(|s| matches!(s.status.as_str(), "pending" | "running" | "interrupted"))
+        self.stages.iter().any(StageRow::live)
     }
 
-    /// `recon 10.0.0.0/24: services interrupted`
-    pub fn describe(&self) -> String {
-        let current = self
-            .stages
+    /// Stages that are over and were not left out by the session's end:
+    /// the `8` of `8/17`.
+    pub fn stages_over(&self) -> usize {
+        self.stages
             .iter()
-            .find(|s| matches!(s.status.as_str(), "running" | "interrupted" | "pending"));
-        match current {
-            Some(stage) => format!(
-                "recon {}: {} {}",
-                self.target,
-                stage.stage.as_str(),
-                stage.status
-            ),
-            None => format!("recon {}: finished", self.target),
-        }
+            .filter(|s| matches!(s.status.as_str(), "done" | "skipped" | "failed") && !s.not_run())
+            .count()
+    }
+
+    /// What is said once, at the next start, of a recon that the end of a
+    /// session cut short. `own`: the session's files are the user's own; of
+    /// a scan that may have been put there by someone else, only that it
+    /// was dropped.
+    pub fn left_line(&self, own: bool) -> String {
+        let target = crate::evidence::sanitize(&self.target, 120);
+        // Only a target that is one is offered as a command to run.
+        let again = Target::parse(&self.target)
+            .filter(|_| own)
+            .map(|target| format!(" Run `meow recon {target}` to scan again."));
+        let Some(again) = again else {
+            return format!("Dropped a scan that was queued in these files: recon {target}");
+        };
+        let stopped = self.stages.iter().find(|s| s.status == "interrupted");
+        let not_run = self.stages.iter().filter(|s| s.not_run()).count();
+        let what = match stopped {
+            Some(stage) => format!("stopped at {}", stage.stage.as_str()),
+            None => "was not finished".to_owned(),
+        };
+        let rest = match not_run {
+            0 => String::new(),
+            1 => format!("; 1 of {} stages was not run", self.stages.len()),
+            n => format!("; {n} of {} stages were not run", self.stages.len()),
+        };
+        format!("recon {target} {what} when the last session ended{rest}.{again}")
     }
 }
 
@@ -396,40 +535,61 @@ fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     })
 }
 
+/// The columns [`read_stage`] reads, in its order.
+const STAGE_COLUMNS: &str = "task_id, stage, status, detail, started_utc, finished_utc";
+
+/// One row of `task_stages`: the task it belongs to and the stage, if it
+/// is one this version knows.
+fn read_stage(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Option<StageRow>)> {
+    let name: String = row.get(1)?;
+    let Some(stage) = Stage::parse(&name) else {
+        return Ok((row.get(0)?, None));
+    };
+    Ok((
+        row.get(0)?,
+        Some(StageRow {
+            stage,
+            status: row.get(2)?,
+            detail: row.get(3)?,
+            started_utc: row.get(4)?,
+            finished_utc: row.get(5)?,
+            progress: None,
+        }),
+    ))
+}
+
+/// Gives each of `rows` its stages from what `stages` selects.
+fn attach_stages(
+    rows: &mut [TaskRow],
+    mut stages: rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Result<()> {
+    let index_by_id: std::collections::HashMap<i64, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| (r.id, idx))
+        .collect();
+    for item in stages.query_map(params, read_stage)? {
+        if let (task_id, Some(stage)) = item? {
+            if let Some(&idx) = index_by_id.get(&task_id) {
+                rows[idx].stages.push(stage);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn attach_stages_range(conn: &rusqlite::Connection, rows: &mut [TaskRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     let min_id = rows.iter().map(|r| r.id).min().unwrap_or(0);
     let max_id = rows.iter().map(|r| r.id).max().unwrap_or(0);
-    let index_by_id: std::collections::HashMap<i64, usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(idx, r)| (r.id, idx))
-        .collect();
-    let mut stmt = conn.prepare(
-        "SELECT task_id, stage, status, detail FROM task_stages
-         WHERE task_id BETWEEN ?1 AND ?2 ORDER BY task_id, position",
-    )?;
-    let iter = stmt.query_map(params![min_id, max_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    for item in iter {
-        let (task_id, stage, status, detail) = item?;
-        if let (Some(&idx), Some(stage)) = (index_by_id.get(&task_id), Stage::parse(&stage)) {
-            rows[idx].stages.push(StageRow {
-                stage,
-                status,
-                detail,
-            });
-        }
-    }
-    Ok(())
+    let stages = conn.prepare(&format!(
+        "SELECT {STAGE_COLUMNS} FROM task_stages
+         WHERE task_id BETWEEN ?1 AND ?2 ORDER BY task_id, position"
+    ))?;
+    attach_stages(rows, stages, params![min_id, max_id])
 }
 
 pub fn enqueue(db: &Db, target: &str, mode: Mode, extra_flags: &[String]) -> Result<i64> {
@@ -496,74 +656,190 @@ pub fn task(db: &Db, id: i64) -> Result<Option<TaskRow>> {
     Ok(rows.into_iter().next())
 }
 
-/// Tasks with pending or interrupted stages, oldest first.
+/// Stages that still have work to do in the session that queued them
+/// ([`StageRow::live`]), as SQL.
+const LIVE_STAGE: &str = "(status IN ('pending', 'running')
+     OR (status = 'interrupted' AND detail <> 'stopped: the session was closed'))";
+
+/// Tasks with work still to do, oldest first.
 pub fn unfinished(db: &Db) -> Result<Vec<TaskRow>> {
     let conn = db.conn();
-    let mut statement = conn.prepare(
+    let live = format!("SELECT DISTINCT task_id FROM task_stages WHERE {LIVE_STAGE}");
+    let mut statement = conn.prepare(&format!(
         "SELECT id, target, mode, extra_flags, created_utc FROM tasks
-         WHERE id IN (
-             SELECT DISTINCT task_id FROM task_stages
-             WHERE status IN ('pending', 'running', 'interrupted')
-         )
-         ORDER BY id ASC",
-    )?;
+         WHERE id IN ({live}) ORDER BY id ASC"
+    ))?;
     let mut rows: Vec<TaskRow> = statement
         .query_map([], map_task_row)?
         .collect::<rusqlite::Result<_>>()?;
     if !rows.is_empty() {
-        let index_by_id: std::collections::HashMap<i64, usize> = rows
-            .iter()
-            .enumerate()
-            .map(|(idx, r)| (r.id, idx))
-            .collect();
-        let mut stmt = conn.prepare(
-            "SELECT task_id, stage, status, detail FROM task_stages
-             WHERE task_id IN (
-                 SELECT DISTINCT task_id FROM task_stages
-                 WHERE status IN ('pending', 'running', 'interrupted')
-             )
-             ORDER BY task_id ASC, position ASC",
-        )?;
-        let iter = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for item in iter {
-            let (task_id, stage, status, detail) = item?;
-            if let (Some(&idx), Some(stage)) = (index_by_id.get(&task_id), Stage::parse(&stage)) {
-                rows[idx].stages.push(StageRow {
-                    stage,
-                    status,
-                    detail,
-                });
-            }
-        }
+        let stages = conn.prepare(&format!(
+            "SELECT {STAGE_COLUMNS} FROM task_stages
+             WHERE task_id IN ({live}) ORDER BY task_id ASC, position ASC"
+        ))?;
+        attach_stages(&mut rows, stages, [])?;
     }
     Ok(rows)
 }
 
-/// A stage still marked `running` belongs to a session that ended (or
-/// crashed) while it ran. Returns how many were marked `interrupted`.
-pub fn mark_running_interrupted(db: &Db) -> Result<usize> {
-    Ok(db.conn().execute(
-        "UPDATE task_stages SET status = 'interrupted', detail = 'the session ended while this stage was running'
-         WHERE status = 'running'",
-        [],
-    )?)
+/// The most unfinished tasks [`shown`] returns.
+const SHOWN_UNFINISHED: usize = 100;
+
+/// The tasks a session shows, newest first: every task above `floor` (the
+/// session's own) that still has work to do, and the newest of all the
+/// others up to `limit` in all. Tasks run oldest first, so the one that is
+/// running is the first to fall out of a list of the newest alone. Of more
+/// unfinished tasks than [`SHOWN_UNFINISHED`], the ones that run first.
+pub fn shown(db: &Db, floor: i64, limit: usize) -> Result<Vec<TaskRow>> {
+    let mut rows: Vec<TaskRow> = unfinished(db)?
+        .into_iter()
+        .filter(|task| task.id > floor)
+        .take(SHOWN_UNFINISHED)
+        .collect();
+    if rows.len() < limit {
+        for task in tasks(db, limit)? {
+            if rows.len() >= limit {
+                break;
+            }
+            if !rows.iter().any(|row| row.id == task.id) {
+                rows.push(task);
+            }
+        }
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.id));
+    Ok(rows)
 }
 
-/// The operator declined to resume: the remaining stages are skipped.
-pub fn decline(db: &Db, task: i64) -> Result<()> {
-    db.conn().execute(
-        "UPDATE task_stages SET status = 'skipped', detail = 'not resumed', finished_utc = ?2
-         WHERE task_id = ?1 AND status IN ('pending', 'interrupted', 'running')",
-        params![task, now_rfc3339()],
+/// The newest task's number, or 0: what a session finds when it starts is
+/// at or below it and is never run.
+pub fn newest_id(db: &Db) -> Result<i64> {
+    Ok(db
+        .conn()
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM tasks", [], |row| {
+            row.get(0)
+        })?)
+}
+
+/// How a session ended, for what becomes of its recons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// In order: the terminal was closed, the shell left, a signal.
+    Closed,
+    /// Without a word (killed, a crash): found by the next session as it
+    /// starts.
+    Lost,
+}
+
+/// The recons that the end of a session cut short, kept in `meta` until
+/// the user has been told of them at the next start.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Left {
+    /// The newest of them, oldest first: at most [`LEFT_MAX`].
+    ids: Vec<i64>,
+    /// How many more there were.
+    more: usize,
+}
+
+const LEFT_KEY: &str = "recon_left";
+/// The most recons that are told one by one.
+pub const LEFT_MAX: usize = 5;
+/// The most that "and N more" says.
+const LEFT_COUNTED: usize = 9999;
+
+impl Left {
+    fn load(conn: &rusqlite::Connection) -> Self {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [LEFT_KEY], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        // A workspace's database may not be meow's own: a short list or none.
+        .filter(|text| text.len() <= 64 * LEFT_MAX)
+        .and_then(|text| serde_json::from_str::<Left>(&text).ok())
+        .unwrap_or_default()
+    }
+
+    fn add(&mut self, ids: &[i64]) {
+        self.ids.extend(ids);
+        let over = self.ids.len().saturating_sub(LEFT_MAX);
+        self.ids.drain(..over);
+        self.more = self.more.saturating_add(over);
+    }
+}
+
+/// A session is over, and so are its recons: the stage that was running was
+/// stopped with it, and every stage that had not started is left out.
+/// Finished stages keep their status and results. Nothing is kept waiting
+/// for a later session. Returns how many recons this cut short; said again,
+/// it changes nothing.
+pub fn end_session(db: &Db, end: SessionEnd) -> Result<usize> {
+    let now = now_rfc3339();
+    let (not_run, stopped_at) = match end {
+        SessionEnd::Closed => (NOT_RUN_CLOSED, Some(now.clone())),
+        // When its tool went is not known: no end time is made up.
+        SessionEnd::Lost => (NOT_RUN_ENDED, None),
+    };
+    // Taken for writing from the start: a helper that reads the database
+    // at this moment is waited for, not run into.
+    let tx =
+        rusqlite::Transaction::new_unchecked(db.conn(), rusqlite::TransactionBehavior::Immediate)?;
+    let cut: Vec<i64> = tx
+        .prepare(&format!(
+            "SELECT DISTINCT task_id FROM task_stages WHERE {LIVE_STAGE} ORDER BY task_id"
+        ))?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if cut.is_empty() {
+        return Ok(0);
+    }
+    // A recon an earlier version kept for a resume: the stage it had
+    // stopped is one this version stopped.
+    tx.execute(
+        "UPDATE task_stages SET detail = ?1 WHERE status = 'interrupted' AND detail = ?2",
+        params![CLOSED_DETAIL, CLOSED_DETAIL_BEFORE],
     )?;
-    Ok(())
+    // A stage that light mode had stopped keeps the times it ran from and to.
+    tx.execute(
+        &format!(
+            "UPDATE task_stages SET status = 'skipped', detail = ?1,
+                    finished_utc = COALESCE(finished_utc, ?2)
+             WHERE status <> 'running' AND {LIVE_STAGE}"
+        ),
+        params![not_run, now],
+    )?;
+    tx.execute(
+        "UPDATE task_stages SET status = 'interrupted', detail = ?1, finished_utc = ?2
+         WHERE status = 'running'",
+        params![CLOSED_DETAIL, stopped_at],
+    )?;
+    let mut left = Left::load(&tx);
+    left.add(&cut);
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![LEFT_KEY, serde_json::to_string(&left)?],
+    )?;
+    tx.commit()?;
+    Ok(cut.len())
+}
+
+/// The recons that the end of an earlier session cut short and the user
+/// has not been told of: the newest of them, oldest first, and how many
+/// more there were. Each is returned once.
+pub fn take_left(db: &Db) -> Result<(Vec<TaskRow>, usize)> {
+    if db.get_meta(LEFT_KEY)?.is_none() {
+        return Ok((Vec::new(), 0));
+    }
+    let conn = db.conn();
+    let Left { mut ids, more } = Left::load(conn);
+    conn.execute("DELETE FROM meta WHERE key = ?1", [LEFT_KEY])?;
+    ids.truncate(LEFT_MAX);
+    ids.dedup();
+    let mut rows = Vec::new();
+    for id in ids {
+        rows.extend(task(db, id)?);
+    }
+    Ok((rows, more.min(LEFT_COUNTED)))
 }
 
 /// Number of unfinished tasks in a workspace's `state.db`, without creating
@@ -579,8 +855,7 @@ pub fn count_unfinished(state_db: &Path) -> usize {
             let _ = conn.busy_timeout(crate::db::BUSY_TIMEOUT);
             crate::db::harden_connection(&conn)?;
             conn.query_row(
-                "SELECT COUNT(DISTINCT task_id) FROM task_stages
-                 WHERE status IN ('pending', 'running', 'interrupted')",
+                &format!("SELECT COUNT(DISTINCT task_id) FROM task_stages WHERE {LIVE_STAGE}"),
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -849,6 +1124,42 @@ fn remove_regular_file(path: &Path) {
     }
 }
 
+/// Removes what a tool left in the workspace's `tmp/` when meow was killed
+/// while it ran: the private folder it ran in and its unfinished output.
+/// For the start of a session, before any tool runs. Only entries of `tmp`
+/// itself with those names go, and no link is followed. Returns how many.
+pub fn clear_tool_leftovers(tmp: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // The entry's own kind: a link is neither a folder nor a file here.
+        let (Some(name), Ok(kind)) = (name.to_str(), entry.file_type()) else {
+            continue;
+        };
+        let gone = if kind.is_dir() && name.starts_with(runner::RUN_DIR_PREFIX) {
+            std::fs::remove_dir_all(entry.path()).is_ok()
+        } else if kind.is_file() && is_stage_output(name) {
+            std::fs::remove_file(entry.path()).is_ok()
+        } else {
+            false
+        };
+        removed += usize::from(gone);
+    }
+    removed
+}
+
+/// `nmap_svc_12_0.xml`: a stage's file name, `_` and the task's number.
+fn is_stage_output(name: &str) -> bool {
+    STAGES.iter().any(|stage| {
+        name.strip_prefix(stage_file(*stage))
+            .and_then(|rest| rest.strip_prefix('_'))
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
 /// Reads a scanner's XML output (and `<hosts up="N"/>` count), then deletes
 /// the file. A stage knows what its tool writes: the format is never guessed
 /// from the content, part of which the scanned server chose.
@@ -1103,6 +1414,11 @@ fn stage_file(stage: Stage) -> &'static str {
 }
 
 async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
+    // Only what this session queued: a recon that was in the database when
+    // the session started is over, whatever its rows say.
+    if !state.owns_recon(id) {
+        return Ok(());
+    }
     let Some(task_row) = task(&state.db_lock(), id)? else {
         return Ok(());
     };
@@ -1110,6 +1426,9 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
         .with_context(|| format!("invalid target '{}'", task_row.target))?;
     let update = |stage: Stage, status: &str, detail: &str| {
         let result = set_stage(&state.db_lock(), id, stage, status, detail);
+        // How far the stage was belongs to the run that just began or ended.
+        state.clear_progress(id, stage);
+        state.notice_tool_fault();
         state.touch();
         result
     };
@@ -1126,6 +1445,10 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
     }
 
     for stage in STAGES {
+        // The session is over: what has not started is left out with it.
+        if state.is_closing() {
+            return Ok(());
+        }
         let current_status = {
             let db = state.db_lock();
             db.conn()
@@ -1150,7 +1473,7 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
             // Light mode sends no packets: stop here and keep the rest for
             // later. A task stored as light (meow queues none) never runs.
             if running_mode(state, &task_row) == Mode::Light {
-                update(stage, "interrupted", "paused: the session is in light mode")?;
+                update(stage, "interrupted", LIGHT_DETAIL)?;
                 state.notice(format!(
                     "recon {} paused: light mode sends no packets",
                     task_row.target
@@ -1163,7 +1486,16 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
                 task_row.target,
                 stage.as_str()
             ));
-            match run_stage(state, &task_row, &target, stage).await {
+            let end = run_stage(state, &task_row, &target, stage).await;
+            if state.is_closing() {
+                // Its tool was stopped with the session, so whatever it
+                // says now is not its result. The stage is left as running:
+                // the session marks it stopped as it ends (`end_session`),
+                // which is also what puts this recon on the list the next
+                // start tells the user of.
+                return Ok(());
+            }
+            match end {
                 // Start the stage again with what the mode is now.
                 Ok(StageEnd::ModeChanged) => state.notice(format!(
                     "recon {}: {} stopped, the mode changed",
@@ -1223,6 +1555,9 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
 pub async fn worker(state: Arc<State>, mut queue: mpsc::UnboundedReceiver<i64>) {
     let one_at_a_time = Semaphore::new(1);
     while let Some(id) = queue.recv().await {
+        if state.is_closing() {
+            break;
+        }
         let Ok(_permit) = one_at_a_time.acquire().await else {
             break;
         };

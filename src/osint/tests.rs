@@ -1022,3 +1022,51 @@ fn windows_dns_servers_are_read_from_socket_addresses() {
         assert!(!server.ip().to_string().starts_with("fec0:"), "{server}");
     }
 }
+
+/// A helper program of a probe (traceroute, openssl) is one of the
+/// session's programs: when the session closes it is gone with what it
+/// started, and the probe waiting for it returns at once.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_probes_program_ends_when_the_session_closes() {
+    let tools = Tracker::new();
+    let mut slow = tokio::process::Command::new("/bin/sh");
+    slow.args(["-c", "sleep 300 & echo \"$$ $!\"; wait"]);
+    configure_osint_command(&mut slow);
+    let (mut child, group) = tools.spawn(&mut slow).unwrap();
+    // Its first line: its own process id and that of what it started.
+    let mut said = Vec::new();
+    let mut stdout = child.stdout.take().unwrap();
+    while !said.contains(&b'\n') {
+        let mut byte = [0u8; 1];
+        assert_eq!(stdout.read(&mut byte).await.unwrap(), 1, "it ended early");
+        said.push(byte[0]);
+    }
+    child.stdout = Some(stdout);
+    let pids: Vec<libc::pid_t> = String::from_utf8_lossy(&said)
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2);
+    assert_eq!(tools.running(), 1);
+
+    let closing = tools.clone();
+    let closer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        closing.close();
+    });
+    let started = std::time::Instant::now();
+    // Far less than the time the probe would wait for it.
+    let read = wait_bounded_stdout(child, group, 4096, Duration::from_secs(60)).await;
+    assert!(started.elapsed() < Duration::from_secs(10), "{read:?}");
+    closer.await.unwrap();
+    assert_eq!(tools.running(), 0);
+    for pid in pids {
+        crate::procs::tests::wait_gone(pid);
+    }
+    // And none starts in a session that is over.
+    let mut late = tokio::process::Command::new("/bin/sh");
+    late.args(["-c", "sleep 300"]);
+    configure_osint_command(&mut late);
+    assert!(tools.spawn(&mut late).is_err());
+}

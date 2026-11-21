@@ -3410,7 +3410,8 @@ pub struct WorkspaceSummary {
     pub mode: Option<Mode>,
     /// Hosts in `graph.json`.
     pub hosts: usize,
-    /// Background tasks with pending or interrupted stages.
+    /// Recons with stages still to run. They run only while their session
+    /// is open, and end with it.
     pub unfinished_tasks: usize,
     pub last_active: Option<SystemTime>,
     /// The folder's device and number when it was listed (Unix), which
@@ -3870,9 +3871,12 @@ fn format_listing_with_home(
             .last_active
             .map(|at| format_age(now.duration_since(at).unwrap_or_default()))
             .unwrap_or_else(|| "unknown".to_owned());
+        // Only an open session has work under way: what a closed one left
+        // is dropped when it opens.
+        let open = matches!(w.state, SessionState::Running | SessionState::Current);
         let tasks = match w.unfinished_tasks {
-            0 => "-".to_owned(),
-            n => format!("{n} unfinished"),
+            n if open && n > 0 => format!("{n} unfinished"),
+            _ => "-".to_owned(),
         };
         rows.push([
             name,
@@ -5008,7 +5012,8 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             },
             mode,
             hosts: if local { 12 } else { 0 },
-            unfinished_tasks: usize::from(mode.is_none()),
+            // What a closed session left is not shown: it is dropped.
+            unfinished_tasks: usize::from(local),
             last_active: Some(now - Duration::from_secs(secs)),
             id: None,
         };
@@ -5028,8 +5033,8 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             format!(
                 "NAME      STATE         MODE        HOSTS  TASKS         LAST ACTIVE  WHERE\n\
                  acme-lab  this session  aggressive  0      -             just now     ~{sep}.meow/workspaces/acme-lab\n\
-                 web       running       light       12     -             2m ago       ~{sep}proj/meow/web\n\
-                 old       -             ?           12     1 unfinished  3d ago       /srv/x/.meow\n"
+                 web       running       light       12     1 unfinished  2m ago       ~{sep}proj/meow/web\n\
+                 old       -             ?           12     -             3d ago       /srv/x/.meow\n"
             )
         );
         assert!(format_listing(&[], now).contains("No workspaces yet"));

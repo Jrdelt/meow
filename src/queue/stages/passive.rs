@@ -6,9 +6,15 @@ use super::*;
 pub(crate) async fn lan(cx: &Ctx<'_>) -> Result<StageEnd> {
     let state = cx.state;
     let targets = state.graph().target_ips();
-    let local = tokio::task::spawn_blocking(move || crate::observer::observe(&targets))
-        .await
-        .context("local ARP/NDP sweep failed")?;
+    let tools = state.tools().clone();
+    let local =
+        tokio::task::spawn_blocking(move || crate::observer::observe_with(&tools, &targets))
+            .await
+            .context("local ARP/NDP sweep failed")?;
+    if state.is_closing() {
+        // Cut short with the session: not what the tables hold.
+        return Ok(StageEnd::ModeChanged);
+    }
     let neighbors = local.neighbors.len();
     let routes = local.routes.len();
     let changed = {
@@ -178,9 +184,27 @@ pub(crate) async fn mail_dns_with(
         .collect();
     // An internal target's questions stay on this machine's resolvers.
     let internal = crate::osint::is_internal_target(domain, &dns_found.ips).await;
+    // How many questions it will ask depends on the answers: said as it goes.
+    let asked = |answered: usize| {
+        cx.report(Progress {
+            done: Some(answered as u64),
+            note: Some(match answered {
+                1 => "1 lookup so far".to_owned(),
+                n => format!("{n} lookups so far"),
+            }),
+            ..Progress::default()
+        });
+    };
     let ran = while_same_mode(
         &same_mode,
-        crate::maildns::run_on(resolver, domain, &primary_address, &ct_names, internal),
+        crate::maildns::run_on_counted(
+            resolver,
+            domain,
+            &primary_address,
+            &ct_names,
+            internal,
+            asked,
+        ),
     )
     .await;
     let (observations, summary) = match ran {
@@ -243,7 +267,7 @@ pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {
     let ip_str = resolved_ip.to_string();
     let traced = while_same_mode(
         &same_mode,
-        crate::osint::run_trace(&ip_str, local_gateway.as_deref()),
+        crate::osint::run_trace(state.tools(), &ip_str, local_gateway.as_deref()),
     )
     .await;
     let (observations, summary) = match traced {

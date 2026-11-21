@@ -221,8 +221,12 @@
     flash.timer = setTimeout(function () { box.remove(); }, 6000);
   }
 
+  function connected() {
+    return !!socket && socket.readyState === WebSocket.OPEN;
+  }
+
   function send(command) {
-    if (socket && socket.readyState === WebSocket.OPEN) {
+    if (connected()) {
       socket.send(JSON.stringify(command));
     } else {
       flash('Not connected to the session.');
@@ -268,6 +272,10 @@
           askedWhere = true;
           send({ cmd: 'locate' });
         }
+      } else if (message.type === 'progress') {
+        // How far the running stages are, sent alone while a tool counts
+        // its results: only the strip is drawn again, not the cards.
+        if (state && message.key === pageKey) { reconProgress(message); }
       } else if (message.type === 'result' && !message.ok) {
         flash(message.error || 'Command failed.');
       }
@@ -276,6 +284,7 @@
       if (socket !== ws) { return; }
       byId('conn').textContent = ended ? 'session ended' : 'session closed';
       byId('conn').className = 'badge off';
+      reconStill();
       if (!ended) {
         var wait = reconnectDelay;
         reconnectDelay = Math.min(30000, Math.round(reconnectDelay * 1.5));
@@ -1118,6 +1127,621 @@
     return box;
   }
 
+  // Recon progress: a strip above the map, one row for each target (the
+  // run that has work to do, else the newest): a bar with one segment per
+  // stage, and one line of text.
+  // The page renders again on every push and a clock ticks in between, so
+  // a row is built once and only what changed is written after that.
+  var RECON_ROWS = 3, RECON_TARGETS = 12, RECON_STAGES = 32, RECON_EARLIER = 8, RECON_SCAN = 2000;
+  var STATUS_WORD = { pending: 'waiting', running: 'running', done: 'done', skipped: 'skipped',
+    failed: 'failed', interrupted: 'stopped' };
+  var STATUS_CUE = { pending: '\u00b7', running: '\u25b8', done: '\u2713', skipped: '\u2013',
+    failed: '\u2715', interrupted: '\u25a0' };
+  var reconViews = [], reconByKey = table(), reconOrder = null, reconWatched = table();
+  var reconHeight = 0, reconTimer = null;
+  // The state the strip was last drawn from, and when it arrived.
+  var reconState = null, reconArrived = 0;
+
+  // Text from the session on one line, cut to `max` characters.
+  function plain(value, max) {
+    if (typeof value !== 'string' && typeof value !== 'number') { return ''; }
+    var text = String(value).slice(0, max * 4)
+      .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]+/g, ' ').trim();
+    return text.length > max ? text.slice(0, max - 1) + '\u2026' : text;
+  }
+  // A count from the session: a whole number from 0 to `max`, or null.
+  function whole(value, max) {
+    return typeof value === 'number' && isFinite(value) && value >= 0 ? Math.min(max, Math.floor(value)) : null;
+  }
+  // An RFC 3339 time as milliseconds, or null.
+  function stamp(value) {
+    if (typeof value !== 'string' || value.length > 40 || !/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(value)) { return null; }
+    var at = Date.parse(value);
+    return isFinite(at) ? at : null;
+  }
+  // 192 -> "3:12", 3723 -> "1:02:03"
+  function clockText(seconds) {
+    var s = Math.max(0, Math.min(359999, Math.floor(seconds) || 0));
+    var two = function (n) { return (n < 10 ? '0' : '') + n; };
+    var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+    return (h ? h + ':' + two(m) : String(m)) + ':' + two(s % 60);
+  }
+  function leftText(seconds) {
+    var minutes = Math.round(seconds / 60);
+    if (seconds < 60) { return 'under 1 min left'; }
+    if (minutes < 60) { return 'about ' + minutes + ' min left'; }
+    return 'about ' + Math.floor(minutes / 60) + ' h ' + (minutes % 60 ? minutes % 60 + ' min ' : '') + 'left';
+  }
+  function setText(node, text) {
+    if (node.textContent !== text) { node.textContent = text; }
+  }
+  // Right-to-left text, kept from reordering what stands beside it.
+  function apart(text) {
+    return /[\u0590-\u08ff\ufb1d-\ufefc]/.test(text) ? '\u2068' + text + '\u2069' : text;
+  }
+
+  // The session's clock as an offset from this page's steady one: elapsed
+  // times tick between pushes and do not follow this machine's clock.
+  var clockOffset = null, clockFromSession = false;
+  function steady() {
+    return window.performance && performance.now ? performance.now() : Date.now();
+  }
+  function syncClock(nowUtc) {
+    var at = stamp(nowUtc);
+    if (at === null) {
+      if (clockOffset === null || clockFromSession) { clockOffset = Date.now() - steady(); }
+      clockFromSession = false;
+      return;
+    }
+    // A stamp is a little behind by the time it is read (more so when cut
+    // to whole seconds): keep the latest reading, unless the clock moved.
+    var fresh = at - steady();
+    clockOffset = clockFromSession && Math.abs(fresh - clockOffset) < 2000 ? Math.max(clockOffset, fresh) : fresh;
+    clockFromSession = true;
+  }
+  function sessionNow() { return steady() + clockOffset; }
+
+  function took(stage) {
+    return stage.status !== 'running' && stage.started !== null && stage.finished !== null &&
+      stage.finished >= stage.started ? stage.finished - stage.started : null;
+  }
+
+  // What the session says about one run, checked and cut to size.
+  function reconStages(task) {
+    var list = Array.isArray(task.stages) ? task.stages : [], stages = [];
+    for (var i = 0; i < list.length && i < RECON_STAGES; i++) {
+      var raw = list[i] && typeof list[i] === 'object' ? list[i] : {};
+      var status = typeof raw.status === 'string' && hasOwn.call(STATUS_WORD, raw.status) ? raw.status : 'pending';
+      var stage = { name: plain(raw.stage, 24) || '?', status: status, detail: plain(raw.detail, 300),
+        started: stamp(raw.started_utc), finished: stamp(raw.finished_utc), progress: null };
+      if (status === 'running') {
+        var p = raw.progress && typeof raw.progress === 'object' ? raw.progress : {};
+        var percent = whole(p.percent, 100), done = whole(p.done, 1e9), total = whole(p.total, 1e9);
+        stage.progress = { part: null, items: '', percent: percent === null ? '' : percent + '%',
+          eta: whole(p.eta_s, 359999), note: plain(p.note, 80) };
+        // "3/9", "42%", or both ("1/4" and "42%"): the percent is then of
+        // the item it is on.
+        var items = done !== null && total ? Math.min(done, total) : null;
+        if (items !== null) {
+          stage.progress.part = Math.min(1, (items + (percent || 0) / 100) / total);
+          stage.progress.items = items + '/' + total;
+        } else if (percent !== null) {
+          stage.progress.part = percent / 100;
+        }
+      }
+      stages.push(stage);
+    }
+    return stages;
+  }
+  // What a running stage's tool says: "1/4 \u00b7 Service scan 42%",
+  // "SYN Stealth Scan 75%", "3/9", "412 URLs so far". A percent is of the
+  // scan named with it: nmap starts it over with each of its scans.
+  function figure(progress) {
+    if (!progress) { return ''; }
+    var scan = progress.percent ? (progress.note ? apart(progress.note) + ' ' : '') + progress.percent : apart(progress.note);
+    return [progress.items, scan].filter(Boolean).join(' \u00b7 ');
+  }
+  // A recon ends with its session: the stage that was running is stopped
+  // for good, and the stages after it are left out with these words.
+  var CLOSED_DETAIL = 'stopped: the session was closed', NOT_RUN_DETAIL = 'not run: the session was closed';
+  function notRun(stage) {
+    return stage.status === 'skipped' && /^not run: /.test(stage.detail);
+  }
+  // Has work to do in its session: waiting, running, or stopped by light mode.
+  function live(stage) {
+    return stage.status === 'pending' || stage.status === 'running' ||
+      (stage.status === 'interrupted' && stage.detail !== CLOSED_DETAIL);
+  }
+  function reconCounts(stages) {
+    var count = { pending: 0, running: 0, done: 0, skipped: 0, failed: 0, interrupted: 0, live: 0, notRun: 0 };
+    stages.forEach(function (stage) {
+      count[stage.status] += 1;
+      if (live(stage)) { count.live += 1; }
+      if (notRun(stage)) { count.notRun += 1; }
+    });
+    return count;
+  }
+  // The end of a session dropped it before any of its stages ran.
+  function dropped(count) {
+    return count.notRun > 0 && !(count.done || count.failed || count.interrupted);
+  }
+  // 0: a stage is running. 1: stages are left. 2: nothing is left.
+  function reconRank(count) {
+    return count.running ? 0 : count.live ? 1 : 2;
+  }
+  // "stopped", then why: a reason that starts with the word says it once.
+  function statusWords(stage) {
+    var word = STATUS_WORD[stage.status], detail = stage.detail;
+    if (!detail) { return [word]; }
+    return detail.slice(0, word.length).toLowerCase() === word ? [apart(detail)] : [word, apart(detail)];
+  }
+  // "services · done · 3 open ports · took 0:42": a segment's hint.
+  function describeStage(stage) {
+    var words = statusWords(stage), parts = [apart(stage.name), words[0]], spent = took(stage);
+    if (figure(stage.progress)) { parts.push(figure(stage.progress)); }
+    if (words.length > 1) { parts.push(words[1]); }
+    if (spent !== null) { parts.push('took ' + clockText(spent / 1000)); }
+    return parts.join(' \u00b7 ');
+  }
+
+  function reconModel(entry) {
+    var task = entry.task, stages = entry.stages, count = entry.count, total = stages.length;
+    var model = { stages: stages, running: -1, older: entry.older, olderCount: entry.olderCount,
+      others: [entry.queued ? '+' + entry.queued + ' queued' : '', entry.notRun ? '+' + entry.notRun + ' not run' : '']
+        .filter(Boolean).join(', '),
+      id: plain(task.id, 20), mode: plain(task.mode, 16).replace(/[^a-z0-9_-]/gi, ''),
+      when: stamp(task.created_utc) === null ? '' : String(task.created_utc).replace('T', ' ').slice(0, 16),
+      cut: (Array.isArray(task.stages) ? task.stages.length : 0) - total };
+    var spent = 0, timed = false, first = { failed: null, interrupted: null, skipped: null }, left = null;
+    stages.forEach(function (stage, index) {
+      var time = took(stage);
+      if (time !== null) { spent += time; timed = true; }
+      if (stage.status === 'running' && model.running < 0) { model.running = index; }
+      if (hasOwn.call(first, stage.status) && !first[stage.status]) { first[stage.status] = stage; }
+      if (!left && notRun(stage)) { left = stage; }
+    });
+    model.shape = model.id + '\n' + stages.map(function (stage) { return stage.name; }).join('\n');
+
+    var now = model.running >= 0 ? stages[model.running] : null;
+    // Stages that are over, however they ended, but not the ones the end
+    // of the session left out: the HUD's "7/17", and how full the bar is.
+    var over = count.done + count.skipped + count.failed - count.notRun;
+    // "done" counts the stages that are done, and nothing else.
+    var parts = [], of = count.done + ' of ' + total + ' done';
+    var problem = entry.rank === 1 ? first.interrupted || first.failed : first.failed;
+    if (now) {
+      parts.push('stage ' + (model.running + 1) + ' of ' + total);
+      if (count.failed) { parts.push(count.failed + ' failed'); }
+      var said = figure(now.progress);
+      parts.push(apart(now.name) + (said ? ' \u00b7 ' + said : ' running'));
+      model.note = problem ? describeStage(problem) : '';
+    } else if (entry.rank === 1) {
+      if (count.done) { parts.push(of); }
+      if (count.failed) { parts.push(count.failed + ' failed'); }
+      var why = first.interrupted ? first.interrupted.detail : null;
+      parts.push(why === null ? 'waiting' : /light mode/i.test(why) ? 'stopped \u2014 light mode' : 'stopped');
+      model.note = problem ? describeStage(problem) : '';
+    } else if (entry.dropped) {
+      // Its session ended before it began.
+      parts.push('not run \u2014 session closed');
+      model.note = describeStage(left);
+    } else if (first.interrupted || left) {
+      // Its session ended while it ran: it does not go on.
+      parts.push('stopped \u2014 session closed', of);
+      if (count.failed) { parts.push(count.failed + ' failed'); }
+      model.note = describeStage(first.interrupted || left);
+    } else if (total && count.skipped === total) {
+      parts.push('skipped');
+      model.note = first.skipped.detail;
+    } else {
+      parts.push(total ? 'done' + (timed ? ' in ' + clockText(spent / 1000) : '') : 'no stages');
+      if (count.failed) { parts.push(count.failed + ' failed'); }
+      if (count.skipped) { parts.push(count.skipped + ' skipped'); }
+      model.note = problem ? describeStage(problem) : '';
+    }
+    model.main = parts.join(' \u00b7 ');
+    var settled = over + (now && now.progress.part ? now.progress.part : 0);
+    model.percent = total ? Math.round(100 * settled / total) : 0;
+    return model;
+  }
+
+  // Which segment of a row an event happened on, or -1.
+  function segmentAt(view, target) {
+    for (var node = target; node && node !== view.list; node = node.parentNode) {
+      if (node.parentNode === view.list) { return Array.prototype.indexOf.call(view.list.children, node); }
+    }
+    return -1;
+  }
+  // The line under the bar: the stage under the pointer or the keyboard,
+  // or else what the running stage is doing (or what went wrong).
+  function paintNote(view) {
+    var index = view.hover >= 0 ? view.hover : view.focused;
+    var stage = index >= 0 && view.model ? view.model.stages[index] : null;
+    var text = stage ? describeStage(stage) : view.model ? view.model.note : '';
+    if (view.noteText === text) { return; }
+    view.noteText = text;
+    view.note.textContent = text;
+    view.note.title = text;
+    view.note.className = stage ? 'recon-note peek' : 'recon-note';
+  }
+  function moveFocus(view, index) {
+    if (index < 0 || index >= view.segs.length || index === view.at) { return; }
+    view.segs[view.at].node.tabIndex = -1;
+    view.at = index;
+    view.segs[index].node.tabIndex = 0;
+  }
+
+  function reconView(key) {
+    var view = { key: key, model: null, shape: null, segs: [], at: 0, hover: -1, focused: -1,
+      noteText: null, meterText: null, lines: null, eta: null, etaAt: 0 };
+    view.item = el('li', 'recon-task');
+    var head = view.item.appendChild(el('div', 'recon-head'));
+    var name = head.appendChild(hint(el('div', 'recon-name'), key));
+    name.appendChild(el('span', 'recon-word', 'Recon '));
+    name.appendChild(el('span', null, key));
+    view.queued = name.appendChild(el('span', 'recon-queued'));
+    var text = head.appendChild(el('div', 'recon-text'));
+    view.main = text.appendChild(el('span'));
+    view.left = text.appendChild(el('span', 'recon-left'));
+    view.clock = head.appendChild(hint(el('div', 'recon-clock'), 'Time in this stage'));
+    var bar = view.item.appendChild(el('div', 'recon-bar'));
+    view.meter = bar.appendChild(el('div', 'recon-meter'));
+    view.meter.setAttribute('role', 'progressbar');
+    view.meter.setAttribute('aria-valuemin', '0');
+    view.meter.setAttribute('aria-valuemax', '100');
+    view.meter.setAttribute('aria-label', 'Recon ' + key);
+    view.list = bar.appendChild(el('div', 'recon-segs'));
+    view.list.setAttribute('role', 'list');
+    view.list.setAttribute('aria-label', 'Stages');
+    // One stop for the Tab key per bar; the arrow keys walk its stages.
+    view.list.addEventListener('keydown', function (event) {
+      var last = view.segs.length - 1, to = -1;
+      if (event.key === 'ArrowRight') { to = Math.min(last, view.at + 1); }
+      if (event.key === 'ArrowLeft') { to = Math.max(0, view.at - 1); }
+      if (event.key === 'Home') { to = 0; }
+      if (event.key === 'End') { to = last; }
+      if (to < 0 || last < 0) { return; }
+      event.preventDefault();
+      moveFocus(view, to);
+      view.segs[view.at].node.focus();
+    });
+    view.list.addEventListener('focusin', function (event) {
+      view.focused = segmentAt(view, event.target);
+      moveFocus(view, view.focused);
+      paintNote(view);
+    });
+    view.list.addEventListener('focusout', function () { view.focused = -1; paintNote(view); });
+    view.list.addEventListener('mouseover', function (event) {
+      view.hover = segmentAt(view, event.target);
+      paintNote(view);
+    });
+    view.list.addEventListener('mouseleave', function () { view.hover = -1; paintNote(view); });
+    var foot = view.item.appendChild(el('div', 'recon-foot'));
+    view.note = foot.appendChild(el('div', 'recon-note'));
+    view.more = foot.appendChild(fold('recon:' + key, 'recon-more', false));
+    var summary = view.more.appendChild(hint(el('summary', null, 'Stages'), 'Every stage of this run, and its other runs'));
+    view.panel = view.more.appendChild(el('div', 'recon-stages'));
+    // Filled just before it opens, so it never opens empty.
+    summary.addEventListener('click', function () { paintStages(view, true); });
+    view.more.addEventListener('toggle', function () { paintStages(view); });
+    return view;
+  }
+
+  // The time left and the time in the running stage: all that changes
+  // between pushes. Returns the milliseconds until it changes again, or 0.
+  function paintClock(view) {
+    var model = view.model, stage = model && model.running >= 0 ? model.stages[model.running] : null;
+    var now = sessionNow(), left = '', clock = '', next = 0;
+    // The time left when the state was made, less the time since. One
+    // that has run out is no longer known.
+    var remaining = stage && view.eta !== null ? view.eta - (steady() - view.etaAt) / 1000 : 0;
+    if (remaining > 0) {
+      left = ' \u00b7 ' + leftText(remaining);
+      next = 1000;
+    }
+    if (stage && stage.started !== null) {
+      clock = clockText((now - stage.started) / 1000);
+      next = 1000 - Math.max(0, now - stage.started) % 1000;
+    }
+    setText(view.left, left);
+    setText(view.clock, clock);
+    return next;
+  }
+  function reconTick() {
+    clearTimeout(reconTimer);
+    reconTimer = null;
+    var wait = 0;
+    reconViews.forEach(function (view) {
+      var next = paintClock(view);
+      if (next && (!wait || next < wait)) { wait = next; }
+    });
+    if (wait) { reconTimer = setTimeout(reconTick, wait + 20); }
+  }
+  // The session has gone (its terminal was closed) or cannot be reached.
+  // Its recons ended with it, so they are shown as the next session will
+  // find them: the running stage stopped, the ones after it left out, in
+  // the words the session itself stores. Nothing ticks until it is back.
+  function reconStill() {
+    var tasks = state && Array.isArray(state.tasks) ? state.tasks : [], stopped = false;
+    tasks.forEach(function (task) {
+      (task && Array.isArray(task.stages) ? task.stages : []).forEach(function (stage) {
+        if (!stage || typeof stage !== 'object') { return; }
+        if (stage.status === 'running') {
+          stage.status = 'interrupted';
+          stage.detail = CLOSED_DETAIL;
+        } else if (stage.status === 'pending' || (stage.status === 'interrupted' && stage.detail !== CLOSED_DETAIL)) {
+          stage.status = 'skipped';
+          stage.detail = NOT_RUN_DETAIL;
+        } else {
+          return;
+        }
+        delete stage.progress;
+        stopped = true;
+      });
+    });
+    if (stopped) { renderRecon(); }
+    byId('recon').classList.add('still');
+    reconTick();
+  }
+
+  function paintRow(view, model) {
+    view.model = model;
+    if (view.shape !== model.shape) {
+      view.shape = model.shape;
+      clear(view.list);
+      view.at = 0;
+      view.hover = view.focused = -1;
+      view.eta = null;
+      view.segs = model.stages.map(function (stage, index) {
+        var node = view.list.appendChild(el('span', 'seg'));
+        node.setAttribute('role', 'listitem');
+        node.tabIndex = index ? -1 : 0;
+        var seg = { node: node, look: '', width: '', text: '', most: 0, lost: false };
+        seg.fill = node.appendChild(el('span', 'fill'));
+        seg.cue = node.appendChild(el('span', 'cue'));
+        node.appendChild(el('span', 'name', stage.name));
+        return seg;
+      });
+      view.list.className = 'recon-segs' + (view.segs.length > 18 ? ' many' : '');
+    }
+    model.stages.forEach(function (stage, index) {
+      var seg = view.segs[index], part = stage.progress ? stage.progress.part : null;
+      if (stage.status !== 'running') {
+        seg.most = 0;
+        seg.lost = false;
+      } else if (part !== null) {
+        // nmap starts its figures over with each of its scans. A fill
+        // that would shrink turns to the striped one of a share not
+        // known, for the rest of the stage.
+        if (part + 0.005 < seg.most) { seg.lost = true; }
+        seg.most = Math.max(seg.most, part);
+      }
+      if (seg.lost) { part = null; }
+      var look = stage.status + (stage.progress && part === null ? ' unknown' : '');
+      if (seg.look !== look) {
+        seg.look = look;
+        seg.node.className = 'seg ' + look;
+        seg.cue.textContent = STATUS_CUE[stage.status];
+      }
+      var width = part === null ? '' : Math.round(part * 100) + '%';
+      if (seg.width !== width) { seg.width = width; seg.fill.style.width = width; }
+      var text = describeStage(stage);
+      if (seg.text !== text) {
+        seg.text = text;
+        hint(seg.node, text).setAttribute('aria-label', text);
+      }
+    });
+    var now = model.running >= 0 ? model.stages[model.running] : null;
+    // The time left is the time left when this state was made.
+    view.eta = now ? now.progress.eta : null;
+    view.etaAt = reconArrived;
+    setText(view.main, model.main);
+    setText(view.queued, model.others ? ' ' + model.others : '');
+    var meter = model.percent + ' ' + model.main;
+    if (view.meterText !== meter) {
+      view.meterText = meter;
+      view.meter.setAttribute('aria-valuenow', String(model.percent));
+      view.meter.setAttribute('aria-valuetext', model.main);
+    }
+    paintNote(view);
+    paintStages(view);
+  }
+
+  // Behind "Stages": one line per stage, then the other runs of the
+  // target (all kept in the workspace). Built when opened.
+  function paintStages(view, opening) {
+    var model = view.model;
+    if (!(opening || view.more.open) || !model) { return; }
+    var lines = model.stages.map(function (stage) {
+      var words = statusWords(stage), spent = took(stage);
+      if (spent !== null) { words.push('took ' + clockText(spent / 1000)); }
+      return { stage: stage, text: words.join(' \u00b7 ') };
+    });
+    var facts = [model.id ? '#' + model.id : '', model.mode, model.when].filter(Boolean).join(' \u00b7 ');
+    var sig = facts + '\n' + model.olderCount + '\n' + lines.map(function (line) {
+      return line.stage.name + ' ' + line.stage.status + ' ' + line.text;
+    }).join('\n');
+    if (view.lines === sig) { return; }
+    view.lines = sig;
+    clear(view.panel);
+    if (facts) { view.panel.appendChild(el('div', 'dim', facts)); }
+    var list = view.panel.appendChild(el('div', 'recon-lines'));
+    lines.forEach(function (line) {
+      var label = el('span', 'label');
+      label.appendChild(el('span', 'recon-cue ' + line.stage.status, STATUS_CUE[line.stage.status]));
+      label.appendChild(document.createTextNode(' ' + line.stage.name));
+      list.appendChild(row(label, line.text, line.stage.status));
+    });
+    if (model.cut > 0) { view.panel.appendChild(el('div', 'dim', model.cut + ' more stages not shown')); }
+    if (model.olderCount) {
+      var past = view.panel.appendChild(fold('runs:' + view.key, 'names', false));
+      past.appendChild(el('summary', null, 'Other runs (' + model.olderCount + ')'));
+      model.older.forEach(function (run) {
+        var count = reconCounts(reconStages(run)), words = [];
+        ['running', 'done', 'failed', 'interrupted', 'skipped', 'pending'].forEach(function (status) {
+          if (count[status]) { words.push(count[status] + ' ' + STATUS_WORD[status]); }
+        });
+        var when = stamp(run.created_utc) === null ? '' : String(run.created_utc).replace('T', ' ').slice(0, 16);
+        var line = past.appendChild(el('div', 'fact'));
+        line.appendChild(el('div', null, '#' + plain(run.id, 20) + (when ? '  ' + when : '')));
+        line.appendChild(el('div', 'dim', words.join(' \u00b7 ')));
+      });
+      if (model.olderCount > model.older.length) {
+        past.appendChild(el('div', 'fact dim', (model.olderCount - model.older.length) + ' more not shown'));
+      }
+    }
+  }
+
+  // The strip's height is taken off the map's, so both fit the window.
+  function reconFit() {
+    var box = byId('recon'), height = box.hidden ? 0 : box.offsetHeight + 14;
+    if (height === reconHeight) { return; }
+    reconHeight = height;
+    byId('top').style.setProperty('--recon-h', height + 'px');
+    cy.resize();
+    fitDrawing(false);
+  }
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(reconFit).observe(byId('recon'));
+  } else {
+    window.addEventListener('resize', reconFit);
+  }
+
+  // A progress message: how far the running stages are, and the session's
+  // clock. It changes nothing else, so nothing else is drawn again: the
+  // cards keep their selection and every click reaches its button.
+  var RECON_TICKS = 64;
+  function reconProgress(message) {
+    var said = table(), list = Array.isArray(message.running) ? message.running : [];
+    for (var i = 0; i < list.length && i < RECON_TICKS; i++) {
+      var tick = list[i];
+      if (tick && typeof tick === 'object' && tick.progress && typeof tick.progress === 'object') {
+        said[plain(tick.task, 20) + '\n' + plain(tick.stage, 24)] = tick.progress;
+      }
+    }
+    (Array.isArray(state.tasks) ? state.tasks : []).forEach(function (task) {
+      if (!task || typeof task !== 'object' || !Array.isArray(task.stages)) { return; }
+      task.stages.forEach(function (stage) {
+        if (!stage || typeof stage !== 'object' || stage.status !== 'running') { return; }
+        var progress = own(said, plain(task.id, 20) + '\n' + plain(stage.stage, 24));
+        if (progress) { stage.progress = progress; } else { delete stage.progress; }
+      });
+    });
+    if (typeof message.now_utc === 'string') { state.now_utc = message.now_utc; }
+    // The time left counts from this message.
+    reconState = null;
+    renderRecon();
+  }
+
+  function renderRecon() {
+    syncClock(state.now_utc);
+    if (state !== reconState) {
+      reconState = state;
+      reconArrived = steady();
+    }
+    // Each target once: the run that has work to do (the one running, else
+    // the oldest that waits: tasks run oldest first), else the newest that
+    // began, else the newest. Newer runs that wait behind it are counted as
+    // queued, newer ones a session's end dropped as not run. The session
+    // lists the newest first. The HUD picks the same way.
+    var tasks = Array.isArray(state.tasks) ? state.tasks : [];
+    var groups = table(), keyed = [], entries = [];
+    for (var i = 0; i < tasks.length && i < RECON_SCAN; i++) {
+      var task = tasks[i];
+      if (!task || typeof task !== 'object') { continue; }
+      var key = plain(task.target, 120) || '?';
+      var group = own(groups, key);
+      if (!group) {
+        group = groups[key] = { key: key, runs: [] };
+        keyed.push(group);
+      }
+      group.runs.push({ task: task, at: i });
+    }
+    var targets = keyed.length;
+    keyed.slice(0, 10 * RECON_TARGETS).forEach(function (group) {
+      var runs = group.runs, pick = -1, queued = 0, older = [];
+      runs.forEach(function (run, j) {
+        run.stages = reconStages(run.task);
+        run.count = reconCounts(run.stages);
+        if (pick < 0 && run.count.running) { pick = j; }
+      });
+      for (var j = runs.length - 1; pick < 0 && j >= 0; j--) {
+        if (runs[j].count.live) { pick = j; }
+      }
+      for (var k = 0; pick < 0 && k < runs.length; k++) {
+        if (!dropped(runs[k].count)) { pick = k; }
+      }
+      pick = Math.max(0, pick);
+      var notRun = 0;
+      runs.forEach(function (run, j) {
+        if (j === pick) { return; }
+        if (j < pick && run.count.live) {
+          queued += 1;
+        } else {
+          if (j < pick && dropped(run.count)) { notRun += 1; }
+          older.push(run.task);
+        }
+      });
+      var chosen = runs[pick];
+      entries.push({ key: group.key, task: chosen.task, index: chosen.at, stages: chosen.stages,
+        count: chosen.count, rank: reconRank(chosen.count), queued: queued, notRun: notRun,
+        dropped: dropped(chosen.count), older: older.slice(0, RECON_EARLIER), olderCount: older.length });
+    });
+    // Shown in full, three rows at most: what is running, what waits its
+    // turn (the next one first), then what finished while this page
+    // watched; a lone finished run when there is nothing else. The others
+    // fold away under them.
+    var chosen = entries.slice().sort(function (a, b) {
+      return a.rank - b.rank || a.dropped - b.dropped ||
+        (a.rank === 1 ? b.index - a.index : a.index - b.index);
+    }).slice(0, RECON_TARGETS);
+    var watched = table(), top = [], rest = [];
+    chosen.forEach(function (item) {
+      var mark = item.key + '\n' + plain(item.task.id, 20);
+      if (item.rank < 2 || own(reconWatched, mark)) {
+        watched[mark] = true;
+        if (top.length < RECON_ROWS) { top.push(item); return; }
+      }
+      rest.push(item);
+    });
+    reconWatched = watched;
+    if (!top.length && rest.length) { top.push(rest.shift()); }
+    var hidden = targets - chosen.length;
+
+    var list = byId('recon-list'), box = byId('recon');
+    var order = JSON.stringify([top.map(function (item) { return item.key; }),
+      rest.map(function (item) { return item.key; }), hidden]);
+    var changed = order !== reconOrder;
+    if (changed) {
+      reconOrder = order;
+      var views = table();
+      reconViews = [];
+      var place = function (parent) {
+        return function (item) {
+          var view = views[item.key] = own(reconByKey, item.key) || reconView(item.key);
+          reconViews.push(view);
+          parent.appendChild(view.item);
+        };
+      };
+      clear(list);
+      top.forEach(place(list));
+      if (rest.length || hidden) {
+        var more = list.appendChild(el('li', 'recon-rest')).appendChild(fold('recon-rest', 'recon-fold', false));
+        more.appendChild(el('summary', null, (rest.length + hidden) + ' more'));
+        var inner = more.appendChild(el('ul'));
+        rest.forEach(place(inner));
+        if (hidden) { inner.appendChild(el('li', 'dim', hidden + ' not shown')); }
+      }
+      reconByKey = views;
+      box.hidden = !reconViews.length;
+      document.body.classList.toggle('recon-on', reconViews.length > 0);
+    }
+    top.concat(rest).forEach(function (item) { paintRow(own(reconByKey, item.key), reconModel(item)); });
+    box.classList.remove('still');
+    reconTick();
+    if (changed) { reconFit(); }
+  }
+
   function selectedNodeData() {
     if (!selected || !state) { return null; }
     var node = cy.$id(selected);
@@ -1337,49 +1961,6 @@
     renderMachine();
     renderHosts();
     renderCves();
-
-    // The newest run of each target in full; earlier runs of the same
-    // target (all kept in the workspace) fold away under it.
-    var latest = [];
-    var earlier = table();
-    (state.tasks || []).forEach(function (task) {
-      if (hasOwn.call(earlier, task.target)) { earlier[task.target].push(task); return; }
-      earlier[task.target] = [];
-      latest.push(task);
-    });
-    byId('tasks').parentNode.hidden = !latest.length;
-    renderList(byId('tasks'), latest, '', function (task) {
-      var item = el('li');
-      var stages = task.stages || [];
-      var count = function (status) { return stages.filter(function (s) { return s.status === status; }).length; };
-      var running = stages.filter(function (s) { return s.status === 'running'; }).map(function (s) { return s.stage; });
-      var summary = count('done') + '/' + stages.length + ' done' +
-        (running.length ? ' \u00b7 ' + running.join(', ') + ' running' : '') +
-        (count('skipped') ? ' \u00b7 ' + count('skipped') + ' skipped' : '');
-      item.appendChild(el('div', 'label', 'recon ' + task.target));
-      item.appendChild(el('div', 'dim run-summary', summary));
-      // Only stages that failed, stopped or were skipped get a line; the
-      // reason is the hint.
-      stages.forEach(function (stage) {
-        if (!/failed|interrupted|skipped/.test(stage.status)) { return; }
-        var kind = stage.status === 'skipped' ? 'info' : 'bad';
-        item.appendChild(hint(row(stage.stage, marked(stage.status, kind)), stage.detail));
-      });
-      var older = earlier[task.target];
-      if (older.length) {
-        var past = item.appendChild(fold('runs:' + task.target, 'names', false));
-        past.appendChild(el('summary', null, 'Earlier runs (' + older.length + ')'));
-        older.forEach(function (run) {
-          var when = (run.created_utc || '').replace('T', ' ').slice(0, 16);
-          var line = past.appendChild(el('div', 'fact'));
-          line.appendChild(el('div', null, '#' + run.id + (when ? '  ' + when : '')));
-          line.appendChild(el('div', 'dim', (run.stages || []).map(function (stage) {
-            return stage.stage + ' ' + stage.status;
-          }).join(' · ')));
-        });
-      }
-      return item;
-    });
 
     var notices = (state.notices || []).slice(-25).reverse();
     byId('notices-count').textContent = notices.length ? '(' + notices.length + ')' : '';
@@ -2899,6 +3480,7 @@
 
   function render() {
     renderHeader();
+    renderRecon();
     renderGraph();
     renderWhere();
     renderSide();

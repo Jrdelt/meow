@@ -10,7 +10,7 @@
 //! with crossterm is fine here.
 
 use std::io::IsTerminal;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -37,7 +37,8 @@ use crate::evidence::sanitize;
 use crate::graph::{Advisory, Graph, Host, PathNode};
 use crate::mode::Mode;
 use crate::observer::{machine_report, MachineReport};
-use crate::queue::{self, TaskRow};
+use crate::queue::{self, StageRow, TaskRow};
+use crate::timeutil::parse_rfc3339;
 use crate::topology::{host_headline, host_open_ports, only_mentioned};
 use crate::workspace::Workspace;
 
@@ -61,16 +62,21 @@ pub struct Snapshot {
     pub ai: AiStatus,
     #[serde(default)]
     pub budget: Budget,
+    /// The session's clock when it sent this: the stage times count from it.
+    #[serde(default)]
+    pub now_utc: String,
 }
 
 impl Snapshot {
     /// Reads the workspace files directly, for when no session is running.
     pub fn offline(workspace: &Workspace) -> Result<Self> {
-        let tasks = if workspace.state_db_path().symlink_metadata().is_ok() {
+        let mut tasks = if workspace.state_db_path().symlink_metadata().is_ok() {
             queue::tasks(&Db::open(&workspace.state_db_path())?, 20)?
         } else {
             Vec::new()
         };
+        // A session that was killed left its stages as they were.
+        queue::show_ended(&mut tasks);
         Ok(Self {
             session: sanitize(&workspace.name, 80),
             mode: workspace.profile.mode,
@@ -79,9 +85,22 @@ impl Snapshot {
             notices: Vec::new(),
             ai: AiStatus::default(),
             budget: Budget::default(),
+            now_utc: String::new(),
         })
     }
 }
+
+/// How far one running stage is, as a `progress` message says it.
+#[derive(Debug, Deserialize)]
+struct Tick {
+    task: i64,
+    stage: queue::Stage,
+    #[serde(default)]
+    progress: queue::Progress,
+}
+
+/// The most stages one `progress` message is read for.
+const MAX_TICKS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -111,6 +130,56 @@ pub struct Model {
     pub show_ai: bool,
     /// The upper-right panel shows everything known about this machine.
     pub show_machine: bool,
+    /// How long ago the snapshot arrived: a running stage's clock goes on
+    /// between two of them.
+    pub age: Duration,
+    /// How far the snapshot's `now_utc` was behind the session's clock when
+    /// it arrived, as far as the stamps before it tell.
+    pub lead: Duration,
+    sync: ClockSync,
+}
+
+/// The session's clock, read from the stamps it sends. A stamp is cut to
+/// whole seconds, so it is up to a second behind when it arrives: of
+/// several readings the one furthest ahead is the nearest. The map page
+/// reads the clock the same way, so both show the same second.
+#[derive(Debug, Clone, Copy)]
+struct ClockSync {
+    /// Where this panel's own steady clock starts.
+    since: std::time::Instant,
+    /// The session's clock less this panel's, in milliseconds.
+    offset: Option<i128>,
+}
+
+impl ClockSync {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            offset: None,
+        }
+    }
+
+    /// Takes the stamp of a state that arrived just now; returns how far
+    /// behind the session's clock it is.
+    fn read(&mut self, stamp: SystemTime) -> Duration {
+        let session = stamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as i128);
+        self.behind(session - self.since.elapsed().as_millis() as i128)
+    }
+
+    /// `fresh`: the session's clock less this panel's, by the stamp just
+    /// read.
+    fn behind(&mut self, fresh: i128) -> Duration {
+        let best = match self.offset {
+            // The same clock: the reading furthest ahead is the nearest.
+            Some(known) if (fresh - known).abs() < 2000 => known.max(fresh),
+            // The first reading, or the session's clock was set.
+            _ => fresh,
+        };
+        self.offset = Some(best);
+        Duration::from_millis(u64::try_from(best - fresh).unwrap_or(0))
+    }
 }
 
 impl Model {
@@ -126,7 +195,31 @@ impl Model {
             status: String::new(),
             show_ai: false,
             show_machine: false,
+            age: Duration::ZERO,
+            lead: Duration::ZERO,
+            sync: ClockSync::new(),
         }
+    }
+
+    /// The session is gone, and its recons ended with it: the running
+    /// stage stopped, the rest left out. Shown as the next session will
+    /// find them.
+    pub fn session_ended(&mut self) {
+        self.live = false;
+        self.status = "the session has ended; showing its last state".to_owned();
+        if let Some(snapshot) = &mut self.snapshot {
+            queue::show_ended(&mut snapshot.tasks);
+        }
+    }
+
+    /// A stage is running: its clock is worth drawing every second.
+    pub fn has_running_stage(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .tasks
+                .iter()
+                .any(|task| task.stages.iter().any(|stage| stage.status == "running"))
+        })
     }
 
     /// Machines that were seen first; names that were only printed in the
@@ -190,7 +283,11 @@ impl Model {
                         if let Some(address) = &mut snapshot.ai.address {
                             *address = sanitize(address, 120);
                         }
+                        snapshot.now_utc = sanitize(&snapshot.now_utc, 40);
+                        self.lead = parse_rfc3339(&snapshot.now_utc)
+                            .map_or(Duration::ZERO, |stamp| self.sync.read(stamp));
                         self.snapshot = Some(snapshot);
+                        self.age = Duration::ZERO;
                     }
                     Err(error) => {
                         self.status = format!(
@@ -210,6 +307,39 @@ impl Model {
                     }
                 }
                 self.clamp();
+            }
+            // How far the running stages are, and nothing else: sent while
+            // a tool counts its results, in place of the whole state.
+            Some("progress") => {
+                let Some(snapshot) = &mut self.snapshot else {
+                    return;
+                };
+                let said: Vec<Tick> = message
+                    .get("running")
+                    .and_then(Value::as_array)
+                    .map(|running| {
+                        running
+                            .iter()
+                            .take(MAX_TICKS)
+                            .filter_map(|tick| serde_json::from_value(tick.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for task in &mut snapshot.tasks {
+                    for stage in task.stages.iter_mut().filter(|s| s.status == "running") {
+                        stage.progress = said
+                            .iter()
+                            .find(|tick| tick.task == task.id && tick.stage == stage.stage)
+                            .map(|tick| tick.progress.clone());
+                    }
+                }
+                // The time left counts from this message's clock.
+                if let Some(now) = message.get("now_utc").and_then(Value::as_str) {
+                    snapshot.now_utc = sanitize(now, 40);
+                    self.lead = parse_rfc3339(&snapshot.now_utc)
+                        .map_or(Duration::ZERO, |stamp| self.sync.read(stamp));
+                    self.age = Duration::ZERO;
+                }
             }
             Some("result") => {
                 self.status = match message.get("ok").and_then(Value::as_bool) {
@@ -782,53 +912,478 @@ fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model) {
     );
 }
 
-fn draw_activity(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
-    let [queue_area, notice_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
-    let mut lines: Vec<Line> = Vec::new();
-    // The newest run of each target; earlier runs are only counted.
-    let mut shown: Vec<&TaskRow> = Vec::new();
-    for task in &snapshot.tasks {
-        if !shown.iter().any(|t| t.target == task.target) {
-            shown.push(task);
+/// The session's clock, carried on by this panel's own since the snapshot
+/// arrived. Nothing is counted from this machine's idea of the date.
+struct Clock {
+    now: Option<SystemTime>,
+    age: Duration,
+}
+
+impl Clock {
+    /// How long ago `started_utc` was.
+    fn since(&self, started_utc: Option<&str>) -> Option<Duration> {
+        let started = parse_rfc3339(started_utc?)?;
+        Some(self.now?.duration_since(started).unwrap_or_default() + self.age)
+    }
+}
+
+/// `0:42`, `12:05`, `1:02:03`.
+fn clock_time(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs / 3600 {
+        0 => format!("{}:{:02}", secs / 60, secs % 60),
+        hours => format!("{hours}:{:02}:{:02}", secs % 3600 / 60, secs % 60),
+    }
+}
+
+/// `45s`, `12m`, `1h05m`: time left, which is an estimate. From a minute
+/// on it is the nearest minute, as on the map (`about 12 min left`).
+fn rough_time(secs: u64) -> String {
+    let minutes = (secs + 30) / 60;
+    match (secs, minutes) {
+        (0..60, _) => format!("{secs}s"),
+        (_, 0..60) => format!("{minutes}m"),
+        _ => format!("{}h{:02}m", minutes / 60, minutes % 60),
+    }
+}
+
+/// `text` in at most `room` columns: cut with `…` where it is too long,
+/// and nothing at all where not even a few letters of it fit.
+fn fit(text: &str, room: usize) -> String {
+    if Span::raw(text).width() <= room {
+        return text.to_owned();
+    }
+    if room < 4 {
+        return String::new();
+    }
+    let mut cut = String::new();
+    for c in text.chars() {
+        cut.push(c);
+        if Span::raw(cut.as_str()).width() > room - 1 {
+            cut.pop();
+            break;
         }
     }
-    for task in shown.into_iter().take(4) {
-        let runs = snapshot
-            .tasks
+    format!("{}…", cut.trim_end())
+}
+
+/// One cell of a task's bar: each status has a mark and a colour of its
+/// own, so it reads without colours too.
+fn stage_cell(status: &str) -> Span<'static> {
+    let (mark, style) = match status {
+        "done" => ("█", GOOD),
+        "running" => (">", WARN.add_modifier(Modifier::BOLD)),
+        "failed" => ("x", BAD),
+        "interrupted" => ("!", Style::new().fg(Color::Magenta)),
+        "skipped" => ("-", Style::new().fg(Color::Blue)),
+        _ => ("·", DIM),
+    };
+    Span::styled(mark, style)
+}
+
+/// What a task is doing now, in at most `width` columns: `ports 0:42 ·
+/// SYN Stealth Scan 12% (56s left)` for a running stage, `ports stopped`
+/// for one that was cut off, `waiting` before the first, `stopped` for one
+/// whose session ended with no stage running, `not run` for one it ended
+/// before it began. Empty for a task that is over.
+fn current_stage(task: &TaskRow, clock: &Clock, width: usize) -> Vec<Span<'static>> {
+    let Some(stage) = task
+        .stages
+        .iter()
+        .find(|s| matches!(s.status.as_str(), "running" | "interrupted" | "pending"))
+    else {
+        if dropped(task) {
+            return vec![Span::styled("not run", Style::new().fg(Color::Magenta))];
+        }
+        if task.stages.iter().any(StageRow::not_run) {
+            return vec![Span::styled("stopped", Style::new().fg(Color::Magenta))];
+        }
+        return Vec::new();
+    };
+    let name = stage.stage.as_str();
+    match stage.status.as_str() {
+        "running" => running_stage(name, stage, clock, width),
+        "interrupted" => vec![Span::styled(
+            format!("{name} stopped"),
+            Style::new().fg(Color::Magenta),
+        )],
+        _ if task.stages.iter().all(|s| s.status == "pending") => {
+            vec![Span::styled("waiting", DIM)]
+        }
+        _ => vec![Span::styled(format!("{name} waiting"), DIM)],
+    }
+}
+
+/// A running stage in at most `width` columns: its name, how many of its
+/// items are done and how long it has run; then what its tool is on, with
+/// the tool's own figures: `services 1/4 0:42 · Service scan 12% (56s
+/// left)`. A percent and a time left are those of the scan named before
+/// them, not of the stage: nmap starts both over with each of its scans.
+fn running_stage(name: &str, stage: &StageRow, clock: &Clock, width: usize) -> Vec<Span<'static>> {
+    let (mut items, mut percent, mut note, mut left) =
+        (String::new(), String::new(), String::new(), String::new());
+    if let Some(progress) = &stage.progress {
+        if let (Some(done), Some(total)) = (progress.done, progress.total) {
+            items = format!("{done}/{total}");
+        }
+        if let Some(value) = progress.percent {
+            percent = format!("{}%", value.min(100));
+        }
+        // What the tool says in words: the scan a percent is of, or all
+        // there is (`412 results so far`).
+        if !percent.is_empty() || items.is_empty() {
+            note = sanitize(progress.note.as_deref().unwrap_or(""), 80);
+        }
+        // The time left when the state was made, less the time since.
+        if let Some(secs) = progress
+            .eta_s
+            .map(|secs| secs.saturating_sub(clock.age.as_secs()))
+            .filter(|secs| *secs > 0)
+        {
+            left = format!(" ({} left)", rough_time(secs));
+        }
+    }
+    let elapsed = clock
+        .since(stage.started_utc.as_deref())
+        .map(clock_time)
+        .unwrap_or_default();
+    let line = |items: &str, note: &str, percent: &str| {
+        let join = |words: [&str; 3]| {
+            let words: Vec<&str> = words.into_iter().filter(|word| !word.is_empty()).collect();
+            words.join(" ")
+        };
+        let (stage, tool) = (join([name, items, &elapsed]), join([note, percent, ""]));
+        if tool.is_empty() {
+            stage
+        } else {
+            format!("{stage} \u{b7} {tool}")
+        }
+    };
+    let fits = |text: &str, left: &str| Span::raw(text).width() + left.len() <= width;
+    // In a narrow panel these give way, in this order: the time left, the
+    // count, the tool's words (cut, then left out), the percent. The time
+    // the stage has run is never cut: half a clock reads as another time.
+    let whole = line(&items, &note, &percent);
+    let (text, left) = if fits(&whole, &left) {
+        (whole, left)
+    } else if fits(&whole, "") {
+        (whole, String::new())
+    } else {
+        let bare = line("", "", &percent);
+        // A note takes a separator of three columns, or the space before
+        // the percent.
+        let taken = Span::raw(bare.as_str()).width() + if percent.is_empty() { 3 } else { 1 };
+        let cut = fit(&note, width.saturating_sub(taken));
+        let text = [
+            line("", &note, &percent),
+            line("", &cut, &percent),
+            bare,
+            line("", "", ""),
+        ]
+        .into_iter()
+        .find(|text| fits(text, ""))
+        .unwrap_or_else(|| match elapsed.is_empty() {
+            true => name.to_owned(),
+            false => elapsed.clone(),
+        });
+        (text, String::new())
+    };
+    let mut spans = vec![Span::styled(text, WARN.add_modifier(Modifier::BOLD))];
+    if !left.is_empty() {
+        spans.push(Span::styled(left, DIM));
+    }
+    spans
+}
+
+/// One target's recon as the queue panel shows it.
+struct Shown<'a> {
+    task: &'a TaskRow,
+    /// Runs of the same target that wait behind this one.
+    queued: usize,
+    /// Newer runs of it that the end of a session dropped before they began.
+    not_run: usize,
+    /// Its other runs.
+    earlier: usize,
+    /// 0: a stage is running. 1: stages are left. 2: nothing is left.
+    rank: u8,
+}
+
+/// Whether the end of a session dropped `task` before any of its stages ran.
+fn dropped(task: &TaskRow) -> bool {
+    task.stages.iter().any(StageRow::not_run)
+        && !task
+            .stages
             .iter()
-            .filter(|t| t.target == task.target)
+            .any(|stage| matches!(stage.status.as_str(), "done" | "failed" | "interrupted"))
+}
+
+/// The recons to show, one for each target, in the order they matter: the
+/// one that is running, those that wait (the next one first), then those
+/// that are over (the newest first, those that never began last). Of a
+/// target that was queued more than once, the run that has work to do: the
+/// one that is running, else the oldest that waits (tasks run oldest
+/// first), else the newest that began, else the newest. The map picks and
+/// orders the same way.
+fn shown_runs(tasks: &[TaskRow]) -> Vec<Shown<'_>> {
+    let running = |task: &TaskRow| task.stages.iter().any(|stage| stage.status == "running");
+    let mut shown: Vec<Shown> = Vec::new();
+    // The session lists the newest first.
+    for newest in tasks {
+        if shown.iter().any(|run| run.task.target == newest.target) {
+            continue;
+        }
+        let runs = || tasks.iter().filter(|task| task.target == newest.target);
+        let task = runs()
+            .find(|task| running(task))
+            .or_else(|| runs().rfind(|task| task.unfinished()))
+            .or_else(|| runs().find(|task| !dropped(task)))
+            .unwrap_or(newest);
+        let newer = || runs().filter(|run| run.id > task.id);
+        let queued = newer().filter(|run| run.unfinished()).count();
+        let not_run = newer()
+            .filter(|run| !run.unfinished() && dropped(run))
             .count();
-        let mut spans = vec![Span::raw(format!("recon {} ", sanitize(&task.target, 120)))];
-        if runs > 1 {
-            spans.push(Span::styled(format!("(+{} earlier) ", runs - 1), DIM));
+        shown.push(Shown {
+            task,
+            queued,
+            not_run,
+            earlier: runs().count() - 1 - queued - not_run,
+            rank: match (running(task), task.unfinished()) {
+                (true, _) => 0,
+                (false, true) => 1,
+                (false, false) => 2,
+            },
+        });
+    }
+    shown.sort_by_key(|run| {
+        let turn = if run.rank == 1 {
+            run.task.id
+        } else {
+            -run.task.id
+        };
+        (run.rank, dropped(run.task), turn)
+    });
+    shown
+}
+
+/// The progress of one task in `width` columns: its target, a bar with a
+/// cell for every stage, how many stages are over, and what it is doing
+/// now. On one line where that fits, on up to three where it does not.
+fn task_lines(run: &Shown, clock: &Clock, width: usize) -> Vec<Line<'static>> {
+    let task = run.task;
+    let mut head = vec![Span::raw(format!("recon {}", sanitize(&task.target, 120)))];
+    let others: Vec<String> = [
+        (run.queued, "queued"),
+        (run.not_run, "not run"),
+        (run.earlier, "earlier"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, what)| format!("+{count} {what}"))
+    .collect();
+    if !others.is_empty() {
+        head.push(Span::styled(format!(" ({})", others.join(", ")), DIM));
+    }
+    // Stages the end of the session left out are not counted as over.
+    let count = Span::raw(format!("{}/{}", task.stages_over(), task.stages.len()));
+    // A panel too narrow for the bar still says how far the task is.
+    let bar = if task.stages.len() + 1 + count.width() <= width {
+        let mut bar: Vec<Span> = task.stages.iter().map(|s| stage_cell(&s.status)).collect();
+        bar.push(Span::raw(" "));
+        bar.push(count);
+        bar
+    } else {
+        vec![count]
+    };
+    let mut lines = Vec::new();
+    let mut line: Vec<Span> = Vec::new();
+    let mut used = 0;
+    for part in [head, bar, current_stage(task, clock, width)] {
+        let part_width: usize = part.iter().map(Span::width).sum();
+        if part_width == 0 {
+            continue;
         }
-        for stage in &task.stages {
-            let style = match stage.status.as_str() {
-                "done" => GOOD,
-                "running" => WARN.add_modifier(Modifier::BOLD),
-                "failed" | "interrupted" => BAD,
-                _ => DIM,
-            };
-            spans.push(Span::styled(
-                format!("{}:{} ", stage.stage.as_str(), sanitize(&stage.status, 32)),
-                style,
-            ));
+        if used > 0 && used + 2 + part_width > width {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            used = 0;
         }
-        lines.push(Line::from(spans));
-        if let Some(active) = task.stages.iter().rev().find(|s| !s.detail.is_empty()) {
-            let room = (queue_area.width as usize).saturating_sub(4);
-            for piece in wrap_words(&sanitize(&active.detail, 300), room) {
-                lines.push(Line::styled(format!("  {piece}"), DIM));
-            }
+        if used > 0 {
+            line.push(Span::raw("  "));
+            used += 2;
+        }
+        line.extend(part);
+        used += part_width;
+    }
+    lines.push(Line::from(line));
+    lines
+}
+
+/// The line under a task's bar. Of a recon that the end of its session cut
+/// short: where, as on the map (the stage that was stopped, or the first
+/// one left out). Else the stages that failed, by name: the bar's marks
+/// have none. Else what the latest stage with a result said; why a stage
+/// was left out only where no stage has more to say.
+fn said_under(task: &TaskRow) -> Option<String> {
+    let of =
+        |stage: &StageRow| format!("{}: {}", stage.stage.as_str(), sanitize(&stage.detail, 300));
+    let stopped = |s: &&StageRow| s.status == "interrupted" && !s.live();
+    let cut = task
+        .stages
+        .iter()
+        .find(stopped)
+        .or_else(|| task.stages.iter().find(|s| s.not_run()));
+    if let Some(stage) = cut {
+        return Some(of(stage));
+    }
+    let failed: Vec<&StageRow> = task
+        .stages
+        .iter()
+        .filter(|stage| stage.status == "failed")
+        .collect();
+    match failed.as_slice() {
+        [] => {}
+        [one] if one.detail.is_empty() => return Some(format!("{} failed", one.stage.as_str())),
+        [one] => {
+            return Some(format!(
+                "{} failed: {}",
+                one.stage.as_str(),
+                sanitize(&one.detail, 300)
+            ))
+        }
+        many => {
+            let names: Vec<&str> = many.iter().map(|stage| stage.stage.as_str()).collect();
+            return Some(format!("failed: {}", names.join(", ")));
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "No recon tasks. Queue one with `meow recon <target>`.",
+    let said = |skipped: bool| {
+        task.stages
+            .iter()
+            .rev()
+            .find(|s| !s.detail.is_empty() && (s.status == "skipped") == skipped)
+    };
+    said(false).or_else(|| said(true)).map(of)
+}
+
+/// The most recons the queue panel lays out.
+const MAX_SHOWN: usize = 12;
+
+/// What the marks of a task's bar stand for, where a row is free for it.
+fn legend(width: usize) -> Option<Line<'static>> {
+    let mut spans = Vec::new();
+    for status in [
+        "done",
+        "running",
+        "failed",
+        "interrupted",
+        "skipped",
+        "pending",
+    ] {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(stage_cell(status));
+        spans.push(Span::styled(
+            format!(" {}", queue::status_word(status)),
             DIM,
         ));
     }
+    let line = Line::from(spans);
+    (line.width() <= width).then_some(line)
+}
+
+/// The queue panel's lines for `rows` rows of `room` columns. The recon
+/// that is running comes first and keeps all its lines; where the panel is
+/// too short, the lines under the others' bars go first, then whole recons
+/// from the end, and the last row says how many were left out.
+fn queue_lines(tasks: &[TaskRow], clock: &Clock, room: usize, rows: usize) -> Vec<Line<'static>> {
+    let shown = shown_runs(tasks);
+    if shown.is_empty() {
+        return vec![Line::styled(
+            "No recon tasks. Queue one with `meow recon <target>`.",
+            DIM,
+        )];
+    }
+    struct Block {
+        main: Vec<Line<'static>>,
+        under: Vec<Line<'static>>,
+        running: bool,
+    }
+    let mut blocks: Vec<Block> = shown
+        .iter()
+        .take(MAX_SHOWN)
+        .map(|run| Block {
+            main: task_lines(run, clock, room),
+            under: said_under(run.task)
+                .map(|said| {
+                    wrap_words(&said, room.saturating_sub(2))
+                        .into_iter()
+                        .map(|piece| Line::styled(format!("  {piece}"), DIM))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            running: run.rank == 0,
+        })
+        .collect();
+    let height = |blocks: &[Block]| -> usize {
+        blocks
+            .iter()
+            .map(|block| block.main.len() + block.under.len())
+            .sum()
+    };
+    // Too many lines: first without what the others say under their bars.
+    for index in (0..blocks.len()).rev() {
+        if height(&blocks) <= rows {
+            break;
+        }
+        if !blocks[index].running {
+            blocks[index].under.clear();
+        }
+    }
+    // Still too many: whole recons from the end, with a row to say so.
+    let mut kept = blocks.len();
+    let fits = |blocks: &[Block], kept: usize| {
+        height(&blocks[..kept]) + usize::from(kept < shown.len()) <= rows
+    };
+    while kept > 1 && !fits(&blocks, kept) {
+        kept -= 1;
+    }
+    // Not even the first one: without the line under its bar.
+    if !fits(&blocks, kept) {
+        blocks[0].under.clear();
+    }
+    let mut lines: Vec<Line> = blocks
+        .drain(..kept)
+        .flat_map(|block| block.main.into_iter().chain(block.under))
+        .collect();
+    let left_out = &shown[kept..];
+    if !left_out.is_empty() {
+        let what = if left_out.iter().all(|run| run.rank == 1) {
+            "waiting"
+        } else {
+            "more"
+        };
+        lines.push(Line::styled(format!("+{} {what}", left_out.len()), DIM));
+    } else if let Some(legend) = legend(room).filter(|_| lines.len() < rows) {
+        // At the foot of the panel, where it is out of the way.
+        lines.resize(rows - 1, Line::default());
+        lines.push(legend);
+    }
+    lines
+}
+
+fn draw_activity(frame: &mut Frame, area: Rect, model: &Model, snapshot: &Snapshot) {
+    let [queue_area, notice_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+    let clock = Clock {
+        now: parse_rfc3339(&snapshot.now_utc).map(|now| now + model.lead),
+        age: model.age,
+    };
+    let lines = queue_lines(
+        &snapshot.tasks,
+        &clock,
+        (queue_area.width as usize).saturating_sub(2),
+        (queue_area.height as usize).saturating_sub(2),
+    );
     frame.render_widget(
         Paragraph::new(lines).block(panel("Background queue", false)),
         queue_area,
@@ -1001,7 +1556,7 @@ pub fn draw(frame: &mut Frame, model: &Model) {
         );
     }
     draw_advisories(frame, advisories, model);
-    draw_activity(frame, activity, snapshot);
+    draw_activity(frame, activity, model, snapshot);
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,11 +1602,21 @@ async fn event_loop(
     mut socket: Option<Socket>,
 ) -> Result<()> {
     let mut input = spawn_input();
+    let mut arrived = std::time::Instant::now();
+    // Often enough that a running stage's clock moves on the second.
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Once the session is gone its clocks stand still.
+        if model.live {
+            model.age = arrived.elapsed();
+        }
         terminal
             .draw(|frame| draw(frame, model))
             .context("cannot draw the panel")?;
         tokio::select! {
+            // Only to draw again: the time a stage has been running.
+            _ = tick.tick(), if model.live && model.has_running_stage() => {}
             event = input.recv() => {
                 let Some(event) = event else { break };
                 let action = match event {
@@ -1079,12 +1644,17 @@ async fn event_loop(
                     None => std::future::pending().await,
                 }
             } => match message {
-                Some(Ok(Message::Text(text))) => model.apply_message(&text),
+                Some(Ok(Message::Text(text))) => {
+                    model.apply_message(&text);
+                    // A new state starts its age again.
+                    if model.age.is_zero() {
+                        arrived = std::time::Instant::now();
+                    }
+                }
                 Some(Ok(_)) => {}
                 _ => {
                     socket = None;
-                    model.live = false;
-                    model.status = "the session has ended; showing its last state".to_owned();
+                    model.session_ended();
                 }
             },
         }
@@ -1264,7 +1834,8 @@ mod tests {
             "title of CVE-2020-0002",
             "cpe:2.3:a:nginx:nginx:1.18.0  80/tcp",
             "Background queue",
-            "recon 10.10.10.0/23 ports:done services:running crawl:pending dirs:pending",
+            "recon 10.10.10.0/23  █>·· 1/4  services",
+            "  ports: 2 hosts up",
             "Notices",
             "09:41:00 not running as root: -sS replaced with -sT (connect scan)",
             "n note  L/C/R AI",
@@ -1319,6 +1890,292 @@ mod tests {
         assert_eq!(wrap_words("abcdefghijkl mn", 8), ["abcdefgh", "ijkl mn"]);
     }
 
+    /// A state whose tasks are `runs`: (id, target, the status of each
+    /// stage), newest first. `closed` is a stage the end of the session
+    /// stopped, `not run` one it left out.
+    fn runs_message(runs: &[(i64, &str, &[&str])]) -> serde_json::Value {
+        let tasks: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|(id, target, statuses)| {
+                let stages: Vec<serde_json::Value> = queue::STAGES
+                    .iter()
+                    .zip(*statuses)
+                    .map(|(stage, status)| {
+                        let (status, detail) = match *status {
+                            "closed" => ("interrupted", queue::CLOSED_DETAIL),
+                            "not run" => ("skipped", queue::NOT_RUN_CLOSED),
+                            status => (status, ""),
+                        };
+                        let mut row = json!({ "stage": stage, "status": status, "detail": detail });
+                        if status == "running" {
+                            row["started_utc"] = json!("2026-11-12T10:00:00Z");
+                        }
+                        row
+                    })
+                    .collect();
+                json!({ "id": id, "target": target, "mode": "mild", "extra_flags": [],
+                    "created_utc": "", "stages": stages })
+            })
+            .collect();
+        let mut message: serde_json::Value =
+            serde_json::from_str(&state_message(&Graph::default())).unwrap();
+        message["state"]["now_utc"] = json!("2026-11-12T10:00:42Z");
+        message["state"]["tasks"] = json!(tasks);
+        message
+    }
+
+    /// The queue panel's rows at this size, without its border.
+    fn queue_rows(model: &Model, width: u16, height: u16) -> Vec<String> {
+        let text = screen(model, width, height);
+        let lines: Vec<&str> = text.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains("Background queue"))
+            .expect("the queue panel");
+        let inner = (width / 2) as usize - 2;
+        lines[top + 1..lines.len() - 3]
+            .iter()
+            .map(|line| line.chars().skip(1).take(inner).collect::<String>())
+            .map(|row| row.trim_end().to_owned())
+            .collect()
+    }
+
+    /// A target queued again while its first run is still going: the run
+    /// that is running stays on its row, and the new one is counted.
+    #[test]
+    fn a_target_queued_again_keeps_showing_the_run_that_has_work() {
+        const RUNNING: [&str; 17] = [
+            "done", "done", "done", "done", "done", "done", "done", "done", "running", "pending",
+            "pending", "pending", "pending", "pending", "pending", "pending", "pending",
+        ];
+        let message = runs_message(&[
+            (3, "192.0.2.10", &["pending"; 17]),
+            (2, "192.0.2.10", &RUNNING),
+            (1, "192.0.2.10", &["done"; 17]),
+        ]);
+        let model = shown(&message);
+        let rows = queue_rows(&model, 200, 40);
+        assert_eq!(
+            rows[0],
+            "recon 192.0.2.10 (+1 queued, +1 earlier)  ████████>········ 8/17  services 0:42"
+        );
+        // One row for the target, and nothing says it waits.
+        assert!(rows[1..9].iter().all(String::is_empty), "{rows:?}");
+
+        // Both stopped by light mode: the older one is next, so it is
+        // shown; once it runs again it still is.
+        let mut paused = RUNNING;
+        paused[8] = "interrupted";
+        let message = runs_message(&[
+            (3, "192.0.2.10", &["pending"; 17]),
+            (2, "192.0.2.10", &paused),
+        ]);
+        let rows = queue_rows(&shown(&message), 160, 40);
+        assert_eq!(
+            rows[0],
+            "recon 192.0.2.10 (+1 queued)  ████████!········ 8/17  services stopped"
+        );
+        // Nothing left to do in any of them: the newest.
+        let mut failed = ["done"; 17];
+        failed[16] = "failed";
+        let message = runs_message(&[(3, "192.0.2.10", &failed), (2, "192.0.2.10", &["done"; 17])]);
+        let rows = queue_rows(&shown(&message), 160, 40);
+        assert_eq!(
+            rows[..2],
+            [
+                "recon 192.0.2.10 (+1 earlier)  ████████████████x 17/17",
+                "  dirs failed"
+            ]
+        );
+        // The session was closed: the run it stopped is shown, not the
+        // newer one it dropped before it began, and before the targets
+        // whose runs never began.
+        let mut cut = ["not run"; 17];
+        cut[..8].fill("done");
+        cut[8] = "closed";
+        let message = runs_message(&[
+            (4, "192.0.2.11", &["not run"; 17]),
+            (3, "192.0.2.10", &["not run"; 17]),
+            (2, "192.0.2.10", &cut),
+        ]);
+        let rows = queue_rows(&shown(&message), 160, 40);
+        assert_eq!(
+            rows[..4],
+            [
+                "recon 192.0.2.10 (+1 not run)  ████████!-------- 8/17  services stopped",
+                "  services: stopped: the session was closed",
+                "recon 192.0.2.11  ----------------- 0/17  not run",
+                "  lan: not run: the session was closed",
+            ]
+        );
+    }
+
+    /// Several targets: the one that is running first with all its lines,
+    /// then those that wait in the order they will run, then what is over;
+    /// what does not fit is counted, never cut in the middle.
+    #[test]
+    fn the_running_recon_comes_first_and_what_is_left_out_is_counted() {
+        const RUNNING: [&str; 17] = [
+            "skipped", "skipped", "skipped", "skipped", "skipped", "done", "running", "pending",
+            "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending",
+            "pending",
+        ];
+        let mut runs: Vec<(i64, String, &[&str])> = (2..=6)
+            .rev()
+            .map(|id| (id, format!("192.0.2.{}", 30 + id), &["pending"; 17][..]))
+            .collect();
+        runs.push((1, "192.0.2.31".to_owned(), &RUNNING));
+        runs.push((0, "192.0.2.30".to_owned(), &["done"; 17]));
+        let runs: Vec<(i64, &str, &[&str])> = runs
+            .iter()
+            .map(|(id, target, statuses)| (*id, target.as_str(), *statuses))
+            .collect();
+        let mut message = runs_message(&runs);
+        message["state"]["tasks"][5]["stages"][5]["detail"] = json!("12 hops");
+        message["state"]["tasks"][5]["stages"][6]["progress"] =
+            json!({ "percent": 11, "eta_s": 36, "note": "SYN Stealth Scan" });
+        let model = shown(&message);
+
+        // Tall and wide: all seven, in order.
+        let rows = queue_rows(&model, 160, 40);
+        assert_eq!(
+            rows[..9],
+            [
+                "recon 192.0.2.31  -----█>·········· 6/17",
+                "ports 0:42 · SYN Stealth Scan 11% (36s left)",
+                "  trace: 12 hops",
+                "recon 192.0.2.32  ················· 0/17  waiting",
+                "recon 192.0.2.33  ················· 0/17  waiting",
+                "recon 192.0.2.34  ················· 0/17  waiting",
+                "recon 192.0.2.35  ················· 0/17  waiting",
+                "recon 192.0.2.36  ················· 0/17  waiting",
+                "recon 192.0.2.30  █████████████████ 17/17",
+            ],
+        );
+        // A row is free at the foot: what the marks stand for.
+        assert_eq!(
+            rows[9],
+            "█ done  > running  x failed  ! stopped  - skipped  · waiting"
+        );
+
+        // 160 x 30: six rows. The running one with all its lines, the next
+        // ones, and how many more there are.
+        let rows = queue_rows(&model, 160, 30);
+        assert_eq!(
+            rows,
+            [
+                "recon 192.0.2.31  -----█>·········· 6/17",
+                "ports 0:42 · SYN Stealth Scan 11% (36s left)",
+                "  trace: 12 hops",
+                "recon 192.0.2.32  ················· 0/17  waiting",
+                "recon 192.0.2.33  ················· 0/17  waiting",
+                "+4 more",
+            ]
+        );
+        // 80 x 24: six rows of 38 columns. The running recon keeps its
+        // lines; the others are counted.
+        let rows = queue_rows(&model, 80, 24);
+        assert_eq!(
+            rows,
+            [
+                "recon 192.0.2.31",
+                "-----█>·········· 6/17",
+                "ports 0:42 · SYN Stealth Scan 11%",
+                "  trace: 12 hops",
+                "+6 more",
+                "",
+            ]
+        );
+        // Only waiting ones are left out: said so. What the others say
+        // under their bars goes before a recon does.
+        let mut waiting = runs_message(&runs[..6]);
+        waiting["state"]["tasks"][4]["stages"][0]["status"] = json!("skipped");
+        waiting["state"]["tasks"][4]["stages"][0]["detail"] = json!("turned off");
+        let rows = queue_rows(&shown(&waiting), 160, 30);
+        assert_eq!(
+            rows,
+            [
+                "recon 192.0.2.31  -----█>·········· 6/17  ports 0:42",
+                "recon 192.0.2.32  -················ 1/17  dns waiting",
+                "recon 192.0.2.33  ················· 0/17  waiting",
+                "recon 192.0.2.34  ················· 0/17  waiting",
+                "recon 192.0.2.35  ················· 0/17  waiting",
+                "recon 192.0.2.36  ················· 0/17  waiting",
+            ]
+        );
+        let rows = queue_rows(&shown(&waiting), 80, 24);
+        assert_eq!(
+            rows,
+            [
+                "recon 192.0.2.31",
+                "-----█>·········· 6/17  ports 0:42",
+                "recon 192.0.2.32",
+                "-················ 1/17  dns waiting",
+                "+4 waiting",
+                "",
+            ]
+        );
+        // No recon: no legend either.
+        let none = queue_rows(&shown(&runs_message(&[])), 160, 40);
+        assert_eq!(
+            none[0],
+            "No recon tasks. Queue one with `meow recon <target>`."
+        );
+        assert!(none[1..].iter().all(String::is_empty), "{none:?}");
+    }
+
+    /// While a tool counts its results the session sends only how far the
+    /// running stages are: the panel takes that in without a new state.
+    #[test]
+    fn a_progress_message_moves_the_running_stage_without_a_new_state() {
+        let message = recon_message(
+            &SEVENTEEN,
+            json!({ "started_utc": "2026-11-12T10:00:00Z", "progress": { "done": 3 , "note": "3 results so far" } }),
+        );
+        let mut model = shown(&message);
+        assert!(screen(&model, 160, 40).contains("ports 0:42 · 3 results so far"));
+        model.age = Duration::from_secs(3);
+        let tick = |running: serde_json::Value| {
+            json!({ "type": "progress", "key": "k", "now_utc": "2026-11-12T10:00:50Z",
+                "running": running })
+            .to_string()
+        };
+        model.apply_message(&tick(json!([
+            { "task": 7, "stage": "ports",
+              "progress": { "percent": 40, "eta_s": 30, "note": "SYN Stealth Scan" } },
+            // Not a running stage of a task that is shown: ignored.
+            { "task": 7, "stage": "lan", "progress": { "percent": 99 } },
+            { "task": 8, "stage": "ports", "progress": { "percent": 98 } },
+            { "task": 7, "stage": "no-such-stage", "progress": { "percent": 97 } },
+            "junk",
+        ])));
+        assert_eq!(model.status, "");
+        assert_eq!(
+            model.age,
+            Duration::ZERO,
+            "the time left counts from this message"
+        );
+        let text = screen(&model, 160, 40);
+        assert!(
+            text.contains("ports 0:50 · SYN Stealth Scan 40% (30s left)"),
+            "{text}"
+        );
+        assert!(!text.contains("99%") && !text.contains("98%") && !text.contains("97%"));
+        let tasks = &model.snapshot.as_ref().unwrap().tasks;
+        assert!(tasks[0].stages[0].progress.is_none());
+        // A stage the message no longer names says nothing any more.
+        model.apply_message(&tick(json!([])));
+        let text = screen(&model, 160, 40);
+        assert!(text.contains(" 6/17  ports 0:50  "), "{text}");
+        // What is not a list changes nothing but the clock; no state yet,
+        // nothing at all.
+        model.apply_message(&tick(json!("all of them")));
+        assert!(screen(&model, 160, 40).contains(" 6/17  ports 0:50  "));
+        let mut empty = Model::new(true);
+        empty.apply_message(&tick(json!([])));
+        assert!(empty.snapshot.is_none());
+    }
+
     #[test]
     fn only_the_newest_run_of_a_target_is_shown() {
         let mut message: serde_json::Value =
@@ -1332,10 +2189,555 @@ mod tests {
         model.apply_message(&message.to_string());
         let text = screen(&model, 160, 64);
         assert!(
-            text.contains("recon 10.10.10.5 (+2 earlier) ports:running"),
+            text.contains("recon 10.10.10.5 (+2 earlier)  > 0/1  ports"),
             "{text}"
         );
         assert_eq!(text.matches("recon 10.10.10.5").count(), 1, "{text}");
+    }
+
+    /// A state with one recon task whose stages have `statuses`, in order.
+    fn recon_message(statuses: &[&str], running: serde_json::Value) -> serde_json::Value {
+        let stages: Vec<serde_json::Value> = queue::STAGES
+            .iter()
+            .zip(statuses)
+            .map(|(stage, status)| {
+                let mut row = json!({ "stage": stage, "status": status, "detail": "" });
+                if *status == "running" {
+                    for (key, value) in running.as_object().unwrap() {
+                        row[key] = value.clone();
+                    }
+                }
+                row
+            })
+            .collect();
+        let mut message: serde_json::Value =
+            serde_json::from_str(&state_message(&Graph::default())).unwrap();
+        message["state"]["now_utc"] = json!("2026-11-12T10:00:42Z");
+        message["state"]["tasks"] = json!([ { "id": 7, "target": "192.0.2.5", "mode": "mild",
+            "extra_flags": [], "created_utc": "", "stages": stages } ]);
+        message
+    }
+
+    const SEVENTEEN: [&str; 17] = [
+        "done", "done", "skipped", "done", "failed", "done", "running", "pending", "pending",
+        "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending",
+    ];
+
+    fn shown(message: &serde_json::Value) -> Model {
+        let mut model = Model::new(true);
+        model.apply_message(&message.to_string());
+        assert_eq!(model.status, "", "the state was not read");
+        model
+    }
+
+    #[test]
+    fn a_recon_task_shows_a_bar_and_how_far_the_running_stage_is() {
+        let message = recon_message(
+            &SEVENTEEN,
+            json!({ "started_utc": "2026-11-12T10:00:00Z", "detail": "",
+                "progress": { "percent": 12, "eta_s": 56, "note": "SYN Stealth Scan" } }),
+        );
+        let mut model = shown(&message);
+        assert!(model.has_running_stage());
+        // On a wide screen: one line.
+        let wide = screen(&model, 200, 40);
+        assert!(
+            wide.contains(
+                "recon 192.0.2.5  ██-█x█>·········· 6/17  ports 0:42 · SYN Stealth Scan 12% (56s left)"
+            ),
+            "{wide}"
+        );
+        // Where that is too long, what it is doing has a line of its own.
+        let wide = screen(&model, 160, 40);
+        for expected in [
+            "│recon 192.0.2.5  ██-█x█>·········· 6/17 ",
+            "│ports 0:42 · SYN Stealth Scan 12% (56s left) ",
+        ] {
+            assert!(wide.contains(expected), "missing {expected:?} in:\n{wide}");
+        }
+        // In 80 columns the same, on lines of its own; the time left is
+        // the first to give way.
+        let narrow = screen(&model, 80, 24);
+        for expected in [
+            "│recon 192.0.2.5 ",
+            "│██-█x█>·········· 6/17 ",
+            "│ports 0:42 · SYN Stealth Scan 12% ",
+        ] {
+            assert!(
+                narrow.contains(expected),
+                "missing {expected:?} in:\n{narrow}"
+            );
+        }
+        // The stamp was cut to the second and earlier ones said the
+        // session's clock is further on: the stage's clock is too.
+        model.lead = Duration::from_millis(800);
+        model.age = Duration::from_millis(300);
+        let ahead = screen(&model, 160, 40);
+        assert!(
+            ahead.contains("ports 0:43 · SYN Stealth Scan 12% (56s left)"),
+            "{ahead}"
+        );
+        model.lead = Duration::ZERO;
+        // Between two states the panel's own clock carries on.
+        model.age = Duration::from_secs(5);
+        let later = screen(&model, 160, 40);
+        assert!(
+            later.contains("ports 0:47 · SYN Stealth Scan 12% (51s left)"),
+            "{later}"
+        );
+        model.age = Duration::from_secs(3600);
+        let late = screen(&model, 160, 40);
+        assert!(
+            late.contains("ports 1:00:42 · SYN Stealth Scan 12% │"),
+            "{late}"
+        );
+        assert!(!late.contains("left)"), "{late}");
+
+        // Items instead of a percent, both, or only what the tool says.
+        for (progress, expected) in [
+            (json!({ "done": 3, "total": 9 }), "ports 3/9 0:42  "),
+            (
+                json!({ "done": 1, "total": 4, "percent": 100, "eta_s": 7200 }),
+                "ports 1/4 0:42 · 100% (2h00m left)",
+            ),
+            // The scan a percent is of is named with it.
+            (
+                json!({ "done": 1, "total": 4, "percent": 37, "eta_s": 44, "note": "Service scan" }),
+                "ports 1/4 0:42 · Service scan 37% (44s left)",
+            ),
+            // A count of items says what it counts: no words with it.
+            (
+                json!({ "done": 3, "total": 9, "note": "hosts" }),
+                "ports 3/9 0:42  ",
+            ),
+            (
+                json!({ "done": 412, "note": "412 results so far" }),
+                "ports 0:42 · 412 results so far  ",
+            ),
+            (json!({ "eta_s": 90 }), "ports 0:42 (2m left)"),
+            (json!({}), "ports 0:42  "),
+        ] {
+            let message = recon_message(
+                &SEVENTEEN,
+                json!({ "started_utc": "2026-11-12T10:00:00Z", "progress": progress }),
+            );
+            let text = screen(&shown(&message), 160, 40);
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        // No times, or times that are none: the name alone, and no clock.
+        for running in [
+            json!({}),
+            json!({ "started_utc": "yesterday" }),
+            json!({ "started_utc": "2026-11-12T10:00:00Z\u{1b}[2J" }),
+        ] {
+            let text = screen(&shown(&recon_message(&SEVENTEEN, running)), 160, 40);
+            assert!(text.contains(" 6/17  ports  "), "{text}");
+        }
+        // A start after the session's own clock counts as now.
+        let ahead = recon_message(&SEVENTEEN, json!({ "started_utc": "2026-11-12T10:05:00Z" }));
+        assert!(screen(&shown(&ahead), 160, 40).contains(" 6/17  ports 0:00  "));
+    }
+
+    #[test]
+    fn a_session_that_ends_leaves_its_running_stage_shown_as_stopped() {
+        let message = recon_message(
+            &SEVENTEEN,
+            json!({ "started_utc": "2026-11-12T10:00:00Z",
+                "progress": { "percent": 75, "eta_s": 50 } }),
+        );
+        let mut model = shown(&message);
+        assert!(screen(&model, 160, 40).contains("ports 0:42 · 75% (50s left)"));
+        model.age = Duration::from_secs(9);
+
+        model.session_ended();
+        assert!(!model.live && !model.has_running_stage());
+        let text = screen(&model, 160, 40);
+        for expected in [
+            "the session has ended; showing its last state",
+            "recon 192.0.2.5  ██-█x█!---------- 6/17  ports stopped",
+            "  ports: stopped: the session was closed",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(!text.contains("75%") && !text.contains("left)"), "{text}");
+        // Finished stages are as they were; the ones that had not started
+        // are left out, and are not counted as over.
+        let stages = &model.snapshot.as_ref().unwrap().tasks[0].stages;
+        let statuses: Vec<&str> = stages.iter().map(|s| s.status.as_str()).collect();
+        let mut expected = SEVENTEEN;
+        expected[6] = "interrupted";
+        for status in &mut expected[7..] {
+            *status = "skipped";
+        }
+        assert_eq!(statuses, expected);
+        assert!(stages[7..]
+            .iter()
+            .all(|s| s.detail == "not run: the session was closed"));
+        assert_eq!(stages[2].detail, "", "turned off, as it was");
+
+        // A recon none of whose stages had started: not run, nothing over.
+        let mut model = shown(&recon_message(&["pending"; 17], json!({})));
+        model.session_ended();
+        let text = screen(&model, 160, 40);
+        assert!(
+            text.contains("recon 192.0.2.5  ----------------- 0/17  not run"),
+            "{text}"
+        );
+        // The line under the bar says where it was cut, as the map does.
+        assert!(
+            text.contains("  lan: not run: the session was closed"),
+            "{text}"
+        );
+        // One that was cut after results: the first stage left out, not
+        // the last, and not the result before it.
+        let mut message = recon_message(&["pending"; 17], json!({}));
+        for index in 0..3 {
+            message["state"]["tasks"][0]["stages"][index]["status"] = json!("done");
+            message["state"]["tasks"][0]["stages"][index]["detail"] = json!("3 found");
+        }
+        let mut model = shown(&message);
+        model.session_ended();
+        let text = screen(&model, 160, 40);
+        assert!(
+            text.contains("recon 192.0.2.5  ███-------------- 3/17  stopped"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  subdomains: not run: the session was closed"),
+            "{text}"
+        );
+        // Nothing to show yet: nothing to change.
+        Model::new(true).session_ended();
+    }
+
+    #[test]
+    fn every_stage_status_has_a_mark_and_a_colour_of_its_own() {
+        let mut marks = std::collections::BTreeSet::new();
+        let mut colours = std::collections::BTreeSet::new();
+        for status in [
+            "pending",
+            "running",
+            "done",
+            "skipped",
+            "failed",
+            "interrupted",
+        ] {
+            let cell = stage_cell(status);
+            assert_eq!(cell.width(), 1, "{status}");
+            marks.insert(cell.content.to_string());
+            colours.insert(format!("{:?}", cell.style.fg));
+        }
+        assert_eq!((marks.len(), colours.len()), (6, 6));
+        // What this version does not know is drawn as waiting.
+        assert_eq!(
+            stage_cell("\u{1b}[2J").content,
+            stage_cell("pending").content
+        );
+
+        // On the screen: the colours of the bar's cells.
+        let mut statuses = SEVENTEEN;
+        statuses[6] = "interrupted";
+        let model = shown(&recon_message(&statuses, json!({})));
+        assert!(!model.has_running_stage());
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = screen(&model, 160, 40);
+        assert!(
+            text.contains("recon 192.0.2.5  ██-█x█!·········· 6/17  ports stopped"),
+            "{text}"
+        );
+        let row = text
+            .lines()
+            .position(|line| line.contains("recon 192.0.2.5"))
+            .unwrap();
+        let line = text.lines().nth(row).unwrap();
+        let start = line.chars().position(|c| c == '█').unwrap();
+        let colour = |offset: usize| buffer[((start + offset) as u16, row as u16)].fg;
+        assert_eq!(
+            [colour(0), colour(2), colour(4), colour(6), colour(7)],
+            [
+                Color::Green,
+                Color::Blue,
+                Color::Red,
+                Color::Magenta,
+                Color::DarkGray
+            ]
+        );
+
+        // A task that is over: its count, and nothing it is doing.
+        let over = shown(&recon_message(&["done"; 17], json!({})));
+        let text = screen(&over, 160, 40);
+        assert!(
+            text.contains("recon 192.0.2.5  █████████████████ 17/17  "),
+            "{text}"
+        );
+        // One that has not begun.
+        let waiting = shown(&recon_message(&["pending"; 17], json!({})));
+        assert!(screen(&waiting, 160, 40).contains(" 0/17  waiting"));
+    }
+
+    /// A stamp is up to a second old when it arrives; the reading furthest
+    /// ahead is the nearest, and the others say how far behind they are.
+    #[test]
+    fn the_session_clock_is_the_reading_furthest_ahead() {
+        let mut sync = ClockSync::new();
+        let behind = |sync: &mut ClockSync, fresh: i128| sync.behind(fresh).as_millis();
+        assert_eq!(behind(&mut sync, 5_000), 0);
+        // Cut later in its second: 600 ms behind the reading before it.
+        assert_eq!(behind(&mut sync, 4_400), 600);
+        // Nearer than any before: the new best.
+        assert_eq!(behind(&mut sync, 5_300), 0);
+        assert_eq!(behind(&mut sync, 5_000), 300);
+        // The session's clock was set, either way: start again from it.
+        assert_eq!(behind(&mut sync, 90_000), 0);
+        assert_eq!(behind(&mut sync, 89_500), 500);
+        assert_eq!(behind(&mut sync, 1_000), 0);
+
+        // Read from states: one stamp, then the same stamp a moment later
+        // (so further behind), and no stamp at all.
+        let mut model = Model::new(true);
+        let message = recon_message(&SEVENTEEN, json!({}));
+        model.apply_message(&message.to_string());
+        assert_eq!(model.lead, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(30));
+        model.apply_message(&message.to_string());
+        assert!(
+            (Duration::from_millis(30)..Duration::from_secs(1)).contains(&model.lead),
+            "{:?}",
+            model.lead
+        );
+        let mut unstamped = message.clone();
+        unstamped["state"]["now_utc"] = json!("soon");
+        model.apply_message(&unstamped.to_string());
+        assert_eq!(model.lead, Duration::ZERO);
+    }
+
+    /// Under the bar: the stages that failed, by name (the bar's marks have
+    /// none); else the result of the latest stage that has one, not the
+    /// reason a stage after it was left out.
+    #[test]
+    fn the_line_under_the_bar_names_what_failed_or_else_the_latest_result() {
+        let mut message =
+            recon_message(&SEVENTEEN, json!({ "started_utc": "2026-11-12T10:00:00Z" }));
+        let details = [
+            (0, "3 neighbours"),
+            (2, "turned off in config.toml (recon.skip)"),
+            (3, "4 open ports"),
+            (4, "no route"),
+            (5, "12 hops"),
+        ];
+        for (index, detail) in details {
+            message["state"]["tasks"][0]["stages"][index]["detail"] = json!(detail);
+        }
+        let set = |message: &mut serde_json::Value, index: usize, key: &str, value: &str| {
+            message["state"]["tasks"][0]["stages"][index][key] = json!(value);
+        };
+        // Stage 4 failed: it is named, and why, though a later stage has a
+        // result.
+        let text = screen(&shown(&message), 160, 40);
+        assert!(text.contains("  mail-dns failed: no route"), "{text}");
+        assert!(!text.contains("trace: 12 hops"), "{text}");
+        set(&mut message, 4, "detail", "");
+        let text = screen(&shown(&message), 160, 40);
+        assert!(text.contains("  mail-dns failed  "), "{text}");
+        // Several: their names.
+        set(&mut message, 3, "status", "failed");
+        let text = screen(&shown(&message), 160, 40);
+        assert!(text.contains("  failed: subdomains, mail-dns  "), "{text}");
+
+        // None failed: the latest result.
+        set(&mut message, 3, "status", "done");
+        set(&mut message, 4, "status", "done");
+        let text = screen(&shown(&message), 160, 40);
+        assert!(text.contains("  trace: 12 hops"), "{text}");
+        // A stage left out after the last result does not take its place.
+        set(&mut message, 5, "status", "skipped");
+        set(&mut message, 5, "detail", "turned off");
+        let text = screen(&shown(&message), 160, 40);
+        assert!(text.contains("  subdomains: 4 open ports"), "{text}");
+        assert!(!text.contains("trace: turned off"), "{text}");
+        // Where every stage with something to say was left out, the last
+        // of them says why.
+        for index in [0, 3] {
+            set(&mut message, index, "detail", "");
+        }
+        let text = screen(&shown(&message), 160, 40);
+        assert!(text.contains("  trace: turned off"), "{text}");
+    }
+
+    #[test]
+    fn the_recon_line_gives_way_on_narrow_screens_and_shows_only_plain_text() {
+        let message = recon_message(
+            &SEVENTEEN,
+            json!({ "started_utc": "2026-11-12T10:00:00Z",
+                "progress": { "percent": 12, "eta_s": 56 } }),
+        );
+        let model = shown(&message);
+        for width in [1, 8, 20, 30, 40, 50, 60, 79, 80, 100, 120, 200] {
+            for height in [1, 5, 12, 24, 50] {
+                let text = screen(&model, width, height);
+                // Never wider than its panel: nothing is drawn over the
+                // notices beside it.
+                for line in text.lines() {
+                    assert_eq!(line.chars().count(), width as usize);
+                }
+            }
+        }
+        // Too narrow for a cell per stage: the count still says how far.
+        let clock = Clock {
+            now: parse_rfc3339("2026-11-12T10:00:42Z"),
+            age: Duration::ZERO,
+        };
+        let task = &model.snapshot.as_ref().unwrap().tasks[0];
+        let plain = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        let run = |task, earlier: usize| Shown {
+            task,
+            queued: 0,
+            not_run: 0,
+            earlier,
+            rank: 0,
+        };
+        assert_eq!(
+            plain(task_lines(&run(task, 0), &clock, 21)),
+            ["recon 192.0.2.5  6/17", "ports 0:42 · 12%"]
+        );
+        assert_eq!(
+            plain(task_lines(&run(task, 2), &clock, 38)),
+            [
+                "recon 192.0.2.5 (+2 earlier)",
+                "██-█x█>·········· 6/17",
+                "ports 0:42 · 12% (56s left)"
+            ]
+        );
+        // No room at all: the time, whole.
+        assert_eq!(
+            plain(task_lines(&run(task, 0), &clock, 0)),
+            ["recon 192.0.2.5", "6/17", "0:42"]
+        );
+
+        // Words from a tool give way to the clock where the panel is
+        // narrow: they are cut, the time the stage has run is not.
+        let mut wordy = recon_message(
+            &SEVENTEEN,
+            json!({ "started_utc": "2026-11-12T10:00:00Z",
+                "progress": { "done": 3, "note": "site 1 of 3, 3 results so far" } }),
+        );
+        let wordy_model = shown(&wordy);
+        let wordy_task = &wordy_model.snapshot.as_ref().unwrap().tasks[0];
+        assert_eq!(
+            plain(task_lines(&run(wordy_task, 0), &clock, 38)),
+            [
+                "recon 192.0.2.5",
+                "██-█x█>·········· 6/17",
+                "ports 0:42 · site 1 of 3, 3 results s…"
+            ]
+        );
+        let last = |width: usize| plain(task_lines(&run(wordy_task, 0), &clock, width)).pop();
+        assert_eq!(
+            last(42).as_deref(),
+            Some("ports 0:42 · site 1 of 3, 3 results so far")
+        );
+        assert_eq!(last(17).as_deref(), Some("ports 0:42 · sit…"));
+        // No room for even a few letters: the name and the clock.
+        assert_eq!(last(16).as_deref(), Some("6/17  ports 0:42"));
+        assert_eq!(last(10).as_deref(), Some("ports 0:42"));
+        assert_eq!(last(9).as_deref(), Some("0:42"));
+        assert_eq!(fit("résultats so far", 9), "résultat…");
+        assert_eq!(fit("so far", 6), "so far");
+        assert_eq!(fit("so far", 3), "");
+        // With a time left too: it is the first to go.
+        wordy["state"]["tasks"][0]["stages"][6]["progress"]["eta_s"] = json!(600);
+        let both = shown(&wordy);
+        let both_task = &both.snapshot.as_ref().unwrap().tasks[0];
+        let last = |width: usize| plain(task_lines(&run(both_task, 0), &clock, width)).pop();
+        assert_eq!(
+            last(53).as_deref(),
+            Some("ports 0:42 · site 1 of 3, 3 results so far (10m left)")
+        );
+        assert_eq!(
+            last(52).as_deref(),
+            Some("ports 0:42 · site 1 of 3, 3 results so far")
+        );
+        assert_eq!(
+            last(38).as_deref(),
+            Some("ports 0:42 · site 1 of 3, 3 results s…")
+        );
+
+        // A long-running stage with every figure, in panels from 40
+        // columns of terminal up: the line fits its panel at every width,
+        // and the clock is never cut (half of it reads as another time).
+        let long = recon_message(
+            &SEVENTEEN,
+            json!({ "started_utc": "2026-11-12T08:58:39Z",
+                "progress": { "done": 1, "total": 4, "percent": 42, "eta_s": 3900,
+                    "note": "Service scan" } }),
+        );
+        let long_model = shown(&long);
+        let long_task = &long_model.snapshot.as_ref().unwrap().tasks[0];
+        let last = |width: usize| {
+            plain(task_lines(&run(long_task, 0), &clock, width))
+                .pop()
+                .unwrap()
+        };
+        for width in 8..=80 {
+            let line = last(width);
+            assert!(line.chars().count() <= width, "{width}: {line:?}");
+            assert!(line.contains("1:02:03"), "{width}: {line:?}");
+        }
+        assert_eq!(
+            [
+                last(18),
+                last(19),
+                last(24),
+                last(28),
+                last(33),
+                last(37),
+                last(49)
+            ],
+            [
+                "ports 1:02:03",
+                "ports 1:02:03 · 42%",
+                "ports 1:02:03 · Ser… 42%",
+                "ports 1:02:03 · Service… 42%",
+                "ports 1:02:03 · Service scan 42%",
+                "ports 1/4 1:02:03 · Service scan 42%",
+                "ports 1/4 1:02:03 · Service scan 42% (1h05m left)",
+            ]
+        );
+
+        // What a tool or a scanned server wrote is shown as plain text.
+        let mut none_failed = SEVENTEEN;
+        none_failed[4] = "done";
+        let hostile = recon_message(
+            &none_failed,
+            json!({ "started_utc": "2026-11-12T10:00:00Z",
+                "detail": "note\u{1b}]52;c;x\u{7}",
+                "progress": { "done": 2, "note": "\u{1b}[2J\u{202e}results\u{7} so far" } }),
+        );
+        let text = screen(&shown(&hostile), 160, 40);
+        assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text}");
+        assert!(text.contains("ports 0:42 · [2Jresults so far"), "{text}");
+        assert!(text.contains("  ports: note]52;c;x"), "{text}");
+
+        assert_eq!(clock_time(Duration::from_secs(59)), "0:59");
+        assert_eq!(clock_time(Duration::from_secs(3723)), "1:02:03");
+        assert_eq!(
+            [
+                rough_time(45),
+                rough_time(61),
+                rough_time(3600),
+                rough_time(3900)
+            ],
+            ["45s", "1m", "1h00m", "1h05m"]
+        );
+        // The nearest minute, like the map's "about N min left".
+        assert_eq!(
+            [59, 60, 89, 90, 3569, 3570, 7170].map(rough_time),
+            ["59s", "1m", "1m", "2m", "59m", "1h00m", "2h00m"]
+        );
     }
 
     #[test]
@@ -1624,8 +3026,9 @@ mod tests {
         let text = screen(&model, 140, 40);
         assert!(text.contains("read-only (no session running)"), "{text}");
         assert!(text.contains("10.10.10.5"), "{text}");
+        // No session is open: what one left waiting is over.
         assert!(
-            text.contains("recon 10.10.10.0/23 lan:pending dns:pending"),
+            text.contains("recon 10.10.10.0/23  ----------------- 0/17  not run"),
             "{text}"
         );
 

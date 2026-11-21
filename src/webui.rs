@@ -314,6 +314,44 @@ pub fn open_in_browser(url: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The page and the HUD say the same of a stage: the page's words for
+    /// each status are the queue's, and the recons of a session that went
+    /// away are shown with the very words the session stores for them.
+    #[test]
+    fn the_page_words_a_stage_as_the_queue_and_the_hud_do() {
+        use crate::queue::{
+            status_word, CLOSED_DETAIL, LIGHT_DETAIL, NOT_RUN, NOT_RUN_CLOSED, NOT_RUN_ENDED,
+        };
+        for status in [
+            "pending",
+            "running",
+            "done",
+            "skipped",
+            "failed",
+            "interrupted",
+        ] {
+            let pair = format!("{status}: '{}'", status_word(status));
+            assert!(SCRIPT.contains(&pair), "the page has no {pair}");
+        }
+        assert!(SCRIPT.contains(&format!(
+            "var CLOSED_DETAIL = '{CLOSED_DETAIL}', NOT_RUN_DETAIL = '{NOT_RUN_CLOSED}';"
+        )));
+        // A stage the end of its session left out is told by how its
+        // reason starts, whichever way the session ended.
+        assert!(SCRIPT.contains(&format!("/^{NOT_RUN}/.test(stage.detail)")));
+        for detail in [NOT_RUN_CLOSED, NOT_RUN_ENDED] {
+            assert!(detail.starts_with(NOT_RUN), "{detail}");
+        }
+        // The reason it tells apart is found in what the session says.
+        assert!(SCRIPT.contains("/light mode/i") && LIGHT_DETAIL.contains("light mode"));
+        assert!(!CLOSED_DETAIL.contains("light mode"));
+        for detail in [CLOSED_DETAIL, LIGHT_DETAIL] {
+            assert!(detail.starts_with("stopped: "), "{detail}");
+        }
+        // Nothing on the page says a recon goes on in a later session.
+        assert!(!SCRIPT.to_lowercase().contains("resum"));
+    }
+
     #[test]
     fn page_references_its_assets_with_the_token() {
         let token = "ab".repeat(32);

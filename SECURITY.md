@@ -48,13 +48,15 @@ shares, whose access lists it cannot read. It keeps `./meow` private
 disables SQLite schema execution (`trusted_schema = OFF`). A session that
 came with a cloned, unpacked, copied or moved folder is not opened until
 you accept it, and never under the name of one of yours. If a `git pull`
-or an unpacked archive replaces files of your own session, meow says so,
-drops its shell history and last folder, and resumes its scans only on a
-yes. `./meow` and each session in it have a `.gitignore`. A running
-session puts back one a pull changed and warns when git tracks session
-files; between sessions, a pull that knows a session's name can still let
-git take its files in. On Windows, and when working inside untrusted or
-shared directories, use `meow <name> --home` (`~/.meow/workspaces/`).
+or an unpacked archive replaces files of your own session, meow says so
+and drops its shell history and last folder. A scan queued in a session's
+files never runs: a recon ends with the session that started it, and a new
+session runs only what you queue in it. `./meow` and each session in it
+have a `.gitignore`. A running session puts back one a pull changed and
+warns when git tracks session files; between sessions, a pull that knows
+a session's name can still let git take its files in. On Windows, and
+when working inside untrusted or shared directories, use
+`meow <name> --home` (`~/.meow/workspaces/`).
 
 ## Supported versions
 

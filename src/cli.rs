@@ -167,6 +167,9 @@ pub enum Command {
         #[command(flatten)]
         session: SessionArg,
     },
+    /// Started by a session: ends its scans if meow itself is killed
+    #[command(name = crate::procs::GUARD_COMMAND, hide = true)]
+    Guard,
 }
 
 /// Which workspace a helper subcommand targets. Without either flag it is
@@ -197,6 +200,7 @@ impl Command {
             Command::Hud { .. } => "hud",
             Command::Add { .. } => "add",
             Command::Report { .. } => "report",
+            Command::Guard => crate::procs::GUARD_COMMAND,
         }
     }
 
@@ -208,7 +212,8 @@ impl Command {
             | Command::Delete { .. }
             | Command::Setup { .. }
             | Command::Update { .. }
-            | Command::Tools { .. } => None,
+            | Command::Tools { .. }
+            | Command::Guard => None,
             Command::Mode { session, .. }
             | Command::Recon { session, .. }
             | Command::Map { session, .. }

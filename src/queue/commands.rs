@@ -549,6 +549,13 @@ pub(super) fn discovery_hint(flags: &[String]) -> String {
         .to_owned()
 }
 
+/// Added to every nmap command of meow's own: nmap then writes a
+/// `taskprogress` element into its XML output every few seconds, which is
+/// where the progress shown for a scan comes from. Not a flag an operator
+/// or a preset may give (see [`validate_nmap_flags`]), so it is never there
+/// twice.
+pub const NMAP_STATS: [&str; 2] = ["--stats-every", "5s"];
+
 /// Flags that say which ports to scan.
 fn chooses_ports(flag: &str) -> bool {
     flag == "-F"
@@ -606,6 +613,7 @@ pub fn ports_command(
     if ipv6 && !args.iter().any(|a| a == "-6") {
         args.push("-6".to_owned());
     }
+    args.extend(strings(&NMAP_STATS));
     args.extend([
         "-oX".to_owned(),
         path_arg(output),
@@ -684,6 +692,7 @@ pub fn udp_command(
     if ipv6 {
         args.push("-6".to_owned());
     }
+    args.extend(strings(&NMAP_STATS));
     args.extend(["-oX".to_owned(), path_arg(output), "--".to_owned()]);
     args.extend(targets.iter().cloned());
     ToolCommand {
@@ -739,9 +748,9 @@ pub fn services_command(
         args.push("-6".to_owned());
     }
     let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+    args.extend(["-p".to_owned(), ports.join(",")]);
+    args.extend(strings(&NMAP_STATS));
     args.extend([
-        "-p".to_owned(),
-        ports.join(","),
         "-oX".to_owned(),
         path_arg(output),
         "--".to_owned(),

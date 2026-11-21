@@ -214,8 +214,10 @@ async fn measure_tcp_rtt_ms(ip: IpAddr) -> Option<f64> {
 }
 
 /// Runs a lightweight traceroute (`traceroute`, `tracepath`, or `tracert`) to
-/// `target_ip` with a 10-second cap.
+/// `target_ip` with a 10-second cap, as one of the session's `tools`: it
+/// ends with the session.
 pub async fn run_trace(
+    tools: &Tracker,
     target_ip: &str,
     local_gateway: Option<&str>,
 ) -> Result<(Vec<Observation>, String)> {
@@ -246,11 +248,12 @@ pub async fn run_trace(
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.args(*args);
         configure_osint_command(&mut cmd);
-        let Ok(child) = cmd.spawn() else {
+        let Ok((child, group)) = tools.spawn(&mut cmd) else {
             continue;
         };
         tool_ran = true;
-        if let Some(stdout) = wait_bounded_stdout(child, 128 * 1024, Duration::from_secs(10)).await
+        if let Some(stdout) =
+            wait_bounded_stdout(child, group, 128 * 1024, Duration::from_secs(10)).await
         {
             raw_out = stdout;
             hops = parse_traceroute_output(&raw_out, &ip_str);

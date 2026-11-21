@@ -110,7 +110,7 @@ A new session asks where to save it. Press Enter to keep the folder you are in, 
     -> /Users/j/Desktop/meow/acme
 ```
 
-Sessions saved in the same folder share one `meow/` folder there (`meow/acme/`, `meow/beta/`). It is private, and the `.gitignore` files in it keep it out of git; a running session puts them back if a pull changes them, and warns if git tracks files there. If a pull or an unpacked archive replaces files in it, meow says so, drops that session's shell history and asks before resuming its scans. `meow acme` reopens the same session from any folder.
+Sessions saved in the same folder share one `meow/` folder there (`meow/acme/`, `meow/beta/`). It is private, and the `.gitignore` files in it keep it out of git; a running session puts them back if a pull changes them, and warns if git tracks files there. If a pull or an unpacked archive replaces files in it, meow says so and drops that session's shell history. A scan queued in such files never runs. `meow acme` reopens the same session from any folder.
 
 Then your normal shell opens inside the session. Your prompt is prefixed with `(meow:acme:light)` (reflecting the active session and mode) so you always know a session is active, and `meow` prints the localhost URL for the live topology map.
 
@@ -206,7 +206,7 @@ meow mode aggressive
 
 ## What `meow recon` Does (17 Stages)
 
-`meow recon <target>` runs these one at a time in the background (mild and aggressive mode). Follow along in `meow hud` or on the map.
+`meow recon <target>` runs these one at a time in the background (mild and aggressive mode). `meow hud` and the map show a progress bar: which stages are done, which one is running and how far it is.
 
 | # | Stage | What it finds |
 |---|---|---|
@@ -231,6 +231,9 @@ meow mode aggressive
 Good to know:
 
 - A missing tool skips its stage with the reason; the rest still run. `meow tools` installs them.
+- Closing the terminal (or `exit`) stops the running stage and every process it started. Finished stages are kept; the rest is dropped, and the next start says so. Nothing starts again by itself: run `meow recon <target>` to scan again.
+- If meow itself is killed (`kill -9`, a crash), its helper `meow-guard` stops the scan; if that is killed too, the next start of meow does. A program that a scanner starts in a session of its own (`setsid`, `sudo` with its own terminal) is not stopped.
+- `meow mode light` pauses a recon; `meow mode mild` (or `aggressive`) continues it in the same session.
 - DNS questions go to your own resolvers. DNS-over-HTTPS is used only when they give no answer; it and `crt.sh` only get public names, never internal ones or private addresses. The target's address is the one your system gives (`/etc/hosts` included), as for `nmap`.
 - `mail-dns` only asks DNS questions; nothing is sent to the target's servers.
 - `js` reads only the target site's scripts (15 in mild, 40 in aggressive). A key it finds goes straight into the Privacy Vault: you only ever see a placeholder like `<<SEC_03>>`, and the report lists it to rotate. Endpoints keep their parameter names, never the values.

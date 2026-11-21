@@ -98,7 +98,9 @@ fn bytes_to_string_lossy(bytes: Vec<u8>) -> String {
         .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
 }
 
-fn open_regular_file(path: &Path) -> Result<(std::fs::File, u64)> {
+/// Opens `path` for reading if it is a regular file and no link: the file
+/// and its size.
+pub(crate) fn open_regular_file(path: &Path) -> Result<(std::fs::File, u64)> {
     crate::workspace::refuse_file_symlink(path)?;
     #[cfg(unix)]
     let file = {

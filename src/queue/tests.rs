@@ -37,7 +37,11 @@ fn the_udp_scan_names_its_services_and_explains_open_ones() {
     )
     .args
     .contains(&"-6".to_owned()));
-    validate_nmap_flags(&command.args[..command.args.len() - 4]).unwrap();
+    // Its flags are ones an operator may give, but for the progress
+    // reports, which are meow's own.
+    let own = command.args.len() - 6;
+    assert_eq!(command.args[own..own + 3], ["--stats-every", "5s", "-oX"]);
+    validate_nmap_flags(&command.args[..own]).unwrap();
     // Every port scanned has a note, and the notes are about UDP services.
     for port in UDP_PORTS.trim_start_matches("U:").split(',') {
         let port: u16 = port.parse().unwrap();
@@ -157,7 +161,7 @@ fn port_stage_command_is_built_from_preset_extra_flags_and_target() {
     assert_eq!(command.program, "nmap");
     assert_eq!(
         args(&command),
-        "-sS -T3 --top-ports 1000 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.0/24"
+        "-sS -T3 --top-ports 1000 --stats-every 5s -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.0/24"
     );
     assert!(notices.is_empty());
 
@@ -169,7 +173,7 @@ fn port_stage_command_is_built_from_preset_extra_flags_and_target() {
         ports_command(&settings, &mild, &target("10.0.0.5"), &extra, false, out);
     assert_eq!(
         args(&command),
-        "-sT -T3 -p 80,443 -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
+        "-sT -T3 -p 80,443 --stats-every 5s -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"
     );
     assert_eq!(notices.len(), 2);
     for (extra, expected) in [
@@ -189,7 +193,7 @@ fn port_stage_command_is_built_from_preset_extra_flags_and_target() {
         );
         assert_eq!(
             args(&command),
-            format!("{expected} -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"),
+            format!("{expected} --stats-every 5s -oX /w/tmp/nmap_ports_7.xml -- 10.0.0.5"),
             "{extra:?}"
         );
     }
@@ -205,7 +209,7 @@ fn port_stage_command_is_built_from_preset_extra_flags_and_target() {
     );
     assert_eq!(
         args(&command),
-        "-sS -T4 -p- -O -6 -oX /w/tmp/nmap_ports_7.xml -- 2001:db8::/64"
+        "-sS -T4 -p- -O -6 --stats-every 5s -oX /w/tmp/nmap_ports_7.xml -- 2001:db8::/64"
     );
 }
 
@@ -225,7 +229,7 @@ fn service_stage_probes_only_the_open_ports() {
     assert_eq!(
         args(&command),
         "-sV --version-intensity 5 -T3 --script ssl-cert,http-server-header,http-title \
-         -p 22,443,8080 -oX /t/svc.xml -- 10.0.0.5"
+         -p 22,443,8080 --stats-every 5s -oX /t/svc.xml -- 10.0.0.5"
     );
     let (command, _) = services_command(
         &settings,
@@ -236,7 +240,7 @@ fn service_stage_probes_only_the_open_ports() {
         true,
         Path::new("/t/svc.xml"),
     );
-    assert!(args(&command).contains("-6 -p 80 -oX /t/svc.xml -- 2001:db8::a"));
+    assert!(args(&command).contains("-6 -p 80 --stats-every 5s -oX /t/svc.xml -- 2001:db8::a"));
 }
 
 #[test]
@@ -300,6 +304,8 @@ fn os_detection_versions_and_scripts_go_to_the_stage_they_belong_to() {
             "-Pn",
             "-p",
             "22,445",
+            "--stats-every",
+            "5s",
             "-oX",
             "/t/svc.xml",
             "--",
@@ -545,6 +551,29 @@ fn wordlist_is_only_used_if_it_exists() {
     }
 }
 
+fn statuses_of(db: &Db, id: i64) -> Vec<String> {
+    task(db, id)
+        .unwrap()
+        .unwrap()
+        .stages
+        .iter()
+        .map(|s| s.status.clone())
+        .collect()
+}
+
+fn stage_of(row: &TaskRow, stage: Stage) -> StageRow {
+    row.stages
+        .iter()
+        .find(|s| s.stage == stage)
+        .unwrap()
+        .clone()
+}
+
+fn is_time(text: &Option<String>) -> bool {
+    text.as_deref()
+        .is_some_and(|t| crate::timeutil::parse_rfc3339(t).is_some())
+}
+
 #[test]
 fn task_rows_track_stage_status() {
     let db = Db::open_in_memory().unwrap();
@@ -553,17 +582,10 @@ fn task_rows_track_stage_status() {
     assert_eq!(row.target, "10.0.0.0/24");
     assert_eq!(row.mode, Mode::Mild);
     assert_eq!(row.extra_flags, ["-p", "80"]);
-    let statuses = |db: &Db| -> Vec<String> {
-        task(db, id)
-            .unwrap()
-            .unwrap()
-            .stages
-            .iter()
-            .map(|s| s.status.clone())
-            .collect()
-    };
-    assert_eq!(statuses(&db), ["pending"; STAGES.len()]);
-    assert_eq!(row.describe(), "recon 10.0.0.0/24: lan pending");
+    assert_eq!(statuses_of(&db, id), ["pending"; STAGES.len()]);
+    assert!(row.unfinished());
+    assert_eq!(row.stages_over(), 0);
+    assert_eq!(newest_id(&db).unwrap(), id);
 
     // Every stage before `services` is done; `services` is running.
     let running = STAGES.iter().position(|s| *s == Stage::Services).unwrap();
@@ -572,36 +594,495 @@ fn task_rows_track_stage_status() {
     }
     set_stage(&db, id, Stage::Services, "running", "").unwrap();
     assert_eq!(unfinished(&db).unwrap().len(), 1);
+    assert_eq!(task(&db, id).unwrap().unwrap().stages_over(), running);
 
-    // The session dies here; on reopen the running stage is interrupted.
-    assert_eq!(mark_running_interrupted(&db).unwrap(), 1);
-    let after = statuses(&db);
-    assert!(after[..running].iter().all(|s| s == "done"), "{after:?}");
-    assert_eq!(after[running], "interrupted");
-    assert!(
-        after[running + 1..].iter().all(|s| s == "pending"),
-        "{after:?}"
-    );
-    let row = task(&db, id).unwrap().unwrap();
-    assert!(row.unfinished());
-    assert_eq!(row.describe(), "recon 10.0.0.0/24: services interrupted");
+    // Light mode stops it: it still has work to do in this session.
+    set_stage(&db, id, Stage::Services, "interrupted", LIGHT_DETAIL).unwrap();
+    let paused = task(&db, id).unwrap().unwrap();
+    assert!(paused.unfinished() && paused.stages[running].live());
+    assert_eq!(unfinished(&db).unwrap(), std::slice::from_ref(&paused));
 
-    decline(&db, id).unwrap();
-    let declined = statuses(&db);
-    assert!(
-        declined[..running].iter().all(|s| s == "done"),
-        "{declined:?}"
+    // Every stage over, however it ended: nothing is left to do.
+    for s in &STAGES[running..] {
+        set_stage(&db, id, *s, "skipped", "turned off").unwrap();
+    }
+    let over = task(&db, id).unwrap().unwrap();
+    assert!(!over.unfinished());
+    assert_eq!(over.stages_over(), STAGES.len());
+    assert!(unfinished(&db).unwrap().is_empty());
+    assert_eq!(task(&db, 999).unwrap(), None);
+    assert_eq!(newest_id(&Db::open_in_memory().unwrap()).unwrap(), 0);
+
+    // The same rule as SQL, for the same words.
+    assert!(LIVE_STAGE.contains(&format!("detail <> '{CLOSED_DETAIL}'")));
+    for (status, word) in [
+        ("pending", "waiting"),
+        ("running", "running"),
+        ("done", "done"),
+        ("skipped", "skipped"),
+        ("failed", "failed"),
+        ("interrupted", "stopped"),
+    ] {
+        assert_eq!(status_word(status), word);
+    }
+}
+
+/// A session that closes ends its recons: the running stage is stopped,
+/// the stages that had not started are left out, and what was finished
+/// stays as it is. Nothing is kept waiting for a later session.
+#[test]
+fn a_closed_session_stops_its_running_stage_and_drops_the_rest() {
+    let db = Db::open_in_memory().unwrap();
+    let id = enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+    for stage in STAGES.iter().take_while(|stage| **stage != Stage::Ports) {
+        set_stage(&db, id, *stage, "done", "").unwrap();
+    }
+    set_stage(&db, id, Stage::Lan, "done", "3 neighbours").unwrap();
+    set_stage(&db, id, Stage::Dns, "skipped", "turned off").unwrap();
+    set_stage(&db, id, Stage::Trace, "failed", "no route").unwrap();
+    // A stage that ran before and is running again.
+    set_stage(&db, id, Stage::Ports, "done", "earlier").unwrap();
+    set_stage(&db, id, Stage::Ports, "running", "").unwrap();
+    // A second recon, queued behind it: nothing of it has started.
+    let queued = enqueue(&db, "192.0.2.6", Mode::Aggressive, &[]).unwrap();
+    let before = task(&db, id).unwrap().unwrap();
+    // The times of each stage come with the rows.
+    assert!(is_time(&stage_of(&before, Stage::Lan).finished_utc));
+    assert!(is_time(&stage_of(&before, Stage::Ports).started_utc));
+    assert_eq!(
+        stage_of(&before, Stage::Ports).finished_utc,
+        None,
+        "running again"
     );
-    assert!(
-        declined[running..].iter().all(|s| s == "skipped"),
-        "{declined:?}"
+    assert_eq!(stage_of(&before, Stage::Services).started_utc, None);
+    assert_eq!(
+        stage_of(&before, Stage::Ports).progress,
+        None,
+        "never stored"
     );
+    let over_before = before.stages_over();
+
+    assert_eq!(end_session(&db, SessionEnd::Closed).unwrap(), 2);
+    let after = task(&db, id).unwrap().unwrap();
+    for (was, is) in before.stages.iter().zip(&after.stages) {
+        match was.status.as_str() {
+            "running" => {
+                assert_eq!(is.status, "interrupted", "{:?}", is.stage);
+                assert_eq!(is.detail, "stopped: the session was closed");
+                assert_eq!(is.started_utc, was.started_utc);
+                assert!(is_time(&is.finished_utc), "{:?}", is.finished_utc);
+                assert!(!is.live() && !is.not_run());
+            }
+            "pending" => {
+                assert_eq!(is.status, "skipped", "{:?}", is.stage);
+                assert_eq!(is.detail, "not run: the session was closed");
+                assert!(is.started_utc.is_none() && is_time(&is.finished_utc));
+                assert!(is.not_run() && !is.live());
+            }
+            // Finished stages keep status, result and times.
+            _ => assert_eq!(was, is),
+        }
+    }
+    assert_eq!(stage_of(&after, Stage::Lan).detail, "3 neighbours");
+    assert!(
+        !stage_of(&after, Stage::Dns).not_run(),
+        "turned off, not cut"
+    );
+    // Nothing of either recon is left to do, now or later.
+    assert!(!after.unfinished());
     assert!(unfinished(&db).unwrap().is_empty());
     assert_eq!(
-        task(&db, id).unwrap().unwrap().describe(),
-        "recon 10.0.0.0/24: finished"
+        after.stages_over(),
+        over_before,
+        "the cut stages are not over"
     );
-    assert_eq!(task(&db, 999).unwrap(), None);
+    let never = task(&db, queued).unwrap().unwrap();
+    assert!(never.stages.iter().all(StageRow::not_run), "{never:?}");
+    assert_eq!(never.stages_over(), 0);
+    assert_eq!(tasks(&db, 5).unwrap(), [never.clone(), after.clone()]);
+    // Said again, it changes nothing.
+    assert_eq!(end_session(&db, SessionEnd::Closed).unwrap(), 0);
+    assert_eq!(end_session(&db, SessionEnd::Lost).unwrap(), 0);
+    assert_eq!(task(&db, id).unwrap().unwrap(), after);
+
+    // The next start is told of both, once.
+    let after_ports = STAGES.len() - 1 - STAGES.iter().position(|s| *s == Stage::Ports).unwrap();
+    let (left, more) = take_left(&db).unwrap();
+    assert_eq!(
+        (left.as_slice(), more),
+        ([after.clone(), never.clone()].as_slice(), 0)
+    );
+    assert_eq!(
+        after.left_line(true),
+        format!(
+            "recon 192.0.2.5 stopped at ports when the last session ended; {after_ports} of 17 \
+             stages were not run. Run `meow recon 192.0.2.5` to scan again."
+        )
+    );
+    assert_eq!(
+        never.left_line(true),
+        "recon 192.0.2.6 was not finished when the last session ended; 17 of 17 stages were \
+         not run. Run `meow recon 192.0.2.6` to scan again."
+    );
+    assert_eq!(take_left(&db).unwrap(), (Vec::new(), 0));
+}
+
+/// After a meow that was killed, the next start finds its stages as they
+/// were: the one left running is marked stopped (nothing says when it
+/// ended) and the ones that had not run are left out.
+#[test]
+fn what_a_killed_meow_left_is_ended_by_the_next_start() {
+    let db = Db::open_in_memory().unwrap();
+    let id = enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+    for stage in STAGES.iter().take_while(|stage| **stage != Stage::Ports) {
+        set_stage(&db, id, *stage, "running", "").unwrap();
+        set_stage(&db, id, *stage, "done", "3 neighbours").unwrap();
+    }
+    // A stage that ended once and was running again.
+    set_stage(&db, id, Stage::Ports, "running", "").unwrap();
+    set_stage(&db, id, Stage::Ports, "interrupted", LIGHT_DETAIL).unwrap();
+    set_stage(&db, id, Stage::Ports, "running", "").unwrap();
+    // A recon that light mode had stopped at a stage that had run.
+    let paused = enqueue(&db, "192.0.2.6", Mode::Mild, &[]).unwrap();
+    set_stage(&db, paused, Stage::Lan, "running", "").unwrap();
+    set_stage(&db, paused, Stage::Lan, "interrupted", LIGHT_DETAIL).unwrap();
+    let before = task(&db, id).unwrap().unwrap();
+    let paused_before = task(&db, paused).unwrap().unwrap();
+
+    assert_eq!(end_session(&db, SessionEnd::Lost).unwrap(), 2);
+    let after = task(&db, id).unwrap().unwrap();
+    for (was, is) in before.stages.iter().zip(&after.stages) {
+        match was.status.as_str() {
+            "running" => {
+                assert_eq!(
+                    (is.status.as_str(), is.detail.as_str()),
+                    ("interrupted", CLOSED_DETAIL)
+                );
+                assert_eq!(is.started_utc, was.started_utc);
+                assert_eq!(is.finished_utc, None, "no end time is made up");
+            }
+            "pending" => assert_eq!(
+                (is.status.as_str(), is.detail.as_str()),
+                ("skipped", "not run: the session ended")
+            ),
+            _ => assert_eq!(was, is),
+        }
+    }
+    // The stage light mode had stopped is left out too, with the times it
+    // ran from and to.
+    let after_paused = task(&db, paused).unwrap().unwrap();
+    let lan = stage_of(&after_paused, Stage::Lan);
+    assert_eq!(
+        (lan.status.as_str(), lan.detail.as_str()),
+        ("skipped", NOT_RUN_ENDED)
+    );
+    assert_eq!(
+        (&lan.started_utc, &lan.finished_utc),
+        (
+            &stage_of(&paused_before, Stage::Lan).started_utc,
+            &stage_of(&paused_before, Stage::Lan).finished_utc
+        )
+    );
+    assert!(after_paused.stages.iter().all(StageRow::not_run));
+    assert!(unfinished(&db).unwrap().is_empty());
+    assert_eq!(end_session(&db, SessionEnd::Lost).unwrap(), 0);
+
+    // A later session that ends changes nothing of them: the stopped
+    // stage stays stopped.
+    let later = enqueue(&db, "192.0.2.7", Mode::Mild, &[]).unwrap();
+    assert_eq!(end_session(&db, SessionEnd::Closed).unwrap(), 1);
+    assert_eq!(task(&db, id).unwrap().unwrap(), after);
+    assert_eq!(task(&db, paused).unwrap().unwrap(), after_paused);
+    let (left, more) = take_left(&db).unwrap();
+    assert_eq!(
+        left.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [id, paused, later]
+    );
+    assert_eq!(more, 0);
+}
+
+/// A recon that meow 0.2.3 kept for its resume question: the first start
+/// of this version ends it like any other, and the stage that was stopped
+/// then is shown as stopped.
+#[test]
+fn a_recon_an_earlier_version_kept_for_a_resume_is_ended_too() {
+    let db = Db::open_in_memory().unwrap();
+    let id = enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+    set_stage(&db, id, Stage::Lan, "done", "3 neighbours").unwrap();
+    set_stage(&db, id, Stage::Dns, "running", "").unwrap();
+    set_stage(
+        &db,
+        id,
+        Stage::Dns,
+        "interrupted",
+        "the session ended while this stage was running",
+    )
+    .unwrap();
+    // One it had paused in light mode, in its words.
+    let paused = enqueue(&db, "192.0.2.6", Mode::Mild, &[]).unwrap();
+    set_stage(
+        &db,
+        paused,
+        Stage::Lan,
+        "interrupted",
+        "paused: the session is in light mode",
+    )
+    .unwrap();
+    assert_eq!(unfinished(&db).unwrap().len(), 2);
+
+    assert_eq!(end_session(&db, SessionEnd::Lost).unwrap(), 2);
+    let row = task(&db, id).unwrap().unwrap();
+    let dns = stage_of(&row, Stage::Dns);
+    assert_eq!(
+        (dns.status.as_str(), dns.detail.as_str()),
+        ("interrupted", CLOSED_DETAIL)
+    );
+    assert!(row.stages[2..].iter().all(StageRow::not_run));
+    assert_eq!(
+        row.left_line(true),
+        "recon 192.0.2.5 stopped at dns when the last session ended; 15 of 17 stages were not \
+         run. Run `meow recon 192.0.2.5` to scan again."
+    );
+    assert!(task(&db, paused)
+        .unwrap()
+        .unwrap()
+        .stages
+        .iter()
+        .all(StageRow::not_run));
+    assert!(unfinished(&db).unwrap().is_empty());
+}
+
+/// What is said of a recon that was cut short: short, once, and never a
+/// command to run for a target that someone else may have put there.
+#[test]
+fn the_line_about_a_cut_recon_offers_only_the_users_own_targets() {
+    let db = Db::open_in_memory().unwrap();
+    let id = enqueue(&db, "192.0.2.10", Mode::Mild, &[]).unwrap();
+    for stage in STAGES.iter().take_while(|stage| **stage != Stage::Dirs) {
+        set_stage(&db, id, *stage, "done", "").unwrap();
+    }
+    set_stage(&db, id, Stage::Dirs, "running", "").unwrap();
+    end_session(&db, SessionEnd::Closed).unwrap();
+    let row = task(&db, id).unwrap().unwrap();
+    // Stopped at the last stage: nothing was left out.
+    assert_eq!(
+        row.left_line(true),
+        "recon 192.0.2.10 stopped at dirs when the last session ended. Run `meow recon \
+         192.0.2.10` to scan again."
+    );
+    // Files that are not the user's own: no command is offered.
+    assert_eq!(
+        row.left_line(false),
+        "Dropped a scan that was queued in these files: recon 192.0.2.10"
+    );
+    // A target that is none (only a changed database holds one) is never
+    // put into a command, and is shown as plain text.
+    let mut planted = row.clone();
+    planted.target = "192.0.2.10`; curl x | sh #\u{1b}[2J".to_owned();
+    let line = planted.left_line(true);
+    assert!(
+        !line.contains("Run `") && !line.contains('\u{1b}'),
+        "{line}"
+    );
+    assert!(line.starts_with("Dropped a scan that was queued in these files: recon 192.0.2.10"));
+
+    // More recons than are told one by one: the newest, and how many more.
+    take_left(&db).unwrap();
+    let ids: Vec<i64> = (0..LEFT_MAX + 3)
+        .map(|n| enqueue(&db, &format!("192.0.2.{n}"), Mode::Mild, &[]).unwrap())
+        .collect();
+    assert_eq!(end_session(&db, SessionEnd::Closed).unwrap(), LEFT_MAX + 3);
+    let (left, more) = take_left(&db).unwrap();
+    assert_eq!(left.iter().map(|row| row.id).collect::<Vec<_>>(), ids[3..]);
+    assert_eq!(more, 3);
+
+    // A list that is not meow's own is not believed.
+    for planted in [
+        format!("{{\"ids\":[{}],\"more\":0}}", "1,".repeat(4000) + "1"),
+        "not a list".to_owned(),
+        "{\"ids\":[-5,999999,1,1,1,1,1,1,1,1,1],\"more\":18446744073709551615}".to_owned(),
+    ] {
+        db.set_meta("recon_left", &planted).unwrap();
+        let (left, _) = take_left(&db).unwrap();
+        assert!(left.len() <= LEFT_MAX, "{planted}: {}", left.len());
+        assert_eq!(db.get_meta("recon_left").unwrap(), None);
+    }
+}
+
+/// Tasks as a session that is gone leaves them, for a view of it: the
+/// same as the next start stores, and nothing is stored by looking.
+#[test]
+fn a_view_of_a_session_that_is_gone_shows_its_recons_as_ended() {
+    let db = Db::open_in_memory().unwrap();
+    let id = enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+    set_stage(&db, id, Stage::Lan, "done", "3 neighbours").unwrap();
+    set_stage(&db, id, Stage::Dns, "running", "").unwrap();
+    let paused = enqueue(&db, "192.0.2.6", Mode::Mild, &[]).unwrap();
+    set_stage(&db, paused, Stage::Lan, "interrupted", LIGHT_DETAIL).unwrap();
+
+    let mut shown = tasks(&db, 5).unwrap();
+    shown[1].stages[1].progress = Some(Progress::items(1, 2));
+    show_ended(&mut shown);
+    assert_eq!(statuses_of(&db, id)[..3], ["done", "running", "pending"]);
+    assert_eq!(statuses_of(&db, paused)[..2], ["interrupted", "pending"]);
+
+    end_session(&db, SessionEnd::Closed).unwrap();
+    let ended = tasks(&db, 5).unwrap();
+    for (shown, ended) in shown.iter().zip(&ended) {
+        for (shown, ended) in shown.stages.iter().zip(&ended.stages) {
+            assert_eq!(
+                (&shown.status, &shown.detail, &shown.progress),
+                (&ended.status, &ended.detail, &None),
+                "{:?}",
+                shown.stage
+            );
+        }
+    }
+    // A stage an earlier session stopped stays as it is.
+    let before = shown.clone();
+    show_ended(&mut shown);
+    assert_eq!(shown, before);
+
+    // A workspace meow 0.2.3 closed, looked at before this version first
+    // opens it: the stage it had stopped is shown as stopped, not as one
+    // that never ran, and the same as the first start then stores.
+    let old = enqueue(&db, "192.0.2.7", Mode::Mild, &[]).unwrap();
+    set_stage(&db, old, Stage::Lan, "done", "3 neighbours").unwrap();
+    set_stage(&db, old, Stage::Dns, "running", "").unwrap();
+    set_stage(&db, old, Stage::Dns, "interrupted", CLOSED_DETAIL_BEFORE).unwrap();
+    let mut shown = vec![task(&db, old).unwrap().unwrap()];
+    show_ended(&mut shown);
+    let dns = stage_of(&shown[0], Stage::Dns);
+    assert_eq!(
+        (dns.status.as_str(), dns.detail.as_str()),
+        ("interrupted", CLOSED_DETAIL)
+    );
+    assert!(shown[0].stages[2..].iter().all(StageRow::not_run));
+    end_session(&db, SessionEnd::Lost).unwrap();
+    let stored = task(&db, old).unwrap().unwrap();
+    for (shown, stored) in shown[0].stages.iter().zip(&stored.stages) {
+        assert_eq!(
+            (&shown.status, shown.not_run()),
+            (&stored.status, stored.not_run())
+        );
+    }
+    assert_eq!(stage_of(&stored, Stage::Dns).detail, CLOSED_DETAIL);
+}
+
+/// What a tool was writing when meow was killed is cleared when the next
+/// session starts; nothing else in `tmp/` is touched.
+#[test]
+fn a_new_session_clears_what_a_killed_tool_left_in_tmp() {
+    let dir = tempfile::tempdir().unwrap();
+    let tmp = dir.path().join("tmp");
+    let outside = dir.path().join("outside");
+    for folder in [tmp.join("run-Ab12Cd"), tmp.join("shell"), outside.clone()] {
+        std::fs::create_dir_all(&folder).unwrap();
+    }
+    for file in [
+        tmp.join("run-Ab12Cd").join("nmap.log"),
+        tmp.join("nmap_svc_3_0.xml"),
+        tmp.join("katana_12_1.jsonl"),
+        // Not a tool's: other names, a stage's name without a task.
+        tmp.join("shell").join("bashrc"),
+        tmp.join("map-open.html"),
+        tmp.join("nmap_svc_notes.xml"),
+        tmp.join("run-notes.txt"),
+        outside.join("keep.txt"),
+    ] {
+        std::fs::write(file, "x").unwrap();
+    }
+    #[cfg(unix)]
+    for link in ["run-linked", "ferox_7_0.jsonl"] {
+        // A link with a tool's name leads out of tmp: not followed, kept.
+        let to = if link.starts_with("run-") {
+            outside.clone()
+        } else {
+            outside.join("keep.txt")
+        };
+        std::os::unix::fs::symlink(to, tmp.join(link)).unwrap();
+    }
+
+    assert_eq!(clear_tool_leftovers(&tmp), 3);
+    let mut left: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !matches!(name.as_str(), "run-linked" | "ferox_7_0.jsonl"))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "map-open.html",
+            "nmap_svc_notes.xml",
+            "run-notes.txt",
+            "shell"
+        ]
+    );
+    assert!(tmp.join("shell").join("bashrc").exists());
+    assert!(outside.join("keep.txt").exists());
+    // Nothing left to clear, and no folder at all, are both fine.
+    assert_eq!(clear_tool_leftovers(&tmp), 0);
+    assert_eq!(clear_tool_leftovers(&dir.path().join("none")), 0);
+}
+
+#[test]
+fn only_meow_asks_nmap_for_progress_reports() {
+    let settings = ReconSettings::default();
+    let out = Path::new("/w/tmp/out.xml");
+    let asks = |command: &ToolCommand| {
+        let at: Vec<usize> = (0..command.args.len())
+            .filter(|i| command.args[*i].starts_with("--stats"))
+            .collect();
+        // Once, with its value, among the options (before `--`).
+        let end = command.args.iter().position(|a| a == "--").unwrap();
+        at.len() == 1 && command.args[at[0]..at[0] + 2] == NMAP_STATS && at[0] + 1 < end
+    };
+    for mode in [Mode::Mild, Mode::Aggressive] {
+        let preset = settings.preset(mode, &PresetOverride::default());
+        for extra in [&[][..], &["-p-", "-T4", "-Pn", "-A", "--script", "vuln"]] {
+            let flags = split_recon_flags(&strings(extra));
+            let target = target("192.0.2.0/28");
+            let (ports, _) = ports_command(&settings, &preset, &target, &flags.ports, false, out);
+            assert!(asks(&ports), "{:?}", ports.args);
+            let (services, _) =
+                services_command(&settings, &preset, &flags, "192.0.2.5", &[80], true, out);
+            assert!(asks(&services), "{:?}", services.args);
+        }
+    }
+    assert!(asks(&udp_command(
+        &settings,
+        &["192.0.2.5".into()],
+        false,
+        out
+    )));
+    // The web tools have no such flag.
+    let mild = settings.preset(Mode::Mild, &PresetOverride::default());
+    assert!(!args(&crawl_command(&settings, &mild, "http://192.0.2.5", out)).contains("stats"));
+
+    // Neither an operator nor a preset can give it, in any spelling nmap
+    // would take: it is never there twice, and never with another value.
+    for refused in [
+        &["--stats-every", "1s"][..],
+        &["--stats-every=1s"],
+        &["--stats-every"],
+        &["--stats", "1s"],
+        &["--stats-e=0.001s"],
+        &["-stats-every", "1s"],
+        &["--STATS-EVERY", "1s"],
+        &["-T4", "--stats-every", "5s"],
+    ] {
+        let flags = strings(refused);
+        assert!(validate_nmap_flags(&flags).is_err(), "{refused:?}");
+        assert!(
+            validate_preset_nmap_flags(&flags, &[]).is_err(),
+            "{refused:?}"
+        );
+        assert!(
+            validate_preset_nmap_flags(&[], &flags).is_err(),
+            "{refused:?}"
+        );
+    }
 }
 
 #[test]
@@ -694,10 +1175,21 @@ fn unfinished_tasks_are_counted_without_touching_the_database() {
     {
         let db = Db::open(&path).unwrap();
         let first = enqueue(&db, "10.0.0.5", Mode::Mild, &[]).unwrap();
+        for stage in STAGES {
+            set_stage(&db, first, stage, "done", "").unwrap();
+        }
         enqueue(&db, "10.0.0.6", Mode::Mild, &[]).unwrap();
-        decline(&db, first).unwrap();
     }
     assert_eq!(count_unfinished(&path), 1);
+    // A session's end leaves nothing unfinished, not even the stage it
+    // stopped.
+    {
+        let db = Db::open(&path).unwrap();
+        let cut = enqueue(&db, "10.0.0.7", Mode::Mild, &[]).unwrap();
+        set_stage(&db, cut, Stage::Lan, "running", "").unwrap();
+        assert_eq!(end_session(&db, SessionEnd::Closed).unwrap(), 2);
+    }
+    assert_eq!(count_unfinished(&path), 0);
 }
 
 #[test]

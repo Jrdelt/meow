@@ -922,7 +922,7 @@ pub fn render(inputs: &Inputs) -> String {
                     md(&task.target),
                     task.mode,
                     stage.stage.as_str(),
-                    md(&stage.status),
+                    md(crate::queue::status_word(&stage.status)),
                     md(&stage.detail)
                 );
             }
@@ -1087,7 +1087,12 @@ pub fn read_chats_and_replay(
 /// Gathers the report inputs from a workspace on disk.
 pub fn collect(workspace: &Workspace) -> Result<Inputs> {
     let db = Arc::new(Mutex::new(Db::open(&workspace.state_db_path())?));
-    let tasks = queue::tasks(&db.lock().unwrap_or_else(|p| p.into_inner()), 200)?;
+    let mut tasks = queue::tasks(&db.lock().unwrap_or_else(|p| p.into_inner()), 200)?;
+    // A session that was killed left its stages running or waiting; with
+    // no session open they are over, and the next one marks them so.
+    if !crate::ipc::is_live(&workspace.dir) {
+        queue::show_ended(&mut tasks);
+    }
     let vault = Vault::open(Arc::clone(&db))?;
     let secrets = vault.exposed_secrets();
     let mut graph = Graph::load(&workspace.graph_path())?;
@@ -1237,6 +1242,9 @@ mod tests {
             stage,
             status: status.into(),
             detail: detail.into(),
+            started_utc: None,
+            finished_utc: None,
+            progress: None,
         };
         Inputs {
             session: "acme".into(),
@@ -2277,7 +2285,13 @@ mod tests {
         assert!(text.starts_with("# Audit report: acme\n"));
         assert!(text.contains("Mode: mild."));
         assert!(text.contains("| CVE-2021-23017 | High 7.7 | yes | 1.20.1 |"));
-        assert!(text.contains("| 1 | 10.10.10.0/23 | mild | ports | pending |"));
+        // No session is open: a recon that was left waiting is over.
+        assert!(
+            text.contains(
+                "| 1 | 10.10.10.0/23 | mild | ports | skipped | not run: the session was closed |"
+            ),
+            "{text}"
+        );
         assert!(text.contains("| `<<SEC_01>>` | `hunt... (15 chars)` |"));
         assert!(
             !text.contains("hunter2-hunter2"),

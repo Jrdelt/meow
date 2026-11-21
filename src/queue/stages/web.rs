@@ -22,10 +22,12 @@ pub(crate) async fn headers(cx: &Ctx<'_>) -> Result<StageEnd> {
     let mut observations = Vec::new();
     let mut waf = BTreeMap::new();
     let mut inspected = 0usize;
-    for (address, port, https) in probed.web.iter().take(MAX_URLS_PER_STAGE) {
+    let total = probed.web.len().min(MAX_URLS_PER_STAGE);
+    for (index, (address, port, https)) in probed.web.iter().take(total).enumerate() {
         if !same_mode() {
             return Ok(StageEnd::ModeChanged);
         }
+        cx.progress(index, total);
         let inspected_now = while_same_mode(
             &same_mode,
             crate::osint::inspect_web_endpoint(address, host_header, *port, *https),
@@ -185,13 +187,15 @@ pub(crate) async fn tls_audit(cx: &Ctx<'_>) -> Result<StageEnd> {
     };
     let mut observations = Vec::new();
     let mut audited = 0usize;
-    for (address, port) in tls_targets.iter().take(MAX_URLS_PER_STAGE) {
+    let total = tls_targets.len().min(MAX_URLS_PER_STAGE);
+    for (index, (address, port)) in tls_targets.iter().take(total).enumerate() {
         if !same_mode() {
             return Ok(StageEnd::ModeChanged);
         }
+        cx.progress(index, total);
         let Some(audit) = while_same_mode(
             &same_mode,
-            crate::osint::run_tls_audit(address, host_header, *port),
+            crate::osint::run_tls_audit(state.tools(), address, host_header, *port),
         )
         .await
         else {
@@ -234,10 +238,12 @@ pub(crate) async fn ssh_audit(cx: &Ctx<'_>) -> Result<StageEnd> {
     }
     let mut observations = Vec::new();
     let mut audited = 0usize;
-    for (address, port) in ssh_targets.iter().take(MAX_HOSTS_PER_STAGE) {
+    let total = ssh_targets.len().min(MAX_HOSTS_PER_STAGE);
+    for (index, (address, port)) in ssh_targets.iter().take(total).enumerate() {
         if !same_mode() {
             return Ok(StageEnd::ModeChanged);
         }
+        cx.progress(index, total);
         let Some(audit) =
             while_same_mode(&same_mode, crate::osint::audit_ssh_port(address, *port)).await
         else {
@@ -280,10 +286,12 @@ pub(crate) async fn js(cx: &Ctx<'_>) -> Result<StageEnd> {
     let max_files = if mode == Mode::Aggressive { 40 } else { 15 };
     let (mut files, mut endpoints_found, mut keys_found) = (0usize, 0usize, 0usize);
     let mut observations = Vec::new();
-    for (address, port, https) in probed.web.iter().take(MAX_URLS_PER_STAGE) {
+    let total = probed.web.len().min(MAX_URLS_PER_STAGE);
+    for (index, (address, port, https)) in probed.web.iter().take(total).enumerate() {
         if files >= max_files {
             break;
         }
+        cx.progress(index, total);
         let paths: Vec<String> = {
             let graph = state.graph();
             graph
@@ -442,6 +450,18 @@ pub(crate) fn script_facts(
     (facts, secrets, endpoints)
 }
 
+/// `412 results so far`, and which site it is on when there are several.
+pub(crate) fn results_note(found: u64, site: usize, sites: usize) -> String {
+    let results = match found {
+        1 => "1 result so far".to_owned(),
+        n => format!("{n} results so far"),
+    };
+    match sites {
+        0 | 1 => results,
+        _ => format!("site {} of {sites}, {results}", site + 1),
+    }
+}
+
 pub(crate) async fn crawl_or_dirs(cx: &Ctx<'_>) -> Result<StageEnd> {
     let state = cx.state;
     let task = cx.task;
@@ -449,7 +469,6 @@ pub(crate) async fn crawl_or_dirs(cx: &Ctx<'_>) -> Result<StageEnd> {
     let stage = cx.stage;
     let settings = cx.settings.clone();
     let mode = cx.mode;
-    let same_mode = || cx.same_mode();
     let preset = cx.preset.clone();
     let limits = cx.limits;
     let out = |suffix: &str| cx.out(suffix);
@@ -524,13 +543,28 @@ pub(crate) async fn crawl_or_dirs(cx: &Ctx<'_>) -> Result<StageEnd> {
     };
     let mut changed = 0;
     let mut elsewhere = Names::new();
+    // The results the tool wrote for the sites before this one.
+    let mut found_before = 0u64;
     for (index, url) in urls.iter().enumerate() {
         let output = out(&format!("_{index}.jsonl"));
         let command = match &wordlist {
             Some(wordlist) => dirs_command(&settings, &preset, url, wordlist, &output),
             None => crawl_command(&settings, &preset, url, &output),
         };
-        let outcome = run_tool_while(&command, limits, same_mode).await;
+        let found_here = std::sync::atomic::AtomicU64::new(0);
+        let so_far = |seen: Progress| {
+            let here = seen.done.unwrap_or(0);
+            found_here.store(here, std::sync::atomic::Ordering::Relaxed);
+            let found = found_before + here;
+            Progress {
+                done: Some(found),
+                note: Some(results_note(found, index, urls.len())),
+                ..Progress::default()
+            }
+        };
+        cx.report(so_far(Progress::default()));
+        let outcome = cx.run_tool(&command, OutputKind::JsonLines, &so_far).await;
+        found_before += found_here.load(std::sync::atomic::Ordering::Relaxed);
         match outcome {
             RunOutcome::NotInstalled => {
                 return Ok(StageEnd::Skipped(install_hint(&command.program)))

@@ -583,21 +583,47 @@ pub async fn run(
 
 /// [`run`] with `resolver` for the questions.
 pub async fn run_on(
-    mut resolver: Resolver,
+    resolver: Resolver,
     domain: &str,
     primary_address: &str,
     ct_names: &[String],
     internal: bool,
 ) -> Result<(Vec<Observation>, String)> {
+    run_on_counted(
+        resolver,
+        domain,
+        primary_address,
+        ct_names,
+        internal,
+        |_| {},
+    )
+    .await
+}
+
+/// [`run_on`], telling `asked` after every answer how many questions have
+/// been answered so far.
+pub async fn run_on_counted(
+    mut resolver: Resolver,
+    domain: &str,
+    primary_address: &str,
+    ct_names: &[String],
+    internal: bool,
+    asked: impl Fn(usize),
+) -> Result<(Vec<Observation>, String)> {
     if internal {
         resolver.keep_private();
     }
-    let resolver = &resolver;
+    let answered = std::sync::atomic::AtomicUsize::new(0);
+    let (resolver, answered, asked) = (&resolver, &answered, &asked);
     run_with(
         domain,
         primary_address,
         ct_names,
-        |name: String, rrtype: u16| async move { resolver.resolve(&name, rrtype).await },
+        |name: String, rrtype: u16| async move {
+            let answer = resolver.resolve(&name, rrtype).await;
+            asked(answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+            answer
+        },
     )
     .await
 }
