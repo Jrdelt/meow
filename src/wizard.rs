@@ -1,11 +1,15 @@
-//! Interactive Cat-Themed First-Run & Setup GUI (`Ratatui` TUI) plus shared
-//! Cat ASCII headers across `meow`.
+//! The full-screen setup of the first run and of `meow setup` (`Ratatui`),
+//! plus the cat headers shared across `meow`.
 //!
 //! Runs strictly on the main thread when attached to an interactive terminal
 //! (`stdin` + `stdout` are TTYs and `TERM != "dumb"`), never inside the PTY
 //! host process. Secret fields (cloud API keys and optional NVD API keys) are
 //! rendered as `*` bullets while typing/pasting and by `setup::masked` after
 //! entry, so raw key characters never touch the screen buffer or logs.
+//!
+//! Wording: one question per step, a list of choices with at most one short
+//! line of consequence each, and the longer explanation behind `?`. A row
+//! that would only say "not set" or "n/a" is not drawn.
 
 use std::env;
 use std::io::{IsTerminal, Write};
@@ -20,7 +24,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::ai::{self, AiOverrides, AiSettings, CloudProvider};
@@ -46,8 +50,8 @@ pub const CAT_CLI_BANNER: &str = concat!(
 
 /// Compact Cat ASCII header shown above `meow list` on an interactive TTY.
 pub const CAT_LIST_HEADER: &str = concat!(
-    "  /\\_/\\   meow :: workspaces  (tip: `meow setup` opens the interactive cat GUI)\n",
-    " ( ^.^ )  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n"
+    "  /\\_/\\   meow · sessions\n",
+    " ( ^.^ )  ~~~~~~~~~~~~~~~\n"
 );
 
 /// Mode-reactive 3-line Cat ASCII header printed when opening a session on a TTY.
@@ -73,7 +77,7 @@ pub fn session_header(name: &str, mode: Mode, created: bool) -> String {
     }
 }
 
-/// Outcome returned when the setup GUI exits.
+/// Outcome returned when the setup exits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WizardOutcome {
     Cancelled,
@@ -111,11 +115,11 @@ impl Step {
 
     pub fn short_title(self) -> &'static str {
         match self {
-            Self::Mode => "1 Prowl Mode",
-            Self::LocalAi => "2 Local AI [L]",
-            Self::CloudAi => "3 Cloud AI [C/R]",
-            Self::Toolkit => "4 Claws & Radar",
-            Self::Launch => "5 Launchpad",
+            Self::Mode => "1 Mode",
+            Self::LocalAi => "2 Local AI",
+            Self::CloudAi => "3 Cloud AI",
+            Self::Toolkit => "4 Lookups & tools",
+            Self::Launch => "5 Save",
         }
     }
 
@@ -128,7 +132,7 @@ impl Step {
     }
 }
 
-/// Cloud provider choice on Step 3 (`Cloud Whiskers`).
+/// Cloud provider choice on Step 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudChoice {
     LocalOnly,
@@ -155,17 +159,19 @@ impl EditField {
         matches!(self, Self::CloudApiKey | Self::NvdApiKey)
     }
 
+    /// The title of the edit box. A key's title also says where the key
+    /// is kept and sent (see `edit_title`).
     pub fn label(self) -> &'static str {
         match self {
-            Self::LocalUrl => "Local AI server URL (http:// or https://)",
-            Self::LocalModel => "Local model name (leave empty to let server choose)",
-            Self::CloudApiKey => "Cloud API key (hidden -- never echoed; Ctrl-U clears)",
-            Self::CloudUrl => "Cloud service URL (https:// required unless loopback)",
-            Self::CloudModel => "[C] Cloud triage model",
-            Self::ResearchModel => "[R] Grounded research model",
-            Self::Fallbacks => "Claude refusal fallback models (comma-separated, or 'none')",
-            Self::NvdApiKey => "Optional NIST NVD API key (hidden -- Ctrl-U clears)",
-            Self::WorkspaceName => "First workspace name (letters, digits, '-', '_', '.' or empty)",
+            Self::LocalUrl => "Local AI URL",
+            Self::LocalModel => "Local AI model · empty: server's choice",
+            Self::CloudApiKey => "Cloud AI key",
+            Self::CloudUrl => "Cloud AI URL",
+            Self::CloudModel => "Triage model",
+            Self::ResearchModel => "Research model",
+            Self::Fallbacks => "Fallback models · comma-separated, or none",
+            Self::NvdApiKey => "NVD key",
+            Self::WorkspaceName => "Session name",
         }
     }
 }
@@ -174,16 +180,21 @@ impl EditField {
 pub struct EditState {
     pub field: EditField,
     pub buffer: String,
-    /// Ctrl+V was pressed: the edit box says how to paste instead.
+    /// Ctrl+V was pressed: until the next key or paste the edit box says
+    /// how to paste instead.
     pub paste_hint: bool,
+    /// Why Enter did not take the text; said in the edit box, which stays.
+    pub problem: String,
 }
 
-/// Readiness of external recon scanners and wordlists on this machine.
+/// Whether a scanner, the wordlist or the location database is on this
+/// machine. `meow tools` gets the ones that are not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCheck {
     pub name: String,
+    /// What it is for, said behind `?`.
+    pub purpose: &'static str,
     pub found: Option<String>,
-    pub hint: String,
 }
 
 /// Discovered local model from `[p]` sniffing.
@@ -204,12 +215,14 @@ pub enum WizardAction {
     Quit,
 }
 
-/// State machine for the Interactive Cat Setup GUI.
+/// State machine of the full-screen setup.
 pub struct Wizard {
     pub first_run: bool,
     pub step: Step,
     pub cursors: [usize; 5],
     pub editing: Option<EditState>,
+    /// `?` was pressed: the help card is open.
+    pub show_help: bool,
     pub status: String,
     pub status_warn: bool,
 
@@ -229,6 +242,12 @@ pub struct Wizard {
     pub location_enabled: bool,
     pub location_map: bool,
     pub launch_workspace: String,
+
+    // Shown at the moment of choice, set in `config.toml`.
+    pub daily_usd: f64,
+    pub daily_calls: u32,
+    pub location_host: String,
+    pub tiles_host: String,
 
     // Live probes & system checks
     pub discovered_local: Vec<DiscoveredModel>,
@@ -264,11 +283,7 @@ impl Wizard {
             .key_source()
             .filter(|src| src != "your setup file");
 
-        let has_any_key = own.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
-            || effective.api_key().is_some();
-        let cloud_choice = if own.disable_cloud
-            || (!has_any_key && own.cloud_provider.is_none() && own.cloud_url.is_none())
-        {
+        let cloud_choice = if !setup::cloud_in_use(&own, effective.api_key().is_some()) {
             CloudChoice::LocalOnly
         } else if effective.provider() == CloudProvider::Anthropic {
             CloudChoice::Claude
@@ -291,9 +306,9 @@ impl Wizard {
         let tools = scan_tools(&config, home);
 
         let welcome = if first_run {
-            "Welcome to meow! Use arrows + Enter to customize, or press 's' anytime to save."
+            "Defaults work · change later with `meow setup`"
         } else {
-            "Use Tab/1-5 to switch tabs, arrows + Enter to edit, 's' to save, or 'q' to cancel."
+            ""
         };
 
         Ok(Self {
@@ -301,6 +316,7 @@ impl Wizard {
             step: Step::Mode,
             cursors: [mode_cursor, 0, cloud_cursor, 0, launch_cursor],
             editing: None,
+            show_help: false,
             status: welcome.to_owned(),
             status_warn: false,
             default_mode: config.default_mode,
@@ -322,6 +338,10 @@ impl Wizard {
             location_enabled: config.location.enabled,
             location_map: config.location.map,
             launch_workspace: String::new(),
+            daily_usd: effective.max_daily_usd,
+            daily_calls: effective.max_daily_calls,
+            location_host: crate::location::source(&config.location.url),
+            tiles_host: crate::location::source(&config.location.tiles),
             discovered_local: Vec::new(),
             tools,
             test_results: Vec::new(),
@@ -339,19 +359,34 @@ impl Wizard {
         self.status_warn = warn;
     }
 
+    /// What a row already shows is not said again below the list.
+    fn clear_status(&mut self) {
+        self.set_status("", false);
+    }
+
     fn row_count(&self, step: Step) -> usize {
         match step {
             Step::Mode => 3,
             Step::LocalAi => 6 + self.discovered_local.len(),
-            Step::CloudAi => 8,
+            // The key, address and models of a service that is off are not
+            // drawn; the fallback models belong to the Claude API.
+            Step::CloudAi => match self.cloud_choice {
+                CloudChoice::LocalOnly => 3,
+                CloudChoice::OpenRouter => 7,
+                CloudChoice::Claude => 8,
+            },
             Step::Toolkit => 5,
             Step::Launch => 4,
         }
     }
 
     fn clamp_cursor(&mut self) {
-        let len = self.row_count(self.step);
-        let slot = &mut self.cursors[self.step.index()];
+        self.clamp_cursor_of(self.step);
+    }
+
+    fn clamp_cursor_of(&mut self, step: Step) {
+        let len = self.row_count(step);
+        let slot = &mut self.cursors[step.index()];
         if len == 0 {
             *slot = 0;
         } else if *slot >= len {
@@ -385,13 +420,21 @@ impl Wizard {
     fn select_cloud_choice(&mut self, choice: CloudChoice) {
         let prev = self.cloud_choice;
         self.cloud_choice = choice;
+        // A key stays with the service it was entered for.
+        let removed = format!(
+            "Key removed: it was for {}",
+            crate::location::source(&self.cloud_url)
+        );
         match choice {
             CloudChoice::LocalOnly => {
-                self.cloud_api_key = None;
-                self.set_status(
-                    "Cloud AI disabled ($0.00 local-only mode). Stored API key will be cleared on save.",
-                    false,
-                );
+                let msg = if self.cloud_api_key.take().is_some() {
+                    "Key removed".to_owned()
+                } else if let Some(source) = &self.env_key_source {
+                    format!("Key {} not used", setup::key_origin(source))
+                } else {
+                    String::new()
+                };
+                self.set_status(msg, false);
             }
             CloudChoice::Claude => {
                 let cleared = prev != CloudChoice::Claude
@@ -410,12 +453,7 @@ impl Wizard {
                         .map(|m| (*m).to_owned())
                         .collect();
                 }
-                let msg = if cleared {
-                    "Switched to Anthropic Claude API (previous service key cleared). Paste your Claude key below."
-                } else {
-                    "Switched to Anthropic Claude API. Select 'Cloud API Key' below to paste your key."
-                };
-                self.set_status(msg, false);
+                self.set_status(if cleared { removed } else { String::new() }, false);
             }
             CloudChoice::OpenRouter => {
                 let cleared = prev != CloudChoice::OpenRouter
@@ -432,14 +470,10 @@ impl Wizard {
                     self.research_model = defaults.research_model;
                 }
                 self.cloud_fallbacks.clear();
-                let msg = if cleared {
-                    "Switched to OpenRouter / OpenAI-compatible API (previous service key cleared). Paste your key below."
-                } else {
-                    "Switched to OpenRouter / OpenAI-compatible API. Select 'Cloud API Key' to paste your key."
-                };
-                self.set_status(msg, false);
+                self.set_status(if cleared { removed } else { String::new() }, false);
             }
         }
+        self.clamp_cursor_of(Step::CloudAi);
     }
 
     fn start_edit(&mut self, field: EditField) {
@@ -460,6 +494,7 @@ impl Wizard {
             field,
             buffer: initial,
             paste_hint: false,
+            problem: String::new(),
         });
     }
 
@@ -469,53 +504,49 @@ impl Wizard {
         };
         let trimmed = edit.buffer.trim();
         match edit.field {
-            EditField::LocalUrl => match setup::checked_url(trimmed) {
+            EditField::LocalUrl => match ai::checked_local_url(trimmed) {
                 Ok(url) => {
-                    self.local_url = url.clone();
-                    self.set_status(format!("Local AI server set to {url}"), false);
+                    self.local_url = url;
+                    self.clear_status();
                 }
-                Err(err) => {
-                    self.set_status(format!("{err:#}"), true);
-                    self.editing = Some(edit);
+                Err(why) => {
+                    let problem = why.to_owned();
+                    self.editing = Some(EditState { problem, ..edit });
                 }
             },
             EditField::LocalModel => {
                 self.local_model = sanitize(trimmed, 120);
-                let shown = if self.local_model.is_empty() {
-                    "chosen by the server".to_owned()
-                } else {
-                    self.local_model.clone()
-                };
-                self.set_status(format!("Local AI model: {shown}"), false);
+                self.clear_status();
             }
             EditField::CloudApiKey => {
                 if trimmed.is_empty() {
-                    self.cloud_api_key = None;
-                    self.set_status("Cloud API key cleared.", false);
+                    // The box said so while a key was stored.
+                    let removed = self.cloud_api_key.take().is_some();
+                    self.set_status(if removed { "Key removed" } else { "" }, false);
                 } else if trimmed.len() > 512 || trimmed.chars().any(char::is_control) {
-                    self.set_status(
-                        "API key must be at most 512 bytes and contain no control characters.",
-                        true,
-                    );
+                    self.set_status("Key refused: over 512 bytes or control characters", true);
                 } else {
                     let key = trimmed.to_owned();
+                    let service = self.cloud_choice;
                     if key.starts_with("sk-ant-") {
                         if self.cloud_choice != CloudChoice::Claude {
                             self.select_cloud_choice(CloudChoice::Claude);
                         }
-                    } else if key.starts_with("sk-or-") {
-                        if self.cloud_choice != CloudChoice::OpenRouter {
-                            self.select_cloud_choice(CloudChoice::OpenRouter);
-                        }
-                    } else if self.cloud_choice == CloudChoice::LocalOnly {
+                    } else if key.starts_with("sk-or-")
+                        && self.cloud_choice != CloudChoice::OpenRouter
+                    {
                         self.select_cloud_choice(CloudChoice::OpenRouter);
                     }
-                    let summary = setup::masked(&key);
                     self.cloud_api_key = Some(key);
-                    self.set_status(format!("Cloud API key {summary} (kept hidden)"), false);
+                    // The key chose its service: that is worth a line.
+                    if self.cloud_choice == service {
+                        self.clear_status();
+                    } else {
+                        self.set_status("Service changed to match the key", false);
+                    }
                 }
             }
-            EditField::CloudUrl => match ai::validate_cloud_url(trimmed) {
+            EditField::CloudUrl => match ai::checked_cloud_url(trimmed) {
                 Ok(url) => {
                     let host_of = |raw: &str| {
                         reqwest::Url::parse(raw)
@@ -534,32 +565,29 @@ impl Wizard {
                     } else if self.cloud_choice != CloudChoice::OpenRouter {
                         self.select_cloud_choice(CloudChoice::OpenRouter);
                     }
-                    self.cloud_url = url.clone();
+                    self.cloud_url = url;
                     let note = if cleared {
-                        " (previous host's API key cleared)"
+                        format!("Key removed: it was for {}", sanitize(&old_host, 80))
                     } else {
-                        ""
+                        String::new()
                     };
-                    self.set_status(format!("Cloud service URL set to {url}{note}"), false);
+                    self.set_status(note, false);
                 }
-                Err(err) => {
-                    self.set_status(format!("{err:#}"), true);
-                    self.editing = Some(edit);
+                Err(why) => {
+                    let problem = why.to_owned();
+                    self.editing = Some(EditState { problem, ..edit });
                 }
             },
             EditField::CloudModel => {
                 if !trimmed.is_empty() {
                     self.cloud_model = sanitize(trimmed, 120);
-                    self.set_status(format!("[C] triage model: {}", self.cloud_model), false);
+                    self.clear_status();
                 }
             }
             EditField::ResearchModel => {
                 if !trimmed.is_empty() {
                     self.research_model = sanitize(trimmed, 120);
-                    self.set_status(
-                        format!("[R] research model: {}", self.research_model),
-                        false,
-                    );
+                    self.clear_status();
                 }
             }
             EditField::Fallbacks => {
@@ -567,49 +595,35 @@ impl Wizard {
                     .into_iter()
                     .map(|m| sanitize(&m, 120))
                     .collect();
-                let desc = if self.cloud_fallbacks.is_empty() {
-                    "left to the Claude API".to_owned()
-                } else {
-                    self.cloud_fallbacks.join(" -> ")
-                };
-                self.set_status(format!("Fallback chain: {desc}"), false);
+                self.clear_status();
             }
             EditField::NvdApiKey => {
                 if trimmed.is_empty() {
-                    self.nvd_api_key = None;
-                    self.set_status("NVD API key cleared (6.5s anonymous pacing).", false);
+                    let removed = self.nvd_api_key.take().is_some();
+                    self.set_status(if removed { "NVD key removed" } else { "" }, false);
                 } else if trimmed.len() > 512 || trimmed.chars().any(char::is_control) {
                     self.set_status(
-                        "NVD API key must be at most 512 bytes and contain no control characters.",
+                        "NVD key refused: over 512 bytes or control characters",
                         true,
                     );
                 } else {
-                    let summary = setup::masked(trimmed);
                     self.nvd_api_key = Some(trimmed.to_owned());
-                    self.set_status(format!("NVD API key {summary} (0.7s fast pacing)"), false);
+                    self.clear_status();
                 }
             }
             EditField::WorkspaceName => {
                 if trimmed.is_empty() {
                     self.launch_workspace.clear();
-                    self.set_status(
-                        "No initial workspace selected; saving will finish cleanly.",
-                        false,
-                    );
+                    self.clear_status();
                 } else {
                     match validate_launch_workspace(trimmed) {
                         Ok(valid) => {
-                            self.launch_workspace = valid.clone();
-                            self.set_status(
-                                format!(
-                                    "Will launch session '{valid}' right after saving (it asks where to save it)."
-                                ),
-                                false,
-                            );
+                            self.launch_workspace = valid;
+                            self.clear_status();
                         }
                         Err(reason) => {
-                            self.set_status(format!("Invalid workspace name: {reason}"), true);
-                            self.editing = Some(edit);
+                            let problem = name_problem(&sanitize(&reason, 200), trimmed);
+                            self.editing = Some(EditState { problem, ..edit });
                         }
                     }
                 }
@@ -620,6 +634,8 @@ impl Wizard {
     /// Handles pasted text (such as pasting an API key or URL).
     pub fn on_paste(&mut self, text: &str) {
         if let Some(edit) = &mut self.editing {
+            edit.problem.clear();
+            edit.paste_hint = false;
             let remaining = MAX_EDIT_CHARS.saturating_sub(edit.buffer.chars().count());
             let cleaned: String = text
                 .chars()
@@ -637,11 +653,13 @@ impl Wizard {
         }
 
         if let Some(edit) = &mut self.editing {
-            let mut paste_hint = false;
+            edit.problem.clear();
+            edit.paste_hint = false;
             match key.code {
+                // The closed box says it was cancelled.
                 KeyCode::Esc => {
                     self.editing = None;
-                    self.set_status("Edit cancelled.", false);
+                    self.clear_status();
                 }
                 KeyCode::Enter => self.commit_edit(),
                 KeyCode::Backspace => {
@@ -657,7 +675,6 @@ impl Wizard {
                 // clipboard: say how to paste instead of typing a "v".
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     edit.paste_hint = true;
-                    paste_hint = true;
                 }
                 KeyCode::Char(_)
                     if key
@@ -670,13 +687,19 @@ impl Wizard {
                 }
                 _ => {}
             }
-            if paste_hint {
-                self.set_status(setup::PASTE_HINT, true);
-            }
             return WizardAction::None;
         }
 
         match key.code {
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+                WizardAction::None
+            }
+            // Esc leaves the help first; without it, the setup.
+            KeyCode::Esc if self.show_help => {
+                self.show_help = false;
+                WizardAction::None
+            }
             KeyCode::Char('q') | KeyCode::Esc => WizardAction::Quit,
             KeyCode::Char('s') => self.request_save(),
             KeyCode::Char('p') => WizardAction::ProbeLocal,
@@ -685,42 +708,20 @@ impl Wizard {
                 self.rescan_tools();
                 WizardAction::None
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.step = self.step.next();
-                self.clamp_cursor();
-                WizardAction::None
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.go_to(self.step.next()),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.go_to(self.step.prev()),
+            KeyCode::Char(digit @ '1'..='5') => {
+                self.go_to(Step::ALL[usize::from(digit as u8 - b'1')])
             }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.step = self.step.prev();
-                self.clamp_cursor();
-                WizardAction::None
-            }
-            KeyCode::Char('1') => {
-                self.step = Step::Mode;
-                WizardAction::None
-            }
-            KeyCode::Char('2') => {
-                self.step = Step::LocalAi;
-                WizardAction::None
-            }
-            KeyCode::Char('3') => {
-                self.step = Step::CloudAi;
-                WizardAction::None
-            }
-            KeyCode::Char('4') => {
-                self.step = Step::Toolkit;
-                WizardAction::None
-            }
-            KeyCode::Char('5') => {
-                self.step = Step::Launch;
-                WizardAction::None
-            }
+            // What a status said belongs to the row it was said on.
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_cursor(-1);
+                self.clear_status();
                 WizardAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_cursor(1);
+                self.clear_status();
                 WizardAction::None
             }
             KeyCode::Char(' ') => self.activate_row(false),
@@ -729,10 +730,18 @@ impl Wizard {
         }
     }
 
+    /// Another step: its own status line, not the last one's.
+    fn go_to(&mut self, step: Step) -> WizardAction {
+        self.step = step;
+        self.clamp_cursor();
+        self.clear_status();
+        WizardAction::None
+    }
+
     fn request_save(&mut self) -> WizardAction {
         if !self.launch_workspace.is_empty() {
             if let Err(reason) = validate_launch_workspace(&self.launch_workspace) {
-                self.set_status(format!("Invalid workspace name: {reason}"), true);
+                self.set_status(format!("Session name refused: {reason}"), true);
                 self.step = Step::Launch;
                 return WizardAction::None;
             }
@@ -742,6 +751,10 @@ impl Wizard {
 
     fn activate_row(&mut self, advance_on_mode: bool) -> WizardAction {
         let row = self.cursor();
+        // A row that is not drawn cannot be chosen.
+        if row >= self.row_count(self.step) {
+            return WizardAction::None;
+        }
         match self.step {
             Step::Mode => {
                 self.default_mode = match row {
@@ -749,23 +762,20 @@ impl Wizard {
                     1 => Mode::Mild,
                     _ => Mode::Aggressive,
                 };
-                self.set_status(
-                    format!("Default mode set to '{}'.", self.default_mode),
-                    false,
-                );
+                // On the next step the choice is no longer in sight.
                 if advance_on_mode {
+                    self.set_status(format!("Mode set to {}", self.default_mode), false);
                     self.step = Step::LocalAi;
+                } else {
+                    self.clear_status();
                 }
                 WizardAction::None
             }
             Step::LocalAi => match row {
                 0..=2 => {
-                    let (url, name) = setup::LOCAL_SERVERS[row];
+                    let (url, _) = setup::LOCAL_SERVERS[row];
                     self.local_url = url.to_owned();
-                    self.set_status(
-                        format!("Selected {name} ({url}). Press 'p' to sniff models!"),
-                        false,
-                    );
+                    self.clear_status();
                     WizardAction::None
                 }
                 3 => {
@@ -779,15 +789,9 @@ impl Wizard {
                 5 => WizardAction::ProbeLocal,
                 idx => {
                     if let Some(found) = self.discovered_local.get(idx - 6).cloned() {
-                        self.local_url = found.url.clone();
-                        self.local_model = found.model.clone();
-                        self.set_status(
-                            format!(
-                                "Selected {} on {} ({})",
-                                found.model, found.server_name, found.url
-                            ),
-                            false,
-                        );
+                        self.local_url = found.url;
+                        self.local_model = found.model;
+                        self.clear_status();
                     }
                     WizardAction::None
                 }
@@ -822,31 +826,14 @@ impl Wizard {
                     WizardAction::None
                 }
                 _ => {
-                    if self.cloud_choice == CloudChoice::Claude {
-                        self.start_edit(EditField::Fallbacks);
-                    } else {
-                        self.set_status(
-                            "Refusal fallback chains apply when using the Anthropic Claude API.",
-                            false,
-                        );
-                    }
+                    self.start_edit(EditField::Fallbacks);
                     WizardAction::None
                 }
             },
             Step::Toolkit => match row {
                 0 => {
                     self.cve_enabled = !self.cve_enabled;
-                    self.set_status(
-                        format!(
-                            "Live CVE grounding {}.",
-                            if self.cve_enabled {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            }
-                        ),
-                        false,
-                    );
+                    self.clear_status();
                     WizardAction::None
                 }
                 1 => {
@@ -855,32 +842,12 @@ impl Wizard {
                 }
                 2 => {
                     self.location_enabled = !self.location_enabled;
-                    self.set_status(
-                        format!(
-                            "Public IP location lookup {}.",
-                            if self.location_enabled {
-                                "enabled (skipped automatically when VPN is active)"
-                            } else {
-                                "disabled (local GeoIP only)"
-                            }
-                        ),
-                        false,
-                    );
+                    self.clear_status();
                     WizardAction::None
                 }
                 3 => {
                     self.location_map = !self.location_map;
-                    self.set_status(
-                        format!(
-                            "Satellite map tiles {}.",
-                            if self.location_map {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            }
-                        ),
-                        false,
-                    );
+                    self.clear_status();
                     WizardAction::None
                 }
                 _ => {
@@ -911,14 +878,7 @@ impl Wizard {
                 .unwrap_or_default();
             cfg.recon.wordlist_dir = Some(home.root().join("wordlists"));
             self.tools = scan_tools(&cfg, &home);
-            let ready = self.tools.iter().filter(|t| t.found.is_some()).count();
-            self.set_status(
-                format!(
-                    "Re-scanned local toolkit: {ready}/{} items ready.",
-                    self.tools.len()
-                ),
-                false,
-            );
+            self.set_status("Tools checked", false);
         }
     }
 
@@ -948,7 +908,7 @@ impl Wizard {
                     self.discovered_local.clear();
                     self.clamp_cursor();
                     self.set_status(
-                        "No local model server answered on :1234, :11434, or :8080. Start Ollama or LM Studio first!",
+                        "0 servers found on ports 1234, 11434, 8080 · start one first",
                         true,
                     );
                 } else {
@@ -961,21 +921,15 @@ impl Wizard {
                     }
                     self.discovered_local = models;
                     self.step = Step::LocalAi;
+                    // The found rows are what to look at now.
+                    self.show_help = false;
                     self.clamp_cursor();
-                    self.set_status(
-                        format!(
-                            "Purr! Found {count} local model option(s). Pick one from the list!"
-                        ),
-                        false,
-                    );
+                    self.set_status(format!("{count} found · pick one below"), false);
                 }
             }
             Err(err) => {
                 self.set_status(
-                    format!(
-                        "Could not probe local ports: {}",
-                        sanitize(&format!("{err:#}"), 160)
-                    ),
+                    format!("Search failed: {}", sanitize(&format!("{err:#}"), 160)),
                     true,
                 );
             }
@@ -1013,7 +967,7 @@ impl Wizard {
         }
     }
 
-    /// Runs live connection checks against the currently configured `[L]` and `[C]`.
+    /// Runs live connection checks against the local and the cloud AI as set here.
     pub fn test_connections(&mut self) {
         let local_only = self.cloud_choice == CloudChoice::LocalOnly;
         let preview = AiSettings {
@@ -1037,23 +991,24 @@ impl Wizard {
         match setup::check(&preview, &mut buf) {
             Ok(ok) => {
                 let text = String::from_utf8_lossy(&buf);
-                self.test_results = text.lines().map(|line| sanitize(line, 200)).collect();
+                // The results are drawn on the Review card of the last step,
+                // above the rows that name the address and the service.
+                let reviewed = [
+                    self.local_url.as_str(),
+                    self.cloud_url.as_str(),
+                    "Claude API",
+                ];
+                self.test_results = text
+                    .lines()
+                    .filter_map(|line| test_line(line, &reviewed))
+                    .collect();
                 self.step = Step::Launch;
-                self.set_status(
-                    if ok {
-                        "All configured AI endpoints responded cleanly!"
-                    } else {
-                        "Some endpoints did not answer -- see check results on the right."
-                    },
-                    !ok,
-                );
+                self.show_help = false;
+                self.set_status(if ok { "Test done" } else { "Test failed" }, !ok);
             }
             Err(err) => {
                 self.set_status(
-                    format!(
-                        "Connection test error: {}",
-                        sanitize(&format!("{err:#}"), 160)
-                    ),
+                    format!("Test failed: {}", sanitize(&format!("{err:#}"), 160)),
                     true,
                 );
             }
@@ -1087,56 +1042,67 @@ fn validate_launch_workspace(raw: &str) -> Result<String, String> {
     validate_name(raw)
 }
 
-fn tool_hint(name: &str) -> &'static str {
-    if cfg!(target_os = "macos") {
-        match name {
-            "nmap" => "brew install nmap",
-            "katana" => "brew install katana",
-            "feroxbuster" => "brew install feroxbuster",
-            "geoip" => "run `meow tools` or ./install.sh --tools-only",
-            _ => "run ./install.sh or place a .txt wordlist in ~/.meow/wordlists",
+/// A line of `setup::check` (`[+] Local AI  what happened`) for the Review
+/// card: cleaned, with its gap kept, and without what the card's own rows
+/// say (`reviewed`: the URL or the service a line names, that the cloud AI
+/// is off, and that its key is missing).
+fn test_line(line: &str, reviewed: &[&str]) -> Option<String> {
+    let Some((service, said)) = line.split_once("  ") else {
+        return Some(sanitize(line, 200));
+    };
+    let mut said = sanitize(said, 200);
+    if said == "off" || said == "skipped: no key" {
+        return None;
+    }
+    for shown in reviewed.iter().filter(|shown| !shown.is_empty()) {
+        for lead in [format!("{shown} · "), format!("{shown} ")] {
+            if let Some(rest) = said.strip_prefix(&lead) {
+                said = rest.to_owned();
+                break;
+            }
         }
-    } else if cfg!(target_os = "windows") {
-        match name {
-            "nmap" => "winget install Insecure.Nmap",
-            "katana" => "go install github.com/projectdiscovery/katana/cmd/katana@v1.1.2",
-            "feroxbuster" => "cargo install feroxbuster --locked",
-            "geoip" => "run `meow tools` or .\\install.ps1 -ToolsOnly",
-            _ => "run .\\install.ps1 or place a .txt wordlist in ~/.meow/wordlists",
+        for named in [format!(" at {shown}"), format!(" to {shown}")] {
+            said = said.replace(&named, "");
         }
+    }
+    Some(format!("{}  {said}", sanitize(service, 20)))
+}
+
+/// `text` with its first letter in upper case.
+fn capitalised(text: &str) -> String {
+    let mut rest = text.chars();
+    match rest.next() {
+        Some(first) => first.to_uppercase().chain(rest).collect(),
+        None => String::new(),
+    }
+}
+
+/// Why a session name is refused, as a line of its own. A reason that
+/// starts with the name (`setup is a meow command`) keeps it as typed.
+fn name_problem(reason: &str, typed: &str) -> String {
+    if reason.starts_with(&format!("{typed} is ")) {
+        reason.to_owned()
     } else {
-        match name {
-            "nmap" => "install nmap with your package manager (or ./install.sh)",
-            "katana" => "go install github.com/projectdiscovery/katana/cmd/katana@v1.1.2",
-            "feroxbuster" => "cargo install feroxbuster --locked (or ./install.sh)",
-            "geoip" => "run `meow tools` or ./install.sh --tools-only",
-            _ => "run ./install.sh or place a .txt wordlist in ~/.meow/wordlists",
-        }
+        capitalised(reason)
     }
 }
 
 fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
     let mut out = Vec::new();
-    for (label, bin) in [
+    for (name, purpose, bin) in [
+        ("nmap", "ports and services", config.recon.nmap.as_str()),
+        ("katana", "web crawl", config.recon.katana.as_str()),
         (
-            "nmap (port & service inventory)",
-            config.recon.nmap.as_str(),
-        ),
-        (
-            "katana (web link & JS crawler)",
-            config.recon.katana.as_str(),
-        ),
-        (
-            "feroxbuster (directory discovery)",
+            "feroxbuster",
+            "directory checks",
             config.recon.feroxbuster.as_str(),
         ),
     ] {
-        let short = label.split_whitespace().next().unwrap_or(bin);
         let found = tools::find_program(bin).map(|p| sanitize(&p.display().to_string(), 120));
         out.push(ToolCheck {
-            name: label.to_owned(),
+            name: name.to_owned(),
+            purpose,
             found,
-            hint: tool_hint(short).to_owned(),
         });
     }
     let wordlist = queue::find_wordlist(
@@ -1145,9 +1111,9 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
     )
     .map(|p| sanitize(&p.display().to_string(), 120));
     out.push(ToolCheck {
-        name: "web wordlist (SecLists common.txt)".to_owned(),
+        name: "wordlist".to_owned(),
+        purpose: "names for the directory checks",
         found: wordlist,
-        hint: tool_hint("wordlist").to_owned(),
     });
     let geo_path = {
         let raw = config.location.database.trim();
@@ -1172,9 +1138,9 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
         .filter(|m| m.is_file() && !m.file_type().is_symlink())
         .map(|_| sanitize(&geo_path.display().to_string(), 120));
     out.push(ToolCheck {
-        name: "GeoIP database (DB-IP City Lite)".to_owned(),
+        name: "GeoIP database".to_owned(),
+        purpose: "where a host is, offline",
         found: geo_found,
-        hint: tool_hint("geoip").to_owned(),
     });
     out
 }
@@ -1186,12 +1152,40 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const GOOD: Style = Style::new().fg(Color::Green);
 const WARN: Style = Style::new().fg(Color::Yellow);
+const BAD: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
 const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const PURR: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
 const SELECTED: Style = Style::new()
     .fg(Color::Black)
     .bg(Color::Cyan)
     .add_modifier(Modifier::BOLD);
+
+/// A smaller terminal is told so instead of being drawn a clipped screen.
+const MIN_WIDTH: u16 = 32;
+const MIN_HEIGHT: u16 = 12;
+/// Below this height the header is the steps and their fact only: the
+/// title and the cat leave their rows to the list.
+const ROOMY_HEIGHT: u16 = 16;
+/// The cat is drawn from this width on; narrower, the text gets its room.
+const ART_MIN_WIDTH: u16 = 80;
+const ART_WIDTH: usize = 18;
+/// From this width on a second card stands beside the list, not under it.
+const WIDE: u16 = 130;
+/// From this width on the values of a list start in one column.
+const LABEL_COLUMN_MIN: usize = 64;
+/// Labels longer than this do not push the other rows' values further out.
+const MAX_LABEL: usize = 24;
+
+const SERVERS_CHOICE: &str = "server's choice";
+const FALLBACKS_BY_API: &str = "chosen by the Claude API";
+
+fn chars(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn rows_of(count: usize) -> u16 {
+    u16::try_from(count).unwrap_or(u16::MAX)
+}
 
 fn card(title: &str, focused: bool) -> Block<'_> {
     let border = if focused {
@@ -1204,629 +1198,1184 @@ fn card(title: &str, focused: bool) -> Block<'_> {
         .border_style(border)
 }
 
-struct CatBanner {
-    art: [&'static str; 3],
-    art_style: Style,
-    headline: &'static str,
-    subline: &'static str,
-}
-
-fn cat_banner(wizard: &Wizard) -> CatBanner {
+/// The small cat of each step. On step 1 it follows the highlighted mode.
+fn cat_art(wizard: &Wizard) -> ([&'static str; 3], Style) {
     match wizard.step {
         Step::Mode => match wizard.previewed_mode() {
-            Mode::Light => CatBanner {
-                art: [
+            Mode::Light => (
+                [
                     "   |\\__/,|   (`\\  ",
                     " _.| -.- |_   ) ) ",
                     "-(((---(((--------",
                 ],
-                art_style: GOOD.add_modifier(Modifier::BOLD),
-                headline: "=^..^=  PROWL MODE :: SLEEPING & LISTENING (LIGHT)",
-                subline: "Zero outbound target packets! Passively maps local interfaces, VPNs & routes.",
-            },
-            Mode::Mild => CatBanner {
-                art: [
+                GOOD.add_modifier(Modifier::BOLD),
+            ),
+            Mode::Mild => (
+                [
                     "   /\\_/\\     _    ",
                     "  ( o.o )  _//    ",
                     "   > ^ <  (_/     ",
                 ],
-                art_style: WARN.add_modifier(Modifier::BOLD),
-                headline: "=^..^=  PROWL MODE :: CURIOUS WHISKERS (MILD)",
-                subline: "Polite active recon: rate-limited Nmap, Katana crawl & gentle directory checks.",
-            },
-            Mode::Aggressive => CatBanner {
-                art: [
+                WARN.add_modifier(Modifier::BOLD),
+            ),
+            Mode::Aggressive => (
+                [
                     "  /\\___/\\   /     ",
                     " ( >'w'< ) //     ",
                     "  /     \\ V       ",
                 ],
-                art_style: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-                headline: "=^..^=  PROWL MODE :: FULL POUNCE (AGGRESSIVE)",
-                subline: "Fast Nmap (-T4) + auto-tuned Feroxbuster. Use on dedicated labs & cleared targets!",
-            },
+                BAD,
+            ),
         },
-        Step::LocalAi => CatBanner {
-            art: [
+        Step::LocalAi => (
+            [
                 "   /\\_/\\   [o_o]  ",
                 "  ( ^.^ )  /| |\\  ",
                 "   > ~ <  (_|_|_) ",
             ],
-            art_style: ACCENT,
-            headline: "=^..^=  LOCAL PURR-CESSOR [L] :: $0.00 ON-DEVICE AI",
-            subline: "100% private on this machine. Press 'p' to sniff LM Studio, Ollama & llama.cpp!",
-        },
-        Step::CloudAi => CatBanner {
-            art: [
+            ACCENT,
+        ),
+        Step::CloudAi => (
+            [
                 "   /\\_/\\    .~.   ",
                 "  ( o.O )  (   )  ",
                 "   > ^ <    `~'   ",
             ],
-            art_style: PURR,
-            headline: "=^..^=  CLOUD WHISKERS [C]/[R] :: VAULTED TRIAGE & RESEARCH",
-            subline: "Optional! Every IP, hostname, path & secret is vaulted into <<HOST_01>> tokens first.",
-        },
-        Step::Toolkit => CatBanner {
-            art: [
+            PURR,
+        ),
+        Step::Toolkit => (
+            [
                 "   /\\_/\\   _===_  ",
                 "  ( 0.0 )  (o o)  ",
                 "   > ^ <    \\_/   ",
             ],
-            art_style: WARN.add_modifier(Modifier::BOLD),
-            headline: "=^..^=  CLAWS & CVE RADAR :: SCANNERS & LIVE ADVISORIES",
-            subline: "Free NIST NVD + OSV.dev + CISA KEV grounding ($0 AI) & local scanner readiness.",
-        },
-        Step::Launch => CatBanner {
-            art: [
+            WARN.add_modifier(Modifier::BOLD),
+        ),
+        Step::Launch => (
+            [
                 "   /\\_/\\    *  *  ",
                 "  ( ^w^ )  purrr~ ",
                 "  (\")_(\")~~~~~~~~ ",
             ],
-            art_style: GOOD.add_modifier(Modifier::BOLD),
-            headline: "=^..^=  READY TO POUNCE! :: REVIEW, TEST & SAVE",
-            subline: "Saved privately (0600). Press 't' to test AI endpoints or 's' / Enter to finish!",
-        },
+            GOOD.add_modifier(Modifier::BOLD),
+        ),
     }
 }
 
-fn secret_summary(secret: Option<&str>, env_source: Option<&str>) -> String {
-    match (secret, env_source) {
-        (Some(key), _) if !key.trim().is_empty() => format!("{} (setup file)", setup::masked(key)),
-        (None, Some(src)) => format!("from {src}"),
-        _ => "not set".to_owned(),
-    }
-}
-
-/// Renders the entire Interactive Cat Setup GUI into `frame`.
-pub fn draw(frame: &mut Frame, wizard: &Wizard) {
-    let area = frame.area();
-    if area.width < 12 || area.height < 6 {
-        frame.render_widget(Paragraph::new("=^..^= meow setup"), area);
-        return;
-    }
-
-    let footer_height = if wizard.editing.is_some() { 4 } else { 2 };
-    let [header_area, tabs_area, body_area, footer_area] = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Length(2),
-        Constraint::Min(4),
-        Constraint::Length(footer_height),
-    ])
-    .areas(area);
-
-    draw_cat_header(frame, header_area, wizard);
-    draw_step_bar(frame, tabs_area, wizard);
-    draw_body(frame, body_area, wizard);
-    draw_footer(frame, footer_area, wizard);
-}
-
-fn draw_cat_header(frame: &mut Frame, area: Rect, wizard: &Wizard) {
-    let banner = cat_banner(wizard);
-    let title = if wizard.first_run {
-        "MEOW :: INTERACTIVE FIRST-TIME SETUP"
-    } else {
-        "MEOW :: INTERACTIVE SETUP WIZARD"
-    };
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(banner.art[0], banner.art_style),
-            Span::raw("  "),
-            Span::styled(banner.headline, banner.art_style),
-        ]),
-        Line::from(vec![
-            Span::styled(banner.art[1], banner.art_style),
-            Span::raw("  "),
-            Span::raw(banner.subline),
-        ]),
-        Line::from(vec![
-            Span::styled(banner.art[2], banner.art_style),
-            Span::raw("  "),
-            Span::styled(
-                "Private 0700/0600 storage -- API keys are masked & never echoed.",
-                DIM,
-            ),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(lines).block(card(title, true)), area);
-}
-
-fn draw_step_bar(frame: &mut Frame, area: Rect, wizard: &Wizard) {
-    let mut spans = vec![Span::raw(" ")];
-    for (idx, step) in Step::ALL.iter().copied().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled("  >  ", DIM));
+/// The one thing to know at the moment of choice: where the data goes, what
+/// it costs, or how to change one's mind.
+fn step_fact(wizard: &Wizard) -> (String, Style) {
+    let plain = Style::new();
+    match wizard.step {
+        Step::Mode => ("Change it per session with `meow mode`".to_owned(), plain),
+        Step::LocalAi if ai::is_loopback_url(&wizard.local_url) => {
+            ("$0 · host data stays on this machine".to_owned(), plain)
         }
+        Step::LocalAi => (
+            "Not this machine: it gets masked text only".to_owned(),
+            WARN,
+        ),
+        // Both caps are per day.
+        Step::CloudAi => (
+            format!(
+                "Private data is masked first · cap ${:.2} and {} calls a day",
+                wizard.daily_usd, wizard.daily_calls
+            ),
+            plain,
+        ),
+        Step::Toolkit => (
+            "No lookup carries a scanned host's address or name".to_owned(),
+            plain,
+        ),
+        Step::Launch => ("Saves to files only you can read".to_owned(), plain),
+    }
+}
+
+/// `[1 Mode] 2 Local AI  3 Cloud AI ...`; where that is too wide, the other
+/// steps are numbers only.
+fn step_bar(wizard: &Wizard, width: usize) -> Line<'static> {
+    let full: usize = Step::ALL
+        .iter()
+        .map(|step| chars(step.short_title()) + 2)
+        .sum();
+    let compact = full > width;
+    let mut spans = Vec::new();
+    for (idx, step) in Step::ALL.iter().copied().enumerate() {
         if step == wizard.step {
-            spans.push(Span::styled(
-                format!(" [{}] ", step.short_title()),
-                SELECTED,
-            ));
+            spans.push(Span::styled(format!("[{}]", step.short_title()), SELECTED));
+        } else if compact {
+            spans.push(Span::styled(format!(" {} ", idx + 1), ACCENT));
         } else {
             spans.push(Span::styled(format!(" {} ", step.short_title()), ACCENT));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    Line::from(spans)
 }
 
-fn draw_body(frame: &mut Frame, area: Rect, wizard: &Wizard) {
-    let [left, right] = if area.width >= 90 {
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(area)
+/// The header: a title where the terminal has the rows for one, the steps,
+/// and the fact of the step, whole (on more lines where it has to wrap).
+struct Header {
+    lines: Vec<Line<'static>>,
+    /// The cat stands beside the three lines.
+    art: bool,
+}
+
+fn header(wizard: &Wizard, width: u16, height: u16) -> Header {
+    let (fact, fact_style) = step_fact(wizard);
+    let roomy = height >= ROOMY_HEIGHT;
+    let beside_art = usize::from(width).saturating_sub(ART_WIDTH + 2);
+    let art = roomy && width >= ART_MIN_WIDTH && chars(&fact) <= beside_art;
+    let room = if art {
+        beside_art
     } else {
-        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
+        usize::from(width.saturating_sub(1)).max(1)
     };
-
-    let (left_title, items) = step_items(wizard);
-    let mut state = ListState::default();
-    state.select(Some(wizard.cursor()));
-    let list = List::new(items)
-        .block(card(left_title, wizard.editing.is_none()))
-        .highlight_style(SELECTED)
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(list, left, &mut state);
-
-    let (right_title, details) = step_details(wizard);
-    frame.render_widget(
-        Paragraph::new(details)
-            .wrap(Wrap { trim: false })
-            .block(card(right_title, false)),
-        right,
-    );
-}
-
-fn radio(chosen: bool) -> &'static str {
-    if chosen {
-        "(o)"
-    } else {
-        "( )"
+    let mut lines = Vec::new();
+    if roomy {
+        let mut title = vec![Span::styled("meow setup", ACCENT)];
+        if wizard.first_run {
+            title.push(Span::styled(" · first run", DIM));
+        }
+        lines.push(Line::from(title));
     }
-}
-
-fn checkbox(enabled: bool) -> &'static str {
-    if enabled {
-        "[x]"
-    } else {
-        "[ ]"
+    lines.push(step_bar(wizard, room));
+    for part in wrap_words(&fact, room) {
+        lines.push(Line::styled(part, fact_style));
     }
+    Header { lines, art }
 }
 
-fn step_items(wizard: &Wizard) -> (&'static str, Vec<ListItem<'static>>) {
-    match wizard.step {
-        Step::Mode => {
-            let items = vec![
-                ListItem::new(format!(
-                    "{} Light       Passive only (0 packets sent -- recommended)",
-                    radio(wizard.default_mode == Mode::Light)
-                )),
-                ListItem::new(format!(
-                    "{} Mild        Polite rate-limited Nmap + web crawl",
-                    radio(wizard.default_mode == Mode::Mild)
-                )),
-                ListItem::new(format!(
-                    "{} Aggressive  Fast lab-speed Nmap (-T4) + auto-tune",
-                    radio(wizard.default_mode == Mode::Aggressive)
-                )),
-            ];
-            ("Choose Default Discovery Mode (Enter selects)", items)
-        }
-        Step::LocalAi => {
-            let model_label = if wizard.local_model.is_empty() {
-                "chosen by server".to_owned()
-            } else {
-                wizard.local_model.clone()
-            };
-            let mut items = vec![
-                ListItem::new(format!(
-                    "{} Preset: LM Studio   http://localhost:1234/v1",
-                    radio(wizard.local_url == "http://localhost:1234/v1")
-                )),
-                ListItem::new(format!(
-                    "{} Preset: Ollama      http://localhost:11434/v1",
-                    radio(wizard.local_url == "http://localhost:11434/v1")
-                )),
-                ListItem::new(format!(
-                    "{} Preset: llama.cpp   http://localhost:8080/v1",
-                    radio(wizard.local_url == "http://localhost:8080/v1")
-                )),
-                ListItem::new(format!("Edit Server URL:     {}", wizard.local_url)),
-                ListItem::new(format!("Edit Model Name:     {model_label}")),
-                ListItem::new("[Sniff Local Ports for Running Models (p)]".to_owned()),
-            ];
-            for d in &wizard.discovered_local {
-                let label = if d.model.is_empty() {
-                    format!("Found server: {} ({})", d.server_name, d.url)
-                } else {
-                    format!("Found model:  {}  @ {}", d.model, d.server_name)
-                };
-                items.push(ListItem::new(label));
-            }
-            ("Local AI [L] -- Free & Private", items)
-        }
-        Step::CloudAi => {
-            let key_desc = secret_summary(
-                wizard.cloud_api_key.as_deref(),
-                wizard.env_key_source.as_deref(),
-            );
-            let chain_desc = if wizard.cloud_choice != CloudChoice::Claude {
-                "n/a (Claude API only)".to_owned()
-            } else if wizard.cloud_fallbacks.is_empty() {
-                "left to Claude API".to_owned()
-            } else {
-                wizard.cloud_fallbacks.join(", ")
-            };
-            let items = vec![
-                ListItem::new(format!(
-                    "{} Local Only ($0.00 -- No Cloud API Key)",
-                    radio(wizard.cloud_choice == CloudChoice::LocalOnly)
-                )),
-                ListItem::new(format!(
-                    "{} Anthropic Claude API (native Claude key)",
-                    radio(wizard.cloud_choice == CloudChoice::Claude)
-                )),
-                ListItem::new(format!(
-                    "{} OpenRouter / OpenAI-Compatible Service",
-                    radio(wizard.cloud_choice == CloudChoice::OpenRouter)
-                )),
-                ListItem::new(format!("Cloud API Key:       {key_desc}")),
-                ListItem::new(format!("Cloud Service URL:   {}", wizard.cloud_url)),
-                ListItem::new(format!("[C] Triage Model:    {}", wizard.cloud_model)),
-                ListItem::new(format!("[R] Research Model:  {}", wizard.research_model)),
-                ListItem::new(format!("Refusal Fallbacks:   {chain_desc}")),
-            ];
-            ("Cloud AI [C]/[R] -- Vaulted & Capped", items)
-        }
-        Step::Toolkit => {
-            let nvd_desc = match wizard.nvd_api_key.as_deref() {
-                Some(k) => format!("{} (0.7s fast pace)", setup::masked(k)),
-                None => "not set (6.5s anonymous pace)".to_owned(),
-            };
-            let items = vec![
-                ListItem::new(format!(
-                    "{} Live CVE Grounding (NIST NVD + OSV.dev + CISA KEV)",
-                    checkbox(wizard.cve_enabled)
-                )),
-                ListItem::new(format!("NVD API Key (opt):   {nvd_desc}")),
-                ListItem::new(format!(
-                    "{} Public IP Location Lookup (auto-disabled on VPN)",
-                    checkbox(wizard.location_enabled)
-                )),
-                ListItem::new(format!(
-                    "{} Satellite Map Tiles (EOX Sentinel-2 cloudless)",
-                    checkbox(wizard.location_map)
-                )),
-                ListItem::new("[Re-scan Local Scanners & Wordlists (r)]".to_owned()),
-            ];
-            ("CVE Radar, Location & Toolkit", items)
-        }
-        Step::Launch => {
-            let ws_label = if wizard.first_run {
-                "First Workspace:  "
-            } else {
-                "Launch Workspace: "
-            };
-            let ws = if wizard.launch_workspace.is_empty() {
-                "(optional -- press Enter to name e.g. 'homelab')".to_owned()
-            } else {
-                format!("{}  (will open session on save!)", wizard.launch_workspace)
-            };
-            let save_label = if !wizard.launch_workspace.is_empty() {
-                "[ Save Setup & Launch Workspace! (s) ]"
-            } else if wizard.first_run {
-                "[ Save Setup & Finish (s) ]"
-            } else {
-                "[ Save Setup & Exit (s) ]"
-            };
-            let items = vec![
-                ListItem::new(format!("{ws_label}{ws}")),
-                ListItem::new(save_label.to_owned()),
-                ListItem::new("[ Test AI Connections Now (t) ]".to_owned()),
-                ListItem::new("[ Quit Without Saving (q) ]".to_owned()),
-            ];
-            ("Launchpad & Connection Check", items)
-        }
-    }
-}
-
-fn step_details(wizard: &Wizard) -> (&'static str, Vec<Line<'static>>) {
-    match wizard.step {
-        Step::Mode => {
-            let mode = wizard.previewed_mode();
-            let mut lines = vec![
-                Line::styled(format!("Highlighted mode: {mode}"), ACCENT),
-                Line::raw(""),
-            ];
-            match mode {
-                Mode::Light => {
-                    lines.push(Line::styled("Zero outbound network packets.", GOOD));
-                    lines.push(Line::raw(
-                        "Reads local OS routing, interface, VPN (utun/tun) and ARP tables passively without sudo.",
-                    ));
-                    lines.push(Line::raw(""));
-                    lines.push(Line::raw(
-                        "Active `meow recon` scans are refused until you switch to mild or aggressive (`meow mode mild`).",
-                    ));
-                }
-                Mode::Mild => {
-                    lines.push(Line::styled("Polite, rate-capped inventory.", WARN));
-                    lines.push(Line::raw(
-                        "Runs 1-at-a-time queued Nmap (-T3) + Katana host-scoped crawl + rate-limited Feroxbuster.",
-                    ));
-                    lines.push(Line::raw(""));
-                    lines.push(Line::raw(
-                        "Automatically swaps -sS for -sT when running unprivileged.",
-                    ));
-                }
-                Mode::Aggressive => {
-                    lines.push(Line::styled(
-                        "High-speed lab & CTF profile.",
-                        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ));
-                    lines.push(Line::raw(
-                        "Uses Nmap -T4 and auto-tuned Feroxbuster without rate caps.",
-                    ));
-                    lines.push(Line::raw(""));
-                    lines.push(Line::raw(
-                        "Only select as default if you exclusively work against isolated lab environments.",
-                    ));
-                }
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Tip: Change mode anytime per workspace with `meow mode` or keys 1/2/3 in `meow hud`.",
-                DIM,
-            ));
-            ("How Prowl Modes Work", lines)
-        }
-        Step::LocalAi => {
-            let model_desc = if wizard.local_model.is_empty() {
-                "chosen automatically by server".to_owned()
-            } else {
-                wizard.local_model.clone()
-            };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("Server: ", DIM),
-                    Span::styled(wizard.local_url.clone(), GOOD),
-                ]),
-                Line::from(vec![
-                    Span::styled("Model:  ", DIM),
-                    Span::raw(model_desc),
-                ]),
-                Line::raw(""),
-                Line::raw(
-                    "Press [L] inside `meow hud` to triage a selected host using your local model at $0.00 cost.",
-                ),
-                Line::raw(""),
-                Line::styled("Quick Start:", ACCENT),
-                Line::raw("  * Ollama:    run `ollama serve` (:11434)"),
-                Line::raw("  * LM Studio: Developer > Start Server (:1234)"),
-                Line::raw("  * Press 'p' right now to auto-detect running models!"),
-            ];
-            if !wizard.discovered_local.is_empty() {
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    format!(
-                        "Sniffed {} local option(s) -- select one on the left!",
-                        wizard.discovered_local.len()
-                    ),
-                    GOOD,
-                ));
-            }
-            ("On-Device Purr-cessor Details", lines)
-        }
-        Step::CloudAi => {
-            let provider_desc = match wizard.cloud_choice {
-                CloudChoice::LocalOnly => "Disabled ($0.00 local-only)",
-                CloudChoice::Claude => "Anthropic Claude API",
-                CloudChoice::OpenRouter => "OpenRouter / OpenAI-compatible",
-            };
-            let key_desc = if wizard.cloud_choice == CloudChoice::LocalOnly {
-                "disabled (local-only mode overrides environment keys)".to_owned()
-            } else {
-                secret_summary(
-                    wizard.cloud_api_key.as_deref(),
-                    wizard.env_key_source.as_deref(),
-                )
-            };
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled("Mode:     ", DIM),
-                    Span::styled(provider_desc, ACCENT),
-                ]),
-                Line::from(vec![
-                    Span::styled("API Key:  ", DIM),
-                    Span::styled(
-                        key_desc,
-                        if wizard.cloud_choice != CloudChoice::LocalOnly
-                            && (wizard.cloud_api_key.is_some() || wizard.env_key_source.is_some())
-                        {
-                            GOOD
-                        } else {
-                            WARN
-                        },
-                    ),
-                ]),
-                Line::raw(""),
-                Line::styled("Bidirectional Privacy Vault:", ACCENT),
-                Line::raw(
-                    "Before any cloud prompt leaves this machine, meow replaces IPs, domains/SANs, URL paths, usernames, JWTs & keys with placeholders like <<HOST_01>> and <<SEC_01>>, unmasking replies locally.",
-                ),
-                Line::raw(""),
-                Line::styled(
-                    "No cloud key? No problem! [C] automatically falls back to your local [L] model.",
-                    DIM,
-                ),
-            ];
-            ("Privacy Vault & Cloud Safety", lines)
-        }
-        Step::Toolkit => {
-            let mut lines = vec![Line::styled("Local Scanner & Wordlist Status:", ACCENT)];
-            for item in &wizard.tools {
-                match &item.found {
-                    Some(path) => {
-                        lines.push(Line::from(vec![
-                            Span::styled(" [x] ", GOOD),
-                            Span::raw(format!("{} ", item.name)),
-                        ]));
-                        lines.push(Line::styled(format!("     {path}"), DIM));
-                    }
-                    None => {
-                        lines.push(Line::from(vec![
-                            Span::styled(" [ ] ", WARN),
-                            Span::raw(item.name.clone()),
-                        ]));
-                        lines.push(Line::styled(format!("     add via: {}", item.hint), DIM));
-                    }
-                }
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "CVE lookups send only public CPE / package versions -- never host IPs or paths.",
-                DIM,
-            ));
-            ("System Readiness", lines)
-        }
-        Step::Launch => {
-            let cloud_summary = match wizard.cloud_choice {
-                CloudChoice::LocalOnly => "Local-only ($0.00 -- cloud key not used)".to_owned(),
-                CloudChoice::Claude => format!("Claude API ({})", wizard.cloud_model),
-                CloudChoice::OpenRouter => {
-                    format!("{} ({})", wizard.cloud_url, wizard.cloud_model)
-                }
-            };
-            let local_model = if wizard.local_model.is_empty() {
-                "server default"
-            } else {
-                wizard.local_model.as_str()
-            };
-            let key_summary = if wizard.cloud_choice == CloudChoice::LocalOnly {
-                "disabled (local-only mode)".to_owned()
-            } else {
-                secret_summary(
-                    wizard.cloud_api_key.as_deref(),
-                    wizard.env_key_source.as_deref(),
-                )
-            };
-            let loc_summary = match (wizard.location_enabled, wizard.location_map) {
-                (true, true) => "enabled + satellite map tiles",
-                (true, false) => "enabled (map tiles off)",
-                (false, _) => "disabled (offline GeoIP only)",
-            };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("Default mode:  ", DIM),
-                    Span::styled(wizard.default_mode.as_str(), ACCENT),
-                ]),
-                Line::from(vec![
-                    Span::styled("[L] Local AI:  ", DIM),
-                    Span::raw(format!("{} ({local_model})", wizard.local_url)),
-                ]),
-                Line::from(vec![
-                    Span::styled("[C] Cloud AI:  ", DIM),
-                    Span::raw(cloud_summary),
-                ]),
-                Line::from(vec![
-                    Span::styled("Cloud API key: ", DIM),
-                    Span::raw(key_summary),
-                ]),
-                Line::from(vec![
-                    Span::styled("CVE grounding: ", DIM),
-                    Span::raw(if wizard.cve_enabled {
-                        "enabled (NVD + OSV.dev + CISA KEV)"
-                    } else {
-                        "disabled"
-                    }),
-                ]),
-                Line::from(vec![
-                    Span::styled("Location/map:  ", DIM),
-                    Span::raw(loc_summary),
-                ]),
-                Line::from(vec![
-                    Span::styled("Config files:  ", DIM),
-                    Span::styled(
-                        format!(
-                            "{} & ai.toml (0600)",
-                            sanitize(&wizard.config_file.display().to_string(), 80)
-                        ),
-                        DIM,
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Sessions:      ", DIM),
-                    Span::raw("./meow/<name>/ in the folder you pick (asked once)"),
-                ]),
-            ];
-            if !wizard.test_results.is_empty() {
-                lines.push(Line::raw(""));
-                lines.push(Line::styled("Live Connection Check:", ACCENT));
-                for line in &wizard.test_results {
-                    let style = if line.starts_with("[+]") { GOOD } else { WARN };
-                    lines.push(Line::styled(format!("  {line}"), style));
-                }
-            }
-            ("Summary & Verification", lines)
-        }
-    }
-}
-
-fn draw_footer(frame: &mut Frame, area: Rect, wizard: &Wizard) {
-    if let Some(edit) = &wizard.editing {
-        let shown = if edit.field.is_secret() {
-            let count = edit.buffer.chars().count();
-            let stars = "*".repeat(count.min(36));
-            format!("{stars}_  ({count} chars, hidden)")
-        } else {
-            format!("{}_", sanitize(&edit.buffer, 200))
-        };
-        let help = if edit.paste_hint {
-            Line::styled(format!(" {}", setup::PASTE_HINT), WARN)
-        } else {
-            Line::styled(
-                " Paste: Ctrl+Shift+V or right-click  |  Enter: confirm  |  Ctrl-U: clear  |  Esc: cancel",
-                DIM,
-            )
-        };
-        let lines = vec![
-            Line::from(vec![Span::styled(" > ", ACCENT), Span::raw(shown)]),
-            help,
-        ];
-        frame.render_widget(
-            Paragraph::new(lines).block(card(edit.field.label(), true)),
-            area,
-        );
+/// Renders the whole setup screen into `frame`.
+pub fn draw(frame: &mut Frame, wizard: &Wizard) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        let text = format!("Too small: {MIN_WIDTH}x{MIN_HEIGHT} needed");
+        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
         return;
     }
 
-    let status_style = if wizard.status_warn { WARN } else { GOOD };
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" =^..^= ", ACCENT),
-            Span::styled(sanitize(&wizard.status, 220), status_style),
-        ]),
-        Line::styled(
-            " Tab/Left/Right or 1-5: tab  |  Up/Down: select  |  Enter: edit/pick  |  p: sniff local AI  |  t: test  |  s: save  |  q: quit",
-            DIM,
-        ),
-    ];
+    let (title, rows) = step_rows(wizard);
+    let enter = rows.get(wizard.cursor()).map_or("pick", |row| row.enter);
+    let header = header(wizard, area.width, area.height);
+    let footer = footer(wizard, enter, area.width);
+    let header_height = rows_of(header.lines.len());
+    let left = area
+        .height
+        .saturating_sub(header_height.saturating_add(footer.height()));
+    // An empty row under the header where everything still fits.
+    let gap = u16::from(left > body_height(wizard, &rows, area.width));
+    let [header_area, _, body_area, footer_area] = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Length(gap),
+        Constraint::Min(0),
+        Constraint::Length(footer.height()),
+    ])
+    .areas(area);
+
+    draw_header(frame, header_area, wizard, header);
+    draw_body(frame, body_area, wizard, title, &rows);
+    draw_footer(frame, footer_area, footer);
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, wizard: &Wizard, header: Header) {
+    if !header.art {
+        let text = Rect {
+            x: area.x + 1,
+            width: area.width - 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(header.lines), text);
+        return;
+    }
+    let (art, art_style) = cat_art(wizard);
+    let lines: Vec<Line> = art
+        .iter()
+        .zip(header.lines)
+        .map(|(art, text)| {
+            let mut spans = vec![
+                Span::styled(format!("{art:<ART_WIDTH$}"), art_style),
+                Span::raw("  "),
+            ];
+            spans.extend(text.spans);
+            Line::from(spans)
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    None,
+    Radio(bool),
+    Check(bool),
+}
+
+/// One line of a step's list: `mark label  value`.
+struct Row {
+    mark: Mark,
+    label: String,
+    value: String,
+    style: Style,
+    /// What Enter does on this row, for the key hints.
+    enter: &'static str,
+}
+
+impl Row {
+    fn new(
+        mark: Mark,
+        label: impl Into<String>,
+        value: impl Into<String>,
+        enter: &'static str,
+    ) -> Self {
+        Self {
+            mark,
+            label: label.into(),
+            value: value.into(),
+            style: Style::new(),
+            enter,
+        }
+    }
+
+    fn styled(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+}
+
+/// A key is shown by its ending, or by where it comes from; `None` when
+/// there is none.
+fn key_summary(secret: Option<&str>, env_source: Option<&str>) -> Option<String> {
+    match (secret, env_source) {
+        (Some(key), _) if !key.trim().is_empty() => Some(setup::masked(key)),
+        (None, Some(src)) => Some(setup::key_origin(src)),
+        _ => None,
+    }
+}
+
+/// The question of the step (its parts after a ` · ` are left out where
+/// the box is too narrow) and its rows, in the order of `activate_row`.
+fn step_rows(wizard: &Wizard) -> (&'static str, Vec<Row>) {
+    match wizard.step {
+        Step::Mode => {
+            let pick = |mode: Mode, sends: &str| {
+                Row::new(
+                    Mark::Radio(wizard.default_mode == mode),
+                    mode.as_str(),
+                    sends,
+                    "pick",
+                )
+            };
+            let rows = vec![
+                pick(Mode::Light, "0 packets to hosts"),
+                pick(Mode::Mild, "slow, rate-limited scans"),
+                pick(
+                    Mode::Aggressive,
+                    "fast scans · labs and authorized hosts only",
+                )
+                .styled(WARN),
+            ];
+            // A mode scans nothing by itself.
+            ("Default mode · what `meow recon` may send", rows)
+        }
+        Step::LocalAi => {
+            let preset = |url: &str| wizard.local_url == url;
+            let other = !setup::LOCAL_SERVERS.iter().any(|(url, _)| preset(url));
+            let mut rows: Vec<Row> = setup::LOCAL_SERVERS
+                .iter()
+                .map(|(url, name)| Row::new(Mark::Radio(preset(url)), *name, *url, "pick"))
+                .collect();
+            let other_url = if other { wizard.local_url.as_str() } else { "" };
+            rows.push(Row::new(Mark::Radio(other), "Other URL", other_url, "edit"));
+            let model = match wizard.local_model.as_str() {
+                "" => SERVERS_CHOICE,
+                model => model,
+            };
+            rows.push(Row::new(Mark::None, "Model", model, "edit"));
+            rows.push(Row::new(Mark::None, "Find running servers", "", "find"));
+            for found in &wizard.discovered_local {
+                let label = if found.model.is_empty() {
+                    format!("  {} · {}", found.server_name, found.url)
+                } else {
+                    format!("  {} · {}", found.model, found.server_name)
+                };
+                rows.push(Row::new(Mark::None, label, "", "pick"));
+            }
+            ("Local AI server", rows)
+        }
+        Step::CloudAi => {
+            let choice = |choice: CloudChoice| Mark::Radio(wizard.cloud_choice == choice);
+            let other_host = match wizard.cloud_choice {
+                CloudChoice::OpenRouter => crate::location::source(&wizard.cloud_url),
+                _ => crate::location::source(&AiSettings::default().cloud_url),
+            };
+            let mut rows = vec![
+                Row::new(
+                    choice(CloudChoice::LocalOnly),
+                    "Off",
+                    "local AI only · no CVE research",
+                    "pick",
+                ),
+                Row::new(
+                    choice(CloudChoice::Claude),
+                    "Claude API",
+                    "masked text to api.anthropic.com",
+                    "pick",
+                ),
+                Row::new(
+                    choice(CloudChoice::OpenRouter),
+                    "OpenRouter / other",
+                    format!("masked text to {other_host}"),
+                    "pick",
+                ),
+            ];
+            if wizard.cloud_choice != CloudChoice::LocalOnly {
+                let key = key_summary(
+                    wizard.cloud_api_key.as_deref(),
+                    wizard.env_key_source.as_deref(),
+                );
+                rows.push(match key {
+                    Some(key) => Row::new(Mark::None, "Key", key, "edit").styled(GOOD),
+                    None => Row::new(Mark::None, "Key", setup::KEY_MISSING, "edit").styled(WARN),
+                });
+                rows.push(Row::new(Mark::None, "URL", &wizard.cloud_url, "edit"));
+                rows.push(Row::new(
+                    Mark::None,
+                    "Triage model",
+                    &wizard.cloud_model,
+                    "edit",
+                ));
+                rows.push(Row::new(
+                    Mark::None,
+                    "Research model",
+                    &wizard.research_model,
+                    "edit",
+                ));
+            }
+            if wizard.cloud_choice == CloudChoice::Claude {
+                let chain = if wizard.cloud_fallbacks.is_empty() {
+                    FALLBACKS_BY_API.to_owned()
+                } else {
+                    wizard.cloud_fallbacks.join(", ")
+                };
+                rows.push(Row::new(Mark::None, "Fallback models", chain, "edit"));
+            }
+            ("Cloud AI service", rows)
+        }
+        Step::Toolkit => {
+            let nvd = match wizard.nvd_api_key.as_deref() {
+                Some(key) => setup::masked(key),
+                None => "optional · faster lookups".to_owned(),
+            };
+            // Each lookup: what it sends, and to whom.
+            let rows = vec![
+                Row::new(
+                    Mark::Check(wizard.cve_enabled),
+                    "CVE lookups",
+                    "software versions to NVD, OSV.dev, CISA",
+                    "toggle",
+                ),
+                Row::new(Mark::None, "NVD key", nvd, "edit"),
+                Row::new(
+                    Mark::Check(wizard.location_enabled),
+                    "Public location",
+                    format!(
+                        "your public IP to {} · skipped on VPN",
+                        wizard.location_host
+                    ),
+                    "toggle",
+                ),
+                Row::new(
+                    Mark::Check(wizard.location_map),
+                    "Satellite map",
+                    format!("rough area to {}", wizard.tiles_host),
+                    "toggle",
+                ),
+                Row::new(Mark::None, "Check tools", "", "check"),
+            ];
+            ("Online lookups", rows)
+        }
+        Step::Launch => {
+            let named = !wizard.launch_workspace.is_empty();
+            let session = if named {
+                Row::new(Mark::None, "Session name", &wizard.launch_workspace, "edit")
+            } else {
+                Row::new(
+                    Mark::None,
+                    "Session name",
+                    "optional · opens after saving",
+                    "edit",
+                )
+                .styled(DIM)
+            };
+            let save = if named {
+                format!("Save and open {}", wizard.launch_workspace)
+            } else {
+                "Save".to_owned()
+            };
+            let rows = vec![
+                session,
+                Row::new(Mark::None, save, "", "save"),
+                Row::new(Mark::None, "Test connections", "", "test"),
+                Row::new(Mark::None, "Quit without saving", "", "quit"),
+            ];
+            ("Save", rows)
+        }
+    }
+}
+
+/// `text` in lines broken at blanks: the first at most `first` characters,
+/// the others `width`. A word longer than a line is cut where the line ends.
+fn wrap(text: &str, first: usize, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for mut word in text.split(' ') {
+        loop {
+            let room = if lines.is_empty() {
+                first.max(1)
+            } else {
+                width
+            };
+            let used = chars(&line);
+            let gap = usize::from(used > 0);
+            if used + gap + chars(word) <= room {
+                if gap == 1 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                break;
+            }
+            // On to the next line, also from a first line too short for
+            // a word the others have room for.
+            if used > 0 || (lines.is_empty() && room < width && chars(word) <= width) {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            let cut = word
+                .char_indices()
+                .nth(room)
+                .map_or(word.len(), |(at, _)| at);
+            lines.push(word[..cut].to_owned());
+            word = &word[cut..];
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// [`wrap`] with every line `width` characters at most.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    wrap(text, width, width)
+}
+
+/// `title` as far as it fits `room` characters, cut between its parts
+/// (` · `), and the parts left over.
+fn fit_title(title: &str, room: usize) -> (&str, Option<&str>) {
+    const SEP: &str = " · ";
+    if chars(title) <= room {
+        return (title, None);
+    }
+    let mut end = title.len();
+    let mut first = None;
+    while let Some(at) = title[..end].rfind(SEP) {
+        let split = (&title[..at], Some(&title[at + SEP.len()..]));
+        if chars(split.0) <= room {
+            return split;
+        }
+        first = Some(split);
+        end = at;
+    }
+    // Not even its first part fits: the border cuts that one.
+    first.unwrap_or((title, None))
+}
+
+/// How the rows of a list share its width: the marks, the column the
+/// values start in, and the room of one line.
+struct ListShape {
+    marked: bool,
+    label_width: usize,
+    room: usize,
+}
+
+impl ListShape {
+    /// For a list `width` characters wide inside its box.
+    fn new(rows: &[Row], width: usize) -> Self {
+        // A narrow list has no column: `label  value`.
+        let label_width = if width + 2 >= LABEL_COLUMN_MIN {
+            rows.iter()
+                .filter(|row| !row.value.is_empty())
+                .map(|row| chars(&row.label))
+                .filter(|len| *len <= MAX_LABEL)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Self {
+            marked: rows.iter().any(|row| row.mark != Mark::None),
+            label_width,
+            // The highlight symbol takes three columns of every row.
+            room: width.saturating_sub(3),
+        }
+    }
+
+    fn mark(&self, row: &Row) -> &'static str {
+        match row.mark {
+            Mark::Radio(true) => "(o) ",
+            Mark::Radio(false) => "( ) ",
+            Mark::Check(true) => "[x] ",
+            Mark::Check(false) => "[ ] ",
+            Mark::None if self.marked => "    ",
+            Mark::None => "",
+        }
+    }
+
+    /// The mark and the label, as wide as the column where there is one.
+    fn head(&self, row: &Row) -> String {
+        let width = self.label_width;
+        format!("{}{:<width$}", self.mark(row), row.label)
+    }
+
+    /// The value on lines of its own under the label, for a row whose
+    /// value does not fit beside it. Empty where it fits or there is none.
+    fn below(&self, row: &Row) -> Vec<String> {
+        if row.value.is_empty() || chars(&self.head(row)) + 2 + chars(&row.value) <= self.room {
+            return Vec::new();
+        }
+        wrap_words(&row.value, self.room.saturating_sub(self.mark(row).len()))
+    }
+}
+
+/// The rows as list items for a box with `width` characters and `budget`
+/// rows inside. A value that does not fit beside its label goes on lines of
+/// its own below it: for the focused row always (as many as the box has),
+/// then for a warning, then from the top while rows are left. A row that
+/// gets none shows its label alone, never a cut value.
+fn list_items(rows: &[Row], width: usize, cursor: usize, budget: usize) -> Vec<ListItem<'static>> {
+    let shape = ListShape::new(rows, width);
+    let below: Vec<Vec<String>> = rows.iter().map(|row| shape.below(row)).collect();
+    let mut given = vec![0usize; rows.len()];
+    if let Some(lines) = below.get(cursor) {
+        given[cursor] = lines.len().min(budget.saturating_sub(1));
+    }
+    let mut left = budget.saturating_sub(rows.len() + given.iter().sum::<usize>());
+    let warnings = (0..rows.len()).filter(|idx| rows[*idx].style == WARN);
+    let others = (0..rows.len()).filter(|idx| rows[*idx].style != WARN);
+    for idx in warnings.chain(others) {
+        let want = below[idx].len();
+        if idx != cursor && want <= left {
+            given[idx] = want;
+            left -= want;
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let mark = shape.mark(row);
+            if row.value.is_empty() {
+                return ListItem::new(format!("{mark}{}", row.label));
+            }
+            if below[idx].is_empty() {
+                return ListItem::new(Line::from(vec![
+                    Span::raw(format!("{}  ", shape.head(row))),
+                    Span::styled(row.value.clone(), row.style),
+                ]));
+            }
+            let mut lines = vec![Line::raw(format!("{mark}{}", row.label))];
+            for part in below[idx].iter().take(given[idx]) {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(mark.len())),
+                    Span::styled(part.clone(), row.style),
+                ]));
+            }
+            ListItem::new(lines)
+        })
+        .collect()
+}
+
+/// The rows a list needs inside its box: all of them, or the focused one
+/// alone, each time with the whole value of the focused row.
+fn list_floor(rows: &[Row], width: usize, cursor: usize, all: bool) -> usize {
+    let shape = ListShape::new(rows, width);
+    let focused = rows.get(cursor).map_or(0, |row| shape.below(row).len());
+    focused + if all { rows.len() } else { 1 }
+}
+
+/// `label  value` for a card `width` characters wide, the value starting
+/// in `column`. Where it is too long it goes on under its own start.
+fn pair(
+    (label, label_style): (&str, Style),
+    column: usize,
+    (value, style): (&str, Style),
+    width: usize,
+) -> Vec<Line<'static>> {
+    wrap_words(value, width.saturating_sub(column))
+        .into_iter()
+        .enumerate()
+        .map(|(nth, part)| {
+            let lead = match nth {
+                0 => format!("{label:<column$}"),
+                _ => " ".repeat(column),
+            };
+            Line::from(vec![
+                Span::styled(lead, label_style),
+                Span::styled(part, style),
+            ])
+        })
+        .collect()
+}
+
+/// A paragraph of the help for a card `width` characters wide: its
+/// subject, then what there is to know.
+fn topic(subject: &str, text: &str, width: usize) -> Vec<Line<'static>> {
+    let lead = chars(subject) + 2;
+    wrap(text, width.saturating_sub(lead), width)
+        .into_iter()
+        .enumerate()
+        .map(|(nth, part)| match nth {
+            0 => Line::from(vec![
+                Span::styled(format!("{subject}  "), ACCENT),
+                Span::raw(part),
+            ]),
+            _ => Line::raw(part),
+        })
+        .collect()
+}
+
+/// `path` with the home folder as `~`. One that is still longer than
+/// `room` loses its start, and says so with `…`.
+fn shown_path(path: &Path, room: usize) -> String {
+    let text = crate::workspace::shown_place(path, dirs::home_dir().as_deref());
+    let len = chars(&text);
+    if len <= room {
+        return text;
+    }
+    let keep = room.saturating_sub(1);
+    let tail: String = text.chars().skip(len - keep).collect();
+    format!("…{tail}")
+}
+
+/// The scanners, the wordlist and the location database: which are there.
+fn tools_card(wizard: &Wizard, width: usize) -> (String, Vec<Line<'static>>) {
+    let names = |found: bool| -> String {
+        let names: Vec<&str> = wizard
+            .tools
+            .iter()
+            .filter(|tool| tool.found.is_some() == found)
+            .map(|tool| tool.name.as_str())
+            .collect();
+        names.join(", ")
+    };
+    let (found, missing) = (names(true), names(false));
+    let ready = wizard.tools.iter().filter(|t| t.found.is_some()).count();
+    let mut lines = Vec::new();
+    if !found.is_empty() {
+        lines.extend(pair(("Found", DIM), 9, (&found, Style::new()), width));
+    }
+    if !missing.is_empty() {
+        lines.extend(pair(("Missing", DIM), 9, (&missing, WARN), width));
+        let get = if cfg!(windows) {
+            "`meow tools` says how to get them"
+        } else {
+            "`meow tools` installs them"
+        };
+        for part in wrap_words(get, width) {
+            lines.push(Line::styled(part, DIM));
+        }
+    }
+    (format!("Tools {ready}/{}", wizard.tools.len()), lines)
+}
+
+/// What saving writes, and above it the answers of the last connection
+/// test, for a card `width` characters wide.
+fn review_lines(wizard: &Wizard, width: usize) -> Vec<Line<'static>> {
+    let plain = Style::new();
+    let mut lines = Vec::new();
+    for line in &wizard.test_results {
+        let style = if line.starts_with("[+]") { GOOD } else { WARN };
+        // `[+] Local AI  what happened`.
+        match line.split_once("  ") {
+            Some((service, said)) => lines.extend(pair(
+                (service, style),
+                chars(service) + 2,
+                (said, style),
+                width,
+            )),
+            None => lines.extend(pair(("", style), 0, (line, style), width)),
+        }
+    }
+    let mut row = |label: &str, value: &str, style: Style| {
+        lines.extend(pair((label, DIM), 10, (value, style), width));
+    };
+    row("Mode", wizard.default_mode.as_str(), ACCENT);
+    row("Local AI", &wizard.local_url, plain);
+    if !wizard.local_model.is_empty() {
+        row("Model", &wizard.local_model, plain);
+    }
+    match wizard.cloud_choice {
+        CloudChoice::LocalOnly => row("Cloud AI", "off", plain),
+        choice => {
+            let service = match choice {
+                CloudChoice::Claude => "Claude API".to_owned(),
+                _ => crate::location::source(&wizard.cloud_url),
+            };
+            row(
+                "Cloud AI",
+                &format!("{service} · {}", wizard.cloud_model),
+                plain,
+            );
+            let key = key_summary(
+                wizard.cloud_api_key.as_deref(),
+                wizard.env_key_source.as_deref(),
+            );
+            match key {
+                Some(key) => row("Key", &key, GOOD),
+                None => row("Key", setup::KEY_MISSING, WARN),
+            }
+        }
+    }
+    let lookups: Vec<&str> = [
+        (wizard.cve_enabled, "CVEs"),
+        (wizard.location_enabled, "public location"),
+        (wizard.location_map, "satellite map"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, name)| *name)
+    .collect();
+    let lookups = if lookups.is_empty() {
+        "off".to_owned()
+    } else {
+        lookups.join(", ")
+    };
+    row("Lookups", &lookups, plain);
+    // Both files are in one folder.
+    let second = ", ai.toml";
+    let room = width.saturating_sub(10 + chars(second));
+    row(
+        "Files",
+        &format!("{}{second}", shown_path(&wizard.config_file, room)),
+        plain,
+    );
+    lines
+}
+
+/// The longer explanation of a step, shown by `?`, for a card `width`
+/// characters wide. It adds to the screen: what the header and the rows
+/// say is not said again, the scope of the fast mode aside.
+fn help_lines(wizard: &Wizard, width: usize) -> Vec<Line<'static>> {
+    let mut topics: Vec<(&str, String)> = match wizard.step {
+        Step::Mode => vec![
+            (
+                "light",
+                "reads this machine's routes, interfaces, VPN and ARP table. `meow recon` is refused.".to_owned(),
+            ),
+            (
+                "mild",
+                "Nmap -T3, a web crawl and directory checks: rate-limited, one at a time.".to_owned(),
+            ),
+            (
+                "aggressive",
+                "Nmap -T4 and directory checks without rate limits. Labs and authorized hosts only.".to_owned(),
+            ),
+            ("Later", "1 2 3 in `meow hud` change it too.".to_owned()),
+        ],
+        Step::LocalAi => vec![
+            (
+                "Privacy",
+                "host data goes to this server unmasked. A server on another machine, or another user's, gets masked text only.".to_owned(),
+            ),
+            (
+                "Start one",
+                "Ollama: `ollama serve` · LM Studio: Developer > Start Server".to_owned(),
+            ),
+            (
+                "Use",
+                "in `meow hud`, L asks the local AI about the selected host.".to_owned(),
+            ),
+        ],
+        Step::CloudAi => {
+            let mut topics = vec![
+                (
+                    "Masking",
+                    "addresses, names, paths and secrets become placeholders such as <<HOST_01>> before text leaves this machine; replies are unmasked here.".to_owned(),
+                ),
+                ("Cap", "set under [ai] in config.toml.".to_owned()),
+                (
+                    "Key",
+                    "from Claude Console > API keys, or openrouter.ai > Keys.".to_owned(),
+                ),
+                (
+                    "Other",
+                    "edit URL for any OpenAI-style service, without CVE research.".to_owned(),
+                ),
+            ];
+            if wizard.cloud_choice == CloudChoice::Claude {
+                topics.push((
+                    "Fallback models",
+                    "asked next, in order, when a Claude model declines.".to_owned(),
+                ));
+            }
+            topics.push((
+                "Use",
+                "in `meow hud`, C asks the cloud AI and R researches a CVE.".to_owned(),
+            ));
+            topics
+        }
+        Step::Toolkit => {
+            let uses: Vec<String> = wizard
+                .tools
+                .iter()
+                .map(|tool| format!("{}: {}", tool.name, tool.purpose))
+                .collect();
+            vec![
+                (
+                    "CVE lookups",
+                    "product names and versions go to NVD, OSV.dev and CISA KEV. No AI, no cost.".to_owned(),
+                ),
+                (
+                    "NVD key",
+                    "free from nvd.nist.gov. Lookups then run 0.7 s apart, not 6.5 s.".to_owned(),
+                ),
+                (
+                    "Public location",
+                    "asked when the map opens and when the network changes. The request carries nothing else.".to_owned(),
+                ),
+                (
+                    "Satellite map",
+                    format!(
+                        "{} sends the pictures and learns the rough area shown: yours, or a selected host's.",
+                        wizard.tiles_host
+                    ),
+                ),
+                (
+                    "Tools",
+                    format!("{}. `meow tools` gets the missing ones.", uses.join(" · ")),
+                ),
+            ]
+        }
+        Step::Launch => {
+            let folder = wizard
+                .config_file
+                .parent()
+                .map_or_else(String::new, |dir| shown_path(dir, 80));
+            vec![
+                ("Files", format!("config.toml and ai.toml in {folder}.")),
+                (
+                    "Sessions",
+                    "kept in ./meow/<name>/ of the folder you start them in. A new session asks where.".to_owned(),
+                ),
+                (
+                    "Test",
+                    "asks the local AI server for its models, and the cloud AI service whether it accepts the key.".to_owned(),
+                ),
+            ]
+        }
+    };
+    // The keys the line at the bottom has no room for.
+    let tools_key = if wizard.step == Step::Toolkit {
+        " · r check tools"
+    } else {
+        ""
+    };
+    topics.push((
+        "Keys",
+        format!("1-5 Tab step · Space pick · p find servers · t test{tools_key}"),
+    ));
+    topics
+        .iter()
+        .flat_map(|(subject, text)| topic(subject, text, width))
+        .collect()
+}
+
+/// The card beside (or under) the list, for `width` characters inside it:
+/// the help when it is open, else what the step shows besides its choices.
+fn side_card(wizard: &Wizard, width: usize) -> Option<(String, Vec<Line<'static>>)> {
+    if wizard.show_help {
+        return Some(("Help".to_owned(), help_lines(wizard, width)));
+    }
+    match wizard.step {
+        Step::Toolkit => Some(tools_card(wizard, width)),
+        Step::Launch => Some(("Review".to_owned(), review_lines(wizard, width))),
+        _ => None,
+    }
+}
+
+/// How a body `width` wide is shared: whether a second card stands beside
+/// the list, and how wide the list and that card are.
+fn body_widths(width: u16) -> (bool, u16, u16) {
+    if width >= WIDE {
+        let list = (width * 55 / 100).max(70);
+        (true, list, width - list)
+    } else {
+        (false, width, width)
+    }
+}
+
+fn items_height(items: &[ListItem]) -> u16 {
+    rows_of(items.iter().map(ListItem::height).sum::<usize>()).saturating_add(2)
+}
+
+/// The rows the list and the second card take when nothing is left out.
+fn body_height(wizard: &Wizard, rows: &[Row], width: u16) -> u16 {
+    let (wide, list_width, card_width) = body_widths(width);
+    let inner = usize::from(list_width.saturating_sub(2));
+    let list = items_height(&list_items(rows, inner, wizard.cursor(), usize::MAX));
+    let card = side_card(wizard, usize::from(card_width.saturating_sub(4)))
+        .map_or(0, |(_, lines)| rows_of(lines.len()).saturating_add(2));
+    if wide {
+        list.max(card)
+    } else {
+        list.saturating_add(card)
+    }
+}
+
+fn draw_body(frame: &mut Frame, area: Rect, wizard: &Wizard, title: &str, rows: &[Row]) {
+    // Not even one row inside a box: an edit box on a small terminal.
+    if area.height < 3 {
+        return;
+    }
+    let (wide, list_width, card_width) = body_widths(area.width);
+    let inner = usize::from(list_width.saturating_sub(2));
+    let side = side_card(wizard, usize::from(card_width.saturating_sub(4)));
+    let whole = side
+        .as_ref()
+        .map_or(0, |(_, lines)| rows_of(lines.len()).saturating_add(2));
+    // Under one another, the rows are shared out in this order: every row
+    // of the list (with the help open, its focused row), the second card
+    // whole, then the values of the list that need lines of their own.
+    let card_height = if wide {
+        whole.min(area.height)
+    } else {
+        let floor = list_floor(rows, inner, wizard.cursor(), !wizard.show_help);
+        let floor = rows_of(floor).saturating_add(2).min(area.height);
+        match whole.min(area.height - floor) {
+            // A cut card keeps a row for its "…": one row of text is none.
+            cut if cut < 3 || (cut < whole && cut < 4) => 0,
+            height => height,
+        }
+    };
+    let list_room = if wide {
+        area.height
+    } else {
+        area.height - card_height
+    };
+    let budget = usize::from(list_room.saturating_sub(2));
+    let items = list_items(rows, inner, wizard.cursor(), budget);
+    let list_area = Rect {
+        width: list_width,
+        height: items_height(&items).min(list_room),
+        ..area
+    };
+
+    let (title, _) = fit_title(title, inner.saturating_sub(2));
+    let mut state = ListState::default();
+    state.select(Some(wizard.cursor()));
+    let list = List::new(items)
+        .block(card(title, wizard.editing.is_none()))
+        .highlight_style(SELECTED)
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    let Some((side_title, mut lines)) = side else {
+        return;
+    };
+    if card_height < 3 || card_width < 8 {
+        return;
+    }
+    // A card that does not fit whole says that more follows.
+    let room = usize::from(card_height - 2);
+    if lines.len() > room {
+        lines.truncate(room.saturating_sub(1));
+        lines.push(Line::styled("…", DIM));
+    }
+    let side_area = if wide {
+        Rect {
+            x: area.x + list_width,
+            width: card_width,
+            height: card_height,
+            ..area
+        }
+    } else {
+        Rect {
+            y: area.y + list_area.height,
+            height: card_height,
+            ..area
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(card(&side_title, false).padding(Padding::horizontal(1))),
+        side_area,
+    );
+}
+
+/// `key action` pairs for the keys that work here. Where the line is too
+/// narrow the least needed ones go first; the help lists the other keys.
+fn key_hints(wizard: &Wizard, enter: &str, width: usize) -> String {
+    let help = if wizard.show_help {
+        "? close help"
+    } else {
+        "? help"
+    };
+    // (hint, how much it is needed)
+    let mut hints = vec![
+        ("↑↓ move".to_owned(), 0),
+        ("←→ step".to_owned(), 4),
+        (format!("Enter {enter}"), 5),
+        (help.to_owned(), 3),
+    ];
+    // The last step has rows for saving and quitting.
+    if wizard.step != Step::Launch {
+        hints.push(("s save".to_owned(), 2));
+        hints.push(("q quit".to_owned(), 1));
+    }
+    loop {
+        let line = hints
+            .iter()
+            .map(|(hint, _)| hint.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if chars(&line) < width || hints.len() == 1 {
+            return line;
+        }
+        let least = hints
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, need))| *need)
+            .map_or(0, |(idx, _)| idx);
+        hints.remove(least);
+    }
+}
+
+/// The title of an edit box. A key's says where the key is kept and which
+/// service it is sent to: the moment it is typed is the moment to know.
+fn edit_title(wizard: &Wizard, field: EditField) -> String {
+    match field {
+        EditField::CloudApiKey => format!(
+            "{} · kept in ai.toml · sent only to {}",
+            field.label(),
+            crate::location::source(&wizard.cloud_url)
+        ),
+        EditField::NvdApiKey => {
+            format!("{} · kept in config.toml · sent only to NVD", field.label())
+        }
+        _ => field.label().to_owned(),
+    }
+}
+
+/// The text being typed, for a line with `room` characters: a key as
+/// stars and its length, any other text with its end and the cursor in
+/// sight.
+fn typed_text(edit: &EditState, room: usize) -> String {
+    if edit.field.is_secret() {
+        let count = edit.buffer.chars().count();
+        let tail = format!("_  {count} chars, hidden");
+        let stars = count.min(36).min(room.saturating_sub(chars(&tail)));
+        return format!("{}{tail}", "*".repeat(stars));
+    }
+    let text = sanitize(&edit.buffer, MAX_EDIT_CHARS);
+    let len = chars(&text);
+    if len < room {
+        return format!("{text}_");
+    }
+    let keep = room.saturating_sub(2);
+    let tail: String = text.chars().skip(len - keep).collect();
+    format!("…{tail}_")
+}
+
+/// What stands under the body: the edit box while a text is typed, else
+/// the status line and the key hints.
+enum Footer {
+    Edit {
+        title: String,
+        lines: Vec<Line<'static>>,
+    },
+    Keys {
+        status: Vec<Line<'static>>,
+        hints: String,
+    },
+}
+
+impl Footer {
+    fn height(&self) -> u16 {
+        match self {
+            Self::Edit { lines, .. } => rows_of(lines.len()).saturating_add(2),
+            Self::Keys { status, .. } => rows_of(status.len()).saturating_add(1),
+        }
+    }
+}
+
+fn footer(wizard: &Wizard, enter: &str, width: u16) -> Footer {
+    let Some(edit) = &wizard.editing else {
+        let room = usize::from(width.saturating_sub(1)).max(1);
+        let style = if wizard.status_warn { WARN } else { GOOD };
+        let status = wrap_words(&sanitize(&wizard.status, 220), room)
+            .into_iter()
+            .map(|part| Line::styled(part, style))
+            .collect();
+        let hints = key_hints(wizard, enter, usize::from(width));
+        return Footer::Keys { status, hints };
+    };
+    let room = usize::from(width.saturating_sub(4)).max(1);
+    let whole = edit_title(wizard, edit.field);
+    // What the title has no room for is the first line of the box.
+    let (title, rest) = fit_title(&whole, room);
+    let mut lines = Vec::new();
+    if let Some(rest) = rest {
+        for part in wrap_words(&capitalised(rest), room) {
+            lines.push(Line::styled(part, DIM));
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled("> ", ACCENT),
+        Span::raw(typed_text(edit, room.saturating_sub(2))),
+    ]));
+    if !edit.problem.is_empty() {
+        for part in wrap_words(&edit.problem, room) {
+            lines.push(Line::styled(part, WARN));
+        }
+    }
+    let stored = match edit.field {
+        EditField::CloudApiKey => wizard.cloud_api_key.is_some(),
+        EditField::NvdApiKey => wizard.nvd_api_key.is_some(),
+        _ => false,
+    };
+    let (keys, style) = if edit.paste_hint {
+        (setup::PASTE_HINT, WARN)
+    } else if stored {
+        ("Enter confirm · empty removes the key · Esc cancel", DIM)
+    } else {
+        ("Enter confirm · Esc cancel · Ctrl+U clear", DIM)
+    };
+    for part in wrap_words(keys, room) {
+        lines.push(Line::styled(part, style));
+    }
+    Footer::Edit {
+        title: title.to_owned(),
+        lines,
+    }
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, footer: Footer) {
+    match footer {
+        Footer::Edit { title, lines } => frame.render_widget(
+            Paragraph::new(lines).block(card(&title, true).padding(Padding::horizontal(1))),
+            area,
+        ),
+        Footer::Keys { status, hints } => {
+            let [status_area, hints_area] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+            let inset = |area: Rect| Rect {
+                x: area.x + 1,
+                width: area.width - 1,
+                ..area
+            };
+            frame.render_widget(Paragraph::new(status), inset(status_area));
+            frame.render_widget(Paragraph::new(Line::styled(hints, DIM)), inset(hints_area));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,19 +2404,18 @@ pub fn can_run_tui() -> bool {
 
 fn run_loop(home: &MeowHome, first_run: bool) -> Result<WizardOutcome> {
     if !can_run_tui() {
-        anyhow::bail!("cannot open the interactive setup GUI (requires a TTY)");
+        anyhow::bail!("meow setup needs a terminal");
     }
     let mut wizard = Wizard::load(home, first_run)?;
     crate::pty::ensure_cooked_terminal();
-    let mut terminal =
-        ratatui::try_init().context("cannot initialize terminal for meow setup GUI")?;
+    let mut terminal = ratatui::try_init().context("cannot start the full-screen setup")?;
     let _guard = WizardTerminalGuard;
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
 
     loop {
         terminal
             .draw(|frame| draw(frame, &wizard))
-            .context("cannot draw setup GUI")?;
+            .context("cannot draw the setup")?;
 
         let ev = event::read().context("cannot read terminal input")?;
         match ev {
@@ -1875,25 +2423,19 @@ fn run_loop(home: &MeowHome, first_run: bool) -> Result<WizardOutcome> {
             Event::Key(key) if key.kind == KeyEventKind::Press => match wizard.on_key(key) {
                 WizardAction::None => {}
                 WizardAction::ProbeLocal => {
-                    wizard.set_status(
-                        "Sniffing local ports (:1234, :11434, :8080) for models ...",
-                        false,
-                    );
+                    wizard.set_status("Looking for local AI servers ...", false);
                     let _ = terminal.draw(|frame| draw(frame, &wizard));
                     wizard.probe_local();
                 }
                 WizardAction::TestConnections => {
-                    wizard.set_status("Testing [L] and [C] AI connections ...", false);
+                    wizard.set_status("Testing ...", false);
                     let _ = terminal.draw(|frame| draw(frame, &wizard));
                     wizard.test_connections();
                 }
                 WizardAction::Save => match wizard.save(home) {
                     Ok(outcome) => return Ok(outcome),
                     Err(err) => wizard.set_status(
-                        format!(
-                            "Could not save setup: {}",
-                            sanitize(&format!("{err:#}"), 180)
-                        ),
+                        format!("Not saved: {}", sanitize(&format!("{err:#}"), 180)),
                         true,
                     ),
                 },
@@ -1904,13 +2446,13 @@ fn run_loop(home: &MeowHome, first_run: bool) -> Result<WizardOutcome> {
     }
 }
 
-/// Launches the Interactive First-Time Setup GUI (called on bare `meow` when
-/// `~/.meow` has not been configured yet).
+/// Opens the setup for the first run (a bare `meow` when `~/.meow` has not
+/// been set up yet).
 pub fn run_first_time(home: &MeowHome) -> Result<WizardOutcome> {
     run_loop(home, true)
 }
 
-/// Launches the Interactive Setup GUI for `meow setup`.
+/// Opens the setup for `meow setup`.
 pub fn run_setup(home: &MeowHome) -> Result<WizardOutcome> {
     run_loop(home, false)
 }
@@ -1948,51 +2490,195 @@ mod tests {
         // Step 1: Light (sleeping cat), Mild (curious cat), Aggressive (pouncing cat)
         let light_screen = render(&wiz, 120, 32);
         assert!(
-            light_screen.contains("MEOW :: INTERACTIVE FIRST-TIME SETUP"),
+            light_screen.contains("meow setup · first run"),
             "{light_screen}"
         );
         assert!(light_screen.contains("_.| -.- |_"), "{light_screen}");
+        // Each mode says in a few words what it sends, and the scope of the
+        // fast one stays in sight.
+        for line in [
+            "(o) light       0 packets to hosts",
+            "( ) mild        slow, rate-limited scans",
+            "( ) aggressive  fast scans · labs and authorized hosts only",
+        ] {
+            assert!(light_screen.contains(line), "{line}: {light_screen}");
+        }
+        // When scans run, and what may be sent then.
         assert!(
-            light_screen.contains("SLEEPING & LISTENING (LIGHT)"),
+            light_screen.contains("Default mode · what `meow recon` may send"),
             "{light_screen}"
         );
 
         wiz.on_key(key(KeyCode::Down));
         let mild_screen = render(&wiz, 120, 32);
         assert!(mild_screen.contains("( o.o )  _//"), "{mild_screen}");
-        assert!(
-            mild_screen.contains("CURIOUS WHISKERS (MILD)"),
-            "{mild_screen}"
-        );
 
         wiz.on_key(key(KeyCode::Down));
         let agg_screen = render(&wiz, 120, 32);
         assert!(agg_screen.contains("( >'w'< ) //"), "{agg_screen}");
-        assert!(
-            agg_screen.contains("FULL POUNCE (AGGRESSIVE)"),
-            "{agg_screen}"
-        );
 
         // Step 2..5 each display distinct cat headers
         wiz.on_key(key(KeyCode::Char('2')));
         let s2 = render(&wiz, 120, 32);
         assert!(s2.contains("( ^.^ )  /| |\\"), "{s2}");
-        assert!(s2.contains("LOCAL PURR-CESSOR [L]"), "{s2}");
+        assert!(s2.contains("[2 Local AI]"), "{s2}");
+        assert!(s2.contains("$0 · host data stays on this machine"), "{s2}");
 
         wiz.on_key(key(KeyCode::Char('3')));
         let s3 = render(&wiz, 120, 32);
         assert!(s3.contains("( o.O )  (   )"), "{s3}");
-        assert!(s3.contains("CLOUD WHISKERS [C]/[R]"), "{s3}");
+        assert!(s3.contains("[3 Cloud AI]"), "{s3}");
+        // What leaves the machine, and the cap, at the moment of choice.
+        assert!(
+            s3.contains("Private data is masked first · cap $1.00 and 20 calls a day"),
+            "{s3}"
+        );
 
         wiz.on_key(key(KeyCode::Char('4')));
         let s4 = render(&wiz, 120, 32);
         assert!(s4.contains("( 0.0 )  (o o)"), "{s4}");
-        assert!(s4.contains("CLAWS & CVE RADAR"), "{s4}");
+        assert!(s4.contains("[4 Lookups & tools]"), "{s4}");
+        assert!(
+            s4.contains("[x] CVE lookups      software versions to NVD, OSV.dev, CISA"),
+            "{s4}"
+        );
+        assert!(
+            s4.contains("[x] Public location  your public IP to ipinfo.io · skipped on VPN"),
+            "{s4}"
+        );
+        assert!(
+            s4.contains("[x] Satellite map    rough area to tiles.maps.eox.at"),
+            "{s4}"
+        );
 
         wiz.on_key(key(KeyCode::Char('5')));
         let s5 = render(&wiz, 120, 32);
         assert!(s5.contains("( ^w^ )  purrr~"), "{s5}");
-        assert!(s5.contains("READY TO POUNCE!"), "{s5}");
+        assert!(s5.contains("[5 Save]"), "{s5}");
+        assert!(s5.contains("Saves to files only you can read"), "{s5}");
+        assert!(s5.contains("config.toml,"), "{s5}");
+    }
+
+    /// Nothing a first-time user needs is cut off at 80x24, no step shows a
+    /// row that only says "not set", and the longer text waits behind `?`.
+    #[test]
+    fn screens_fit_80_columns_say_things_once_and_keep_details_behind_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let mut wiz = Wizard::load(&home, true).unwrap();
+        for step in Step::ALL {
+            wiz.step = step;
+            let screen = render(&wiz, 80, 24);
+            // The whole step bar and the last key hint are in sight.
+            assert!(screen.contains("5 Save"), "{screen}");
+            assert!(screen.contains("? help"), "{screen}");
+            for empty in ["not set", "n/a", "unknown", "none"] {
+                assert!(!screen.contains(empty), "{empty:?} in:\n{screen}");
+            }
+            for line in screen.lines() {
+                assert!(
+                    !line
+                        .trim_end()
+                        .ends_with("masked first · cap $1.00 and 20 calls a da"),
+                    "cut off: {line}"
+                );
+            }
+            // A screen is a list, not a page of text: marks, numbers and the
+            // cat included, a step stays at 95 words or fewer (they had 100 to
+            // 135, with more cut off at this size).
+            let words = screen
+                .split_whitespace()
+                .filter(|w| w.chars().any(char::is_alphanumeric))
+                .count();
+            assert!(words <= 95, "{words} words on {step:?}:\n{screen}");
+        }
+
+        // Cloud AI off: no key, address or model rows. A service: its rows,
+        // and the fallback models for the Claude API only.
+        wiz.step = Step::CloudAi;
+        let off = render(&wiz, 80, 24);
+        assert!(
+            off.contains("(o) Off                 local AI only · no CVE research"),
+            "{off}"
+        );
+        assert!(
+            !off.contains("Key ") && !off.contains("Triage model"),
+            "{off}"
+        );
+        wiz.cursors[Step::CloudAi.index()] = 1;
+        wiz.on_key(key(KeyCode::Enter));
+        let claude = render(&wiz, 80, 24);
+        for row in [
+            "(o) Claude API          masked text to api.anthropic.com",
+            "Key                 missing · local AI answers instead",
+            "Fallback models     claude-opus-4-6, claude-opus-4-8",
+        ] {
+            assert!(claude.contains(row), "{row}: {claude}");
+        }
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        let other = render(&wiz, 80, 24);
+        assert!(other.contains("URL                 https://openrouter.ai/api/v1"));
+        assert!(!other.contains("Fallback models"), "{other}");
+        // What a row shows is not repeated below the list.
+        assert_eq!(wiz.status, "");
+
+        // `?` opens the help of the step, Esc closes it without leaving.
+        assert!(!other.contains("<<HOST_01>>"), "{other}");
+        assert_eq!(wiz.on_key(key(KeyCode::Char('?'))), WizardAction::None);
+        let help = render(&wiz, 120, 40);
+        assert!(help.contains("<<HOST_01>>"), "{help}");
+        assert!(help.contains("$1.00 and 20 calls a day"), "{help}");
+        assert!(help.contains("? close help"), "{help}");
+        assert_eq!(wiz.on_key(key(KeyCode::Esc)), WizardAction::None);
+        assert!(!wiz.show_help);
+        assert_eq!(wiz.on_key(key(KeyCode::Esc)), WizardAction::Quit);
+
+        // A local AI that is not on this machine: said where it is chosen.
+        wiz.step = Step::LocalAi;
+        wiz.cursors[Step::LocalAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        wiz.on_paste("localhost:1234");
+        wiz.on_key(key(KeyCode::Enter));
+        // A refused address is explained in the edit box, which stays open.
+        let refused = render(&wiz, 80, 24);
+        assert!(refused.contains("Needs http:// or https://"), "{refused}");
+        // The refusal does not hide the keys of the box.
+        assert!(refused.contains("Enter confirm · Esc cancel"), "{refused}");
+        wiz.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        wiz.on_paste("http://203.0.113.10:1234/v1");
+        wiz.on_key(key(KeyCode::Enter));
+        let remote = render(&wiz, 80, 24);
+        assert!(
+            remote.contains("Not this machine: it gets masked text only"),
+            "{remote}"
+        );
+        assert!(
+            remote.contains("(o) Other URL  http://203.0.113.10:1234/v1"),
+            "{remote}"
+        );
+
+        // Narrow and small terminals: the value of the focused row moves to
+        // a line of its own, and a terminal too small is told so.
+        wiz.step = Step::CloudAi;
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        let narrow = render(&wiz, 40, 14);
+        assert!(narrow.contains("[3 Cloud AI]"), "{narrow}");
+        assert!(narrow.contains("missing · local AI answers"), "{narrow}");
+        let tiny = render(&wiz, 20, 6);
+        assert!(tiny.contains("Too small: 32x12"), "{tiny}");
+        // Where the list has the rows for it, every value is whole: the
+        // scope of the fast mode is in sight at 40 columns too.
+        wiz.step = Step::Mode;
+        let modes = render(&wiz, 40, 14);
+        for part in [
+            "slow, rate-limited scans",
+            "fast scans · labs and",
+            "authorized hosts only",
+        ] {
+            assert!(modes.contains(part), "{part}: {modes}");
+        }
     }
 
     #[test]
@@ -2014,17 +2700,22 @@ mod tests {
         assert_eq!(wiz.default_mode, Mode::Mild);
         assert_eq!(wiz.step, Step::LocalAi);
 
-        // Jump to Step 3 (Cloud AI), open Cloud API Key editor (row 3)
+        // Jump to Step 3 (Cloud AI), choose a service (row 2: its key row
+        // appears), open the key editor (row 3)
         wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_choice, CloudChoice::OpenRouter);
         wiz.cursors[Step::CloudAi.index()] = 3;
         wiz.on_key(key(KeyCode::Enter));
         // Ctrl+V is not a paste in a terminal: a hint, and no "v" typed.
         wiz.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
         assert_eq!(wiz.editing.as_ref().unwrap().buffer, "");
+        // The hint is whole at 80 columns too, until the next key.
         assert!(
-            render(&wiz, 120, 32).contains("Ctrl+V does not paste in a terminal"),
+            render(&wiz, 80, 24).contains(setup::PASTE_HINT),
             "{}",
-            render(&wiz, 120, 32)
+            render(&wiz, 80, 24)
         );
         wiz.on_paste(SECRET_AI);
 
@@ -2035,10 +2726,25 @@ mod tests {
             "{editing_frame}"
         );
         assert!(editing_frame.contains("chars, hidden"), "{editing_frame}");
+        // Where the key is kept and where it goes, while it is typed; the
+        // paste hint is gone once something was pasted.
+        assert!(
+            editing_frame.contains("Cloud AI key · kept in ai.toml · sent only to openrouter.ai"),
+            "{editing_frame}"
+        );
+        assert!(
+            !editing_frame.contains(setup::PASTE_HINT),
+            "{editing_frame}"
+        );
+        assert!(
+            editing_frame.contains("Enter confirm · Esc cancel"),
+            "{editing_frame}"
+        );
 
         wiz.on_key(key(KeyCode::Enter));
-        // Auto-detected sk-ant- -> switched to Claude!
+        // Auto-detected sk-ant- -> switched to Claude, and said so.
         assert_eq!(wiz.cloud_choice, CloudChoice::Claude);
+        assert_eq!(wiz.status, "Service changed to match the key");
         let after_commit = render(&wiz, 120, 32);
         assert!(
             !after_commit.contains(SECRET_AI) && !after_commit.contains("sk-ant"),
@@ -2095,16 +2801,127 @@ mod tests {
     }
 
     #[test]
+    fn long_values_wrap_at_blanks_and_lose_nothing() {
+        assert_eq!(
+            wrap_words("fast scans · labs and authorized hosts only", 31),
+            ["fast scans · labs and", "authorized hosts only"]
+        );
+        assert_eq!(wrap_words("short", 31), ["short"]);
+        assert_eq!(wrap_words("", 5), [""]);
+        // A word longer than the line is cut where the line ends, whatever
+        // its characters are.
+        assert_eq!(
+            wrap_words("https://example.test/v1", 10),
+            ["https://ex", "ample.test", "/v1"]
+        );
+        assert_eq!(wrap_words("ééé à", 2), ["éé", "é", "à"]);
+        assert_eq!(wrap_words("ab", 0), ["a", "b"]);
+    }
+
+    /// The Review card names the address and the service itself: a line of
+    /// the connection test adds only what happened there.
+    #[test]
+    fn a_test_line_says_only_what_the_review_rows_do_not() {
+        let reviewed = [
+            "http://localhost:11434/v1",
+            "https://openrouter.ai/api/v1",
+            "Claude API",
+        ];
+        for (line, shown) in [
+            (
+                "[+] Local AI  http://localhost:11434/v1 · 2 models",
+                "[+] Local AI  2 models",
+            ),
+            (
+                "[+] Cloud AI  Claude API · key accepted",
+                "[+] Cloud AI  key accepted",
+            ),
+            (
+                "[+] Cloud AI  https://openrouter.ai/api/v1 · key accepted",
+                "[+] Cloud AI  key accepted",
+            ),
+            // What failed is what to act on; the card names where.
+            (
+                "[!] Local AI  no answer at http://localhost:11434/v1",
+                "[!] Local AI  no answer",
+            ),
+            // Another server's address is not one the card shows.
+            (
+                "[+] Local AI  http://localhost:1234/v1 · 1 model",
+                "[+] Local AI  http://localhost:1234/v1 · 1 model",
+            ),
+        ] {
+            assert_eq!(test_line(line, &reviewed).as_deref(), Some(shown));
+        }
+        // "Cloud AI  off" and a missing key are rows of the card already.
+        assert_eq!(test_line("[+] Cloud AI  off", &reviewed), None);
+        assert_eq!(test_line("[!] Cloud AI  skipped: no key", &reviewed), None);
+        // A server's words reach the screen as text only.
+        let hostile = test_line("[!] local AI  \x1b[2Jgone\x07", &reviewed).unwrap();
+        assert!(!hostile.contains('\x1b') && !hostile.contains('\x07'));
+    }
+
+    #[test]
     fn tiny_and_large_screens_render_without_panicking() {
         let tmp = tempfile::tempdir().unwrap();
         let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
         let mut wiz = Wizard::load(&home, true).unwrap();
         for step in Step::ALL {
             wiz.step = step;
-            for (w, h) in [(1, 1), (10, 4), (20, 8), (80, 24), (160, 50)] {
-                let _ = render(&wiz, w, h);
+            for help in [false, true] {
+                wiz.show_help = help;
+                for (w, h) in [
+                    (1, 1),
+                    (10, 4),
+                    (20, 8),
+                    (32, 10),
+                    (33, 11),
+                    (40, 12),
+                    (60, 16),
+                    (80, 24),
+                    (100, 30),
+                    (160, 50),
+                ] {
+                    let _ = render(&wiz, w, h);
+                }
             }
         }
+    }
+
+    /// At the smallest size drawn, every step shows its focused row, the
+    /// warning of the fast mode included; smaller is told so.
+    #[test]
+    fn the_smallest_screen_shows_the_focused_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let mut wiz = Wizard::load(&home, true).unwrap();
+        let (w, h) = (MIN_WIDTH, MIN_HEIGHT);
+        assert!(render(&wiz, w, h - 1).contains("Too small: 32x12 needed"));
+        for (step, focused) in [
+            (Step::Mode, "light"),
+            (Step::LocalAi, "LM Studio"),
+            (Step::CloudAi, "Off"),
+            (Step::Toolkit, "CVE lookups"),
+            (Step::Launch, "Session name"),
+        ] {
+            wiz.step = step;
+            wiz.cursors[step.index()] = 0;
+            let screen = render(&wiz, w, h);
+            assert!(screen.contains(">> "), "{screen}");
+            assert!(screen.contains(focused), "{focused}: {screen}");
+        }
+        wiz.step = Step::Mode;
+        wiz.cursors[Step::Mode.index()] = 2;
+        let screen = render(&wiz, w, h);
+        for part in ["aggressive", "labs and", "authorized hosts only"] {
+            assert!(screen.contains(part), "{part}: {screen}");
+        }
+        // A second card that does not fit whole says that more follows.
+        wiz.step = Step::Launch;
+        wiz.cursors[Step::Launch.index()] = 1;
+        let screen = render(&wiz, 40, 16);
+        assert!(screen.contains("Review"), "{screen}");
+        assert!(screen.contains("│ …"), "{screen}");
     }
 
     #[test]
@@ -2182,8 +2999,16 @@ mod tests {
         let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
         let mut wiz = Wizard::load(&home, false).unwrap();
 
-        // Enter a Claude key on Step 3 -> auto-selects Claude.
+        // With cloud AI off there is no key row: Enter there does nothing.
         wiz.on_key(key(KeyCode::Char('3')));
+        assert_eq!(wiz.cloud_choice, CloudChoice::LocalOnly);
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        assert!(wiz.editing.is_none());
+
+        // Choose a service, enter a Claude key -> auto-selects Claude.
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
         wiz.cursors[Step::CloudAi.index()] = 3;
         wiz.on_key(key(KeyCode::Enter));
         wiz.on_paste(CLAUDE_KEY);
@@ -2197,6 +3022,7 @@ mod tests {
         assert_eq!(wiz.cloud_choice, CloudChoice::OpenRouter);
         assert_eq!(wiz.cloud_api_key, None);
         assert_eq!(wiz.build_ai_overrides().api_key, None);
+        assert_eq!(wiz.status, "Key removed: it was for api.anthropic.com");
 
         // Set an OpenRouter key, then change CloudUrl to a different host -> clears key!
         wiz.cursors[Step::CloudAi.index()] = 3;
@@ -2215,6 +3041,12 @@ mod tests {
         wiz.on_key(key(KeyCode::Enter));
         assert_eq!(wiz.cloud_url, "https://api.together.xyz/v1");
         assert_eq!(wiz.cloud_api_key, None);
+        assert_eq!(wiz.status, "Key removed: it was for openrouter.ai");
+        let screen = render(&wiz, 80, 24);
+        assert!(
+            screen.contains("(o) OpenRouter / other  masked text to api.together.xyz"),
+            "{screen}"
+        );
 
         // Oversized (> 512 bytes) keys are rejected.
         wiz.cursors[Step::CloudAi.index()] = 3;
@@ -2222,6 +3054,7 @@ mod tests {
         wiz.on_paste(&"k".repeat(513));
         wiz.on_key(key(KeyCode::Enter));
         assert_eq!(wiz.cloud_api_key, None);
+        assert!(wiz.status_warn && wiz.status.starts_with("Key refused"));
 
         // Broken config.toml with an NVD secret fails Wizard::load without echoing the secret.
         Config::load_or_create(&home).unwrap();

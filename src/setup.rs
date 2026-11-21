@@ -34,8 +34,14 @@ const MAX_MODELS: usize = 500;
 
 /// Said when Ctrl+V is pressed at a key prompt: terminals paste with other
 /// keys, and Ctrl+V itself would only add a "v".
-pub const PASTE_HINT: &str =
-    "Ctrl+V does not paste in a terminal: use Ctrl+Shift+V, or right-click and choose Paste.";
+pub const PASTE_HINT: &str = if cfg!(target_os = "macos") {
+    "Ctrl+V does not paste here: use Cmd+V"
+} else {
+    "Ctrl+V does not paste here: use Ctrl+Shift+V or right-click"
+};
+
+/// What a cloud AI service without a key means, where its key would stand.
+pub(crate) const KEY_MISSING: &str = "missing · local AI answers instead";
 
 /// What `meow setup` was asked to do without asking questions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -101,7 +107,47 @@ pub(crate) fn masked(key: &str) -> String {
     }
 }
 
-/// The current setup in a few lines. Never prints a key.
+/// Where a key comes from, in a word or two: `in ai.toml`, `in config.toml`
+/// or `from $VARIABLE` (as [`AiSettings::key_source`] names them, shorter).
+pub(crate) fn key_origin(source: &str) -> String {
+    let variable = source
+        .strip_prefix("the ")
+        .and_then(|rest| rest.strip_suffix(" environment variable"));
+    match (source, variable) {
+        ("your setup file", _) => "in ai.toml".to_owned(),
+        (_, Some(variable)) => format!("from ${variable}"),
+        _ => format!("in {source}"),
+    }
+}
+
+/// Whether the user's file asks for a cloud AI: not switched off, and a
+/// service was chosen or there is a key to use (`has_key`, from any source).
+/// A fresh install has neither, and its cloud AI is off, not short of a key.
+pub(crate) fn cloud_in_use(own: &AiOverrides, has_key: bool) -> bool {
+    let own_key = own.api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+    let chosen = own.cloud_provider.is_some() || own.cloud_url.is_some();
+    !own.disable_cloud && (own_key || has_key || chosen)
+}
+
+/// [`cloud_in_use`] for the setup `settings` reads: its own file decides. A
+/// file that cannot be read counts as a choice, so nothing is hidden.
+fn cloud_wanted(settings: &AiSettings) -> bool {
+    let effective = settings.effective();
+    if effective.disable_cloud {
+        return false;
+    }
+    let own = match &settings.user_file {
+        Some(file) => AiOverrides::load(file).ok(),
+        None => None,
+    };
+    match own {
+        Some(own) => cloud_in_use(&own, effective.api_key().is_some()),
+        None => true,
+    }
+}
+
+/// The current setup as `Label  value` lines. Never prints a key. What is
+/// not in use is not listed: a cloud AI that is off has no models to show.
 pub fn describe(settings: &AiSettings, file: &Path) -> String {
     // Names and addresses come from files and, once, from a server's
     // answer: none of it reaches the terminal as anything but text.
@@ -119,48 +165,55 @@ pub fn describe(settings: &AiSettings, file: &Path) -> String {
     if let Some(chain) = &mut effective.cloud_fallbacks {
         chain.iter_mut().for_each(|model| *model = clean(model));
     }
-    let model = match effective.local_model.as_str() {
-        "" => "chosen by the server".to_owned(),
-        model => model.to_owned(),
-    };
-    let key = if effective.disable_cloud {
-        "disabled (local-only mode: [C] answers with the local model, [R] is unavailable)"
-            .to_owned()
-    } else {
-        match (effective.api_key(), settings.key_source()) {
-            (Some(key), Some(source)) => format!("{} (from {source})", masked(&key)),
-            _ => "not set: [C] answers with the local model, [R] is unavailable".to_owned(),
-        }
-    };
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    let mut local = effective.local_url.clone();
+    if !effective.local_model.is_empty() {
+        local = format!("{local} · {}", effective.local_model);
+    }
+    rows.push(("Local AI", local));
+    // The local AI gets real text only on this machine.
+    if !crate::ai::is_loopback_url(&effective.local_url) {
+        rows.push(("", "not this machine: it gets masked text only".to_owned()));
+    }
     let claude = effective.provider() == CloudProvider::Anthropic;
     let service = match claude {
-        true => "the Claude API".to_owned(),
+        true => "Claude API".to_owned(),
         false => effective.cloud_url.clone(),
     };
-    // The local tier sends real text only to this machine.
-    let off_machine = if crate::ai::is_loopback_url(&effective.local_url) {
-        ""
-    } else {
-        " (not this machine: what is sent there is masked)"
+    let key = match (effective.api_key(), settings.key_source()) {
+        (Some(key), Some(source)) => Some(format!("{} ({})", masked(&key), key_origin(&source))),
+        _ => None,
     };
-    // What happens when a model declines a request: the Claude API only.
-    let declined = match (claude, effective.fallbacks().as_slice()) {
-        (false, _) => String::new(),
-        (true, []) => "\x20 If it declines    left to the Claude API\n".to_owned(),
-        (true, chain) => format!("\x20 If it declines    then {}\n", chain.join(", then ")),
-    };
-    format!(
-        "Your AI setup ({}):\n\
-         \x20 [L] local model    {}{off_machine}, model: {model}\n\
-         \x20 [C] cloud triage   {service}, model: {}\n\
-         \x20 [R] research       model: {}\n\
-         {declined}\
-         \x20 API key            {key}\n",
-        file.display(),
-        effective.local_url,
-        effective.cloud_model,
-        effective.research_model,
-    )
+    match key {
+        _ if !cloud_wanted(settings) => rows.push(("Cloud AI", "off".to_owned())),
+        // The one thing to act on; the models of a service without a key
+        // are not in use.
+        None => {
+            rows.push(("Cloud AI", service));
+            rows.push(("Key", format!("{KEY_MISSING}, no CVE research")));
+        }
+        Some(key) => {
+            rows.push(("Cloud AI", service));
+            rows.push(("Triage model", effective.cloud_model.clone()));
+            rows.push(("Research model", effective.research_model.clone()));
+            // Asked next when a model declines a request: the Claude API only.
+            if claude {
+                rows.push((
+                    "Fallback models",
+                    match effective.fallbacks().as_slice() {
+                        [] => "chosen by the Claude API".to_owned(),
+                        chain => chain.join(", "),
+                    },
+                ));
+            }
+            rows.push(("Key", key));
+        }
+    }
+    let mut text = format!("AI setup · {}\n", file.display());
+    for (label, value) in rows {
+        text.push_str(&format!("  {label:<15}  {value}\n"));
+    }
+    text
 }
 
 /// Points the cloud tiers at the Claude API. Model names of another service
@@ -226,7 +279,7 @@ fn model_name(id: &str) -> Option<String> {
 
 fn validate_bearer_key(key: &str) -> Result<()> {
     if key.trim().is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
-        bail!("the configured API key is empty or contains control characters");
+        bail!("the key is empty, too long or has control characters");
     }
     Ok(())
 }
@@ -248,13 +301,13 @@ pub async fn list_models(url: &str, key: Option<&str>) -> Result<Vec<String>> {
     }
     let mut response = match request.send().await {
         Ok(response) => response,
-        Err(error) if error.is_connect() => bail!("nothing is listening at {url}"),
+        Err(error) if error.is_connect() => bail!("no answer at {url}"),
         Err(error) if error.is_timeout() => bail!("{url} did not answer in time"),
         Err(error) => return Err(error).with_context(|| format!("cannot reach {url}")),
     };
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        bail!("{url} refused the API key (HTTP {})", status.as_u16());
+        bail!("{url} refused the key (HTTP {})", status.as_u16());
     }
     if !status.is_success() {
         bail!("{url} answered HTTP {}", status.as_u16());
@@ -290,7 +343,7 @@ pub async fn check_key(url: &str, key: &str) -> Result<()> {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) if matches!(response.status().as_u16(), 401 | 403) => {
             bail!(
-                "{url} refused the API key (HTTP {})",
+                "{url} refused the key (HTTP {})",
                 response.status().as_u16()
             )
         }
@@ -308,8 +361,8 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T> {
 }
 
 /// Tries the local server and, if there is a key, the cloud service, and
-/// says in plain words what happened. Returns whether everything set up
-/// works.
+/// says what happened, a line each: `[+]` it works, `[!]` it does not or
+/// was skipped. Returns whether everything set up works.
 pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> {
     let clean = |text: &str| crate::evidence::sanitize(text, 200);
     let effective = settings.effective();
@@ -317,39 +370,44 @@ pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> 
     let safe_cloud_url = clean(&effective.cloud_url);
     let mut works = true;
     match block_on(list_models(&effective.local_url, None))? {
-        Ok(models) => writeln!(
-            out,
-            "[+] [L] {safe_local_url} answers with {} model(s){}",
-            models.len(),
-            match models.first() {
-                Some(first) => format!(", for example {first}"),
+        Ok(models) => {
+            let count = match models.len() {
+                1 => "1 model".to_owned(),
+                n => format!("{n} models"),
+            };
+            // Another machine's server, or another user's, is sent masked
+            // text: said here, where the server was just seen to answer.
+            let masked = match crate::ai::not_own_server_short(&effective.local_url) {
+                Some(whose) => format!(" · {}: masked text only", clean(&whose)),
                 None => String::new(),
-            }
-        )?,
+            };
+            writeln!(out, "[+] Local AI  {safe_local_url} · {count}{masked}")?;
+        }
         Err(error) => {
             works = false;
-            writeln!(out, "[!] [L] {}", clean(&format!("{error:#}")))?;
+            writeln!(out, "[!] Local AI  {}", clean(&format!("{error:#}")))?;
         }
     }
-    if effective.disable_cloud {
-        writeln!(
-            out,
-            "[+] [C] disabled (local-only mode: [C] answers locally)"
-        )?;
+    if !cloud_wanted(settings) {
+        writeln!(out, "[+] Cloud AI  off")?;
         return Ok(works);
     }
     let claude = effective.provider() == CloudProvider::Anthropic;
     match effective.api_key() {
-        None => writeln!(out, "[!] [C] no API key set, so it was not tried")?,
+        None => writeln!(out, "[!] Cloud AI  skipped: no key")?,
         Some(key) if claude => {
             // The key first, then every model the setup names: a key is not
             // necessarily offered all of them.
             let url = &effective.cloud_url;
             let client = http(url)?;
             match block_on(anthropic::list_models(&client, url, &key))? {
-                Ok(_) => writeln!(out, "[+] [C] the Claude API accepts your API key")?,
+                Ok(_) => writeln!(out, "[+] Cloud AI  Claude API · key accepted")?,
+                Err(error) if anthropic::key_refused(&error) => {
+                    writeln!(out, "[!] Cloud AI  Claude API refused the key")?;
+                    return Ok(false);
+                }
                 Err(error) => {
-                    writeln!(out, "[!] [C] {}", clean(&format!("{error:#}")))?;
+                    writeln!(out, "[!] Cloud AI  {}", clean(&format!("{error:#}")))?;
                     return Ok(false);
                 }
             }
@@ -357,56 +415,61 @@ pub(crate) fn check(settings: &AiSettings, out: &mut dyn Write) -> Result<bool> 
             models.push(effective.research_model.clone());
             models.extend(effective.fallbacks());
             let mut asked: Vec<String> = Vec::new();
+            // The models this key is offered on one line; one line for each
+            // that it is not.
+            let mut offered: Vec<String> = Vec::new();
+            let mut refused: Vec<String> = Vec::new();
             for model in models {
                 if asked.contains(&model) {
                     continue;
                 }
                 let safe_model = clean(&model);
                 match block_on(anthropic::has_model(&client, url, &key, &model))? {
-                    Ok(()) => writeln!(out, "[+] [C] {safe_model} is available to this key")?,
+                    Ok(()) => offered.push(safe_model),
                     Err(error) => {
                         works = false;
-                        writeln!(
-                            out,
-                            "[!] [C] {safe_model}: {}",
-                            clean(&format!("{error:#}"))
-                        )?;
+                        refused.push(match anthropic::model_unknown(&error) {
+                            true => format!("[!] Cloud AI  {safe_model} not offered to this key"),
+                            false => format!(
+                                "[!] Cloud AI  {safe_model}: {}",
+                                clean(&format!("{error:#}"))
+                            ),
+                        });
                     }
                 }
                 asked.push(model);
             }
+            if !offered.is_empty() {
+                writeln!(out, "[+] Cloud AI  {} available", offered.join(", "))?;
+            }
+            for line in refused {
+                writeln!(out, "{line}")?;
+            }
         }
         Some(key) => match block_on(check_key(&effective.cloud_url, &key))? {
-            Ok(()) => writeln!(out, "[+] [C] {safe_cloud_url} accepts your API key")?,
+            Ok(()) => writeln!(out, "[+] Cloud AI  {safe_cloud_url} · key accepted")?,
             Err(error) => {
                 works = false;
-                writeln!(out, "[!] [C] {}", clean(&format!("{error:#}")))?;
+                writeln!(out, "[!] Cloud AI  {}", clean(&format!("{error:#}")))?;
             }
         },
     }
     Ok(works)
 }
 
-/// Applies the flags to the user's file. Returns what changed, in words.
+/// Applies the flags to the user's file. Returns what the setup printed
+/// afterwards cannot say: a key that was removed, and what to do next, as
+/// whole lines (`[+]` done, `[!]` to do).
 fn apply(
     args: &SetupArgs,
     current: &AiSettings,
     own: &mut AiOverrides,
     key_from_stdin: Option<String>,
 ) -> Result<Vec<String>> {
-    let mut changed = Vec::new();
+    let mut notes = Vec::new();
     match args.provider.as_deref().map(str::to_lowercase).as_deref() {
-        Some("claude" | "anthropic") => {
-            use_claude(own, current);
-            changed.push("cloud service: the Claude API, with your Claude API key".to_owned());
-        }
-        Some("openrouter" | "openai") => {
-            use_openai_style(own, current, None);
-            if args.cloud_url.is_none() {
-                let url = own.cloud_url.clone().unwrap_or_default();
-                changed.push(format!("cloud service: {url}"));
-            }
-        }
+        Some("claude" | "anthropic") => use_claude(own, current),
+        Some("openrouter" | "openai") => use_openai_style(own, current, None),
         Some(other) => bail!(
             "unknown provider '{}': use claude or openrouter",
             crate::evidence::sanitize(other, 80)
@@ -414,29 +477,16 @@ fn apply(
         None => {}
     }
     if let Some(chain) = &args.fallback_models {
-        let chain = parse_chain(chain);
-        changed.push(match chain.as_slice() {
-            [] => "if a model declines: left to the Claude API".to_owned(),
-            chain => format!("if a model declines: then {}", chain.join(", then ")),
-        });
-        own.cloud_fallbacks = Some(chain);
+        own.cloud_fallbacks = Some(parse_chain(chain));
     }
     if let Some(url) = &args.local_url {
-        let url = checked_url(url)?;
-        changed.push(format!("local model server: {url}"));
-        own.local_url = Some(url);
+        own.local_url = Some(checked_url(url)?);
     }
     if let Some(model) = &args.local_model {
-        let clean = crate::evidence::sanitize(model, 120);
-        changed.push(match clean.as_str() {
-            "" => "local model: chosen by the server".to_owned(),
-            model => format!("local model: {model}"),
-        });
-        own.local_model = Some(clean);
+        own.local_model = Some(crate::evidence::sanitize(model, 120));
     }
     if let Some(url) = &args.cloud_url {
         let url = crate::ai::validate_cloud_url(url)?;
-        changed.push(format!("cloud service: {url}"));
         own.disable_cloud = false;
         // The address decides the protocol unless a provider was named.
         if args.provider.is_none() {
@@ -448,16 +498,11 @@ fn apply(
         }
         own.cloud_url = Some(url);
     }
-    for (value, slot, what) in [
-        (&args.cloud_model, &mut own.cloud_model, "triage model"),
-        (
-            &args.research_model,
-            &mut own.research_model,
-            "research model",
-        ),
+    for (value, slot) in [
+        (&args.cloud_model, &mut own.cloud_model),
+        (&args.research_model, &mut own.research_model),
     ] {
         if let Some(model) = value.as_deref().and_then(model_name) {
-            changed.push(format!("{what}: {model}"));
             *slot = Some(model);
         }
     }
@@ -474,22 +519,24 @@ fn apply(
         host(own.cloud_url.as_deref().unwrap_or(&current.cloud_url)),
     );
     if before != after && key_from_stdin.is_none() && own.api_key.take().is_some() {
-        changed.push(format!(
-            "API key removed from your setup file: it was entered for {before}. \
-             Give the key for {after} with --api-key-stdin"
-        ));
+        notes.push(format!("[+] Key removed: it was for {before}"));
+        notes.push(format!("[!] Add the key for {after} with --api-key-stdin"));
     }
     if args.forget_key {
-        own.api_key = None;
-        changed.push("API key removed from your setup file".to_owned());
+        match own.api_key.take() {
+            Some(_) => notes.push("[+] Key removed".to_owned()),
+            // Unless the line above just said where it went.
+            None if notes.is_empty() => notes.push(NO_KEY_STORED.to_owned()),
+            None => {}
+        }
     }
     if let Some(key) = key_from_stdin {
         let key = key.trim().to_owned();
         if key.is_empty() {
-            bail!("no API key arrived on standard input");
+            bail!("no key on standard input");
         }
         if key.len() > 512 || key.chars().any(char::is_control) {
-            bail!("the API key on standard input contains control characters or is too long");
+            bail!("key refused: over 512 bytes or control characters");
         }
         if key.starts_with("sk-ant-")
             && args.provider.is_none()
@@ -504,14 +551,17 @@ fn apply(
             if let Some(model) = args.research_model.as_deref().and_then(model_name) {
                 own.research_model = Some(model);
             }
-            changed.push("cloud service: the Claude API, with your Claude API key".to_owned());
         }
         own.disable_cloud = false;
-        changed.push(format!("API key {}", masked(&key)));
         own.api_key = Some(key);
     }
-    Ok(changed)
+    Ok(notes)
 }
+
+/// Said when a key is to be removed and none is stored.
+const NO_KEY_STORED: &str = "[+] No key stored";
+/// Said once after the setup was saved: a mode is fixed when a session starts.
+const RUNNING_SESSIONS: &str = "[+] Running sessions use the AI setup from their next request";
 
 /// One line typed by the user, without the line end. `None` at end of input.
 fn ask(prompt: &str) -> Result<Option<String>> {
@@ -645,27 +695,28 @@ pub(crate) fn probe_local_servers(current_url: &str) -> Result<Vec<(String, Stri
 }
 
 fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
-    println!("Looking for model servers on this machine ...");
+    println!("Looking for local AI servers ...");
     let current = settings.effective().local_url;
     let probed = probe_local_servers(&current)?;
     let mut found: Vec<(String, Vec<String>)> = Vec::new();
     for (url, name, models) in probed {
-        println!(
-            "  {}  {url}  ({name}, {} model(s))",
-            found.len() + 1,
-            models.len()
-        );
+        let count = match models.len() {
+            1 => "1 model".to_owned(),
+            n => format!("{n} models"),
+        };
+        println!("  {}  {url}  {name} · {count}", found.len() + 1);
         found.push((url, models));
     }
     let urls: Vec<String> = found.iter().map(|(url, _)| url.clone()).collect();
     let prompt = if found.is_empty() {
         println!(
-            "  None answered. Start one first (LM Studio: Developer > Start Server; \
-             Ollama: `ollama serve`), or type the address of yours."
+            "0 found. Start one first, or type its URL:\n\
+             \x20 Ollama     ollama serve\n\
+             \x20 LM Studio  Developer > Start Server"
         );
-        "Server address (Enter to go back): ".to_owned()
+        "URL (Enter goes back): ".to_owned()
     } else {
-        "Server (press Enter for 1, or type a number or another address): ".to_owned()
+        "Server, number or URL (Enter: 1): ".to_owned()
     };
     let Some(url) = choose(&prompt, &urls, urls.first().map(String::as_str))? else {
         return Ok(false);
@@ -677,7 +728,7 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
             Ok(models) => models,
             Err(error) => {
                 println!(
-                    "[!] {}. Saved all the same; start the server before using [L].",
+                    "[!] {}. Saved anyway: start the server before use",
                     crate::evidence::sanitize(&format!("{error:#}"), 300)
                 );
                 Vec::new()
@@ -688,7 +739,7 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         println!("  {}  {model}", index + 1);
     }
     let model = choose(
-        "Model (number or name; Enter lets the server choose): ",
+        "Model, number or name (Enter: server's choice): ",
         &models,
         Some(""),
     )?
@@ -700,14 +751,11 @@ fn setup_local(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
 
 fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     println!(
-        "Your Claude API key is created in the Claude Console, under API keys. It is kept \
-         in your setup file on this machine and sent to the Claude API only."
+        "Get a key: Claude Console > API keys\n\
+         Kept in ai.toml, which only you can read; sent only to the Claude API"
     );
-    let Some(key) = ask_hidden(
-        "Your Claude API key (nothing shows as you type or paste; Enter to finish, Esc to cancel): ",
-    )?
-    else {
-        println!("Nothing changed.");
+    let Some(key) = ask_hidden("Claude key, hidden (Esc cancels): ")? else {
+        println!("[+] Nothing changed");
         return Ok(false);
     };
     let mut next = own.clone();
@@ -721,17 +769,12 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         120,
     );
     let chain_now = next.cloud_fallbacks.clone().unwrap_or_default();
-    let triage = ask(&format!(
-        "Model for [C] triage (press Enter to keep {triage_now}): "
-    ))?
-    .unwrap_or_default();
-    let research = ask(&format!(
-        "Model for [R] research (press Enter to keep {research_now}): "
-    ))?
-    .unwrap_or_default();
+    let triage = ask(&format!("Triage model (Enter keeps {triage_now}): "))?.unwrap_or_default();
+    let research =
+        ask(&format!("Research model (Enter keeps {research_now}): "))?.unwrap_or_default();
     let chain = ask(&format!(
-        "If a model declines a request, ask these next, in this order\n\
-         (press Enter to keep {}; type none to leave it to the Claude API): ",
+        "Fallback models, asked in order when one declines\n\
+         (Enter keeps {}; none: the Claude API chooses): ",
         match chain_now.as_slice() {
             [] => "none".to_owned(),
             chain => crate::evidence::sanitize(&chain.join(", "), 200),
@@ -755,29 +798,22 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
 fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     let effective = settings.effective();
     println!(
-        "Using OpenRouter? Press Enter at the first question, then paste your key \
-         (create one at openrouter.ai under Keys).\n\
-         Any other OpenAI-style service works for [C] too; [R] (research with web \
-         search) needs OpenRouter or a Claude API key."
+        "Get a key: openrouter.ai > Keys\n\
+         Another OpenAI-style service works too, without research: type its URL\n\
+         Kept in ai.toml, which only you can read; sent only to that service"
     );
     // Coming from a Claude key, the address to propose is OpenRouter's.
     let proposed = match anthropic::is_claude_api(&effective.cloud_url) {
         true => AiSettings::default().cloud_url,
         false => crate::evidence::sanitize(&effective.cloud_url, 200),
     };
-    let url = ask(&format!(
-        "Service address (press Enter to keep {proposed}): "
-    ))?
-    .unwrap_or_default();
+    let url = ask(&format!("URL (Enter keeps {proposed}): "))?.unwrap_or_default();
     let url = match url.as_str() {
         "" => crate::ai::validate_cloud_url(&proposed)?,
         typed => crate::ai::validate_cloud_url(typed)?,
     };
-    let Some(key) = ask_hidden(
-        "Your API key (nothing shows as you type or paste; Enter to finish, Esc to cancel): ",
-    )?
-    else {
-        println!("Nothing changed.");
+    let Some(key) = ask_hidden("Key, hidden (Esc cancels): ")? else {
+        println!("[+] Nothing changed");
         return Ok(false);
     };
     // What would be kept if every question is answered with Enter: model
@@ -789,14 +825,9 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         crate::evidence::sanitize(&kept(&next.cloud_model, &effective.cloud_model), 120);
     let research_now =
         crate::evidence::sanitize(&kept(&next.research_model, &effective.research_model), 120);
-    let triage = ask(&format!(
-        "Triage model (press Enter to keep {triage_now}): "
-    ))?
-    .unwrap_or_default();
-    let research = ask(&format!(
-        "Research model (press Enter to keep {research_now}): "
-    ))?
-    .unwrap_or_default();
+    let triage = ask(&format!("Triage model (Enter keeps {triage_now}): "))?.unwrap_or_default();
+    let research =
+        ask(&format!("Research model (Enter keeps {research_now}): "))?.unwrap_or_default();
     *own = next;
     own.api_key = Some(key);
     if let Some(clean) = model_name(&triage) {
@@ -808,21 +839,29 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     Ok(true)
 }
 
-/// The line-mode menu shown by `meow setup --plain` (or `TERM=dumb`).
+/// The line-mode menu shown by `meow setup --plain` (or `TERM=dumb`). The
+/// setup is printed at the start and after each change, not with every menu.
 fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Result<()> {
     println!("{}\n", crate::wizard::CAT_CLI_BANNER);
-    println!("meow setup: your own AI for meow. Nothing here is shared with anyone else.\n");
+    print!("{}", describe(settings, file));
+    let mut saved_any = false;
+    // What running sessions do with it is said once, on the way out.
+    let done = |saved_any: bool| {
+        if saved_any {
+            println!("{RUNNING_SESSIONS}");
+        }
+    };
     loop {
-        print!("{}", describe(settings, file));
         println!(
-            "\n  1  Use a model on this machine (LM Studio, Ollama, llama.cpp, ...)\n\
-             \x20 2  Use my Claude API key\n\
-             \x20 3  Use my OpenRouter key (or another OpenAI-style service)\n\
-             \x20 4  Remove my API key\n\
-             \x20 5  Check that it works\n\
+            "\n  1  Local AI server\n\
+             \x20 2  Claude key\n\
+             \x20 3  OpenRouter or other key\n\
+             \x20 4  Remove key\n\
+             \x20 5  Test\n\
              \x20 q  Done"
         );
         let Some(answer) = ask("> ")? else {
+            done(saved_any);
             return Ok(());
         };
         let saved = match answer.as_str() {
@@ -830,20 +869,28 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
             "2" => setup_claude(settings, own),
             "3" => setup_cloud(settings, own),
             "4" => {
-                own.api_key = None;
-                Ok(true)
+                let stored = own.api_key.take().is_some();
+                if !stored {
+                    println!("{NO_KEY_STORED}");
+                }
+                Ok(stored)
             }
             "5" => check(settings, &mut std::io::stdout()).map(|_| false),
-            "q" | "Q" | "" => return Ok(()),
+            "q" | "Q" | "" => {
+                done(saved_any);
+                return Ok(());
+            }
             _ => {
-                println!("Type a number from 1 to 5, or q.");
+                println!("Type 1-5 or q");
                 Ok(false)
             }
         };
         match saved {
             Ok(true) => {
                 own.save(file)?;
-                println!("[+] Saved. A running session uses it for its next request.");
+                saved_any = true;
+                println!("[+] Saved");
+                print!("{}", describe(settings, file));
             }
             Ok(false) => {}
             // A mistyped address must not end the whole setup.
@@ -852,7 +899,6 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
                 crate::evidence::sanitize(&format!("{error:#}"), 300)
             ),
         }
-        println!();
     }
 }
 
@@ -866,17 +912,20 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
     {
         match crate::wizard::run_setup(home)? {
             crate::wizard::WizardOutcome::Saved { launch_workspace } => {
-                let settings = Config::load_or_create(home)?.ai;
+                let config = Config::load_or_create(home)?;
                 let file = home.ai_path();
+                // Both files are in the folder the setup's first line names;
+                // the mode is the one thing saved that the lines below do
+                // not show.
                 println!(
-                    "[+] Saved to {} & {}. A running session uses it for its next request.",
-                    home.config_path().display(),
-                    file.display()
+                    "[+] Saved config.toml and ai.toml · default mode {}",
+                    config.default_mode
                 );
-                print!("{}", describe(&settings, &file));
+                println!("{RUNNING_SESSIONS}");
+                print!("{}", describe(&config.ai, &file));
                 if let Some(name) = launch_workspace {
                     let valid = crate::workspace::validate_name(&name)
-                        .map_err(|reason| anyhow::anyhow!("invalid workspace name: {reason}"))?;
+                        .map_err(|reason| anyhow::anyhow!("session name refused: {reason}"))?;
                     let exe = std::env::current_exe().context("cannot locate the meow binary")?;
                     let cwd = std::env::current_dir()
                         .context("cannot determine the current directory")?;
@@ -893,7 +942,7 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
                 }
             }
             crate::wizard::WizardOutcome::Cancelled => {
-                println!("[+] Nothing changed.");
+                println!("[+] Nothing changed");
             }
         }
         return Ok(ExitCode::SUCCESS);
@@ -911,17 +960,17 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
                 .lock()
                 .take(MAX_INPUT_BYTES)
                 .read_line(&mut line)
-                .context("cannot read the API key from standard input")?;
+                .context("cannot read the key from standard input")?;
             Some(line)
         } else {
             None
         };
-        let changed = apply(args, &settings.effective(), &mut own, key)?;
+        let notes = apply(args, &settings.effective(), &mut own, key)?;
         own.save(&file)?;
-        for line in &changed {
-            println!("[+] {line}");
+        for line in &notes {
+            println!("{line}");
         }
-        println!("[+] Saved to {}", file.display());
+        println!("[+] Saved");
     } else if !args.show && !args.check {
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             interactive(&settings, &file, &mut own)?;
@@ -929,10 +978,7 @@ pub fn run(home: &MeowHome, args: &SetupArgs) -> Result<ExitCode> {
         }
         // Nothing to ask on: show the state and how to change it.
         print!("{}", describe(&settings, &file));
-        println!(
-            "\nRun `meow setup` in a terminal to change it, or use the flags listed by \
-             `meow setup --help`."
-        );
+        println!("\nRun `meow setup` in a terminal to change it, or see `meow setup --help`");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -961,8 +1007,40 @@ mod tests {
             .is_some_and(|value| value.to_str().unwrap() == format!("Bearer {GOOD_KEY}"))
     }
 
-    /// Three services: a local model server, an OpenRouter-like one with a
-    /// `/key` endpoint, and a plain OpenAI-compatible one without it.
+    /// The Claude API's model list: for the right `x-api-key` only.
+    async fn claude_models(headers: HeaderMap) -> (StatusCode, Json<Value>) {
+        match headers
+            .get("x-api-key")
+            .is_some_and(|key| key == CLAUDE_KEY)
+        {
+            true => (StatusCode::OK, Json(json!({ "data": [] }))),
+            false => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": {
+                    "type": "authentication_error", "message": "invalid x-api-key" } })),
+            ),
+        }
+    }
+
+    /// One model of the Claude API: every one but `claude-opus-4-6`.
+    async fn claude_model(
+        axum::extract::Path(id): axum::extract::Path<String>,
+    ) -> (StatusCode, Json<Value>) {
+        match id.as_str() {
+            "claude-opus-4-6" => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": {
+                    "type": "not_found_error", "message": format!("model: {id}") } })),
+            ),
+            _ => (StatusCode::OK, Json(json!({ "id": id }))),
+        }
+    }
+
+    const CLAUDE_KEY: &str = "sk-ant-test-their-claude-key-5b2c";
+
+    /// Four services: a local model server, an OpenRouter-like one with a
+    /// `/key` endpoint, a plain OpenAI-compatible one without it, and a
+    /// stand-in for the Claude API.
     async fn services() -> String {
         let models = || Json(json!({ "data": [ { "id": "llama3.2" }, { "id": "qwen2.5" } ] }));
         let guarded = move |headers: HeaderMap| async move {
@@ -975,7 +1053,9 @@ mod tests {
             .route("/local/v1/models", get(move || async move { models() }))
             .route("/openrouter/v1/key", get(guarded))
             .route("/plain/v1/models", get(guarded))
-            .route("/odd/v1/models", get(|| async { "not json" }));
+            .route("/odd/v1/models", get(|| async { "not json" }))
+            .route("/claude/v1/models", get(claude_models))
+            .route("/claude/v1/models/{id}", get(claude_model));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1000,7 +1080,7 @@ mod tests {
         let dead = "http://127.0.0.1:9/v1";
         assert_eq!(
             error(list_models(dead, None).await),
-            format!("nothing is listening at {dead}")
+            format!("no answer at {dead}")
         );
         let odd = format!("{base}/odd/v1");
         assert!(error(list_models(&odd, None).await)
@@ -1011,15 +1091,12 @@ mod tests {
         let openrouter = format!("{base}/openrouter/v1");
         check_key(&openrouter, GOOD_KEY).await.unwrap();
         let refused = format!("{:#}", check_key(&openrouter, "wrong").await.unwrap_err());
-        assert_eq!(
-            refused,
-            format!("{openrouter} refused the API key (HTTP 401)")
-        );
+        assert_eq!(refused, format!("{openrouter} refused the key (HTTP 401)"));
         // Any other service: no key endpoint, so its model list decides.
         let plain = format!("{base}/plain/v1");
         check_key(&plain, GOOD_KEY).await.unwrap();
         let refused = format!("{:#}", check_key(&plain, "wrong").await.unwrap_err());
-        assert_eq!(refused, format!("{plain} refused the API key (HTTP 401)"));
+        assert_eq!(refused, format!("{plain} refused the key (HTTP 401)"));
         // The error never repeats the key.
         assert!(!refused.contains("wrong"));
     }
@@ -1029,7 +1106,7 @@ mod tests {
         // Whatever answers on the local model port: here with a title
         // change, a clipboard write and a forged status line in one name.
         const HOSTILE: &str =
-            "llama3\u{1b}]0;owned\u{7}\u{1b}]52;c;aGk=\u{7}\r\u{1b}[2K[+] [C] accepts your API key";
+            "llama3\u{1b}]0;owned\u{7}\u{1b}]52;c;aGk=\u{7}\r\u{1b}[2K[+] cloud AI  key accepted";
         let app = Router::new().route(
             "/v1/models",
             get(|| async {
@@ -1060,6 +1137,8 @@ mod tests {
             cloud_model: Some(format!("m{HOSTILE}")),
             cloud_fallbacks: Some(vec![HOSTILE.into()]),
             cloud_provider: Some(CloudProvider::Anthropic),
+            // With a key the models and the fallback models are listed.
+            api_key: Some(GOOD_KEY.into()),
             ..AiOverrides::default()
         }
         .save(&file)
@@ -1074,6 +1153,11 @@ mod tests {
             "{shown:?}"
         );
         assert!(shown.contains("llama3]0;owned"));
+        assert_eq!(
+            shown.matches("llama3]0;owned").count(),
+            3,
+            "the local, the triage and the fallback model are listed: {shown}"
+        );
     }
 
     #[test]
@@ -1101,15 +1185,13 @@ mod tests {
             },
         ] {
             let mut own = stored();
-            let changed = apply(&args, &claude, &mut own, None).unwrap();
-            assert_eq!(own.api_key, None, "{changed:?}");
-            let said = changed.join("\n");
-            assert!(
-                said.contains(
-                    "API key removed from your setup file: it was entered for api.anthropic.com"
-                ),
-                "{said}"
-            );
+            let notes = apply(&args, &claude, &mut own, None).unwrap();
+            assert_eq!(own.api_key, None, "{notes:?}");
+            assert_eq!(notes[0], "[+] Key removed: it was for api.anthropic.com");
+            // What is left to do is not marked as done.
+            assert!(notes[1].starts_with("[!] Add the key for "), "{notes:?}");
+            assert!(notes[1].ends_with(" with --api-key-stdin"), "{notes:?}");
+            let said = notes.join("\n");
             assert!(!said.contains("ZZ99") && !said.contains("sk-ant"), "{said}");
         }
         // With the new service's key in the same call, that key is stored.
@@ -1147,23 +1229,16 @@ mod tests {
             ..SetupArgs::default()
         };
         assert!(args.changes_something());
-        let changed = apply(
+        let notes = apply(
             &args,
             &AiSettings::default(),
             &mut own,
             Some(format!("{GOOD_KEY}\n")),
         )
         .unwrap();
-        assert_eq!(
-            changed,
-            [
-                "local model server: http://localhost:11434/v1",
-                "local model: llama3.2",
-                "research model: my/research",
-                "API key set, ends in 9f3a",
-            ],
-            "what changed is said in words, and the key only by its ending"
-        );
+        // The setup printed afterwards shows each of these: nothing is
+        // said twice, and the key's ending once.
+        assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(
             own,
             AiOverrides {
@@ -1185,11 +1260,15 @@ mod tests {
             local_model: Some(String::new()),
             ..SetupArgs::default()
         };
-        apply(&args, &AiSettings::default(), &mut own, None).unwrap();
+        let notes = apply(&args, &AiSettings::default(), &mut own, None).unwrap();
+        assert_eq!(notes, ["[+] Key removed"]);
         assert_eq!(
             (own.api_key.as_deref(), own.local_model.as_deref()),
             (None, Some(""))
         );
+        // Removing a key that is not there changes nothing, and says so.
+        let notes = apply(&args, &AiSettings::default(), &mut own, None).unwrap();
+        assert_eq!(notes, ["[+] No key stored"]);
 
         // Refused before anything is saved.
         let bad = |args: SetupArgs, key: Option<String>| {
@@ -1208,14 +1287,17 @@ mod tests {
             local_url: Some(url.into()),
             ..SetupArgs::default()
         };
-        assert!(bad(url("ftp://models.example"), None).contains("must start with http://"));
-        assert!(bad(url("localhost:1234"), None).contains("must start with http://"));
-        assert!(bad(url("not a url"), None).contains("is not a URL"));
+        assert_eq!(
+            bad(url("ftp://models.example"), None),
+            "'ftp://models.example': needs http:// or https://"
+        );
+        assert!(bad(url("localhost:1234"), None).ends_with(": needs http:// or https://"));
+        assert_eq!(bad(url("not a url"), None), "'not a url': not a URL");
         let cloud_http = SetupArgs {
             cloud_url: Some("http://203.0.113.10/v1".into()),
             ..SetupArgs::default()
         };
-        assert!(bad(cloud_http, None).contains("must start with https://"));
+        assert!(bad(cloud_http, None).ends_with(": needs https:// (http:// only for this machine)"));
         let cloud_loopback = SetupArgs {
             cloud_url: Some("http://127.0.0.1:8080/v1".into()),
             ..SetupArgs::default()
@@ -1231,7 +1313,7 @@ mod tests {
             api_key_stdin: true,
             ..SetupArgs::default()
         };
-        assert!(bad(empty_key, Some("  \n".into())).contains("no API key arrived"));
+        assert!(bad(empty_key, Some("  \n".into())).contains("no key on standard input"));
         assert!(!SetupArgs::default().changes_something());
         assert!(!SetupArgs {
             show: true,
@@ -1263,20 +1345,14 @@ mod tests {
             api_key_stdin: true,
             ..SetupArgs::default()
         };
-        let changed = apply(
+        let notes = apply(
             &args,
             &settings.effective(),
             &mut own,
             Some(claude_key.into()),
         )
         .unwrap();
-        assert_eq!(
-            changed,
-            [
-                "cloud service: the Claude API, with your Claude API key",
-                "API key set, ends in 7c1d",
-            ]
-        );
+        assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(
             own,
             AiOverrides {
@@ -1300,10 +1376,11 @@ mod tests {
         assert_eq!(effective.key_variable(), "ANTHROPIC_API_KEY");
         let text = describe(&settings, &file);
         for expected in [
-            "[C] cloud triage   the Claude API, model: claude-opus-5-5",
-            "[R] research       model: claude-opus-5-5",
-            "If it declines    then claude-opus-4-6, then claude-opus-4-8",
-            "API key            set, ends in 7c1d (from your setup file)",
+            "  Cloud AI         Claude API\n",
+            "  Triage model     claude-opus-5-5\n",
+            "  Research model   claude-opus-5-5\n",
+            "  Fallback models  claude-opus-4-6, claude-opus-4-8\n",
+            "  Key              set, ends in 7c1d (in ai.toml)\n",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
@@ -1322,14 +1399,7 @@ mod tests {
             fallback_models: Some("claude-opus-4-8, claude-opus-5".into()),
             ..SetupArgs::default()
         };
-        let changed = apply(&args, &settings.effective(), &mut own, None).unwrap();
-        assert_eq!(
-            changed,
-            [
-                "if a model declines: then claude-opus-4-8, then claude-opus-5",
-                "triage model: claude-sonnet-5-5",
-            ]
-        );
+        apply(&args, &settings.effective(), &mut own, None).unwrap();
         own.save(&file).unwrap();
         let again = SetupArgs {
             provider: Some("anthropic".into()),
@@ -1346,25 +1416,23 @@ mod tests {
             fallback_models: Some("none".into()),
             ..SetupArgs::default()
         };
-        let changed = apply(&none, &settings.effective(), &mut own, None).unwrap();
-        assert_eq!(changed, ["if a model declines: left to the Claude API"]);
+        apply(&none, &settings.effective(), &mut own, None).unwrap();
         own.save(&file).unwrap();
         assert!(settings.effective().fallbacks().is_empty());
-        assert!(describe(&settings, &file).contains("If it declines    left to the Claude API"));
+        assert!(describe(&settings, &file).contains("Fallback models  chosen by the Claude API"));
 
         // Back to OpenRouter: its address and its model names return.
         let back = SetupArgs {
             provider: Some("openrouter".into()),
             ..SetupArgs::default()
         };
-        let changed = apply(&back, &settings.effective(), &mut own, None).unwrap();
+        let notes = apply(&back, &settings.effective(), &mut own, None).unwrap();
         // The Claude key does not go along to the other service.
         assert_eq!(
-            changed,
+            notes,
             [
-                "cloud service: https://openrouter.ai/api/v1",
-                "API key removed from your setup file: it was entered for api.anthropic.com. \
-                 Give the key for openrouter.ai with --api-key-stdin"
+                "[+] Key removed: it was for api.anthropic.com",
+                "[!] Add the key for openrouter.ai with --api-key-stdin"
             ]
         );
         assert_eq!(own.api_key, None);
@@ -1375,7 +1443,17 @@ mod tests {
         assert_eq!(effective.research_model, "anthropic/claude-opus-5.5");
         assert!(effective.fallbacks().is_empty());
         assert_eq!(effective.key_variable(), "OPENROUTER_API_KEY");
-        assert!(!describe(&settings, &file).contains("If it declines"));
+        // Without a key, and for another service: no fallback models, and
+        // no models of a cloud AI that is not in use.
+        let text = describe(&settings, &file);
+        assert!(!text.contains("Fallback models"), "{text}");
+        assert!(
+            text.ends_with(
+                "  Cloud AI         https://openrouter.ai/api/v1\n\
+                 \x20 Key              missing · local AI answers instead, no CVE research\n"
+            ),
+            "{text}"
+        );
 
         // The address alone is enough to know which protocol to speak.
         let by_address = AiSettings {
@@ -1407,9 +1485,33 @@ mod tests {
             ..AiSettings::default()
         };
         let text = describe(&settings, &file);
-        assert!(text
-            .contains("[L] local model    http://localhost:1234/v1, model: chosen by the server"));
-        assert!(text.contains("API key            not set: [C] answers with the local model"));
+        // No service chosen and no key: the cloud AI is off, as the setup
+        // screen shows it, not short of a key nobody asked for.
+        assert_eq!(
+            text,
+            format!(
+                "AI setup · {}\n\
+                 \x20 Local AI         http://localhost:1234/v1\n\
+                 \x20 Cloud AI         off\n",
+                file.display()
+            ),
+            "nothing empty is listed"
+        );
+        // A service chosen, its key not entered yet: that is to act on.
+        AiOverrides {
+            cloud_provider: Some(CloudProvider::OpenAi),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        assert!(
+            describe(&settings, &file).ends_with(
+                "  Cloud AI         https://openrouter.ai/api/v1\n\
+                 \x20 Key              missing · local AI answers instead, no CVE research\n"
+            ),
+            "{}",
+            describe(&settings, &file)
+        );
 
         AiOverrides {
             local_model: Some("llama3.2".into()),
@@ -1419,9 +1521,12 @@ mod tests {
         .save(&file)
         .unwrap();
         let text = describe(&settings, &file);
-        assert!(text.contains("model: llama3.2"), "{text}");
         assert!(
-            text.contains("API key            set, ends in 9f3a (from your setup file)"),
+            text.contains("  Local AI         http://localhost:1234/v1 · llama3.2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  Key              set, ends in 9f3a (in ai.toml)\n"),
             "{text}"
         );
         assert!(
@@ -1430,6 +1535,233 @@ mod tests {
         );
         // A short key is not even hinted at.
         assert_eq!(masked("abc123"), "set");
+
+        // Cloud AI switched off: one word, and nothing of the unused service.
+        AiOverrides {
+            disable_cloud: true,
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        let text = describe(&settings, &file);
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(
+            rows,
+            [
+                "  Local AI         http://localhost:1234/v1",
+                "  Cloud AI         off"
+            ]
+        );
+        // A local AI on another machine: where the text goes is said.
+        AiOverrides {
+            local_url: Some("http://203.0.113.10:1234/v1".into()),
+            ..AiOverrides::default()
+        }
+        .save(&file)
+        .unwrap();
+        let text = describe(&settings, &file);
+        assert!(
+            text.contains(
+                "  Local AI         http://203.0.113.10:1234/v1\n\
+                 \x20                  not this machine: it gets masked text only\n"
+            ),
+            "{text}"
+        );
+        // Where a key comes from, in a word or two.
+        assert_eq!(key_origin("your setup file"), "in ai.toml");
+        assert_eq!(key_origin("config.toml"), "in config.toml");
+        assert_eq!(
+            key_origin("the OPENROUTER_API_KEY environment variable"),
+            "from $OPENROUTER_API_KEY"
+        );
+    }
+
+    /// `--check` and the setup screen's test: one short line per service,
+    /// and a local AI that is not this user's own is said to get masked text.
+    #[test]
+    fn the_check_says_one_short_line_per_service() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                tx.send(services().await).unwrap();
+                std::future::pending::<()>().await
+            });
+        });
+        let base = rx.recv().unwrap();
+        let settings = AiSettings {
+            local_url: format!("{base}/local/v1"),
+            cloud_url: format!("{base}/openrouter/v1"),
+            openrouter_api_key: Some(GOOD_KEY.into()),
+            user_file: None,
+            ..AiSettings::default()
+        };
+        let said = |settings: &AiSettings| {
+            let mut out = Vec::new();
+            let works = check(settings, &mut out).unwrap();
+            (works, String::from_utf8(out).unwrap())
+        };
+        {
+            let _owner = crate::ai::FakePortOwner::set(None);
+            assert_eq!(
+                said(&settings),
+                (
+                    true,
+                    format!(
+                        "[+] Local AI  {base}/local/v1 · 2 models\n\
+                         [+] Cloud AI  {base}/openrouter/v1 · key accepted\n"
+                    )
+                )
+            );
+            // No key: skipped, and said so; cloud AI off: one word.
+            let no_key = AiSettings {
+                openrouter_api_key: None,
+                ..settings.clone()
+            };
+            let (_, text) = said(&no_key);
+            assert!(text.ends_with("[!] Cloud AI  skipped: no key\n"), "{text}");
+            let off = AiSettings {
+                disable_cloud: true,
+                ..settings.clone()
+            };
+            let (works, text) = said(&off);
+            assert!(works && text.ends_with("[+] Cloud AI  off\n"), "{text}");
+        }
+        // Another user's server on this machine: the local AI gets masked
+        // text, and the key is not sent at all.
+        let _owner = crate::ai::FakePortOwner::set(Some(4242));
+        let (works, text) = said(&settings);
+        assert!(!works, "{text}");
+        let whose = match cfg!(windows) {
+            true => "another user's server",
+            false => "another user's server (uid 4242)",
+        };
+        assert_eq!(
+            text,
+            format!(
+                "[+] Local AI  {base}/local/v1 · 2 models · {whose}: masked text only\n\
+                 [!] Cloud AI  key not sent to {base}/openrouter/v1: {whose}\n"
+            )
+        );
+        assert!(
+            !text.contains(GOOD_KEY) && !text.contains("sk-test"),
+            "{text}"
+        );
+    }
+
+    /// The Claude API: the key, then every model the setup names. A refusal
+    /// is said in a few words, without the API's own sentence or the model
+    /// twice.
+    #[test]
+    fn the_check_names_the_claude_models_a_key_is_not_offered() {
+        if std::env::var(anthropic::KEY_ENV).is_ok() {
+            return; // a key in the environment would be the one checked
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                tx.send(services().await).unwrap();
+                std::future::pending::<()>().await
+            });
+        });
+        let base = rx.recv().unwrap();
+        let _owner = crate::ai::FakePortOwner::set(None);
+        let settings = AiSettings {
+            local_url: format!("{base}/local/v1"),
+            cloud_url: format!("{base}/claude/v1"),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            cloud_model: "claude-opus-5-5".into(),
+            research_model: "claude-opus-5-5".into(),
+            cloud_fallbacks: Some(vec!["claude-opus-4-6".into(), "claude-opus-4-8".into()]),
+            openrouter_api_key: Some(CLAUDE_KEY.into()),
+            user_file: None,
+            ..AiSettings::default()
+        };
+        let said = |settings: &AiSettings| {
+            let mut out = Vec::new();
+            let works = check(settings, &mut out).unwrap();
+            (works, String::from_utf8(out).unwrap())
+        };
+        assert_eq!(
+            said(&settings),
+            (
+                false,
+                format!(
+                    "[+] Local AI  {base}/local/v1 · 2 models\n\
+                     [+] Cloud AI  Claude API · key accepted\n\
+                     [+] Cloud AI  claude-opus-5-5, claude-opus-4-8 available\n\
+                     [!] Cloud AI  claude-opus-4-6 not offered to this key\n"
+                )
+            )
+        );
+        let wrong = AiSettings {
+            openrouter_api_key: Some("sk-ant-test-wrong-key-0000".into()),
+            ..settings
+        };
+        let (works, text) = said(&wrong);
+        assert!(!works);
+        assert!(
+            text.ends_with("[!] Cloud AI  Claude API refused the key\n"),
+            "{text}"
+        );
+        assert!(!text.contains("sk-ant"), "{text}");
+    }
+
+    /// A fresh install: no service chosen and no key. `--check` calls the
+    /// cloud AI off, as `--show` and the setup screen do.
+    #[test]
+    fn a_fresh_install_has_its_cloud_ai_off_not_a_key_missing() {
+        if std::env::var(anthropic::KEY_ENV).is_ok()
+            || std::env::var(crate::ai::API_KEY_ENV).is_ok()
+        {
+            return; // a key in the environment is a cloud AI in use
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        let settings = AiSettings {
+            // Nothing listens there.
+            local_url: "http://127.0.0.1:9/v1".into(),
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let said = |settings: &AiSettings| {
+            let mut out = Vec::new();
+            check(settings, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            said(&settings),
+            "[!] Local AI  no answer at http://127.0.0.1:9/v1\n[+] Cloud AI  off\n"
+        );
+        assert!(!cloud_in_use(&AiOverrides::default(), false));
+        assert!(cloud_in_use(&AiOverrides::default(), true));
+        // A service chosen, by name or by URL: its key is what is missing.
+        for own in [
+            AiOverrides {
+                cloud_provider: Some(CloudProvider::OpenAi),
+                ..AiOverrides::default()
+            },
+            AiOverrides {
+                cloud_url: Some("https://llm.other-service.example/v1".into()),
+                ..AiOverrides::default()
+            },
+        ] {
+            assert!(cloud_in_use(&own, false));
+            own.save(&file).unwrap();
+            assert!(
+                said(&settings).ends_with("[!] Cloud AI  skipped: no key\n"),
+                "{}",
+                said(&settings)
+            );
+        }
+        // Switched off wins over a key.
+        let off = AiOverrides {
+            disable_cloud: true,
+            api_key: Some(GOOD_KEY.into()),
+            ..AiOverrides::default()
+        };
+        assert!(!cloud_in_use(&off, true));
     }
 
     #[test]

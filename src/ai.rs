@@ -1180,30 +1180,50 @@ fn is_unspecified_host(host: &url::Host<&str>) -> bool {
     }
 }
 
-/// Validates a local AI endpoint URL: must use `http://` or `https://` with a
-/// concrete host (never `0.0.0.0`/`::`), and without embedded credentials,
-/// query parameters, or fragments. Non-loopback hosts are allowed here because
-/// `run_local` automatically masks prompts sent off-machine.
-pub fn validate_local_url(raw: &str) -> Result<String> {
-    let url = raw.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
-    let Some(host) = parsed.host() else {
-        bail!("'{raw}' must start with http:// or https://");
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        bail!("'{raw}' must start with http:// or https://");
-    }
-    if is_unspecified_host(&host) {
-        bail!("'{raw}' must name a specific host, not 0.0.0.0 or ::");
+/// What every model server URL needs besides its scheme: a concrete host
+/// (never `0.0.0.0`/`::`) and no credentials, query or fragment.
+fn url_host_and_path_only(parsed: &url::Url, host: &url::Host<&str>) -> Result<(), &'static str> {
+    if is_unspecified_host(host) {
+        return Err("Needs a host other than 0.0.0.0 or ::");
     }
     if !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        bail!("'{raw}' must not include credentials, query parameters, or fragments");
+        return Err("No credentials, query or fragment allowed");
     }
+    Ok(())
+}
+
+/// A local AI server's URL without its trailing slash, or why it is refused
+/// in words that do not repeat it: an edit box shows the typed text itself.
+/// `http://` or `https://`; hosts on other machines are allowed because
+/// `run_local` masks what is sent off this one.
+pub(crate) fn checked_local_url(raw: &str) -> Result<String, &'static str> {
+    const SCHEME: &str = "Needs http:// or https://";
+    let url = raw.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(url).map_err(|_| "Not a URL")?;
+    let host = parsed.host().ok_or(SCHEME)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(SCHEME);
+    }
+    url_host_and_path_only(&parsed, &host)?;
     Ok(url.to_owned())
+}
+
+/// The refusal for a line that does not show the text:
+/// `'ftp://x': needs https://`.
+fn refused_url(raw: &str, why: &str) -> anyhow::Error {
+    let mut rest = why.chars();
+    let first = rest.next().map_or(' ', |c| c.to_ascii_lowercase());
+    anyhow::anyhow!("'{raw}': {first}{}", rest.as_str())
+}
+
+/// [`checked_local_url`] for a command line or a file: the refusal names
+/// the URL.
+pub fn validate_local_url(raw: &str) -> Result<String> {
+    checked_local_url(raw).map_err(|why| refused_url(raw, why))
 }
 
 /// Strips terminal escape/control characters (preserving `\n` and `\t`) and
@@ -1929,17 +1949,46 @@ fn port_owner(_port: u16) -> Option<u32> {
     Some(u32::MAX)
 }
 
+/// Whose a model server is when it is not this user's own on this machine.
+enum NotOwn {
+    Elsewhere,
+    Unverified,
+    /// Windows names its users by no number.
+    OtherUser(Option<u32>),
+}
+
+fn not_own(url: &str) -> Option<NotOwn> {
+    if !is_loopback_url(url) {
+        return Some(NotOwn::Elsewhere);
+    }
+    another_users_server(url).map(|uid| match uid {
+        u32::MAX => NotOwn::Unverified,
+        _ if cfg!(windows) => NotOwn::OtherUser(None),
+        uid => NotOwn::OtherUser(Some(uid)),
+    })
+}
+
 /// Why the model server at `url` is not this user's own on this machine,
 /// or `None` when it is.
 pub(crate) fn not_own_server(url: &str) -> Option<String> {
-    if !is_loopback_url(url) {
-        return Some("the server is not on this machine".to_owned());
-    }
-    another_users_server(url).map(|uid| match uid {
-        u32::MAX => "cannot verify that the server on that port is yours".to_owned(),
-        // Windows names its users by no number.
-        _ if cfg!(windows) => "the server belongs to another user".to_owned(),
-        uid => format!("the server belongs to another user, uid {uid}"),
+    not_own(url).map(|who| match who {
+        NotOwn::Elsewhere => "the server is not on this machine".to_owned(),
+        NotOwn::Unverified => "cannot verify that the server on that port is yours".to_owned(),
+        NotOwn::OtherUser(None) => "the server belongs to another user".to_owned(),
+        NotOwn::OtherUser(Some(uid)) => {
+            format!("the server belongs to another user, uid {uid}")
+        }
+    })
+}
+
+/// [`not_own_server`] in a few words, for a line that names the server
+/// already: `another user's server (uid 1001)`.
+pub(crate) fn not_own_server_short(url: &str) -> Option<String> {
+    not_own(url).map(|who| match who {
+        NotOwn::Elsewhere => "not on this machine".to_owned(),
+        NotOwn::Unverified => "owner not verified".to_owned(),
+        NotOwn::OtherUser(None) => "another user's server".to_owned(),
+        NotOwn::OtherUser(Some(uid)) => format!("another user's server (uid {uid})"),
     })
 }
 
@@ -1966,8 +2015,8 @@ pub(crate) fn check_server(url: &str, carries: Carries) -> Result<()> {
         Carries::Key => {
             validate_cloud_url(url)?;
             if is_loopback_url(url) {
-                if let Some(why) = not_own_server(url) {
-                    bail!("refusing to send the API key to {url}: {why}");
+                if let Some(why) = not_own_server_short(url) {
+                    bail!("key not sent to {url}: {why}");
                 }
             }
         }
@@ -2036,38 +2085,28 @@ fn mask_prompt(
     Ok((masked, unmasker))
 }
 
-/// Validates a cloud AI endpoint URL: must use `https://`, or `http://` only
-/// when the host is loopback (`localhost`, `127.0.0.0/8`, `::1`), and must not
-/// contain userinfo, query parameters, or fragments.
-pub fn validate_cloud_url(raw: &str) -> Result<String> {
+/// A cloud AI service's URL without its trailing slash, or why it is
+/// refused in words that do not repeat it (see [`checked_local_url`]).
+/// `https://`, or `http://` only when the host is loopback (`localhost`,
+/// `127.0.0.0/8`, `::1`).
+pub(crate) fn checked_cloud_url(raw: &str) -> Result<String, &'static str> {
+    const SCHEME: &str = "Needs https://";
     let url = raw.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(url).with_context(|| format!("'{raw}' is not a URL"))?;
-    let Some(host) = parsed.host() else {
-        bail!("'{raw}' must start with https://");
-    };
-    if is_unspecified_host(&host) {
-        bail!("'{raw}' must name a specific host, not 0.0.0.0 or ::");
-    }
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        bail!("'{raw}' must not include credentials, query parameters, or fragments");
-    }
+    let parsed = url::Url::parse(url).map_err(|_| "Not a URL")?;
+    let host = parsed.host().ok_or(SCHEME)?;
+    url_host_and_path_only(&parsed, &host)?;
     match parsed.scheme() {
         "https" => Ok(url.to_owned()),
-        "http" => {
-            if is_loopback_url(url) {
-                Ok(url.to_owned())
-            } else {
-                bail!(
-                    "cloud URL '{raw}' must start with https:// (http:// is only allowed for localhost/loopback)"
-                )
-            }
-        }
-        _ => bail!("'{raw}' must start with https://"),
+        "http" if is_loopback_url(url) => Ok(url.to_owned()),
+        "http" => Err("Needs https:// (http:// only for this machine)"),
+        _ => Err(SCHEME),
     }
+}
+
+/// [`checked_cloud_url`] for a command line or a file: the refusal names
+/// the URL.
+pub fn validate_cloud_url(raw: &str) -> Result<String> {
+    checked_cloud_url(raw).map_err(|why| refused_url(raw, why))
 }
 
 impl AiEngine {
@@ -4655,7 +4694,7 @@ mod tests {
         let vault = Mutex::new(Vault::ephemeral());
         let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
         let err = format!("{:#}", outcome.unwrap_err());
-        assert!(err.contains("must start with https://"), "{err}");
+        assert!(err.contains("needs https://"), "{err}");
     }
 
     #[test]
@@ -4982,7 +5021,11 @@ mod tests {
             let _owner = FakePortOwner::set(owner);
             for carries in [Carries::Key, Carries::Evidence] {
                 let error = format!("{:#}", check_server(&base, carries).unwrap_err());
-                assert!(error.starts_with("refusing to send"), "{error}");
+                let said = match carries {
+                    Carries::Key => "key not sent to ",
+                    _ => "refusing to send unmasked evidence to ",
+                };
+                assert!(error.starts_with(said), "{error}");
             }
             check_server(&base, Carries::Nothing).unwrap();
             // [C] with a key: refused before anything is sent.
@@ -4991,7 +5034,7 @@ mod tests {
             let vault = Mutex::new(Vault::ephemeral());
             let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
             let error = format!("{:#}", outcome.unwrap_err());
-            assert!(error.contains("refusing to send the API key"), "{error}");
+            assert!(error.contains("key not sent to "), "{error}");
             // [L]: what is sent there is masked.
             let (outcome, _) = run(&engine, Tier::Local, &graph, &vault).await;
             assert!(outcome.unwrap().model.contains("(masked: "));
@@ -5007,11 +5050,11 @@ mod tests {
             let error = crate::setup::check_key(&format!("{base}/cloud"), "sk-or-test")
                 .await
                 .unwrap_err();
-            assert!(format!("{error:#}").contains("refusing to send the API key"));
+            assert!(format!("{error:#}").contains("key not sent to "));
             let error = crate::setup::list_models(&format!("{base}/cloud"), Some("sk-or-test"))
                 .await
                 .unwrap_err();
-            assert!(format!("{error:#}").contains("refusing to send the API key"));
+            assert!(format!("{error:#}").contains("key not sent to "));
         }
         assert!(mock.cloud.lock().unwrap().is_empty(), "no key was sent");
         // The user's own server gets both.

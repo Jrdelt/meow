@@ -181,6 +181,21 @@ fn request(
     Ok(request)
 }
 
+/// How two refusals of the Claude API begin. `meow setup --check` says
+/// them in its own few words ([`key_refused`], [`model_unknown`]).
+const KEY_REFUSED: &str = "the Claude API did not accept the API key";
+const MODEL_UNKNOWN: &str = "the Claude API does not know this model or does not offer it to you";
+
+/// Whether `error` is the Claude API not accepting the key.
+pub(crate) fn key_refused(error: &anyhow::Error) -> bool {
+    format!("{error:#}").starts_with(KEY_REFUSED)
+}
+
+/// Whether `error` is the Claude API not offering a model to the key.
+pub(crate) fn model_unknown(error: &anyhow::Error) -> bool {
+    format!("{error:#}").starts_with(MODEL_UNKNOWN)
+}
+
 /// Sends the request and turns anything but a success into a message a
 /// person can act on.
 async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::Response> {
@@ -204,14 +219,10 @@ async fn send(request: reqwest::RequestBuilder, base: &str) -> Result<reqwest::R
         .unwrap_or(&detail);
     let message = sanitize(message, 300);
     match kind.unwrap_or_default() {
-        "authentication_error" => {
-            bail!("the Claude API did not accept the API key (run `meow setup`): {message}")
-        }
+        "authentication_error" => bail!("{KEY_REFUSED} (run `meow setup`): {message}"),
         "billing_error" => bail!("the Claude API reports a billing problem: {message}"),
         "permission_error" => bail!("this API key may not do that: {message}"),
-        "not_found_error" => {
-            bail!("the Claude API does not know this model or does not offer it to you: {message}")
-        }
+        "not_found_error" => bail!("{MODEL_UNKNOWN}: {message}"),
         "rate_limit_error" => bail!("the Claude API is rate limiting this key; try again shortly"),
         "overloaded_error" => bail!("the Claude API is overloaded right now; try again shortly"),
         _ => bail!(

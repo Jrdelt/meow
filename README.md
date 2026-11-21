@@ -76,21 +76,21 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## First-Time Setup
 
-Run `meow` with no arguments (or `meow setup`) in an interactive terminal to open the **Cat Setup GUI**:
+Run `meow` with no arguments (or `meow setup`) in a terminal to open the full-screen setup:
 
 ```sh
 meow
 ```
 
-The 5-step setup wizard walks you through:
+Five steps, one question each. The defaults work, and `?` explains the step you are on:
 
-1. **Welcome & Overview** — how sessions, masking, and session folders work.
-2. **Cloud AI Provider** — choose **OpenRouter**, **Anthropic (Claude API)**, or **Local-Only (Offline)**, paste your API key (kept hidden), and pick triage/research models.
-3. **Local AI Server** — configure an optional local server (`Ollama` on `http://127.0.0.1:11434/v1` or `LM Studio` on `http://127.0.0.1:1234/v1`) for completely offline `[L]` local triage.
-4. **CVE Feeds & Offline GeoIP** — toggle public vulnerability lookups (NVD, OSV.dev, CISA KEV), optionally add an NVD API key for higher rate limits, and enable offline IP geolocation.
-5. **Companion Tools Check** — verify `nmap`, `katana`, `feroxbuster`, the SecLists wordlist, and the DB-IP City Lite database, and optionally launch your first workspace immediately.
+1. **Mode** — what `meow recon` may send by default: `light` (0 packets to hosts), `mild` (slow, rate-limited scans) or `aggressive` (fast scans; labs and authorized hosts only).
+2. **Local AI** — a model server on this machine: LM Studio, Ollama, llama.cpp, or your own URL. $0; host data stays on this machine.
+3. **Cloud AI** — Off, **Claude API**, or **OpenRouter / other**, with its key (hidden, kept in `ai.toml`, sent only to that service) and models. Private data is masked first; daily cap $1.00 and 20 calls by default.
+4. **Lookups & tools** — CVE lookups (software versions to NVD, OSV.dev, CISA KEV), an optional NVD key, your public IP to ipinfo.io, the satellite map (the rough area to EOX); and which of `nmap`, `katana`, `feroxbuster`, the wordlist and the GeoIP database are installed. No lookup carries a scanned host's address or name.
+5. **Save** — review, test the connections, save to `~/.meow` (files only you can read), and optionally open your first session.
 
-You can re-open this wizard any time with `meow setup` (or pass `meow setup --plain` for a line-by-line text menu).
+`meow setup` opens it again; `meow setup --plain` is a line menu for the AI setup.
 
 ---
 
@@ -270,7 +270,7 @@ meow setup --provider claude --api-key-stdin
 # Configure a local OpenAI-compatible model server (Ollama or LM Studio)
 meow setup --local-url http://localhost:11434/v1 --local-model qwen2.5-coder:14b
 
-# Remove a stored cloud API key (or choose Local-Only in `meow setup` to lock cloud AI off)
+# Remove a stored cloud API key (or choose Off under Cloud AI in `meow setup` to lock cloud AI off)
 meow setup --forget-key
 ```
 

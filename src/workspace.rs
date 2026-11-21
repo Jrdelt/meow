@@ -149,24 +149,26 @@ max_daily_calls = 20
 /// macOS, Linux and Windows.
 pub fn validate_name(raw: &str) -> Result<String, String> {
     if raw.is_empty() || raw.len() > NAME_MAX {
-        return Err(format!("name must be 1-{NAME_MAX} characters"));
+        return Err(format!("must be 1-{NAME_MAX} characters"));
     }
     let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
     if !raw.chars().all(valid_char) {
-        return Err("name may contain only letters, digits, '-', '_' and '.'".into());
+        return Err("only letters, digits, - _ .".into());
     }
     if !raw.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        return Err("name must start with a letter or digit".into());
+        return Err("must start with a letter or digit".into());
     }
     if raw.ends_with('.') {
-        return Err("name must not end with '.'".into());
+        return Err("must not end with a dot".into());
     }
     let stem = raw.split('.').next().unwrap_or(raw).to_ascii_lowercase();
     if WINDOWS_RESERVED.contains(&stem.as_str()) {
-        return Err(format!("'{raw}' is a reserved device name on Windows"));
+        return Err(format!(
+            "{raw} is a device name on Windows: pick another name"
+        ));
     }
     if RESERVED_COMMANDS.contains(&raw.to_ascii_lowercase().as_str()) {
-        return Err(format!("'{raw}' is a reserved meow subcommand name"));
+        return Err(format!("{raw} is a meow command: pick another name"));
     }
     Ok(raw.to_owned())
 }
@@ -3829,7 +3831,7 @@ fn format_age(age: Duration) -> String {
 }
 
 /// `dir` for the listing: the home folder shortened to `~`, as plain text.
-fn shown_place(dir: &Path, user_home: Option<&Path>) -> String {
+pub(crate) fn shown_place(dir: &Path, user_home: Option<&Path>) -> String {
     let text = match user_home.and_then(|home| dir.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
         Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),

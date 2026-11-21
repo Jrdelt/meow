@@ -20,7 +20,7 @@ use crate::workspace::validate_name;
     about,
     before_help = crate::wizard::CAT_CLI_BANNER,
     args_conflicts_with_subcommands = true,
-    after_help = "Run `meow` on a fresh install (or `meow setup` anytime) for the interactive cat setup GUI."
+    after_help = "Run `meow setup` to change the setup."
 )]
 pub struct Cli {
     /// Session to open; a new one asks where to save it (./meow/<NAME>/ here by default)
@@ -44,43 +44,46 @@ pub enum Command {
     /// List every saved workspace and whether its session is running
     #[command(visible_aliases = ["ls", "status"])]
     List,
-    /// Set up your own AI, discovery mode & CVE preferences (opens the interactive Cat GUI on a TTY)
+    /// Set up the default mode, local AI, cloud AI and lookups
     Setup {
-        /// Show the current setup (a key is never printed)
+        /// Show the AI setup (a key is never printed)
         #[arg(long)]
         show: bool,
-        /// Try the local model server and the cloud key, and say what happened
+        /// Test the local AI server and the cloud AI key
         #[arg(long)]
         check: bool,
-        /// Use the plain line-by-line text menu instead of the full-screen Cat TUI
+        /// Line menu for the AI setup
         #[arg(long)]
         plain: bool,
-        /// OpenAI-compatible model server on this machine, e.g. http://localhost:11434/v1
+        /// Local AI server, e.g. http://localhost:11434/v1
         #[arg(long, value_name = "URL")]
         local_url: Option<String>,
-        /// Model the local server should use ("" lets the server choose)
+        /// Local AI model ("": the server's choice)
         #[arg(long, value_name = "NAME")]
         local_model: Option<String>,
-        /// Cloud service: `claude` (`anthropic`) or `openrouter` (`openai`)
-        #[arg(long, value_parser = ["claude", "anthropic", "openrouter", "openai"])]
+        /// Cloud AI service: claude or openrouter
+        #[arg(
+            long,
+            value_parser = ["claude", "anthropic", "openrouter", "openai"],
+            hide_possible_values = true
+        )]
         provider: Option<String>,
-        /// Claude API only: models to ask next when one declines a request,
-        /// in order and comma separated ("" leaves it to the API)
+        /// Claude API: models asked when one declines ("": API chooses)
         #[arg(long, value_name = "A,B")]
         fallback_models: Option<String>,
-        /// Address of another OpenAI-style cloud service
+        /// URL of another OpenAI-style cloud AI service
         #[arg(long, value_name = "URL")]
         cloud_url: Option<String>,
-        /// Model for [C] cloud triage
+        /// Cloud AI triage model
         #[arg(long, value_name = "NAME")]
         cloud_model: Option<String>,
-        /// Model for [R] grounded research
+        /// Cloud AI research model
         #[arg(long, value_name = "NAME")]
         research_model: Option<String>,
-        /// Read your API key from standard input (never from the command line)
+        /// Read the key from standard input, not arguments
         #[arg(long, conflicts_with = "forget_key")]
         api_key_stdin: bool,
-        /// Remove your stored API key
+        /// Remove the stored key
         #[arg(long)]
         forget_key: bool,
     },
