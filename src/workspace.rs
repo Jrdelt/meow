@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ use crate::cve::CveSettings;
 use crate::location::LocationSettings;
 use crate::mode::Mode;
 use crate::queue::{PresetOverride, ReconSettings};
+use crate::update::NoAnswer;
 
 /// Name of the active session, exported inside a session shell.
 pub const SESSION_ENV: &str = "MEOW_SESSION";
@@ -3057,22 +3058,87 @@ fn add_exclude(info: &Path, pattern: &str) -> Result<()> {
 /// Most session files a warning names.
 const GIT_NAMES_SHOWN: usize = 3;
 
+/// How long one [`GitWatch::check`] waits for git. Past it, git is killed
+/// with what it started, and git is not asked again until its index
+/// changes.
+pub const GIT_CHECK_LIMIT: Duration = Duration::from_secs(3);
+
+/// The repository [`GitWatch`] asks git about: the work tree [`own_git`]
+/// found and its `.git`, and the folder that holds `./meow` as a path from
+/// the top, `/` between names (empty at the top).
+#[derive(Debug, Clone)]
+struct WatchedRepo {
+    top: PathBuf,
+    git: PathBuf,
+    below: String,
+}
+
+impl WatchedRepo {
+    /// `None` outside a repository of the user's own, and for a folder
+    /// whose path git could not be given as text.
+    fn of(folder: &Path) -> Option<Self> {
+        let (top, git) = own_git(folder)?;
+        let canonical = fs::canonicalize(folder).ok()?;
+        let mut parts = Vec::new();
+        for part in canonical.strip_prefix(&top).ok()?.components() {
+            let std::path::Component::Normal(part) = part else {
+                return None;
+            };
+            let part = part.to_str()?;
+            if part.chars().any(char::is_control) {
+                return None;
+            }
+            parts.push(part.to_owned());
+        }
+        Some(Self {
+            top,
+            git,
+            below: parts.join("/"),
+        })
+    }
+}
+
 /// Keeps git out of a session in `./meow` while it runs: a pull can
 /// replace the `.gitignore` files that keep session files out (that of
 /// `./meow` and the session's own), or make git track session files, at
 /// any time. Each [`GitWatch::check`] puts back what was changed and says
 /// what git would take in.
-#[derive(Debug, Default)]
+///
+/// The repository is not meow's: git is run on the one [`own_git`] vetted
+/// only, reaches no remote, and is given [`GIT_CHECK_LIMIT`] (see
+/// [`crate::update::git_output_pinned`]).
+#[derive(Default)]
 pub struct GitWatch {
-    /// The work tree and its `.git` folder, once looked up.
-    repo: Option<Option<(PathBuf, PathBuf)>>,
+    /// Where git runs: closing it kills the git a check waits for.
+    git: crate::procs::Tracker,
+    /// The repository, once looked up.
+    repo: Option<Option<WatchedRepo>>,
     /// The git index as last seen: git is asked again when it changes.
     index: Option<Option<(u64, i128)>>,
     /// What git was last found to take in, said once.
     said: (Vec<String>, Vec<String>),
+    /// That git did not answer in time, said once.
+    said_late: bool,
+    /// See [`GitWatch::files_doubtful`].
+    doubtful: bool,
 }
 
 impl GitWatch {
+    /// A watch whose git runs in `git`: a session closes it as it ends.
+    pub fn using(git: crate::procs::Tracker) -> Self {
+        Self {
+            git,
+            ..Self::default()
+        }
+    }
+
+    /// Whether something outside meow may have put files in the session
+    /// since this watch began: git tracks session files (a pull replaces
+    /// them), or a `.gitignore` of meow's had to be put back.
+    pub fn files_doubtful(&self) -> bool {
+        self.doubtful
+    }
+
     /// What to tell the user about the session in `dir`, one line each.
     pub fn check(&mut self, dir: &Path) -> Vec<String> {
         let mut notes = Vec::new();
@@ -3099,22 +3165,44 @@ impl GitWatch {
             if !is_sessions_marker(&marker) && write_marker(&marker).is_ok() {
                 notes.push(format!("{shown} had been changed; meow put its own back"));
                 changed = true;
+                self.doubtful = true;
             }
         }
-        let Some((_, git)) = self.repo.get_or_insert_with(|| own_git(folder)).clone() else {
+        let Some(repo) = self
+            .repo
+            .get_or_insert_with(|| WatchedRepo::of(folder))
+            .clone()
+        else {
             return notes;
         };
-        let index = fs::metadata(git.join("index"))
+        let index = fs::metadata(repo.git.join("index"))
             .ok()
             .map(|meta| (meta.len(), nanos(meta.modified())));
         if !changed && self.index == Some(index) {
             return notes;
         }
         self.index = Some(index);
-        let found = (
-            git_lists(folder, &["--cached"]),
-            git_lists(folder, &["--others", "--exclude-standard"]),
-        );
+        let until = Instant::now() + GIT_CHECK_LIMIT;
+        let found = git_lists(&repo, &["--cached"], until, &self.git).and_then(|cached| {
+            let others = git_lists(&repo, &["--others", "--exclude-standard"], until, &self.git)?;
+            Ok((cached, others))
+        });
+        // No answer is no warning.
+        let found = match found {
+            Ok(found) => found,
+            Err(NoAnswer::TimedOut) if !self.said_late => {
+                self.said_late = true;
+                notes.push(format!(
+                    "git did not answer in {} s: session files not checked",
+                    GIT_CHECK_LIMIT.as_secs()
+                ));
+                return notes;
+            }
+            Err(_) => return notes,
+        };
+        if !found.0.is_empty() {
+            self.doubtful = true;
+        }
         if found == self.said {
             return notes;
         }
@@ -3149,20 +3237,33 @@ impl GitWatch {
     }
 }
 
-/// What `git ls-files <args> -- meow` lists in `folder`, git run without
-/// hooks or fsmonitor. Empty when git cannot say.
-fn git_lists(folder: &Path, args: &[&str]) -> Vec<String> {
-    let mut command = vec!["ls-files", "-z"];
+/// What `git ls-files <args>` lists of `./meow` in `repo`, as paths from
+/// the folder that holds it (`meow/...`), by `until`.
+fn git_lists(
+    repo: &WatchedRepo,
+    args: &[&str],
+    until: Instant,
+    git: &crate::procs::Tracker,
+) -> Result<Vec<String>, NoAnswer> {
+    let above = if repo.below.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", repo.below)
+    };
+    let sessions = format!("{above}{SESSIONS_DIR}");
+    // A folder name is a name, not a pattern.
+    let mut command = vec!["--literal-pathspecs", "ls-files", "-z"];
     command.extend_from_slice(args);
-    command.extend(["--", SESSIONS_DIR]);
-    crate::update::git_output(folder, &command)
-        .map(|out| {
-            out.split(|&byte| byte == 0)
-                .filter(|name| !name.is_empty())
-                .map(|name| String::from_utf8_lossy(name).into_owned())
-                .collect()
+    command.extend(["--", sessions.as_str()]);
+    let out = crate::update::git_output_pinned(&repo.top, &command, until, git)?;
+    Ok(out
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let name = name.strip_prefix(above.as_bytes()).unwrap_or(name);
+            String::from_utf8_lossy(name).into_owned()
         })
-        .unwrap_or_default()
+        .collect())
 }
 
 impl Workspace {
@@ -3210,6 +3311,8 @@ pub struct SessionFiles {
     /// has started ([`SessionFiles::started`]).
     doubtful: bool,
     started: bool,
+    /// See [`SessionFiles::changed_outside`].
+    changed_outside: bool,
 }
 
 impl SessionFiles {
@@ -3245,6 +3348,7 @@ impl SessionFiles {
             start: None,
             doubtful: false,
             started: true,
+            changed_outside: false,
         }
     }
 
@@ -3254,6 +3358,14 @@ impl SessionFiles {
     /// as changed outside meow, so the next open warns again.
     pub fn started(&mut self) {
         self.started = true;
+    }
+
+    /// Says that something outside meow may have put files in the session
+    /// while it ran ([`GitWatch::files_doubtful`]): they are recorded as
+    /// changed outside meow, so the next open warns and drops the shell
+    /// history and last folder.
+    pub fn changed_outside(&mut self) {
+        self.changed_outside = true;
     }
 
     fn record(&self) -> Result<()> {
@@ -3267,7 +3379,8 @@ impl SessionFiles {
             return Ok(());
         }
         let mut now = Snapshot::of(&self.dir);
-        if (self.doubtful && !self.started)
+        if self.changed_outside
+            || (self.doubtful && !self.started)
             || self
                 .start
                 .as_ref()
@@ -6592,6 +6705,126 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         // A folder in no repository: nothing is written above it.
         assert_eq!(exclude_pattern(Path::new("")), Some("/meow/".to_owned()));
         assert_eq!(exclude_pattern(Path::new("x\ny")), None);
+    }
+
+    /// PoC (SUP-1, SUP-V1): a session opened in a prepared repository ran
+    /// the repository's program. Listing session files, git fetched a
+    /// tree its sparse index left out from a promisor remote, through the
+    /// repository's `core.sshCommand`; and in a folder shaped as a bare
+    /// repository below the top (a plain clone brings one), git took that
+    /// folder for the repository. The watch asks the top repository only,
+    /// and git reaches no remote.
+    #[cfg(unix)]
+    #[test]
+    fn git_watch_runs_no_program_of_the_repository() {
+        use crate::update::git_traps;
+        let fx = fixture();
+        let marker = fx.cwd.parent().unwrap().join("ran");
+        let trap = other_folder(&fx, "trap");
+        git_traps::lazy_fetch_trap(&trap, &marker);
+        let acme = open_in(&fx, &trap, "acme");
+        let notes = GitWatch::default().check(&acme.dir);
+        assert!(!marker.exists(), "git ran the repository's ssh command");
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let clone = other_folder(&fx, "clone");
+        git_traps::git(&clone, &["init", "-q"]);
+        let evil = git_traps::embedded_bare_trap(&clone, &marker);
+        let beta = open_in(&fx, &evil, "beta");
+        fs::write(beta.dir.join("chats").join("192.0.2.6.md"), "x").unwrap();
+        git_traps::git(&clone, &["add", "-f", "evil/meow/beta/chats/192.0.2.6.md"]);
+        let mut watch = GitWatch::default();
+        let notes = watch.check(&beta.dir);
+        assert!(!marker.exists(), "git used the planted repository");
+        // Named as before: from the folder that holds `./meow`.
+        assert!(
+            notes
+                .iter()
+                .any(|note| note
+                    .starts_with("git tracks session files (meow/beta/chats/192.0.2.6.md)")),
+            "{notes:?}"
+        );
+        assert!(watch.files_doubtful());
+    }
+
+    /// PoC (SUP-1): with a FIFO as `core.excludesFile`, git waited for good
+    /// and no session could open in the folder. git is killed at
+    /// [`GIT_CHECK_LIMIT`], said once, and not asked again until its index
+    /// changes. No answer is no warning.
+    #[cfg(unix)]
+    #[test]
+    fn git_watch_gives_up_on_a_git_that_does_not_answer() {
+        use crate::update::git_traps;
+        let fx = fixture();
+        let repo = other_folder(&fx, "repo");
+        git_traps::git(&repo, &["init", "-q"]);
+        let fifo = git_traps::blocking_excludes(&repo);
+        let acme = open_in(&fx, &repo, "acme");
+        let mut watch = GitWatch::default();
+        let start = Instant::now();
+        let notes = watch.check(&acme.dir);
+        let took = start.elapsed();
+        assert!(took < GIT_CHECK_LIMIT + Duration::from_secs(2), "{took:?}");
+        assert_eq!(
+            notes,
+            ["git did not answer in 3 s: session files not checked"]
+        );
+        assert!(!git_traps::fifo_has_reader(&fifo), "git still runs");
+        assert!(!watch.files_doubtful());
+        let start = Instant::now();
+        assert!(watch.check(&acme.dir).is_empty());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// PoC (WS-3): a pull while the session ran made git track its shell
+    /// history and replaced it; at the end meow recorded the planted file
+    /// as its own, and the next open used it. Once git tracks session
+    /// files, or a `.gitignore` of meow's had to be put back, the session
+    /// is recorded as changed outside meow.
+    #[test]
+    fn files_git_may_have_put_in_a_running_session_are_not_taken_as_the_users() {
+        let fx = fixture();
+        let repo = other_folder(&fx, "repo");
+        let with_git = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .is_ok_and(|status| status.success());
+        let acme = open_in(&fx, &repo, "acme");
+        let record = |doubt: bool| {
+            let mut files = SessionFiles::for_session(&fx.home, &acme, false);
+            files.started();
+            if doubt {
+                files.changed_outside();
+            }
+        };
+        record(false);
+        assert!(!acme.files_changed(&fx.home));
+        record(true);
+        assert!(acme.files_changed(&fx.home));
+
+        let mut watch = GitWatch::default();
+        watch.check(&acme.dir);
+        assert!(!watch.files_doubtful());
+        fs::write(acme.dir.join(".gitignore"), "!*\n").unwrap();
+        watch.check(&acme.dir);
+        assert!(watch.files_doubtful(), "a marker was put back");
+        if with_git {
+            let mut watch = GitWatch::default();
+            fs::write(acme.dir.join("zsh_history"), "echo planted\n").unwrap();
+            let added = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["add", "-f", "meow/acme/zsh_history"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap();
+            assert!(added.success());
+            watch.check(&acme.dir);
+            assert!(watch.files_doubtful(), "git tracks session files");
+        }
     }
 
     /// Two meow processes started together (two terminals, a script) each

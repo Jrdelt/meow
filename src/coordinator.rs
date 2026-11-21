@@ -317,6 +317,12 @@ pub struct State {
     locating: AtomicBool,
     /// The "graph is full" notice was shown.
     full_noticed: AtomicBool,
+    /// See [`State::files_doubtful`].
+    files_doubtful: AtomicBool,
+    /// The git [`git_guard`] runs, killed when the session ends.
+    git_calls: Tracker,
+    /// What [`git_guard`] and [`State::check_git`] know of git.
+    git_watch: Mutex<GitWatch>,
     /// The location map's pictures, served to the page from memory.
     pictures: Mutex<Vec<Picture>>,
     /// The location database on this disk (`~/.meow/geo`).
@@ -508,6 +514,25 @@ impl State {
         for note in watch.check(&dir) {
             self.notice(note);
         }
+        if watch.files_doubtful() {
+            self.files_doubtful.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Checks git once more, as the timer does: for the end of the
+    /// session, so that a pull just before it is seen too. Skipped while
+    /// a check runs.
+    pub fn check_git(&self) {
+        if let Ok(mut watch) = self.git_watch.try_lock() {
+            self.watch_git(&mut watch);
+        }
+    }
+
+    /// Whether git may have put files in the session while it ran
+    /// ([`GitWatch::files_doubtful`]): they are then not taken as the
+    /// user's own.
+    pub fn files_doubtful(&self) -> bool {
+        self.files_doubtful.load(Ordering::SeqCst)
     }
 
     fn save_if_dirty(&self) {
@@ -1749,16 +1774,13 @@ async fn guard_watch(state: Shared) {
 /// not anything else changes: a pull can change what git ignores at any
 /// time.
 async fn git_guard(state: Shared) {
-    let mut watch = GitWatch::default();
     loop {
         tokio::time::sleep(GIT_GUARD_EVERY).await;
         let state = Arc::clone(&state);
-        watch = tokio::task::spawn_blocking(move || {
-            state.watch_git(&mut watch);
-            watch
+        let _ = tokio::task::spawn_blocking(move || {
+            state.watch_git(&mut lock(&state.git_watch));
         })
-        .await
-        .unwrap_or_default();
+        .await;
     }
 }
 
@@ -2145,6 +2167,7 @@ impl Coordinator {
             }
         };
         let geo = GeoDb::from_optional_dir(geo_dir);
+        let git_calls = Tracker::new();
         let state = Arc::new(State {
             session: workspace.name.clone(),
             port,
@@ -2173,6 +2196,9 @@ impl Coordinator {
             location: Mutex::new(None),
             locating: AtomicBool::new(false),
             full_noticed: AtomicBool::new(false),
+            files_doubtful: AtomicBool::new(false),
+            git_watch: Mutex::new(GitWatch::using(git_calls.clone())),
+            git_calls,
             pictures: Mutex::new(Vec::new()),
             geo,
             target: Mutex::new(None),
@@ -2307,6 +2333,7 @@ impl Coordinator {
         // has to go well for them to be gone, and no stage starts another.
         let tool_ran = self.state.tools.running() > 0;
         self.state.tools.close();
+        self.state.git_calls.close();
         let Some(runtime) = self.runtime.take() else {
             return skipped;
         };
@@ -2417,12 +2444,15 @@ mod tests {
         config.cve.enabled = false;
         let coordinator = Coordinator::start(workspace.clone(), config).unwrap();
         let state = coordinator.state();
+        assert!(!state.files_doubtful());
         let marker = project.join("meow").join(".gitignore");
         let meows = std::fs::read_to_string(&marker).unwrap();
         std::fs::write(&marker, "!*\n").unwrap();
         std::fs::write(workspace.dir.join(".gitignore"), "!*\n").unwrap();
         // Checked on a timer, whether or not anything is saved.
         state.watch_git(&mut GitWatch::default());
+        // The session's files are then not taken as the user's (WS-3).
+        assert!(state.files_doubtful());
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), meows);
         assert_eq!(
             std::fs::read_to_string(workspace.dir.join(".gitignore")).unwrap(),

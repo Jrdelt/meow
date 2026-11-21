@@ -755,7 +755,13 @@ fn start_session(
     let sink = tee_sink(coordinator.tap_sink(), debug_tap_log()?);
     files.started();
     let outcome = pty::run_session(&spec, sink);
+    // A pull while it ran, up to its last moment, may have put files in
+    // the session.
+    state.check_git();
     let skipped = coordinator.shutdown();
+    if state.files_doubtful() {
+        files.changed_outside();
+    }
     // The database closes with its last handle; then the files are recorded.
     drop(state);
     drop(files);

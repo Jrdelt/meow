@@ -7,6 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -128,7 +129,8 @@ fn verify_checkout_security(dir: &Path, explicit_source: bool) -> Result<()> {
 /// this user's own. A folder (or any file git tracks in it, or what git
 /// keeps of its history) that another account owns or can write to, also
 /// through a shared group or an access list, could make both run that
-/// account's code.
+/// account's code. Its git settings are vetted ([`vet_git_folder`]) before
+/// git first reads it.
 #[cfg(unix)]
 fn ensure_own_checkout(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -175,8 +177,9 @@ fn ensure_own_checkout(dir: &Path) -> Result<()> {
         };
         check(&path, &meta)?;
     }
-    // The entries above are this user's alone, so git can be asked which
-    // files it tracks.
+    // The entries above are this user's alone, and once its settings are
+    // those of a plain clone, git can be asked which files it tracks.
+    vet_git_folder(dir)?;
     for path in checkout_paths(dir)? {
         // One deleted here is refused later, as a local change.
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -264,12 +267,21 @@ fn ensure_own_checkout(dir: &Path) -> Result<()> {
             )
         })?;
     }
-    Ok(())
+    vet_git_folder(dir)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_own_checkout(_dir: &Path) -> Result<()> {
-    Ok(())
+fn ensure_own_checkout(dir: &Path) -> Result<()> {
+    vet_git_folder(dir)
+}
+
+/// What git reads first, checked before git reads the checkout: a `.git`
+/// that takes its settings from another folder is refused, and so is any
+/// setting a plain clone lacks (a promisor remote with a `core.sshCommand`
+/// would otherwise run as soon as git lists the files).
+fn vet_git_folder(dir: &Path) -> Result<()> {
+    refuse_shared_git_dir(dir)?;
+    audit_local_git_config(dir)
 }
 
 fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
@@ -524,8 +536,19 @@ fn is_allowed_local_git_config_key(key: &str) -> bool {
 
 fn audit_local_git_config(dir: &Path) -> Result<()> {
     let safe_dir = sanitize(&dir.display().to_string(), 400);
-    let keys = git(dir, &["config", "--local", "--name-only", "--list"])
-        .with_context(|| format!("cannot audit local .git/config in {safe_dir}"))?;
+    // Read as a file: `.git/config` alone, its includes not followed.
+    let keys = git(
+        dir,
+        &[
+            "config",
+            "--file",
+            ".git/config",
+            "--no-includes",
+            "--name-only",
+            "--list",
+        ],
+    )
+    .with_context(|| format!("cannot audit local .git/config in {safe_dir}"))?;
     for key in keys.lines() {
         if !is_allowed_local_git_config_key(key) {
             bail!(
@@ -560,6 +583,24 @@ const GIT_ENV_SCRUB: &[&str] = &[
     "GIT_TEMPLATE_DIR",
 ];
 
+/// `-c` settings that keep git from reaching any remote, whatever the
+/// repository's own config says. A promisor remote is otherwise fetched
+/// from as soon as an object is missing (a sparse index with a tree left
+/// out is enough), with the repository's `core.sshCommand` or credential
+/// helper; and a repository's `protocol.<name>.allow` beats
+/// `protocol.allow`, so each is named.
+const NO_REMOTES: &[&str] = &[
+    "protocol.allow=never",
+    "protocol.file.allow=never",
+    "protocol.ssh.allow=never",
+    "protocol.https.allow=never",
+    "protocol.http.allow=never",
+    "protocol.git.allow=never",
+    "protocol.ext.allow=never",
+    "core.sshCommand=",
+    "credential.helper=",
+];
+
 fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
     for var in GIT_ENV_SCRUB {
         cmd.env_remove(var);
@@ -569,6 +610,10 @@ fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
     } else {
         cmd.env_remove("PATH");
     }
+    // No object is fetched unasked (see `NO_REMOTES`), and git never asks
+    // for a password on the terminal.
+    cmd.env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
     cmd.arg("-c")
         .arg(format!("core.hooksPath={}", hooks_dir.display()))
         .arg("-c")
@@ -615,6 +660,10 @@ pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 
     let mut cmd = Command::new(resolve_git()?);
     configure_git_command(&mut cmd, hooks_path);
+    // Every call made this way reads only what is on disk.
+    for setting in NO_REMOTES {
+        cmd.arg("-c").arg(setting);
+    }
     let output = cmd
         .arg("-C")
         .arg(dir)
@@ -632,8 +681,128 @@ pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Like [`git`], but git talks to the terminal (credential prompts,
-/// progress) and nothing is captured.
+/// Why [`git_output_pinned`] has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoAnswer {
+    /// git is not there, or it failed.
+    Failed,
+    /// git ran past its time, and was killed with what it started.
+    TimedOut,
+}
+
+/// The most a [`git_output_pinned`] call reads of what git prints.
+const PINNED_OUTPUT_MAX: u64 = 8 * 1024 * 1024;
+
+/// [`git_output`] in the work tree `top` of a repository meow did not vet
+/// (the folder a session is saved in): git is pointed at `top/.git` and
+/// `top` itself, so no repository in a folder below can stand in for it,
+/// it reaches no remote ([`NO_REMOTES`]) and takes no bare repository it
+/// was not pointed at. It runs as a tree of its own in `tracker`, killed
+/// at `until` or when `tracker` closes. Paths in `args` are relative to
+/// `top`.
+pub(crate) fn git_output_pinned(
+    top: &Path,
+    args: &[&str],
+    until: Instant,
+    tracker: &crate::procs::Tracker,
+) -> Result<Vec<u8>, NoAnswer> {
+    #[cfg(windows)]
+    let empty_hooks = tempfile::tempdir().map_err(|_| NoAnswer::Failed)?;
+    #[cfg(windows)]
+    let hooks_path = empty_hooks.path();
+    #[cfg(not(windows))]
+    let hooks_path = Path::new("/dev/null");
+
+    let top = git_path(top);
+    let mut git_dir = std::ffi::OsString::from("--git-dir=");
+    git_dir.push(top.join(".git"));
+    let mut work_tree = std::ffi::OsString::from("--work-tree=");
+    work_tree.push(&top);
+    let mut cmd = Command::new(resolve_git().map_err(|_| NoAnswer::Failed)?);
+    configure_git_command(&mut cmd, hooks_path);
+    for setting in NO_REMOTES.iter().chain(&["safe.bareRepository=explicit"]) {
+        cmd.arg("-c").arg(setting);
+    }
+    cmd.arg("-C")
+        .arg(&top)
+        .arg(git_dir)
+        .arg(work_tree)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    output_until(&mut cmd, until, tracker)
+}
+
+/// Runs `cmd` as a tree of its own in `tracker` and returns what it
+/// printed, if it ends well by `until`. Otherwise the tree is killed.
+fn output_until(
+    cmd: &mut Command,
+    until: Instant,
+    tracker: &crate::procs::Tracker,
+) -> Result<Vec<u8>, NoAnswer> {
+    let (mut child, group) = tracker.spawn_std(cmd).map_err(|_| NoAnswer::Failed)?;
+    let (sent, printed) = std::sync::mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let read = stdout.take(PINNED_OUTPUT_MAX + 1).read_to_end(&mut out);
+            let _ = sent.send(read.map(|_| out));
+        });
+    }
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => break Err(NoAnswer::TimedOut),
+            Err(_) => break Err(NoAnswer::Failed),
+        }
+    };
+    if ended.is_err() {
+        group.kill();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // What it started and left running goes with it, and so does the
+    // last holder of its output.
+    drop(group);
+    let status = ended?;
+    let wait = until
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(200));
+    let out = match printed.recv_timeout(wait) {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) => return Err(NoAnswer::Failed),
+        Err(_) => return Err(NoAnswer::TimedOut),
+    };
+    if !status.success() || out.len() as u64 > PINNED_OUTPUT_MAX {
+        return Err(NoAnswer::Failed);
+    }
+    Ok(out)
+}
+
+/// `path` as git reads it: on Windows without the `\\?\` that
+/// `fs::canonicalize` puts before a drive letter.
+fn git_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            if let Prefix::VerbatimDisk(drive) = prefix.kind() {
+                let mut plain = std::ffi::OsString::from(format!("{}:", char::from(drive)));
+                plain.push(components.as_path());
+                return PathBuf::from(plain);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Like [`git`], but git talks to the terminal (progress, what ssh asks;
+/// git itself asks for no password) and nothing is captured.
 fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
     #[cfg(windows)]
     let empty_hooks = tempfile::tempdir().context("cannot create temporary hooks folder")?;
@@ -927,8 +1096,6 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         );
     }
     ensure_own_checkout(&dir)?;
-    refuse_shared_git_dir(&dir)?;
-    audit_local_git_config(&dir)?;
     refuse_submodules(&dir)?;
     audit_untracked_build_overrides(&dir)?;
     println!("[+] meow source: {safe_dir}");
@@ -1038,10 +1205,8 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     }
 
     verify_checkout_security(&dir, explicit_source)?;
-    ensure_own_checkout(&dir)?;
     // build.rs runs git as well.
-    refuse_shared_git_dir(&dir)?;
-    audit_local_git_config(&dir)?;
+    ensure_own_checkout(&dir)?;
     audit_untracked_build_overrides(&dir)?;
     if cfg!(windows) {
         // A running program cannot be replaced on Windows.
@@ -1062,6 +1227,125 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         "[+] Updated. Sessions that are open keep the old version until you close and reopen them."
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// Repositories prepared to make git run a program of theirs, for tests.
+#[cfg(all(test, unix))]
+pub(crate) mod git_traps {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// git for a test, without system or global config: its standard
+    /// output.
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=meow-test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Makes `dir` a repository (`top/f` and `c/d/f` committed, with
+    /// whatever else is in it) whose index is a sparse index without the
+    /// tree of `c`, and which takes missing objects from a promisor remote
+    /// over ssh, through a `core.sshCommand` that adds a line to `marker`.
+    /// Plain `git ls-files` there runs that command.
+    pub(crate) fn lazy_fetch_trap(dir: &Path, marker: &Path) {
+        std::fs::create_dir_all(dir.join("top")).unwrap();
+        std::fs::create_dir_all(dir.join("c").join("d")).unwrap();
+        std::fs::write(dir.join("top").join("f"), "t\n").unwrap();
+        std::fs::write(dir.join("c").join("d").join("f"), "x\n").unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "trap"]);
+        git(
+            dir,
+            &["sparse-checkout", "set", "--cone", "--sparse-index", "top"],
+        );
+        let tree = git(dir, &["rev-parse", "HEAD:c"]);
+        let object = dir
+            .join(".git")
+            .join("objects")
+            .join(&tree[..2])
+            .join(&tree[2..]);
+        std::fs::remove_file(object).unwrap();
+        let command = format!("echo ran >> '{}'; false", marker.display());
+        for (key, value) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialclone", "origin"),
+            ("remote.origin.url", "ssh://example.invalid/x.git"),
+            ("remote.origin.promisor", "true"),
+            // Beats `protocol.allow=never`.
+            ("protocol.ssh.allow", "always"),
+            ("core.sshCommand", &command),
+        ] {
+            git(dir, &["config", key, value]);
+        }
+    }
+
+    /// Puts in the work tree `dir` a folder `evil` shaped as a bare
+    /// repository, with the config and index of a [`lazy_fetch_trap`] and
+    /// no objects, as a clone of a hostile repository brings it. Run inside
+    /// it, plain git takes it for the repository. Returns it.
+    pub(crate) fn embedded_bare_trap(dir: &Path, marker: &Path) -> PathBuf {
+        let source = dir.with_extension("source");
+        lazy_fetch_trap(&source, marker);
+        let evil = dir.join("evil");
+        for folder in ["objects", "refs/heads"] {
+            std::fs::create_dir_all(evil.join(folder)).unwrap();
+            std::fs::write(evil.join(folder).join(".keep"), "").unwrap();
+        }
+        std::fs::write(evil.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        for name in ["config", "index"] {
+            std::fs::copy(source.join(".git").join(name), evil.join(name)).unwrap();
+        }
+        evil
+    }
+
+    /// Makes the `core.excludesFile` of the repository in `dir` a FIFO no
+    /// one writes to: git listing untracked files waits on it for good.
+    /// Returns the FIFO.
+    pub(crate) fn blocking_excludes(dir: &Path) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = dir.join(".git").join("excludes");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a plain system call on a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        git(
+            dir,
+            &["config", "core.excludesFile", fifo.to_str().unwrap()],
+        );
+        fifo
+    }
+
+    /// Whether a process still has the FIFO `fifo` open to read.
+    pub(crate) fn fifo_has_reader(fifo: &Path) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo)
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -1850,5 +2134,194 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains(".git/commondir"), "{err:#}");
+    }
+
+    /// PoC (SUP-1): with a promisor remote over ssh and a sparse index
+    /// without one of its trees, listing the files made git fetch that
+    /// tree with the repository's own `core.sshCommand`.
+    #[cfg(unix)]
+    #[test]
+    fn git_calls_fetch_nothing_and_run_no_ssh_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let marker = tmp.path().join("ran");
+        git_traps::lazy_fetch_trap(&repo, &marker);
+        let listed = git_output(&repo, &["ls-files", "-z", "--cached"]).unwrap();
+        assert!(
+            !marker.exists(),
+            "meow's git ran the repository's ssh command"
+        );
+        assert!(String::from_utf8_lossy(&listed).contains("top/f"));
+        // The settings on their own, for a git older than
+        // GIT_NO_LAZY_FETCH.
+        let plain = |settings: &[&str]| {
+            let mut cmd = Command::new("git");
+            for setting in settings {
+                cmd.arg("-c").arg(setting);
+            }
+            cmd.arg("-C")
+                .arg(&repo)
+                .args(["ls-files", "--cached"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env_remove("GIT_NO_LAZY_FETCH")
+                .output()
+                .unwrap();
+        };
+        plain(NO_REMOTES);
+        assert!(!marker.exists(), "the -c settings let a fetch through");
+        // `protocol.allow=never` alone loses to the repository's
+        // `protocol.ssh.allow=always`, and without any of it git does run
+        // the command: the test is a real one.
+        plain(&["protocol.allow=never"]);
+        assert!(marker.exists());
+    }
+
+    /// PoC (SUP-V1): git run in a folder below the top of a work tree took
+    /// a folder there shaped as a bare repository for the repository, with
+    /// its config. Pinned, git asks the top repository only.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_git_uses_the_top_repository_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().join("clone");
+        let marker = tmp.path().join("ran");
+        std::fs::create_dir(&top).unwrap();
+        git_traps::git(&top, &["init", "-q"]);
+        let evil = git_traps::embedded_bare_trap(&top, &marker);
+        std::fs::create_dir_all(evil.join("meow [x]")).unwrap();
+        std::fs::write(evil.join("meow [x]").join("f"), "f").unwrap();
+        git_traps::git(&top, &["add", "evil/meow [x]/f"]);
+        let until = Instant::now() + Duration::from_secs(10);
+        let listed = git_output_pinned(
+            &top,
+            &[
+                "--literal-pathspecs",
+                "ls-files",
+                "-z",
+                "--cached",
+                "--",
+                "evil/meow [x]",
+            ],
+            until,
+            &crate::procs::Tracker::new(),
+        )
+        .unwrap();
+        assert_eq!(listed, b"evil/meow [x]/f\0");
+        assert!(!marker.exists(), "git used the planted repository");
+        // Plain git in the folder does use it: the test is a real one.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&evil)
+            .args(["ls-files", "--cached"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(marker.exists());
+    }
+
+    /// PoC (SUP-1): with a FIFO as `core.excludesFile`, `git ls-files
+    /// --others` waited for good. Pinned, git is killed at its time.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_git_is_killed_at_its_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().join("repo");
+        std::fs::create_dir(&top).unwrap();
+        git_traps::git(&top, &["init", "-q"]);
+        let fifo = git_traps::blocking_excludes(&top);
+        let start = Instant::now();
+        let got = git_output_pinned(
+            &top,
+            &["ls-files", "-z", "--others", "--exclude-standard"],
+            start + Duration::from_millis(500),
+            &crate::procs::Tracker::new(),
+        );
+        assert_eq!(got, Err(NoAnswer::TimedOut));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!git_traps::fifo_has_reader(&fifo), "git still runs");
+        // A session that ends kills the git it still waits for.
+        let tracker = crate::procs::Tracker::new();
+        let waiting = {
+            let (top, tracker) = (top.clone(), tracker.clone());
+            std::thread::spawn(move || {
+                git_output_pinned(
+                    &top,
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
+                    Instant::now() + Duration::from_secs(60),
+                    &tracker,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        tracker.close();
+        assert_eq!(waiting.join().unwrap(), Err(NoAnswer::Failed));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!git_traps::fifo_has_reader(&fifo), "git still runs");
+        // A git that answers in time is not cut short.
+        git_traps::git(&top, &["config", "--unset", "core.excludesFile"]);
+        std::fs::write(top.join("new"), "x").unwrap();
+        let listed = git_output_pinned(
+            &top,
+            &["ls-files", "-z", "--others", "--exclude-standard"],
+            Instant::now() + Duration::from_secs(10),
+            &crate::procs::Tracker::new(),
+        );
+        assert_eq!(listed, Ok(b"new\0".to_vec()));
+    }
+
+    /// PoC (SUP-2): `meow update --check` listed the checkout's files with
+    /// git before it vetted the checkout's config, so a promisor remote's
+    /// `core.sshCommand` ran first. The config is vetted before git reads
+    /// anything else.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkouts_config_is_vetted_before_git_lists_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("clone");
+        let marker = tmp.path().join("ran");
+        std::fs::create_dir(&clone).unwrap();
+        std::fs::write(clone.join("Cargo.toml"), "[package]\nname = \"meow\"\n").unwrap();
+        git_traps::lazy_fetch_trap(&clone, &marker);
+        private_tree(&clone);
+        // A tracked file others can change: refused only once git has
+        // listed it.
+        let shared = clone.join("top").join("f");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let err = run(&UpdateArgs {
+            check: true,
+            source: Some(clone.clone()),
+        })
+        .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("refusing unsafe local .git/config setting"),
+            "{said}"
+        );
+        assert!(!marker.exists(), "git ran the checkout's ssh command");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_is_given_paths_without_the_verbatim_prefix() {
+        assert_eq!(
+            git_path(Path::new(r"\\?\C:\Users\me\repo")),
+            PathBuf::from(r"C:\Users\me\repo")
+        );
+        assert_eq!(
+            git_path(Path::new(r"C:\Users\me\repo")),
+            PathBuf::from(r"C:\Users\me\repo")
+        );
     }
 }
