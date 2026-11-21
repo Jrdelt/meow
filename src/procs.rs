@@ -1414,12 +1414,24 @@ pub(crate) mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    /// Running and not a zombie: a killed child that its parent has not
+    /// collected yet still answers signal 0, on macOS too.
     fn alive(pid: libc::pid_t) -> bool {
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
             return !status.lines().any(|line| {
                 line.strip_prefix("State:")
                     .is_some_and(|state| state.trim_start().starts_with('Z'))
             });
+        }
+        // No /proc (macOS): ps says Z for a zombie and nothing once it is
+        // gone.
+        if let Ok(out) = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            return !stat.is_empty() && !stat.starts_with('Z');
         }
         // SAFETY: signal 0 only asks whether the process exists.
         unsafe { libc::kill(pid, 0) == 0 }

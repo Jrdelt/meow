@@ -1877,7 +1877,7 @@ fn tools_card(wizard: &Wizard, width: usize) -> (String, Vec<Line<'static>>) {
     if !missing.is_empty() {
         lines.extend(pair(("Missing", DIM), 9, (&missing, WARN), width));
         let get = if cfg!(windows) {
-            "`meow tools` says how to get them"
+            "`meow tools` shows how"
         } else {
             "`meow tools` installs them"
         };

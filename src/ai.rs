@@ -5249,9 +5249,12 @@ mod tests {
         assert!(port_owner(135).is_some());
         let base = "http://127.0.0.1:135/v1";
         assert!(not_own_server(base).is_some());
-        for carries in [Carries::Key, Carries::Evidence] {
+        for (carries, said) in [
+            (Carries::Key, "key not sent to "),
+            (Carries::Evidence, "refusing to send unmasked evidence to "),
+        ] {
             let error = format!("{:#}", check_server(base, carries).unwrap_err());
-            assert!(error.starts_with("refusing to send"), "{error}");
+            assert!(error.starts_with(said), "{error}");
         }
     }
 
