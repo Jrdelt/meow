@@ -583,23 +583,42 @@ const GIT_ENV_SCRUB: &[&str] = &[
     "GIT_TEMPLATE_DIR",
 ];
 
-/// `-c` settings that keep git from reaching any remote, whatever the
-/// repository's own config says. A promisor remote is otherwise fetched
-/// from as soon as an object is missing (a sparse index with a tree left
-/// out is enough), with the repository's `core.sshCommand` or credential
-/// helper; and a repository's `protocol.<name>.allow` beats
-/// `protocol.allow`, so each is named.
+/// `-c` settings that keep git from reaching a remote. A promisor remote
+/// is otherwise fetched from as soon as an object is missing (a sparse
+/// index with a tree left out is enough), with the repository's
+/// `core.sshCommand` or credential helper. A repository's
+/// `protocol.<name>.allow` beats `protocol.allow`, so each name git knows
+/// is named; [`NO_TRANSPORT`] covers the rest.
 const NO_REMOTES: &[&str] = &[
     "protocol.allow=never",
     "protocol.file.allow=never",
     "protocol.ssh.allow=never",
     "protocol.https.allow=never",
     "protocol.http.allow=never",
+    "protocol.ftp.allow=never",
+    "protocol.ftps.allow=never",
     "protocol.git.allow=never",
     "protocol.ext.allow=never",
+    "protocol.fd.allow=never",
     "core.sshCommand=",
     "credential.helper=",
 ];
+
+/// `GIT_ALLOW_PROTOCOL` for a git that must reach no remote: it allows
+/// only the transports it names, and no transport has this name. It beats
+/// every `protocol.<name>.allow`, also that of a remote helper
+/// (`<name>::<url>` runs `git-remote-<name>`, whatever the name), and every
+/// git has it, also one too old for `GIT_NO_LAZY_FETCH`.
+const NO_TRANSPORT: &str = "/";
+
+/// Keeps the git of `cmd` from reaching any remote, whatever the
+/// repository's own config says.
+fn reach_no_remote(cmd: &mut Command) {
+    cmd.env("GIT_ALLOW_PROTOCOL", NO_TRANSPORT);
+    for setting in NO_REMOTES {
+        cmd.arg("-c").arg(setting);
+    }
+}
 
 fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
     for var in GIT_ENV_SCRUB {
@@ -661,9 +680,7 @@ pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = Command::new(resolve_git()?);
     configure_git_command(&mut cmd, hooks_path);
     // Every call made this way reads only what is on disk.
-    for setting in NO_REMOTES {
-        cmd.arg("-c").arg(setting);
-    }
+    reach_no_remote(&mut cmd);
     let output = cmd
         .arg("-C")
         .arg(dir)
@@ -684,30 +701,55 @@ pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// Why [`git_output_pinned`] has no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoAnswer {
-    /// git is not there, or it failed.
+    /// git is not there, or was not started: the session is closing.
+    NotStarted,
+    /// git failed, or was killed as the session closed.
     Failed,
     /// git ran past its time, and was killed with what it started.
     TimedOut,
 }
 
-/// The most a [`git_output_pinned`] call reads of what git prints.
-const PINNED_OUTPUT_MAX: u64 = 8 * 1024 * 1024;
+/// Where [`git_output_pinned`] runs git.
+#[derive(Clone, Copy)]
+pub(crate) enum GitRuns<'a> {
+    /// As a tree of its own in a session's tracker: killed with what it
+    /// started at its time, or when the tracker closes.
+    Tracked(&'a crate::procs::Tracker),
+    /// For a check made while meow itself waits in the terminal: a Ctrl-C
+    /// there ends git with meow. On Unix git is in meow's own process
+    /// group (one of its own would not get the Ctrl-C, and would outlive
+    /// meow), and is killed alone at its time: run this way, with no hook,
+    /// fsmonitor or transport, it starts no program. On Windows it is a
+    /// job of its own, which ends with meow.
+    Foreground,
+}
+
+/// The git variables that change how a pathspec is read: meow's pathspecs
+/// say how they are to be read themselves.
+const PATHSPEC_ENV: &[&str] = &[
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
 
 /// [`git_output`] in the work tree `top` of a repository meow did not vet
 /// (the folder a session is saved in): git is pointed at `top/.git` and
 /// `top` itself, so no repository in a folder below can stand in for it,
-/// it reaches no remote ([`NO_REMOTES`]) and takes no bare repository it
-/// was not pointed at. It runs as a tree of its own in `tracker`, killed
-/// at `until` or when `tracker` closes. Paths in `args` are relative to
-/// `top`.
-pub(crate) fn git_output_pinned(
+/// it reaches no remote ([`reach_no_remote`]) and takes no bare repository
+/// it was not pointed at. It runs as `runs` says, and is killed at
+/// `until`. Paths in `args` are relative to `top`. `read` is given what
+/// git prints, as git prints it, on a thread of its own; its result is
+/// the answer, if git ends well by `until`.
+pub(crate) fn git_output_pinned<T: Send + 'static>(
     top: &Path,
     args: &[&str],
     until: Instant,
-    tracker: &crate::procs::Tracker,
-) -> Result<Vec<u8>, NoAnswer> {
+    runs: GitRuns<'_>,
+    read: impl FnOnce(&mut dyn Read) -> std::io::Result<T> + Send + 'static,
+) -> Result<T, NoAnswer> {
     #[cfg(windows)]
-    let empty_hooks = tempfile::tempdir().map_err(|_| NoAnswer::Failed)?;
+    let empty_hooks = tempfile::tempdir().map_err(|_| NoAnswer::NotStarted)?;
     #[cfg(windows)]
     let hooks_path = empty_hooks.path();
     #[cfg(not(windows))]
@@ -718,11 +760,13 @@ pub(crate) fn git_output_pinned(
     git_dir.push(top.join(".git"));
     let mut work_tree = std::ffi::OsString::from("--work-tree=");
     work_tree.push(&top);
-    let mut cmd = Command::new(resolve_git().map_err(|_| NoAnswer::Failed)?);
+    let mut cmd = Command::new(resolve_git().map_err(|_| NoAnswer::NotStarted)?);
     configure_git_command(&mut cmd, hooks_path);
-    for setting in NO_REMOTES.iter().chain(&["safe.bareRepository=explicit"]) {
-        cmd.arg("-c").arg(setting);
+    for var in PATHSPEC_ENV {
+        cmd.env_remove(var);
     }
+    reach_no_remote(&mut cmd);
+    cmd.arg("-c").arg("safe.bareRepository=explicit");
     cmd.arg("-C")
         .arg(&top)
         .arg(git_dir)
@@ -731,23 +775,42 @@ pub(crate) fn git_output_pinned(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    output_until(&mut cmd, until, tracker)
+    output_until(&mut cmd, until, runs, read)
 }
 
-/// Runs `cmd` as a tree of its own in `tracker` and returns what it
-/// printed, if it ends well by `until`. Otherwise the tree is killed.
-fn output_until(
+/// Starts `cmd` as `runs` says: the child, and the tree it leads when it
+/// has one.
+fn start_pinned(
+    cmd: &mut Command,
+    runs: GitRuns<'_>,
+) -> std::io::Result<(std::process::Child, Option<crate::procs::Group>)> {
+    match runs {
+        GitRuns::Tracked(tracker) => tracker
+            .spawn_std(cmd)
+            .map(|(child, group)| (child, Some(group))),
+        #[cfg(windows)]
+        GitRuns::Foreground => crate::procs::Tracker::new()
+            .spawn_std(cmd)
+            .map(|(child, group)| (child, Some(group))),
+        #[cfg(not(windows))]
+        GitRuns::Foreground => cmd.spawn().map(|child| (child, None)),
+    }
+}
+
+/// Runs `cmd` as `runs` says and gives what it prints to `read`; its
+/// result, if `cmd` ends well by `until`. Otherwise `cmd` is killed, with
+/// its tree when it has one.
+fn output_until<T: Send + 'static>(
     cmd: &mut Command,
     until: Instant,
-    tracker: &crate::procs::Tracker,
-) -> Result<Vec<u8>, NoAnswer> {
-    let (mut child, group) = tracker.spawn_std(cmd).map_err(|_| NoAnswer::Failed)?;
+    runs: GitRuns<'_>,
+    read: impl FnOnce(&mut dyn Read) -> std::io::Result<T> + Send + 'static,
+) -> Result<T, NoAnswer> {
+    let (mut child, group) = start_pinned(cmd, runs).map_err(|_| NoAnswer::NotStarted)?;
     let (sent, printed) = std::sync::mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(mut stdout) = child.stdout.take() {
         std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let read = stdout.take(PINNED_OUTPUT_MAX + 1).read_to_end(&mut out);
-            let _ = sent.send(read.map(|_| out));
+            let _ = sent.send(read(&mut stdout));
         });
     }
     let ended = loop {
@@ -761,7 +824,9 @@ fn output_until(
         }
     };
     if ended.is_err() {
-        group.kill();
+        if let Some(group) = &group {
+            group.kill();
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -772,15 +837,15 @@ fn output_until(
     let wait = until
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(200));
-    let out = match printed.recv_timeout(wait) {
-        Ok(Ok(out)) => out,
+    let answer = match printed.recv_timeout(wait) {
+        Ok(Ok(answer)) => answer,
         Ok(Err(_)) => return Err(NoAnswer::Failed),
         Err(_) => return Err(NoAnswer::TimedOut),
     };
-    if !status.success() || out.len() as u64 > PINNED_OUTPUT_MAX {
+    if !status.success() {
         return Err(NoAnswer::Failed);
     }
-    Ok(out)
+    Ok(answer)
 }
 
 /// `path` as git reads it: on Windows without the `\\?\` that
@@ -1321,20 +1386,60 @@ pub(crate) mod git_traps {
         evil
     }
 
+    /// [`git`] with `input` on its standard input.
+    pub(crate) fn git_with_input(dir: &Path, args: &[&str], input: &str) {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "git {args:?}");
+    }
+
+    /// Makes a FIFO at `path`.
+    pub(crate) fn fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a plain system call on a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
     /// Makes the `core.excludesFile` of the repository in `dir` a FIFO no
     /// one writes to: git listing untracked files waits on it for good.
     /// Returns the FIFO.
     pub(crate) fn blocking_excludes(dir: &Path) -> PathBuf {
-        use std::os::unix::ffi::OsStrExt;
         let fifo = dir.join(".git").join("excludes");
-        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: a plain system call on a valid C string.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        self::fifo(&fifo);
         git(
             dir,
             &["config", "core.excludesFile", fifo.to_str().unwrap()],
         );
         fifo
+    }
+
+    /// The process group of a git that runs on the work tree `top`, as
+    /// `ps` lists it.
+    pub(crate) fn group_of_git_in(top: &Path) -> Option<libc::pid_t> {
+        let out = Command::new("ps")
+            .args(["-A", "-ww", "-o", "pgid=,args="])
+            .output()
+            .ok()?;
+        let work_tree = format!("--work-tree={}", top.display());
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|line| line.contains(&work_tree) && line.contains("ls-files"))
+            .and_then(|line| line.split_whitespace().next()?.parse().ok())
     }
 
     /// Whether a process still has the FIFO `fifo` open to read.
@@ -2138,10 +2243,13 @@ mod tests {
 
     /// PoC (SUP-1): with a promisor remote over ssh and a sparse index
     /// without one of its trees, listing the files made git fetch that
-    /// tree with the repository's own `core.sshCommand`.
+    /// tree with the repository's own `core.sshCommand`. And (its review)
+    /// a git too old for `GIT_NO_LAZY_FETCH` still fetched over ftp, or
+    /// through a remote helper of any name, that the repository allowed.
     #[cfg(unix)]
     #[test]
     fn git_calls_fetch_nothing_and_run_no_ssh_command() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let marker = tmp.path().join("ran");
@@ -2152,28 +2260,49 @@ mod tests {
             "meow's git ran the repository's ssh command"
         );
         assert!(String::from_utf8_lossy(&listed).contains("top/f"));
-        // The settings on their own, for a git older than
-        // GIT_NO_LAZY_FETCH.
-        let plain = |settings: &[&str]| {
+        // A remote helper on PATH, as one a tool installs.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let helper = bin.join("git-remote-meowtrap");
+        let script = format!("#!/bin/sh\necho helper >> '{}'\nexit 1\n", marker.display());
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        // meow's settings with lazy fetch left on, as a git older than
+        // GIT_NO_LAZY_FETCH has it.
+        let plain = |locked: bool| {
             let mut cmd = Command::new("git");
-            for setting in settings {
-                cmd.arg("-c").arg(setting);
+            if locked {
+                reach_no_remote(&mut cmd);
+            } else {
+                cmd.env_remove("GIT_ALLOW_PROTOCOL");
             }
             cmd.arg("-C")
                 .arg(&repo)
                 .args(["ls-files", "--cached"])
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("PATH", &path)
                 .env_remove("GIT_NO_LAZY_FETCH")
                 .output()
                 .unwrap();
         };
-        plain(NO_REMOTES);
-        assert!(!marker.exists(), "the -c settings let a fetch through");
-        // `protocol.allow=never` alone loses to the repository's
-        // `protocol.ssh.allow=always`, and without any of it git does run
-        // the command: the test is a real one.
-        plain(&["protocol.allow=never"]);
+        for (url, transport) in [
+            ("ssh://example.invalid/x.git", "ssh"),
+            ("ftp://192.0.2.1/x.git", "ftp"),
+            ("meowtrap::example.invalid/x", "meowtrap"),
+        ] {
+            git_traps::git(&repo, &["config", "remote.origin.url", url]);
+            let allow = format!("protocol.{transport}.allow");
+            git_traps::git(&repo, &["config", &allow, "always"]);
+            plain(true);
+            assert!(!marker.exists(), "{url}: git reached the remote");
+        }
+        // Without them git does run the helper: the test is a real one.
+        plain(false);
         assert!(marker.exists());
     }
 
@@ -2204,7 +2333,8 @@ mod tests {
                 "evil/meow [x]",
             ],
             until,
-            &crate::procs::Tracker::new(),
+            GitRuns::Tracked(&crate::procs::Tracker::new()),
+            read_all,
         )
         .unwrap();
         assert_eq!(listed, b"evil/meow [x]/f\0");
@@ -2231,20 +2361,24 @@ mod tests {
         std::fs::create_dir(&top).unwrap();
         git_traps::git(&top, &["init", "-q"]);
         let fifo = git_traps::blocking_excludes(&top);
-        let start = Instant::now();
-        let got = git_output_pinned(
-            &top,
-            &["ls-files", "-z", "--others", "--exclude-standard"],
-            start + Duration::from_millis(500),
-            &crate::procs::Tracker::new(),
-        );
-        assert_eq!(got, Err(NoAnswer::TimedOut));
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            start.elapsed()
-        );
-        assert!(!git_traps::fifo_has_reader(&fifo), "git still runs");
+        let tracker = crate::procs::Tracker::new();
+        for runs in [GitRuns::Tracked(&tracker), GitRuns::Foreground] {
+            let start = Instant::now();
+            let got = git_output_pinned(
+                &top,
+                &["ls-files", "-z", "--others", "--exclude-standard"],
+                start + Duration::from_millis(500),
+                runs,
+                read_all,
+            );
+            assert_eq!(got, Err(NoAnswer::TimedOut));
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                start.elapsed()
+            );
+            assert!(!git_traps::fifo_has_reader(&fifo), "git still runs");
+        }
         // A session that ends kills the git it still waits for.
         let tracker = crate::procs::Tracker::new();
         let waiting = {
@@ -2254,7 +2388,8 @@ mod tests {
                     &top,
                     &["ls-files", "-z", "--others", "--exclude-standard"],
                     Instant::now() + Duration::from_secs(60),
-                    &tracker,
+                    GitRuns::Tracked(&tracker),
+                    read_all,
                 )
             })
         };
@@ -2271,13 +2406,70 @@ mod tests {
         // A git that answers in time is not cut short.
         git_traps::git(&top, &["config", "--unset", "core.excludesFile"]);
         std::fs::write(top.join("new"), "x").unwrap();
-        let listed = git_output_pinned(
-            &top,
-            &["ls-files", "-z", "--others", "--exclude-standard"],
-            Instant::now() + Duration::from_secs(10),
-            &crate::procs::Tracker::new(),
-        );
-        assert_eq!(listed, Ok(b"new\0".to_vec()));
+        let tracker = crate::procs::Tracker::new();
+        for runs in [GitRuns::Tracked(&tracker), GitRuns::Foreground] {
+            let listed = git_output_pinned(
+                &top,
+                &["ls-files", "-z", "--others", "--exclude-standard"],
+                Instant::now() + Duration::from_secs(10),
+                runs,
+                read_all,
+            );
+            assert_eq!(listed, Ok(b"new\0".to_vec()));
+        }
+    }
+
+    /// PoC (review of SUP-1): run from the terminal before a session
+    /// opens, git was a process group of its own, so a Ctrl-C there ended
+    /// meow and left git waiting for good. From the terminal it is in
+    /// meow's group; in a session, a group of its own.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_git_from_the_terminal_is_in_meows_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().join("repo");
+        std::fs::create_dir(&top).unwrap();
+        git_traps::git(&top, &["init", "-q"]);
+        // git's own group, read while it waits on the FIFO.
+        let group_of = |runs: GitRuns<'_>| {
+            let fifo = git_traps::blocking_excludes(&top);
+            let watcher = {
+                let top = top.clone();
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut found = None;
+                    while found.is_none() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                        found = git_traps::group_of_git_in(&top);
+                    }
+                    found
+                })
+            };
+            let got = git_output_pinned(
+                &top,
+                &["ls-files", "-z", "--others", "--exclude-standard"],
+                Instant::now() + Duration::from_millis(1500),
+                runs,
+                read_all,
+            );
+            let found = watcher.join().unwrap();
+            git_traps::git(&top, &["config", "--unset", "core.excludesFile"]);
+            std::fs::remove_file(&fifo).unwrap();
+            assert_eq!(got, Err(NoAnswer::TimedOut));
+            found.expect("git was not seen waiting")
+        };
+        // SAFETY: a plain system call about this process.
+        let ours = unsafe { libc::getpgid(0) };
+        assert_eq!(group_of(GitRuns::Foreground), ours);
+        let tracker = crate::procs::Tracker::new();
+        assert_ne!(group_of(GitRuns::Tracked(&tracker)), ours);
+    }
+
+    #[cfg(unix)]
+    fn read_all(out: &mut dyn Read) -> std::io::Result<Vec<u8>> {
+        let mut all = Vec::new();
+        out.read_to_end(&mut all)?;
+        Ok(all)
     }
 
     /// PoC (SUP-2): `meow update --check` listed the checkout's files with
