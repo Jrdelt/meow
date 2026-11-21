@@ -1,18 +1,12 @@
-### What's New in `meow` v0.2.4
+### What's New in `meow` v0.2.5
 
-A security release: a third full audit found 31 issues (none high), and all are fixed.
-
-- **Session folders.** meow refuses a folder that another account can change (a shared group such as macOS `staff`, or an access list), and checks again each time a session is opened. If a `git pull` or an unpacked archive replaced a session's files, meow says so, drops that session's shell history and asks before resuming its scans.
-- **Privacy with cloud AI.** Active Directory and NetBIOS names, and addresses written inside URLs and file names, are now masked. A reply gets back only the triaged host's own address and names; secrets and other hosts' values stay as placeholders. The "is this local server mine?" check now works on macOS and Windows.
-- **DNS.** No fixed public resolvers any more, and DNS-over-HTTPS is never asked about an internal target. The target's address is the one your system gives, as for nmap (so `/etc/hosts` counts).
-- **Imports and CVEs.** Host names in an imported nmap file can no longer move another host's notes and CVEs. CVE lookups started by terminal text are capped at 256 per session and wait behind those of `meow recon`.
-- **Map.** A crafted AI reply can no longer freeze the tab, and a page on another local port can no longer detect a running session.
-- **Updates and releases.** `meow update --source` accepts only the git settings a plain clone has and refuses submodules. Each platform's download is now checked against the job that built it.
-
-Things you may notice:
-
-- A session in a folder other accounts can write to is refused; use `meow <name> --home` or fix the folder's permissions.
-- `meow update --source` may refuse a checkout whose `.git/config` has extra settings; the message names the setting.
+- **Recon progress in the map and the HUD.** A bar shows each stage as done, running, waiting, skipped, failed or stopped, with the running stage's name, nmap's own percent and time left, and the time so far. A finished recon keeps its stage names, so you can see what ran.
+- **Closing the terminal ends the recon cleanly.** The running stage stops and every tool it started (nmap, katana, feroxbuster, traceroute) is killed; stages already done keep their results; stages that had not started are dropped. The next start says once where it stopped. A recon is never carried into a later session.
+- **No leftover scanners.** If meow is killed outright, a small watchdog stops its tools; if both die, the next start finds and stops them (only processes meow started, matched by their exact start time).
+- **Simpler screens.**
+  - Setup: one question per step, one short line per choice, details behind `?` (about 55% fewer words; fits 80x24).
+  - HUD: a numbers-first header (`acme · mild · 3 hosts · 4 CVEs · 1 exploited`), only known facts, only keys that work, `?` for the rest.
+  - Map: one "Findings" card per host, short labels on the drawing, no "unknown" rows (about 45% fewer words).
 
 ---
 
