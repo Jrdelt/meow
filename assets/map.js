@@ -141,7 +141,7 @@
       { selector: 'node.asn-box', style: {
         'shape': 'round-rectangle', 'background-color': '#f4f7fb', 'background-opacity': 0.9,
         'border-width': 2, 'border-style': 'dashed', 'border-color': '#4a6fa5',
-        'padding': 26, 'text-valign': 'top', 'text-halign': 'center', 'text-margin-y': -6,
+        'padding': 26, 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 6,
         'font-size': 13, 'font-weight': 700, 'color': '#1f2d3d', 'text-max-width': 360,
         'text-background-color': '#ffffff', 'text-background-opacity': 0.96, 'text-background-padding': 4,
         'z-index': 2 } },
@@ -193,8 +193,25 @@
     var line = el('div', 'row');
     line.appendChild(typeof label === 'string' ? el('span', 'label', label) : label);
     var holder = line.appendChild(el('div', 'value' + (valueClass ? ' ' + valueClass : '')));
-    if (typeof value === 'string') { holder.textContent = value; } else if (value) { holder.appendChild(value); }
+    // A long value goes under its label on a phone (map.css).
+    if (String(typeof value === 'string' ? value : (value && value.textContent) || '').length > 24) {
+      line.className += ' long';
+    }
+    if (typeof value === 'string') {
+      holder.appendChild(breakable(value));
+    } else if (value) {
+      holder.appendChild(value);
+    }
     return line;
+  }
+  // Text that may break after "_" or "/" rather than inside a word.
+  function breakable(text) {
+    var out = document.createDocumentFragment();
+    String(text).replace(/([_\/])/g, '$1\u0000').split('\u0000').forEach(function (piece, index) {
+      if (index) { out.appendChild(el('wbr')); }
+      out.appendChild(document.createTextNode(piece));
+    });
+    return out;
   }
 
   // A hover hint: the long explanation, kept off the page.
@@ -206,10 +223,14 @@
   function short(text) {
     return String(text || '').split(/: | \(/)[0];
   }
+  function capital(text) {
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
 
+  // A card, with a heading unless the tab it is in already names it.
   function card(title) {
     var box = el('section', 'card');
-    box.appendChild(el('h2', null, title));
+    if (title) { box.appendChild(el('h2', null, title)); }
     return box;
   }
 
@@ -310,8 +331,13 @@
       total.total += counts.total;
       total.kev += counts.kev;
     });
+    // The hosts on the map, as the HUD counts them: not the names only mentioned.
+    hosts = ((state.topology && state.topology.nodes) || []).filter(function (node) {
+      return node.data && node.data.kind === 'host';
+    });
+    // "5 hosts · 9 CVEs · 2 exploited": no CVE count while there are none.
     var parts = [hosts.length + (hosts.length === 1 ? ' host' : ' hosts')];
-    parts.push(cveWords(total) || 'no CVEs');
+    if (total.total) { parts.push(cveWords(total)); }
     byId('counts').textContent = parts.join(' · ');
     document.title = 'meow: ' + sessionName;
   }
@@ -398,27 +424,20 @@
         var meta = [];
         if (hc) { meta.push(hc + (hc === 1 ? ' hop' : ' hops')); }
         if (rtt !== null) { meta.push(Math.round(rtt) + ' ms'); }
-        parts.push('Internet' + (meta.length ? ' (' + meta.join(' · ') + ')' : ''));
+        parts.push(['Internet'].concat(meta).join(' \u00b7 '));
         if ((ts && ts.trace_hops && ts.trace_hops.length) || hc) {
-          parts.push(traceExpanded ? '▴ hide traceroute' : '▾ click to expand traceroute');
+          parts.push(traceExpanded ? '\u25b4 hide hops' : '\u25be show hops');
         }
       } else if (d.kind === 'egress' || d.kind === 'hop' || d.kind === 'waf' || d.kind === 'asn') {
         parts.push(d.label || id);
       } else if (d.kind === 'host') {
-        var dot = d.serious_cves ? ' \ud83d\udd34' : (d.cves ? ' \ud83d\udfe1' : (d.open_ports ? ' \ud83d\udfe2' : ''));
-        var primary = (d.primary_hostname && d.primary_hostname !== d.address)
-          ? (d.primary_hostname + ' (' + d.address + ')')
-          : (d.address || d.label);
-        parts.push(primary + dot);
+        // The address, then "5 ports · 5 CVEs · 1 exploited". The glow
+        // behind the device already says how urgent it is.
+        parts.push(d.address || d.label);
         var sub = [];
-        if (d.ports_compact) {
-          sub.push(d.ports_compact + (d.open_ports ? ' (' + d.open_ports + ' open)' : ''));
-        } else if (d.open_ports) {
-          sub.push(d.open_ports + ' open');
-        }
-        if (d.city) { sub.push(d.city); }
-        if (sub.length) { parts.push(sub.join(' · ')); }
-        if (d.cves) { parts.push(cveWords({ total: d.cves, kev: d.kev || 0 })); }
+        if (d.open_ports) { sub.push(d.open_ports + (d.open_ports === 1 ? ' port' : ' ports')); }
+        if (d.cves) { sub.push(cveWords({ total: d.cves, kev: d.kev || 0 })); }
+        if (sub.length) { parts.push(sub.join(' \u00b7 ')); }
       } else if (d.kind === 'gateway') {
         parts.push('Gateway · ' + (d.label || id.replace(/^gw:/, '')));
       } else if (d.kind === 'interface') {
@@ -486,8 +505,10 @@
       var homeLabel = caption(home);
       put('local', 0, YOU_Y, ['you']);
       put(hub, 0, GW_Y, ['hub', 'side']);
-      if (data[home].network) { networkOf[hub] = data[home].network; }
-      link('local', hub, LINE.ethernet, tree, '(' + homeLabel + ')');
+      // Under the router: its network and how you reach it ("LAN eth0"),
+      // clear of the lines that leave you.
+      networkOf[hub] = [data[home].network, hub === home ? '' : homeLabel].filter(Boolean).join(' · ');
+      link('local', hub, LINE.ethernet, tree);
 
       // Local LAN peers hang to the left of the gateway so the vertical
       // You -> Gateway -> WAN Egress -> Internet -> Target spine stays clean.
@@ -514,23 +535,29 @@
           return /default route|all IPv[46]/i.test(line);
         });
         if (vpnAll || vpnList.length) {
-          var vNames = vpnList.map(vpnName).join(', ') || 'VPN';
+          var vNames = vpnList.map(vpnName).join(', ');
+          var carried = vpnCarries(vpnList);
           data['egress:wan'] = {
             id: 'egress:wan', kind: 'egress', role: 'firewall', icon: 'firewall',
             why: 'active VPN exit tunnel carrying outbound traffic',
-            label: 'VPN Exit · ' + vNames + '\n' + (vpnAll ? 'OPSEC: traffic tunneled' : 'split-tunnel VPN active'),
-            vpn: vNames
+            label: 'VPN exit' + (vNames ? ' ' + vNames : '') + '\n' + (vpnAll ? 'all traffic'
+              : (carried.count ? carried.count + (carried.count === 1 ? ' network' : ' networks') + ' \u00b7 ' : '') +
+                'rest direct'),
+            vpn_all: vpnAll,
+            vpn: vNames || 'VPN',
+            carries: carried.text
           };
           put('egress:wan', 0, EGRESS_Y, ['egress']);
           link(hub, 'egress:wan', LINE.vpn, 'straight dashed', 'VPN');
         } else {
           var pubIp = (where && where.place && where.place.public_address) || '';
           var isp = (where && where.place && (where.place.network || placeName(where.place))) || '';
-          var egressHead = 'WAN Egress' + (pubIp ? ' · ' + pubIp : '') + (isp ? ' (' + isp + ')' : '');
+          // What remote hosts see: your public address, and that no VPN hides it.
+          var egressHead = pubIp ? 'Public ' + pubIp : 'Your public address';
           data['egress:wan'] = {
             id: 'egress:wan', kind: 'egress', role: 'router', icon: 'router',
-            why: 'your public WAN egress IP and ISP seen by remote targets',
-            label: egressHead + '\nno VPN',
+            why: 'your public address and ISP, as remote hosts see them',
+            label: egressHead + '\n' + (isp ? isp + ' · ' : '') + 'no VPN',
             public_address: pubIp,
             isp: isp
           };
@@ -550,8 +577,7 @@
             var hopId = 'hop:' + hop.hop;
             var rttText = (hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
             var where = hopPlace(hop);
-            var hopLabel = 'Hop ' + hop.hop + ': ' + hop.address +
-              (hop.label ? '  (' + hop.label + ')' : '') + '   ' + rttText +
+            var hopLabel = hop.hop + ' · ' + hop.address + ' · ' + rttText +
               (where ? '\n' + where : '');
             data[hopId] = {
               id: hopId, kind: 'hop', role: hop.address === '* * *' ? 'segment' : 'router',
@@ -600,7 +626,7 @@
             data[wafId] = {
               id: wafId, kind: 'waf', role: 'firewall', icon: 'firewall',
               why: 'WAF / CDN proxy detected in front of ' + (hd.address || h),
-              label: 'WAF / CDN · ' + hd.waf_cdn,
+              label: 'WAF · ' + hd.waf_cdn,
               waf: hd.waf_cdn,
               target: hd.address || h
             };
@@ -661,7 +687,7 @@
     }).sort(bySeverity);
     if (rest.length) {
       var y0 = Object.keys(pos).reduce(function (y, id) { return Math.max(y, pos[id].y); }, 0) + 230;
-      title('title:unknown', 'Route not known', rowLeft - 50, y0 - 62, '#6b7178');
+      title('title:unknown', 'No route', rowLeft - 50, y0 - 62, '#6b7178');
       rest.forEach(function (h, i) { put(h, rowLeft + (i % 6) * SUB_STEP, y0 + Math.floor(i / 6) * 170); });
     }
 
@@ -694,6 +720,7 @@
       name: 'preset', fit: false,
       positions: function (node) { return picture.positions[node.id()]; }
     }).run();
+    renderLegend();
     fitDrawing(first);
     if (selected && cy.$id(selected).length) { cy.$id(selected).select(); }
   }
@@ -702,6 +729,7 @@
   // tall drawing makes the card taller rather than unreadably small, and a
   // row of devices wider than the card makes the canvas wider instead: the
   // card then scrolls left and right, opening on the router.
+  var pageZoom = 0;
   function fitDrawing(recentre) {
     var card = byId('card-map'), scroller = byId('scroller'), canvas = byId('cy');
     var all = cy.elements();
@@ -709,8 +737,13 @@
     var bb = all.boundingBox(), zoom = MAX_ZOOM, width = scroller.clientWidth;
     if (!isFinite(bb.x1) || !isFinite(bb.y1)) { return; }
     var bw = Math.max(1, bb.w || 0), bh = Math.max(1, bb.h || 0);
+    var floor = mapExpanded ? Math.min(MAX_ZOOM, pageZoom || READABLE_ZOOM) : 0;
     card.style.height = '';
     card.style.maxHeight = '';
+    if (canvas.style.height) {
+      canvas.style.height = '';
+      cy.resize();
+    }
     var short = Math.ceil(bh * READABLE_ZOOM + 2 * FIT_PADDING) - scroller.clientHeight;
     // Expanded, the card is the window: the drawing shrinks to fit it.
     if (short > 0 && !mapExpanded) {
@@ -725,7 +758,12 @@
       // down to READABLE_ZOOM: past that the row scrolls instead.
       var fitWidth = (scroller.clientWidth - 2 * FIT_PADDING) / bw;
       var fitHeight = (scroller.clientHeight - 2 * FIT_PADDING) / bh;
-      zoom = Math.max(0.05, Math.min(MAX_ZOOM, fitHeight, Math.max(fitWidth, READABLE_ZOOM)));
+      zoom = Math.max(0.05, floor, Math.min(MAX_ZOOM, fitHeight, Math.max(fitWidth, READABLE_ZOOM)));
+      var tall = Math.ceil(bh * zoom + 2 * FIT_PADDING);
+      if (mapExpanded && tall > scroller.clientHeight && canvas.style.height !== tall + 'px') {
+        canvas.style.height = tall + 'px';
+        cy.resize();
+      }
       width = Math.max(scroller.clientWidth, Math.ceil(bw * zoom + 2 * FIT_PADDING));
       if (width > MAX_WIDTH) {
         width = MAX_WIDTH;
@@ -737,45 +775,54 @@
       }
     }
     if (!zoom || !isFinite(zoom)) { return; }
-    var height = scroller.clientHeight;
+    var height = Math.max(scroller.clientHeight, canvas.offsetHeight);
+    if (!mapExpanded) { pageZoom = zoom; }
     cy.viewport({ zoom: zoom, pan: {
       x: (width - bw * zoom) / 2 - bb.x1 * zoom,
       y: (height - bh * zoom) / 2 - bb.y1 * zoom
     } });
     var wide = width > scroller.clientWidth;
-    byId('scroll-hint').hidden = !wide;
+    if (byId('scroll-hint') && byId('scroll-hint').hidden === wide) {
+      byId('scroll-hint').hidden = !wide;
+      legendHint();
+    }
     if (recentre) {
       var router = cy.$('node.side');
       scroller.scrollLeft = router.length ? router.renderedPosition().x - scroller.clientWidth / 2 : 0;
     }
-    if (!wide) { dodgeOverlay(); }
+    dodgeOverlay(wide);
   }
 
   // The location card floats over the drawing's top-right corner. When a
   // device or label would be under it, slide the drawing left, as far as
   // the room on the left allows; the reader can fold the card for the rest.
-  function dodgeOverlay() {
+  function dodgeOverlay(wide) {
     var box = byId('where').firstElementChild;
     if (!box || !box.offsetWidth) { return; }
-    var stage = byId('scroller').getBoundingClientRect(), over = box.getBoundingClientRect();
-    var edge = over.left - stage.left - 12, below = over.bottom - stage.top + 8;
-    var reach = -Infinity, start = Infinity;
-    cy.elements().forEach(function (item) {
-      var bb = item.renderedBoundingBox({ includeLabels: true });
-      if (!isFinite(bb.x1)) { return; }
-      start = Math.min(start, bb.x1);
-      if (bb.y1 < below) { reach = Math.max(reach, bb.x2); }
-    });
-    var overlap = reach - edge;
-    if (!(overlap > 0) || !isFinite(start)) { return; }
-    var shift = Math.min(overlap, Math.max(0, start - 16));
-    if (shift > 0) { cy.panBy({ x: -shift, y: 0 }); }
+    var scroller = byId('scroller');
+    var stage = scroller.getBoundingClientRect(), over = box.getBoundingClientRect();
+    // Where the canvas starts on screen: a wide row is scrolled sideways.
+    var left = stage.left - scroller.scrollLeft;
+    if (!wide) {
+      var edge = over.left - stage.left - 12, below = over.bottom - stage.top + 8;
+      var reach = -Infinity, start = Infinity;
+      cy.elements().forEach(function (item) {
+        var bb = item.renderedBoundingBox({ includeLabels: true });
+        if (!isFinite(bb.x1)) { return; }
+        start = Math.min(start, bb.x1);
+        if (bb.y1 < below) { reach = Math.max(reach, bb.x2); }
+      });
+      var overlap = reach - edge;
+      if (!(overlap > 0) || !isFinite(start)) { return; }
+      var shift = Math.min(overlap, Math.max(0, start - 16));
+      if (shift > 0) { cy.panBy({ x: -shift, y: 0 }); }
+    }
     // Still over a device: fold the card into its pill, unless the reader
     // opened it on purpose. It opens again when the window gets wider.
     if (whereFolded || whereChosen) { return; }
-    var hidden = cy.nodes().some(function (node) {
+    var hidden = cy.nodes().not('.anchor, .asn-box, .ownbar').some(function (node) {
       var bb = node.renderedBoundingBox({ includeLabels: true });
-      return stage.left + bb.x1 < over.right && stage.left + bb.x2 > over.left &&
+      return left + bb.x1 < over.right && left + bb.x2 > over.left &&
         stage.top + bb.y1 < over.bottom && stage.top + bb.y2 > over.top;
     });
     if (hidden) {
@@ -817,13 +864,14 @@
     return [place.city, place.region].filter(Boolean).join(', ') || place.country || 'Unnamed place';
   }
   function placeWords(box, where) {
-    var place = where.place;
-    box.appendChild(el('strong', null, placeName(place)));
-    box.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' + degrees(place.longitude, 'E', 'W')));
+    box.appendChild(el('strong', null, placeName(where.place)));
+  }
+  function coordinates(place) {
+    return degrees(place.latitude, 'N', 'S') + ', ' + degrees(place.longitude, 'E', 'W');
   }
   function estimatedFrom(where) {
     var place = where.place;
-    return 'Estimated from ' + (place.public_address || 'your public address') +
+    return coordinates(place) + '. Estimated from ' + (place.public_address || 'your public address') +
       (place.network ? ' (' + place.network + ')' : '') + ' by ' + where.source + '.';
   }
   // The pictures' licence asks for visible attribution and a link: Sentinel-2
@@ -898,22 +946,23 @@
     svg('path', { d: 'M0 0 C-1.8 -5 -8 -8.6 -8 -15 A8 8 0 1 1 8 -15 C8 -8.6 1.8 -5 0 0 Z',
       fill: '#5b82d9', stroke: '#3c5fae', 'stroke-width': 1 }, pin);
     svg('circle', { cx: 0, cy: -15, r: 3.2, fill: '#ffffff' }, pin);
-    // Under the map: the place, its coordinates, and the credit the
-    // pictures' licence asks for.
+    // Under the map: the place and the credit the pictures' licence asks
+    // for. The coordinates are in the hover.
     var words = card.appendChild(el('div', 'place'));
     words.appendChild(el('strong', null, placeName(place)));
-    words.appendChild(el('span', null, degrees(place.latitude, 'N', 'S') + ', ' +
-      degrees(place.longitude, 'E', 'W')));
     if (extra) { extra(words); }
     words.appendChild(credit(view));
     return card;
   }
 
-  // The selected device's own addresses, under its map.
+  // The selected device's other addresses, under its map: the one it was
+  // selected by is already its title.
   function addressLines(box, target) {
     var known = target.addresses || {};
-    box.appendChild(el('span', 'address', 'IPv4 ' + ((known.ipv4 || []).join(', ') || 'not seen')));
-    box.appendChild(el('span', 'address', 'IPv6 ' + ((known.ipv6 || []).join(', ') || 'not seen')));
+    [['IPv4', known.ipv4], ['IPv6', known.ipv6]].forEach(function (pair) {
+      var others = (pair[1] || []).filter(function (address) { return address !== target.address; });
+      if (others.length) { box.appendChild(el('span', 'address', pair[0] + ' ' + others.join(', '))); }
+    });
   }
   function dbCredit(box, target) {
     if (!target.credit) { return; }
@@ -944,7 +993,7 @@
       var where = { place: target.place, map: target.map,
         source: target.status === 'local' ? 'your own estimate' : 'the location database on this machine' };
       var card = box.appendChild(satellite(where, function (words) {
-        if (target.status === 'local') { words.appendChild(el('span', 'dim', 'On your network, near you')); }
+        if (target.status === 'local') { words.appendChild(el('span', 'dim', 'On your network')); }
         addressLines(words, target);
         dbCredit(words, target);
       }));
@@ -952,14 +1001,24 @@
         ? 'on your network, so it is where you are.' : estimatedFrom(where));
       return;
     }
+    // Nothing to draw: the place or "Location unknown", and why in short.
     var off = box.appendChild(el('div', 'compass off'));
-    off.appendChild(compass());
     var why = off.appendChild(el('div', 'words'));
     why.appendChild(el('strong', null, target.place ? placeName(target.place) : 'Location unknown'));
-    if (target.status === 'local') { why.appendChild(el('span', 'dim', 'On your network, near you')); }
-    if (target.note) { why.appendChild(el('span', 'dim', target.note)); }
+    if (target.status === 'local') { why.appendChild(el('span', 'dim', 'On your network')); }
+    if (target.note) { why.appendChild(unknownWhy(target.note)); }
     addressLines(why, target);
     dbCredit(why, target);
+  }
+
+  // "No database · meow tools": why a place is unknown, the rest a hint.
+  function unknownWhy(text) {
+    if (/database is not installed/i.test(text || '')) {
+      var line = hint(el('span', 'dim', 'No database \u00b7 '), text);
+      line.appendChild(el('code', null, 'meow tools'));
+      return line;
+    }
+    return hint(el('span', 'dim', capital(short(text))), text);
   }
 
   // The location card folds into a pill: when the reader folds it (kept
@@ -997,6 +1056,7 @@
     button.textContent = on ? 'Back (Esc)' : 'Expand';
     cy.resize();
     fitDrawing(true);
+    if (state) { renderWhere(); }
   }
   byId('map-full').addEventListener('click', function () { expandMap(!mapExpanded); });
   document.addEventListener('keydown', function (event) {
@@ -1004,6 +1064,20 @@
   });
   // Extracts the VPN adapter name from `"{name} {cidr}: carries ..."` across
   // Linux/macOS (`tun0`, `utun3`) and Windows (`WireGuard Tunnel`) + IPv6.
+  // What split tunnels carry: "10.10.10.0/23, 10.10.14.0/23", and how
+  // many networks and hosts that is.
+  function vpnCarries(lines) {
+    var texts = [], count = 0;
+    lines.forEach(function (line) {
+      var said = /:\s+carries (.*)$/.exec(String(line || ''));
+      if (!said) { return; }
+      texts.push((lines.length > 1 ? vpnName(line) + ' ' : '') + said[1]);
+      count += (said[1].match(/\d+\.\d+\.\d+\.\d+\/\d+|[0-9a-f:]+:[0-9a-f:]*\/\d+/gi) || []).length;
+      var more = /(\d+) more networks/.exec(said[1]);
+      if (more) { count += Number(more[1]); }
+    });
+    return { text: texts.join('; '), count: count };
+  }
   function vpnName(line) {
     var text = String(line || '');
     var split = /^(.*):\s+(?:carries\b|no route\b)/.exec(text);
@@ -1018,14 +1092,24 @@
     var where = state.location;
     // Drawn again only when something changed, so the pictures load once.
     var target = state.target && state.target.address === selectedAddress() ? state.target : null;
-    var key = JSON.stringify([vpn, where, mapCloser, target, whereFolded]);
+    var key = JSON.stringify([vpn, where, mapCloser, target, whereFolded, mapExpanded]);
     if (key === whereDrawn) { return; }
     whereDrawn = key;
     // Top right: a blue pill when a VPN is up, the round map under it.
     var box = clear(byId('where')).appendChild(el('div', 'where-side'));
+    // Nothing to show (no VPN, no lookup, no selected device): no pill.
+    var vpnAll = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
+      return /default route|all IPv[46]/i.test(line);
+    });
+    var shows = (vpn.length && (vpnAll || mapExpanded)) || target ||
+      (where && (where.status === 'found' || where.status === 'unavailable'));
+    if (!shows) {
+      fitDrawing(false);
+      return;
+    }
     if (whereFolded) {
       box.className = 'where-side folded';
-      if (vpn.length) { box.appendChild(el('span', 'vpn-pill', 'VPN ' + vpn.map(vpnName).join(', '))); }
+      if (vpn.length && mapExpanded) { box.appendChild(el('span', 'vpn-pill', 'VPN ' + vpn.map(vpnName).join(', '))); }
       var place = target && target.place ? placeName(target.place)
         : where && where.status === 'found' && where.place ? placeName(where.place) : 'Location';
       var open = box.appendChild(el('button', 'where-open', place + ' \u25be'));
@@ -1036,14 +1120,14 @@
       return;
     }
     if (vpn.length) {
-      var names = vpn.map(vpnName).join(', ');
-      var all = (where && where.status === 'hidden_by_vpn') || vpn.some(function (line) {
-        return /default route|all IPv[46]/i.test(line);
-      });
-      var pill = box.appendChild(el('span', 'vpn-pill', 'VPN ' + names + (all ? ' \u00b7 location hidden' : '')));
-      pill.title = vpn.join('\n') + '\n' + (all
-        ? 'It carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
-        : 'It carries only some networks, so the location shown is your own connection\'s.');
+      var names = vpn.map(vpnName).join(', '), all = vpnAll;
+      if (all || mapExpanded) {
+        var pill = box.appendChild(el('span', 'vpn-pill', mapExpanded
+          ? 'VPN ' + names + (all ? ' \u00b7 location hidden' : '') : 'Location hidden'));
+        pill.title = vpn.join('\n') + '\n' + (all
+          ? 'It carries all traffic, so no location is shown (a lookup would only find the VPN\'s exit).'
+          : 'It carries only some networks, so the location shown is your own connection\'s.');
+      }
     }
     if (target) {
       targetView(box, target);
@@ -1057,10 +1141,9 @@
       card.title = estimatedFrom(where) + (where.map_error ? ' No map: ' + where.map_error : '');
     } else if (where && where.status === 'unavailable') {
       var off = box.appendChild(el('div', 'compass off'));
-      off.appendChild(compass());
       var why = off.appendChild(el('div', 'words'));
       why.appendChild(el('strong', null, 'Location unknown'));
-      why.appendChild(el('span', 'dim', where.reason));
+      why.appendChild(unknownWhy(where.reason));
     }
     // Something shown: a button folds it into a pill, out of the drawing.
     if (box.firstChild) {
@@ -1073,36 +1156,77 @@
     fitDrawing(false);
   }
 
+  // The legend lists only what is drawn. Its height is kept free under the
+  // drawing, so a legend that wraps on a narrow screen never covers it.
   function renderLegend() {
-    var legend = byId('legend');
-    [['warn', 'CVEs'], ['bad', 'critical, high or exploited']].forEach(function (key) {
-      var item = legend.appendChild(el('span', 'item'));
+    var legend = clear(byId('legend'));
+    var nodes = cy.nodes(), edges = cy.edges();
+    [['warn', 'CVEs', 'A device with CVEs'],
+     ['bad', 'serious CVEs', 'A device with a CVE that is known exploited, critical or high']].forEach(function (key) {
+      if (!nodes.filter('.' + key[0]).length) { return; }
+      var item = legend.appendChild(hint(el('span', 'item'), key[2]));
       item.appendChild(el('span', 'glow ' + key[0]));
       item.appendChild(el('span', null, key[1]));
     });
-    [['solid', 'wired', LINE.ethernet], ['dotted', 'Wi-Fi', LINE.ethernet],
-     ['dashed', 'VPN', LINE.vpn], ['dashed', 'virtual network', LINE.virtual]].forEach(function (key) {
+    var colour = function (edge) { return edge.data('color'); };
+    [['solid', 'wired', LINE.ethernet, function (edge) {
+      return colour(edge) === LINE.ethernet && !edge.hasClass('wifi') && !edge.hasClass('dashed');
+    }], ['dotted', 'Wi-Fi', LINE.ethernet, function (edge) { return edge.hasClass('wifi'); }],
+     ['dashed', 'VPN', LINE.vpn, function (edge) { return colour(edge) === LINE.vpn; }],
+     ['dashed', 'virtual network', LINE.virtual, function (edge) { return colour(edge) === LINE.virtual; }]
+    ].forEach(function (key) {
+      if (!edges.filter(key[3]).length) { return; }
       var item = legend.appendChild(el('span', 'item'));
       var bar = item.appendChild(el('span', 'bar ' + key[0]));
       bar.style.borderColor = key[2];
       item.appendChild(el('span', null, key[1]));
     });
     legend.title = 'Other devices are drawn connected the way you are (assumed: meow only sees your own link).';
-    var more = legend.appendChild(el('span', 'item note', 'Scroll sideways for more'));
+    var more = legend.appendChild(el('span', 'item note', 'Scroll for more'));
     more.id = 'scroll-hint';
     more.hidden = true;
+    var click = legend.appendChild(el('span', 'item note', 'Click a device for details'));
+    click.id = 'click-hint';
+    var hosts = state && state.topology && (state.topology.nodes || []).some(function (node) {
+      return node.data && node.data.kind === 'host';
+    });
+    if (state && !hosts) {
+      var how = legend.appendChild(el('span', 'item note how', 'No hosts yet: '));
+      if (state.mode === 'light') {
+        how.appendChild(el('code', null, 'meow add <file>'));
+        how.appendChild(document.createTextNode(' \u00b7 recon needs '));
+        how.appendChild(el('code', null, 'meow mode mild'));
+      } else {
+        how.appendChild(el('code', null, 'meow recon <target>'));
+        how.appendChild(document.createTextNode(' or '));
+        how.appendChild(el('code', null, 'meow add <file>'));
+      }
+    }
+    legendHint();
+  }
+  function legendHint() {
+    var click = byId('click-hint');
+    if (click) { click.hidden = !!selected || cy.nodes().length < 2; }
+    var legend = byId('legend'), room = (legend.offsetHeight ? legend.offsetHeight + 18 : 10) + 'px';
+    var stage = byId('stage');
+    if (stage.style.getPropertyValue('--legend-h') === room) { return; }
+    stage.style.setProperty('--legend-h', room);
+    if (drawn) {
+      cy.resize();
+      fitDrawing(false);
+    }
   }
 
   // Why a node is drawn the way it is. A hint, not a finding.
   function drawnAs(data) {
     var name = '';
     ROLES.forEach(function (role) { if (role[0] === data.role) { name = role[1]; } });
-    return el('div', 'dim drawn', name && data.why ? 'Shown as ' + name + ': ' + data.why + '.' : '');
+    return name && data.why ? 'Shown as ' + name + ': ' + data.why + '.' : '';
   }
 
   function renderList(target, items, empty, build) {
     clear(target);
-    if (!items.length) { target.appendChild(el('li', 'dim', empty)); }
+    if (!items.length && empty) { target.appendChild(el('li', 'dim', empty)); }
     items.forEach(function (item) { target.appendChild(build(item)); });
   }
 
@@ -1113,7 +1237,8 @@
 
   // A value with a mark after it, for the right-hand side of a row.
   function marked(text, kind) {
-    var holder = el('span', null, text + ' ');
+    var holder = el('span');
+    holder.appendChild(breakable(text + ' '));
     holder.appendChild(mark(kind));
     return holder;
   }
@@ -1269,9 +1394,24 @@
   function reconRank(count) {
     return count.running ? 0 : count.live ? 1 : 2;
   }
+  // A stage's result in the map's words: "2 hops", "1 host up · 4 open
+  // ports", without the count of facts the tools added.
+  var SKIP_DETAIL = 'turned off in config.toml (recon.skip)';
+  function stageResult(detail) {
+    return String(detail || '')
+      .replace(/ \(\d+ new facts?\)/g, '')
+      .replace(/\bintermediate (hops?)\b/g, '$1')
+      .replace(/^(\d+) hosts up, (\d+) open ports/, '$1 hosts up \u00b7 $2 open ports')
+      .replace(/^(\d+) UDP services answered, (\d+) open\|filtered \(no answer, so maybe open\)/,
+        function (all, answered, maybe) {
+          return answered + ' UDP ports answered' + (Number(maybe) ? ' \u00b7 ' + maybe + ' maybe open' : '');
+        })
+      .replace(/\b1 (host|port|hop|neighbour|route|script|endpoint|key|CVE)s\b/g, '1 $1')
+      .replace(/\b1 UDP ports\b/g, '1 UDP port');
+  }
   // "stopped", then why: a reason that starts with the word says it once.
   function statusWords(stage) {
-    var word = STATUS_WORD[stage.status], detail = stage.detail;
+    var word = STATUS_WORD[stage.status], detail = stageResult(stage.detail);
     if (!detail) { return [word]; }
     return detail.slice(0, word.length).toLowerCase() === word ? [apart(detail)] : [word, apart(detail)];
   }
@@ -1280,7 +1420,7 @@
     var words = statusWords(stage), parts = [apart(stage.name), words[0]], spent = took(stage);
     if (figure(stage.progress)) { parts.push(figure(stage.progress)); }
     if (words.length > 1) { parts.push(words[1]); }
-    if (spent !== null) { parts.push('took ' + clockText(spent / 1000)); }
+    if (spent !== null) { parts.push(clockText(spent / 1000)); }
     return parts.join(' \u00b7 ');
   }
 
@@ -1310,10 +1450,11 @@
     var parts = [], of = count.done + ' of ' + total + ' done';
     var problem = entry.rank === 1 ? first.interrupted || first.failed : first.failed;
     if (now) {
-      parts.push('stage ' + (model.running + 1) + ' of ' + total);
+      parts.push((model.running + 1) + '/' + total);
       if (count.failed) { parts.push(count.failed + ' failed'); }
-      var said = figure(now.progress);
-      parts.push(apart(now.name) + (said ? ' \u00b7 ' + said : ' running'));
+      // "ports 3%": the tool's own name for its scan is the hint's.
+      var said = now.progress.percent || figure(now.progress);
+      parts.push(apart(now.name) + (said ? (now.progress.percent ? ' ' : ' \u00b7 ') + said : ' running'));
       model.note = problem ? describeStage(problem) : '';
     } else if (entry.rank === 1) {
       if (count.done) { parts.push(of); }
@@ -1340,6 +1481,9 @@
       model.note = problem ? describeStage(problem) : '';
     }
     model.main = parts.join(' \u00b7 ');
+    model.spoken = now ? model.main.replace(/^(\d+)\/(\d+)/, 'stage $1 of $2') : model.main;
+    // A run that is over keeps its bar; the stage names are in its hints.
+    model.over = entry.rank === 2;
     var settled = over + (now && now.progress.part ? now.progress.part : 0);
     model.percent = total ? Math.round(100 * settled / total) : 0;
     return model;
@@ -1536,12 +1680,13 @@
     view.eta = now ? now.progress.eta : null;
     view.etaAt = reconArrived;
     setText(view.main, model.main);
+    view.item.classList.toggle('over', model.over);
     setText(view.queued, model.others ? ' ' + model.others : '');
     var meter = model.percent + ' ' + model.main;
     if (view.meterText !== meter) {
       view.meterText = meter;
       view.meter.setAttribute('aria-valuenow', String(model.percent));
-      view.meter.setAttribute('aria-valuetext', model.main);
+      view.meter.setAttribute('aria-valuetext', model.spoken);
     }
     paintNote(view);
     paintStages(view);
@@ -1552,9 +1697,14 @@
   function paintStages(view, opening) {
     var model = view.model;
     if (!(opening || view.more.open) || !model) { return; }
+    // The reason most skipped stages share is said once, above them.
+    var offByConfig = model.stages.filter(function (stage) {
+      return stage.status === 'skipped' && stage.detail === SKIP_DETAIL;
+    }).length;
     var lines = model.stages.map(function (stage) {
-      var words = statusWords(stage), spent = took(stage);
-      if (spent !== null) { words.push('took ' + clockText(spent / 1000)); }
+      var words = stage.status === 'skipped' && stage.detail === SKIP_DETAIL ? [STATUS_WORD.skipped]
+        : statusWords(stage), spent = took(stage);
+      if (spent !== null) { words.push(clockText(spent / 1000)); }
       return { stage: stage, text: words.join(' \u00b7 ') };
     });
     var facts = [model.id ? '#' + model.id : '', model.mode, model.when].filter(Boolean).join(' \u00b7 ');
@@ -1565,12 +1715,17 @@
     view.lines = sig;
     clear(view.panel);
     if (facts) { view.panel.appendChild(el('div', 'dim', facts)); }
+    if (offByConfig) {
+      view.panel.appendChild(el('div', 'dim', offByConfig + ' skipped \u00b7 off in config.toml (recon.skip)'));
+    }
     var list = view.panel.appendChild(el('div', 'recon-lines'));
-    lines.forEach(function (line) {
+    lines.forEach(function (line, index) {
       var label = el('span', 'label');
       label.appendChild(el('span', 'recon-cue ' + line.stage.status, STATUS_CUE[line.stage.status]));
       label.appendChild(document.createTextNode(' ' + line.stage.name));
-      list.appendChild(row(label, line.text, line.stage.status));
+      var again = index > 0 && lines[index - 1].text === line.text && line.text.indexOf(' \u00b7 ') > 0;
+      var shown = list.appendChild(row(label, again ? STATUS_WORD[line.stage.status] : line.text, line.stage.status));
+      if (again) { shown.title = line.text; }
     });
     if (model.cut > 0) { view.panel.appendChild(el('div', 'dim', model.cut + ' more stages not shown')); }
     if (model.olderCount) {
@@ -1727,7 +1882,7 @@
       top.forEach(place(list));
       if (rest.length || hidden) {
         var more = list.appendChild(el('li', 'recon-rest')).appendChild(fold('recon-rest', 'recon-fold', false));
-        more.appendChild(el('summary', null, (rest.length + hidden) + ' more'));
+        more.appendChild(el('summary', null, '+' + (rest.length + hidden) + ' recon'));
         var inner = more.appendChild(el('ul'));
         rest.forEach(place(inner));
         if (hidden) { inner.appendChild(el('li', 'dim', hidden + ' not shown')); }
@@ -1753,50 +1908,135 @@
     return null;
   }
 
-  // "This machine": address -> type -> OS -> version, then a row per
-  // subject. The long tables (routes, neighbours, every interface) are
-  // cards of their own further down the page.
+  // "This machine": only what is known. Its system in one row, a row per
+  // interface (with its address and gateway), the ports it listens on. The
+  // long tables (routes, neighbours, every interface) fold away further
+  // down the page. What could not be read is a small hint.
   var machineDrawn = '';
+  // The words the session uses for what it does not know.
+  var UNKNOWN = ['no address', 'computer', 'OS not known', 'version not known'];
+
+  // What the tables are read with, by the words of the command.
+  var READS = [[/link|addr|ifconfig|ipconfig|interface/i, 'interfaces'], [/route/i, 'routes'],
+    [/neigh|arp/i, 'neighbours'], [/^ss\b|netstat|lsof|listen/i, 'ports']];
+  function unreadNote(lines) {
+    var missing = [], failed = [], unread = [], other = [];
+    lines.forEach(function (line) {
+      var said = /^`([^`]+)` (is not installed|failed)/.exec(line);
+      if (!said) { other.push(line.replace(/`/g, '')); return; }
+      var tool = said[1].split(' ')[0], into = said[2] === 'failed' ? failed : missing;
+      if (into.indexOf(tool) < 0) { into.push(tool); }
+      if (into === failed) {
+        READS.forEach(function (read) {
+          if (read[0].test(said[1]) && unread.indexOf(read[1]) < 0) { unread.push(read[1]); }
+        });
+      }
+    });
+    var note = el('p', 'note');
+    var tools = function (names) {
+      names.forEach(function (name, index) {
+        if (index) { note.appendChild(document.createTextNode(', ')); }
+        note.appendChild(el('code', null, name));
+      });
+    };
+    if (missing.length) {
+      tools(missing);
+      note.appendChild(document.createTextNode(' not installed'));
+    }
+    if (failed.length) {
+      if (missing.length) { note.appendChild(document.createTextNode(' \u00b7 ')); }
+      tools(failed);
+      note.appendChild(document.createTextNode(' failed' + (unread.length ? ': ' + unread.join(', ') + ' not read' : '')));
+    }
+    if (!missing.length && !failed.length) { note.textContent = capital(short(other.join(' '))); }
+    return note;
+  }
 
   function renderMachine() {
     var machine = state.machine || { vpn: [], sections: [] };
     var vpn = byId('vpn');
-    vpn.textContent = machine.vpn.length ? 'VPN ' + machine.vpn.map(vpnName).join(', ') : 'no VPN';
-    vpn.className = machine.vpn.length ? 'badge ok' : 'badge';
-    vpn.title = machine.vpn.join('\n') || 'No VPN interface with an address was found.';
+    if (machine.vpn.length) {
+      vpn.hidden = false;
+      vpn.textContent = 'VPN ' + machine.vpn.map(vpnName).join(', ');
+      vpn.className = 'badge ok';
+      vpn.title = machine.vpn.join('\n');
+    } else {
+      var seen = state.location && state.location.place && state.location.place.public_address;
+      vpn.hidden = state.mode === 'light';
+      vpn.textContent = 'no VPN';
+      vpn.className = 'badge warn';
+      vpn.title = 'Hosts you scan see ' + (seen || 'your real address');
+    }
 
     var key = JSON.stringify(machine);
     if (key === machineDrawn) { return; }
     machineDrawn = key;
     var box = clear(byId('machine'));
-    var parts = (machine.headline || '').split(' -> ');
-    ['Address', 'Machine', 'System', 'Version'].forEach(function (label, index) {
-      box.appendChild(row(label, parts[index] || 'not known'));
+    var parts = (machine.headline || '').split(' -> ').map(function (part, index) {
+      return part === UNKNOWN[index] ? '' : part;
     });
+    var address = parts[0], interfaces = [], hints = [];
+    // "MacBook Pro · macOS 15.1", "Ubuntu 24.04"
+    var system = [parts[1], [parts[2], parts[3]].filter(Boolean).join(' ')].filter(Boolean).join(' \u00b7 ');
     var tables = clear(byId('machine-cards'));
     machine.sections.forEach(function (section) {
-      var lines = el('div');
-      section.lines.forEach(function (line) {
-        lines.appendChild(el('div', section.warn ? 'warn-text' : null, line));
-      });
-      if (section.open) {
-        // One short value; the sentence it came from is the hint.
-        var text = section.lines.join(' ');
-        var tools = (text.match(/`([^`]+)`/g) || []).map(function (t) { return t.slice(1, -1); });
-        var value = /not installed/.test(text) && tools.length ? tools.join(', ') + ' not installed'
-          : text.length > 32 ? short(text) : text;
-        box.appendChild(hint(row(section.title, value, section.warn ? 'warn-text' : null), section.lines.join('\n')));
+      if (section.open && section.title === 'Interfaces') {
+        section.lines.forEach(function (line) {
+          // "eth0  192.168.1.5/24  gateway 192.168.1.1"
+          var cells = line.split(/\s{2,}/);
+          if (/^unknown:/.test(line)) { return; }
+          if (/^not connected:/.test(line)) {
+            interfaces.push(hint(row('Network', marked('not connected', 'warn')), line));
+            return;
+          }
+          if (cells.length < 2) { interfaces.push(row('Interface', line)); return; }
+          if (address && cells[1].split('/')[0] === address) { address = ''; }
+          interfaces.push(row(cells[0], cells.slice(1).join(' \u00b7 ')));
+        });
         return;
       }
-      // A table with nothing in it is left out.
+      if (section.open && section.title === 'Open ports') {
+        section.lines.forEach(function (line) {
+          var local = /^this machine only: (.*)$/.exec(line);
+          if (local) {
+            interfaces.push(hint(row('Local only', local[1]), 'Listening on this machine only'));
+          } else if (line !== 'none listening') {
+            interfaces.push(hint(row('Open ports', line), 'Other machines can reach these'));
+          }
+        });
+        return;
+      }
+      if (section.open && section.title === 'Could not be read') {
+        // A hint, not a warning: the tables above are then unread, not
+        // empty. "ip, ss not installed", "ip failed: interfaces, routes not read".
+        hints.push(hint(unreadNote(section.lines), 'Could not be read:\n' +
+          section.lines.join('\n').replace(/`/g, '')));
+        return;
+      }
+      if (section.open) {
+        // One short value; the sentence it came from is the hint.
+        var all = section.lines.join(' ');
+        interfaces.push(hint(row(section.title, all.length > 32 ? short(all) : all,
+          section.warn ? 'warn-text' : null), section.lines.join('\n')));
+        return;
+      }
+      // A table with nothing in it is left out; the others fold away.
       if (/\(0\)$/.test(section.title) || !section.lines.length ||
           (section.lines.length === 1 && /^none$/i.test(section.lines[0]))) {
         return;
       }
-      var table = tables.appendChild(card(section.title));
-      lines.className = 'lines';
-      table.appendChild(lines);
+      var named = /^(.*?) \((.+)\)$/.exec(section.title) || [null, section.title, ''];
+      var folded = tables.appendChild(fold('machine:' + named[1], 'card fold-card', false));
+      var summary = folded.appendChild(el('summary'));
+      var title = summary.appendChild(el('h2', null, named[1] + ' '));
+      title.appendChild(el('span', 'count', named[2]));
+      var lines = folded.appendChild(el('div', 'lines'));
+      section.lines.forEach(function (line) { lines.appendChild(el('div', null, line)); });
     });
+    if (address) { box.appendChild(row('Address', address)); }
+    if (system) { box.appendChild(row('System', system)); }
+    interfaces.forEach(function (line) { box.appendChild(line); });
+    hints.forEach(function (line) { box.appendChild(line); });
     if (machine.observed_utc) {
       box.title = 'Read from this machine at ' + machine.observed_utc.slice(11, 19) +
         ' UTC. Nothing was sent to find this out.';
@@ -1820,6 +2060,7 @@
     renderCves();
     renderWhere();
     renderAiPanel();
+    legendHint();
   }
 
   var MULTI_TLDS = ['co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au',
@@ -1835,6 +2076,14 @@
       return parts[parts.length - 3] + '.' + lastTwo;
     }
     return lastTwo;
+  }
+
+  // The name a host goes by: the first it was found under, else the one
+  // the drawing picked. Empty when it has none but its address.
+  function hostName(host, data) {
+    var name = ((host && host.hostnames) || [])[0] || (data && data.primary_hostname) || '';
+    var address = (host && host.address) || (data && data.address);
+    return name && name !== address ? name : '';
   }
 
   function associatedNamesFor(host, data) {
@@ -1864,94 +2113,82 @@
     return { domains: domains, hosts: hostNames };
   }
 
-  // Associated Hosts: Domains (e.g. nmap.org) and Hosts (e.g. scanme.nmap.org).
+  // Hosts: one row per host, with what it asks of you. The rows are
+  // hidden while a host is selected (its own card says all of it) and the
+  // map says how to get hosts while there are none; the names that were
+  // only mentioned stay listed either way.
   function renderHosts() {
     var list = clear(byId('hosts'));
+    var mentioned = state.topology.mentioned || [];
     var hosts = state.topology.nodes.filter(function (node) { return node.data.kind === 'host'; });
     hosts.sort(function (a, b) { return sortKey(a.data) < sortKey(b.data) ? -1 : 1; });
-    if (!hosts.length) {
-      list.appendChild(hint(el('p', 'note', 'No hosts yet.'), 'Work in the session shell, or import a scan with `meow add <file>`.'));
-    } else {
-      var selData = selectedNodeData();
-      var onlyAddr = selData && selData.kind === 'host' && selData.address ? selData.address : null;
-      var targetNodes = onlyAddr
-        ? hosts.filter(function (n) { return n.data.address === onlyAddr; })
-        : hosts;
-
-      var domainMap = table();
-      var hostRows = [];
-      targetNodes.forEach(function (node) {
-        var d = node.data;
-        var hObj = (state.graph && state.graph.hosts && own(state.graph.hosts, d.address)) || null;
-        var assoc = associatedNamesFor(hObj, d);
-        assoc.domains.forEach(function (dom) {
-          if (!own(domainMap, dom)) { domainMap[dom] = []; }
-          if (domainMap[dom].indexOf(d) < 0) { domainMap[dom].push(d); }
-        });
-        if (assoc.hosts.length) {
-          assoc.hosts.forEach(function (hName) {
-            hostRows.push({ label: hName, data: d });
-          });
-        } else {
-          hostRows.push({ label: d.address, data: d });
-        }
+    var selData = selectedNodeData();
+    if (selData && selData.kind === 'host') { hosts = []; }
+    byId('card-hosts').hidden = !hosts.length && !mentioned.length;
+    var labels = [], domains = table();
+    hosts.forEach(function (node) {
+      var d = node.data;
+      var hObj = (state.graph && state.graph.hosts && own(state.graph.hosts, d.address)) || null;
+      var assoc = associatedNamesFor(hObj, d);
+      var name = hostName(hObj, d);
+      labels.push(name || d.address);
+      assoc.domains.forEach(function (dom) {
+        if (!own(domains, dom)) { domains[dom] = d; }
       });
-
-      var domainKeys = Object.keys(domainMap).sort();
-      list.appendChild(el('h3', null, 'Domains'));
-      if (domainKeys.length) {
-        domainKeys.forEach(function (dom) {
-          var linkedNodes = domainMap[dom];
-          var firstNode = linkedNodes[0];
-          var domBtn = el('button', 'link', dom);
-          domBtn.addEventListener('click', function () { select(firstNode.id); });
-          var addrs = linkedNodes.map(function (n) { return n.address; }).join(', ');
-          var domLine = list.appendChild(row(domBtn, addrs, 'dim'));
-          if (firstNode.id === selected) { domLine.className += ' current'; }
-        });
-      } else {
-        list.appendChild(el('div', 'dim', 'None resolved'));
+      var button = el('button', 'link', name || d.address);
+      button.type = 'button';
+      button.addEventListener('click', function () { select(d.id); });
+      var facts = [];
+      if (name) { facts.push(d.address); }
+      facts.push(d.open_ports + (d.open_ports === 1 ? ' port' : ' ports'));
+      var kind = 'ok';
+      if (d.cves) {
+        facts.push(cveWords({ total: d.cves, kev: d.kev || 0 }));
+        kind = d.serious_cves ? 'bad' : 'warn';
       }
-
-      list.appendChild(el('h3', null, 'Hosts'));
-      hostRows.forEach(function (entry) {
-        var data = entry.data;
-        var name = el('button', 'link', entry.label);
-        name.addEventListener('click', function () { select(data.id); });
-        var facts = [];
-        if (entry.label !== data.address) { facts.push(data.address); }
-        facts.push(data.open_ports + (data.open_ports === 1 ? ' port' : ' ports'));
-        var kind = 'ok';
-        if (data.cves) {
-          facts.push(data.cves + (data.cves === 1 ? ' CVE' : ' CVEs'));
-          kind = data.serious_cves ? 'bad' : 'warn';
-        }
-        var line = list.appendChild(row(name, marked(facts.join(' · '), kind)));
-        if (data.id === selected) { line.className += ' current'; }
+      // A line breaks only between facts, never inside "5 CVEs".
+      facts = facts.map(function (fact) { return fact.replace(/ /g, '\u00a0'); });
+      var line = list.appendChild(hint(row(button, marked(facts.join(' \u00b7 '), kind)),
+        assoc.hosts.length > 1 ? assoc.hosts.join('\n') : ''));
+      line.className += ' host-row';
+      if (d.id === selected) { line.className += ' current'; }
+    });
+    // A domain no name above shows (a host listed by its address): a
+    // button to its first host.
+    var more = Object.keys(domains).filter(function (dom) {
+      return !labels.some(function (label) { return label === dom || label.slice(-dom.length - 1) === '.' + dom; });
+    }).sort();
+    if (more.length) {
+      var links = el('span');
+      more.forEach(function (dom, index) {
+        if (index) { links.appendChild(document.createTextNode(', ')); }
+        var go = links.appendChild(el('button', 'link', dom));
+        go.type = 'button';
+        go.addEventListener('click', function () { select(domains[dom].id); });
       });
+      list.appendChild(row('Domains', links));
     }
 
     // Names that were only printed in the session shell or a log, usually
     // inside a URL. Nothing was seen on them and no address is known, so
     // they are listed here and not drawn as machines.
-    var mentioned = state.topology.mentioned || [];
     if (mentioned.length) {
       var names = list.appendChild(fold('mentioned', 'names', false));
-      names.appendChild(hint(el('summary', null, 'Names only mentioned (' + mentioned.length + ')'),
+      names.appendChild(hint(el('summary', null, 'Only mentioned (' + mentioned.length + ')'),
         'Seen in the terminal, a log or the certificate logs. meow has not connected to them.'));
       mentioned.forEach(function (entry) {
-        var what = (entry.ports || []).join(', ') || 'no port';
-        if (entry.paths) { what += ' · ' + entry.paths + (entry.paths === 1 ? ' path' : ' paths'); }
+        var what = (entry.ports || []).join(', ');
+        if (entry.paths) { what += (what ? ' \u00b7 ' : '') + entry.paths + (entry.paths === 1 ? ' path' : ' paths'); }
         // How the name answers in DNS: one only a wildcard answers for may
         // not exist, so it is faded.
         if (entry.dns_status === 'wildcard') {
-          var faded = names.appendChild(row(entry.name, marked('wildcard only, may not exist', 'warn')));
+          var faded = names.appendChild(row(entry.name, marked('wildcard only', 'warn')));
           faded.className += ' faded';
-          faded.title = entry.dns || '';
+          faded.title = 'Only a wildcard answers: it may not exist. ' + (entry.dns || '');
           return;
         }
-        if (entry.dns_status === 'gone') { what = 'no DNS record now · ' + what; }
-        if (entry.dns_status === 'resolves') { what = (entry.dns || 'resolves') + ' · ' + what; }
+        if (entry.dns_status === 'gone') { what = 'no DNS record' + (what ? ' \u00b7 ' + what : ''); }
+        if (entry.dns_status === 'resolves') { what = (entry.dns || 'resolves') + (what ? ' \u00b7 ' + what : ''); }
         names.appendChild(row(entry.name, what, 'dim'));
       });
     }
@@ -1963,8 +2200,9 @@
     renderCves();
 
     var notices = (state.notices || []).slice(-25).reverse();
-    byId('notices-count').textContent = notices.length ? '(' + notices.length + ')' : '';
-    renderList(byId('notices'), notices, 'Nothing yet.', function (notice) {
+    byId('card-notices').hidden = !notices.length;
+    byId('notices-count').textContent = notices.length ? String(notices.length) : '';
+    renderList(byId('notices'), notices, '', function (notice) {
       var item = el('li');
       item.appendChild(el('span', 'dim', String(notice.at || '').slice(11, 19) + ' '));
       item.appendChild(document.createTextNode(String(notice.text || '')));
@@ -2003,16 +2241,16 @@
     return counts;
   }
 
-  // "3 CVEs (1 known exploited)"
+  // "3 CVEs · 1 exploited"
   function cveWords(counts) {
     if (!counts.total) { return ''; }
     return counts.total + (counts.total === 1 ? ' CVE' : ' CVEs') +
-      (counts.kev ? ' (' + counts.kev + ' known exploited)' : '');
+      (counts.kev ? ' · ' + counts.kev + ' exploited' : '');
   }
 
   // One CVE: its ID, rating and title on a line that unfolds into the
   // release that fixes it.
-  function cveItem(address, advisory, entry, withHost) {
+  function cveItem(address, advisory, entry) {
     var kind = entry.serious ? 'bad' : 'warn';
     var item = fold('cve:' + address + ':' + advisory.id, 'item', false);
     var summary = item.appendChild(el('summary'));
@@ -2020,7 +2258,9 @@
     var line = summary.appendChild(el('span', 'what'));
     line.appendChild(el('span', 'cve-id', advisory.id));
     line.appendChild(el('span', 'sev ' + kind + '-text', entry.severity || 'unrated'));
-    if (advisory.kev) { line.appendChild(el('span', 'kev', 'known exploited')); }
+    if (advisory.kev) {
+      line.appendChild(hint(el('span', 'kev', 'exploited'), 'Known exploited: listed in the CISA KEV catalog'));
+    }
     var title = line.appendChild(el('span', 'title', advisory.title));
     title.title = advisory.title;
     if (advisory.fixed_in) {
@@ -2028,44 +2268,44 @@
     } else if (advisory.last_affected) {
       item.appendChild(row('Affected up to', advisory.last_affected));
     }
-    // The group heading names the software and version; a match on the
-    // name alone is less sure, so it is said.
+    // The group names the software and version; a match on the name alone
+    // is less sure, so it is said.
     var words = /^keywordSearch=(.*)$/.exec(String(advisory.matched || ''));
-    if (words) { item.appendChild(row('Matched on', 'name search: ' + words[1])); }
-    if (withHost) {
-      var look = item.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Show host'));
-      look.addEventListener('click', function () { select('host:' + address); });
-    }
+    if (words) { item.appendChild(hint(row('Matched on', 'name only: ' + words[1]), 'No version was matched')); }
     return item;
   }
 
-  // The CVEs found from one piece of software: "nginx 1.18.0 · 443/tcp ·
-  // fixed in 1.20.1", then each CVE, the most urgent first. At most
-  // `budget.left` of them: the rest are counted.
-  function cveGroup(address, host, group, open, withHost, budget) {
+  // What to do about the CVEs of one piece of software: "Update nginx
+  // 1.18.0 to 1.20.1 or later, or close 443/tcp", "3 CVEs · 1 exploited"
+  // under it. It unfolds into each CVE, the most urgent first: at most
+  // `budget.left` of them, the rest are counted.
+  function cveGroup(address, host, group, fix, open, budget) {
     var entries = group.cves || [];
     var serious = entries.some(function (entry) { return entry.serious; });
     var key = 'cves:' + address + ':' + group.software + ':' + (group.port || '');
     var section = fold(key, 'group ' + (serious ? 'bad' : 'warn'), open);
     var summary = section.appendChild(el('summary'));
-    var parts = [group.software];
-    if (group.port) { parts.push(group.port); }
-    if (group.fix) { parts.push(group.fix); }
-    summary.appendChild(el('span', 'name', parts.join(' · ')));
-    summary.appendChild(el('span', 'dim', ' ' + cveWords({ total: entries.length, kev: group.kev || 0 })));
-    // Said once on the host's own list, not again for each host of the overview.
-    if (group.note && !withHost) { section.appendChild(el('p', 'note', group.note.replace(/`/g, '') + '.')); }
+    var action = 'Update ' + group.software + (fix && fix.target ? ' to ' + fix.target
+      : group.fix ? ' (' + group.fix + ')' : '');
+    if (group.port) { action += ', or close ' + group.port; }
+    summary.appendChild(el('span', 'name', action));
+    summary.appendChild(el('span', 'sub dim', cveWords({ total: entries.length, kev: group.kev || 0 })));
+    if (group.note) {
+      // "Ubuntu backports security fixes ...: the installed package may
+      // already have the fix": its first half, the rest in the hover.
+      var note = String(group.note).replace(/`/g, '');
+      section.appendChild(hint(el('p', 'note', short(note)), note + '.'));
+    }
     var known = table();
     (host.advisories || []).forEach(function (advisory) { known[advisory.id] = advisory; });
     var shown = entries.slice(0, Math.max(0, budget.left));
     budget.left -= shown.length;
     shown.forEach(function (entry) {
       var advisory = own(known, entry.id);
-      if (advisory) { section.appendChild(cveItem(address, advisory, entry, withHost)); }
+      if (advisory) { section.appendChild(cveItem(address, advisory, entry)); }
     });
     if (entries.length > shown.length) {
-      section.appendChild(el('p', 'note', '+' + (entries.length - shown.length) +
-        (withHost ? ' more: select the host to see them' : ' more in the report')));
+      section.appendChild(el('p', 'note', '+' + (entries.length - shown.length) + ' more in the report'));
     }
     return section;
   }
@@ -2074,7 +2314,6 @@
   var CVES_PER_HOST = 200;
   var CVES_IN_OVERVIEW = 80;
   var HOSTS_IN_OVERVIEW = 20;
-  var FIXES_IN_OVERVIEW = 20;
 
   // Whether CVEs could be looked up for a host: a version seen on a port.
   function hasVersions(host) {
@@ -2085,22 +2324,28 @@
     });
   }
 
-  // The CVEs card: what to update first, then the CVEs of each host by
-  // the software and version they were found from. For the selected host,
-  // or for every host when none is selected.
+  // Why a host shows no CVEs, in two or three words.
+  function noCves(host) {
+    if (state.cve_lookups === false) { return 'CVE lookups off'; }
+    if (host && !hasVersions(host)) { return 'No versions seen yet'; }
+    return 'No CVEs found';
+  }
+
+  // The CVEs card: what to update, one line per piece of software (one
+  // update usually fixes every CVE found from it), each unfolding into its
+  // CVEs. Under each host's address when no host is selected, the most
+  // urgent host first; in the host's own tab when one is.
   function renderCves() {
     var box = clear(byId('cves'));
     var selData = selectedNodeData();
     var only = selData && selData.address ? selData.address : null;
-    byId('cves-title').textContent = only ? 'CVEs for ' + only : 'CVEs';
-    // What to do comes first: one line per piece of software, since one
-    // update usually fixes every CVE found from it.
+    // In the host's tab, the tab is its title.
+    byId('cves-title').hidden = !!only;
     var hostsMap = (state.graph && state.graph.hosts) || {};
     var byHost = state.cves || {};
     var addresses = Object.keys(byHost).filter(function (address) {
       return (!only || address === only) && own(hostsMap, address);
     });
-    // The host with the most known exploited, then the most serious, CVEs first.
     addresses.sort(function (a, b) {
       var ca = cveCounts(a), cb = cveCounts(b);
       return (cb.kev - ca.kev) || (cb.serious - ca.serious) || (cb.total - ca.total) || (a < b ? -1 : a > b ? 1 : 0);
@@ -2110,63 +2355,47 @@
     ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
       (iface.addresses || []).forEach(function (cidr) { mine[cidr.split('/')[0]] = true; });
     });
-    // In the order of the CVEs below it.
-    var plan = [];
-    addresses.forEach(function (address) {
-      (own(fixes, address) || []).forEach(function (fix) { plan.push({ address: address, fix: fix }); });
-    });
-    var planLeft = only ? 0 : Math.max(0, plan.length - FIXES_IN_OVERVIEW);
-    if (planLeft) { plan = plan.slice(0, FIXES_IN_OVERVIEW); }
-    if (plan.length) {
-      var todo = box.appendChild(el('div', 'todo'));
-      todo.appendChild(el('h3', null, 'What to update'));
-      var elsewhere = false;
-      plan.forEach(function (entry) {
-        var fix = entry.fix;
-        var here = !!mine[entry.address];
-        elsewhere = elsewhere || !here;
-        var line = todo.appendChild(el('div', 'fix'));
-        line.appendChild(el('div', null, fix.action));
-        line.appendChild(el('div', 'dim', 'On ' + entry.address + (here ? ' (this machine)' : ' (another machine, not this one)') +
-          ' · fixes ' + cveWords({ total: fix.advisories, kev: fix.kev })));
-      });
-      if (planLeft) { todo.appendChild(el('p', 'note', '+' + planLeft + ' more: select a host to see its own')); }
-      todo.appendChild(hint(el('p', 'note', 'Found by version number. Rescan after updating.'),
-        (elsewhere ? 'An update has to be made on the machine named, by whoever looks after it. ' : '') +
-        'A system that takes security updates from its vendor often has the fix under the same version number.'));
-    }
+    // The card shows once there are hosts.
+    byId('card-cves').hidden = !Object.keys(hostsMap).length;
     // Every host's CVEs would be thousands of rows on a large network:
     // the overview shows the first ones, a selected host its own.
     var budget = { left: only ? CVES_PER_HOST : CVES_IN_OVERVIEW };
     var hostsLeft = only ? 0 : Math.max(0, addresses.length - HOSTS_IN_OVERVIEW);
+    var elsewhere = false;
     addresses.slice(0, only ? 1 : HOSTS_IN_OVERVIEW).forEach(function (address) {
       var host = own(hostsMap, address);
+      var here = !!mine[address];
+      elsewhere = elsewhere || !here;
       if (!only) {
         var head = box.appendChild(el('h3', 'cve-host'));
         var names = host.hostnames || [];
-        var link = head.appendChild(el('button', 'link', names.length ? names[0] + ' (' + address + ')' : address));
+        var link = head.appendChild(el('button', 'link', address));
         link.type = 'button';
         link.addEventListener('click', function () { select('host:' + address); });
-        head.appendChild(el('span', 'dim', ' ' + cveWords(cveCounts(address))));
+        if (names.length) { head.appendChild(el('span', 'dim', names[0])); }
+        if (here) { head.appendChild(el('span', 'dim', 'this machine')); }
       }
-      (own(byHost, address) || []).forEach(function (group, index) {
+      var plan = own(fixes, address) || [];
+      (own(byHost, address) || []).forEach(function (group) {
+        var fix = plan.filter(function (item) {
+          return item.software === group.software && (item.port || null) === (group.port || null);
+        })[0];
         var serious = (group.cves || []).some(function (entry) { return entry.serious; });
-        box.appendChild(cveGroup(address, host, group, (index === 0 || serious) && budget.left > 0, !only, budget));
+        box.appendChild(cveGroup(address, host, group, fix, !!only && serious && budget.left > 0, budget));
       });
     });
     if (hostsLeft) {
-      box.appendChild(el('p', 'note', '+' + hostsLeft + (hostsLeft === 1 ? ' more host' : ' more hosts') +
-        ' with CVEs: select one to see them, or see the report'));
+      box.appendChild(el('p', 'note', '+' + hostsLeft + (hostsLeft === 1 ? ' host' : ' hosts') +
+        ' with CVEs in the report'));
     }
-    if (!addresses.length) {
-      var empty = only ? 'No CVEs found for this host.' : 'No CVEs found yet.';
-      if (state.cve_lookups === false) {
-        empty = 'CVE lookups are off.';
-      } else if (only && !hasVersions(own(hostsMap, only))) {
-        empty = 'No software version seen yet.';
-      }
-      box.appendChild(hint(el('p', 'note', empty),
-        'CVEs are looked up from the software and version seen on each port.'));
+    if (addresses.length) {
+      box.appendChild(hint(el('p', 'note', 'Found by version number. Rescan after updating.'),
+        (elsewhere ? 'An update has to be made on the machine named, by whoever looks after it. ' : '') +
+        'A system that takes security updates from its vendor often has the fix under the same version number.'));
+    } else {
+      box.appendChild(hint(el('p', 'note', noCves(only ? own(hostsMap, only) : null)),
+        'CVEs are looked up from the software and version seen on each port.' +
+        (state.cve_lookups === false ? ' Turn lookups on with meow setup.' : '')));
     }
   }
 
@@ -2186,7 +2415,7 @@
   // found. "Check now" makes one connection to each of a few known open
   // ports; light mode sends nothing, so there it is off.
   function statusCard(host) {
-    var box = card('Server Status');
+    var box = card('Status');
     var check = own((state && state.checks) || {}, host.address) || null;
     var facts = (host.facts || []).slice();
     Object.keys(host.ports || {}).forEach(function (key) {
@@ -2207,33 +2436,33 @@
       return port && port.state === 'open';
     }).length;
 
-    var status, kind;
-    if (check && check.status === 'checking') { status = 'checking\u2026'; kind = 'info'; }
-    else if (check && check.status === 'up') { status = 'up'; kind = 'ok'; }
-    else if (check && check.status === 'down') { status = 'not answering'; kind = 'bad'; }
-    else if (seenUp) { status = 'up when last scanned'; kind = 'ok'; }
-    else if (openCount) { status = 'answered on open ports'; kind = 'ok'; }
-    else { status = 'not checked yet'; kind = 'warn'; }
-    box.appendChild(row('Status', marked(status, kind)));
+    var status, kind, why = '';
+    if (check && check.status === 'checking') { status = 'checking…'; kind = 'info'; }
+    else if (check && check.status === 'up') { status = 'up'; kind = 'ok'; why = 'It answered Check now'; }
+    else if (check && check.status === 'down') { status = 'not answering'; kind = 'bad'; why = 'It did not answer Check now'; }
+    else if (seenUp) { status = 'up'; kind = 'ok'; why = 'Up when last scanned'; }
+    else if (openCount) { status = 'up'; kind = 'ok'; why = 'It answered on its open ports'; }
+    else { status = 'not checked'; kind = 'warn'; }
+    box.appendChild(hint(row('Host', marked(status, kind)), why));
     if (seenUp) {
-      var seenRow = box.appendChild(row('Last seen up', sinceText(seenUp)));
+      var seenRow = box.appendChild(row('Last seen', sinceText(seenUp)));
       seenRow.title = seenUp.slice(0, 19).replace('T', ' ') + ' UTC';
     }
-    if (lastScan && lastScan !== seenUp) { box.appendChild(row('Last scan', sinceText(lastScan))); }
-    box.appendChild(row('Open ports', String(openCount)));
+    if (lastScan && (!seenUp || Date.parse(lastScan) - Date.parse(seenUp) > 5 * 60000)) {
+      box.appendChild(row('Last scan', marked(sinceText(lastScan) + ' \u00b7 not seen', 'warn')));
+    }
     if (check && check.status !== 'checking') {
-      box.appendChild(row('Last checked', sinceText(check.at)));
+      // "1 min ago · 443 open 12 ms, 80 open 15 ms"
       var answers = (check.ports || []).map(function (p) {
-        return p.port + ' ' + p.state + (typeof p.ms === 'number' ? ' (' + p.ms.toFixed(0) + ' ms)' : '');
+        return p.port + ' ' + p.state + (typeof p.ms === 'number' ? ' ' + p.ms.toFixed(0) + ' ms' : '');
       });
-      if (answers.length) { box.appendChild(row('Tried', answers.join(', '))); }
-      var fastest = (check.ports || []).filter(function (p) { return typeof p.ms === 'number'; })
-        .map(function (p) { return p.ms; }).sort(function (a, b) { return a - b; })[0];
-      if (typeof fastest === 'number') { box.appendChild(row('Connect time', fastest.toFixed(1) + ' ms')); }
+      box.appendChild(row('Checked', [sinceText(check.at)].concat(answers.length ? [answers.join(', ')] : [])
+        .filter(Boolean).join(' · ')));
     }
     var light = state && state.mode === 'light';
     var actions = box.appendChild(el('div', 'actions'));
-    var button = actions.appendChild(el('button', null, check && check.status === 'checking' ? 'Checking\u2026' : 'Check now'));
+    var button = actions.appendChild(el('button', null, check && check.status === 'checking' ? 'Checking…' : 'Check now'));
+    button.type = 'button';
     button.disabled = !!light || !!(check && check.status === 'checking');
     button.addEventListener('click', function () {
       send({ cmd: 'check_host', address: host.address });
@@ -2244,12 +2473,35 @@
     return box;
   }
 
+  // "CN=www.example.com" -> "www.example.com"
+  function commonName(text) {
+    return String(text || '').replace(/^CN=/i, '');
+  }
+  // How many paths a tree holds, counted up to `max`.
+  function pathCount(node, max) {
+    var count = 0;
+    (function walk(at) {
+      var children = (at && at.children) || {};
+      Object.keys(children).forEach(function (name) {
+        if (count >= max) { return; }
+        count += 1;
+        walk(own(children, name));
+      });
+    })(node);
+    return count;
+  }
+
+  // "https" for nmap's "ssl/http": one name for a service everywhere.
+  function serviceName(port) {
+    return /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || '');
+  }
+
   function hostCards(host, data) {
     var hostPorts = host.ports || {};
 
-    // One line per port: number, state, service and the software that
-    // answered, open ports first.
-    var ports = card('Ports');
+    // One line per port: number, service and the software that answered,
+    // open ports first. A state column only when some are not open.
+    var ports = card(null);
     var stateRank = function (state) {
       return state === 'open' ? 0 : /filtered/.test(state || '') ? 1 : 2;
     };
@@ -2258,37 +2510,44 @@
       var pa = hostPorts[a], pb = hostPorts[b];
       return stateRank(pa.state) - stateRank(pb.state) || pa.number - pb.number || (a < b ? -1 : 1);
     });
-    var grid = keys.length ? ports.appendChild(el('div', 'port-table')) : null;
+    var mixed = keys.some(function (key) { return hostPorts[key].state !== 'open'; });
+    var grid = keys.length ? ports.appendChild(el('div', 'port-table' + (mixed ? '' : ' no-state'))) : null;
     if (grid) {
       var head = grid.appendChild(el('div', 'port-line port-head'));
-      ['Port', 'State', 'Service', 'Version'].forEach(function (name) { head.appendChild(el('span', null, name)); });
+      (mixed ? ['Port', 'State', 'Service', 'Version'] : ['Port', 'Service', 'Version']).forEach(function (name) {
+        head.appendChild(el('span', null, name));
+      });
     }
     keys.forEach(function (key) {
       var port = own(hostPorts, key);
       var line = grid.appendChild(el('div', 'port-line'));
       line.appendChild(el('span', 'num', String(port.number) +
         (port.protocol && port.protocol !== 'tcp' ? '/' + port.protocol : '')));
-      var stateText = String(port.state || 'unverified');
-      var stateClass = stateText === 'open' ? 'open' : /filtered/.test(stateText) ? 'filtered' : 'closed';
-      line.appendChild(el('span', 'state ' + stateClass, stateText));
-      var service = /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || '—');
+      if (mixed) {
+        var stateText = String(port.state || 'unverified');
+        var stateClass = stateText === 'open' ? 'open' : /filtered/.test(stateText) ? 'filtered' : 'closed';
+        line.appendChild(el('span', 'state ' + stateClass, stateText));
+      }
+      var service = serviceName(port) || '—';
       var svc = line.appendChild(el('span', 'svc', service));
       svc.title = service;
       var software = [port.product, port.version].filter(Boolean).join(' ');
       var ver = line.appendChild(el('span', 'ver' + (software ? ' known' : ''), software || '—'));
       if (port.extra_info) { ver.appendChild(el('span', 'extra', ' (' + port.extra_info + ')')); }
     });
-    if (!keys.length) { ports.appendChild(el('p', 'note', 'No ports yet.')); }
+    if (!keys.length) { ports.appendChild(el('p', 'note', 'No ports yet')); }
     var notOpen = host.not_open || {};
     Object.keys(notOpen).forEach(function (key) {
       var group = own(notOpen, key);
       if (!group) { return; }
-      ports.appendChild(hint(el('p', 'note', group.count + ' ' + group.protocol + ' ' + group.state),
+      ports.appendChild(hint(el('p', 'note', group.count + (keys.length ? ' other ' : ' ') +
+        String(group.protocol || '').toUpperCase() + (group.count === 1 ? ' port ' : ' ports ') + group.state),
         group.ports ? group.ports.split(',').join(', ') : ''));
     });
 
-    // What the web ports gave away: server headers, certificate names, paths.
-    var web = card('Web & TLS');
+    // What the web ports gave away, what needs fixing first: exposed keys,
+    // headers, TLS, the certificate; then what the site is built with.
+    var web = card(null);
     Object.keys(hostPorts).forEach(function (key) {
       var port = own(hostPorts, key);
       if (!port) { return; }
@@ -2297,116 +2556,128 @@
       var http = port.http || null;
       if (!http && !sans.length && !paths) { return; }
       web.appendChild(el('h3', null, key));
-      // What the site is built with; an outdated library carries why.
-      if (http && http.tech && http.tech.length) {
-        var stack = el('span');
-        http.tech.forEach(function (name, index) {
-          if (index) { stack.appendChild(document.createTextNode(', ')); }
-          var old = /\(older than|end of life/.test(name);
-          stack.appendChild(hint(el('span', old ? 'warn-text' : null, name.split(' (')[0] + (old ? ' \u26a0' : '')),
-            old ? name : ''));
+      http = http || {};
+      // Keys found in the site's scripts: only their vault placeholder.
+      if (http.js_secrets && http.js_secrets.length) {
+        var found = el('div');
+        http.js_secrets.forEach(function (secret) {
+          found.appendChild(hint(el('div', 'secret'), secret.file + ' · ' + secret.preview))
+            .appendChild(marked(short(secret.kind) + ' · ' + secret.token, 'bad'));
         });
-        web.appendChild(row('Stack', stack));
+        web.appendChild(hint(row('Exposed keys', found), 'The keys are in the vault, never shown here; ' +
+          'the report lists them to rotate. Test them only within the engagement’s scope.'));
       }
-      if (http && http.header_grade) {
+      if (http.header_grade) {
         var graded = el('span', 'grade-inline');
         var missingCount = (http.header_notes || []).filter(function (n) { return /^missing /.test(n); })
           .map(function (n) { return n.split(', ').length; })[0] || 0;
         if (missingCount) { graded.appendChild(el('span', 'dim', missingCount + ' missing ')); }
         graded.appendChild(el('span', 'grade small ' + gradeKind(http.header_grade), http.header_grade));
         web.appendChild(hint(row('Headers', graded), (http.header_notes || []).join('\n')));
+      } else {
+        var secHdrs = Array.isArray(http.security_headers) ? http.security_headers
+          : Object.keys(http.security_headers || {}).filter(function (k) {
+            return own(http.security_headers, k) !== undefined;
+          });
+        if (secHdrs.length) { web.appendChild(row('Security headers', marked(secHdrs.join(', '), 'ok'))); }
+        if (http.missing_headers && http.missing_headers.length) {
+          web.appendChild(row('Missing headers', marked(http.missing_headers.join(', '), 'warn')));
+        }
       }
-      if (http && http.cookies && http.cookies.length) {
+      if (http.tls_versions && http.tls_versions.length) {
+        var hasLegacy = http.tls_versions.some(function (v) { return v === 'TLS 1.0' || v === 'TLS 1.1'; });
+        web.appendChild(hint(row('TLS', marked(http.tls_versions.map(function (v) {
+          return v.replace(/^TLS /, '');
+        }).join(', '), hasLegacy ? 'warn' : 'ok')), http.tls_versions.join(', ') +
+          (hasLegacy ? ': TLS 1.0 and 1.1 are outdated' : '')));
+      }
+      if (http.tls_weak_ciphers && http.tls_weak_ciphers.length) {
+        web.appendChild(row('Weak ciphers', marked(http.tls_weak_ciphers.join(', '), 'warn')));
+      }
+      if (http.tls_subject || http.tls_issuer) {
+        web.appendChild(row('Certificate', [commonName(http.tls_subject),
+          http.tls_issuer ? 'issuer ' + commonName(http.tls_issuer) : ''].filter(Boolean).join(' · ')));
+      }
+      if (http.tls_not_after) {
+        // Soon or already past: said with a mark.
+        var ends = Date.parse(http.tls_not_after), days = isFinite(ends) ? Math.floor((ends - Date.now()) / 86400000) : null;
+        var expiry = days === null || days > 30 ? http.tls_not_after
+          : marked(http.tls_not_after + (days < 0 ? ' · expired' : ' · in ' + days + (days === 1 ? ' day' : ' days')),
+            days < 0 ? 'bad' : 'warn');
+        web.appendChild(hint(row('Expires', expiry), http.tls_not_before ? 'Valid from ' + http.tls_not_before : ''));
+      }
+      if (sans.length) { web.appendChild(hint(row('Names', sans.join(', ')), 'Names in the certificate')); }
+      if (http.cookies && http.cookies.length) {
         var jar = el('div');
         http.cookies.forEach(function (cookie) {
           var issues = (cookie.issues || []).map(short);
           var line = jar.appendChild(hint(el('div', 'cookie'), cookie.flags + ((cookie.issues || []).length
             ? '\n' + cookie.issues.join('\n') : '')));
           line.appendChild(el('span', null, cookie.name));
-          if (issues.length) { line.appendChild(el('span', 'warn-text', ' \u2014 ' + issues.join(', '))); }
+          if (issues.length) { line.appendChild(el('span', 'warn-text', ' — ' + issues.join(', '))); }
         });
         web.appendChild(row('Cookies', jar));
       }
-      // Keys found in the site's scripts: only their vault placeholder.
-      if (http && http.js_secrets && http.js_secrets.length) {
-        var keys = el('div');
-        http.js_secrets.forEach(function (secret) {
-          keys.appendChild(hint(el('div', 'secret'), secret.file + ' \u00b7 ' + secret.preview))
-            .appendChild(marked(short(secret.kind) + ' \u00b7 ' + secret.token, 'bad'));
+      // What the site is built with; an outdated library carries why.
+      if (http.tech && http.tech.length) {
+        var stack = el('span');
+        http.tech.forEach(function (name, index) {
+          if (index) { stack.appendChild(document.createTextNode(', ')); }
+          var old = /\(older than|end of life/.test(name);
+          stack.appendChild(hint(el('span', old ? 'warn-text' : null, name.split(' (')[0] + (old ? ' ⚠' : '')),
+            old ? name : ''));
         });
-        web.appendChild(hint(row('Exposed keys', keys), 'The keys are in the vault, never shown here; ' +
-          'the report lists them to rotate. Test them only within the engagement\u2019s scope.'));
+        web.appendChild(row('Stack', stack));
+      } else {
+        // The stack names the server and what powers it, when there is one.
+        if (http.server) { web.appendChild(row('Server', http.server)); }
+        if (http.powered_by) { web.appendChild(row('Powered by', http.powered_by)); }
       }
-      if (http && http.js_endpoints && http.js_endpoints.length) {
+      if (http.title) { web.appendChild(row('Title', http.title)); }
+      if (http.location) { web.appendChild(row('Redirects to', http.location)); }
+      if (http.waf) { web.appendChild(row('WAF', marked(http.waf, 'info'))); }
+      if (http.robots_disallow && http.robots_disallow.length) {
+        web.appendChild(hint(row('robots.txt', http.robots_disallow.join(', ')), 'Paths robots.txt asks crawlers to skip'));
+      }
+      if (http.security_txt) { web.appendChild(row('security.txt', http.security_txt)); }
+      if (http.favicon_hash !== null && http.favicon_hash !== undefined) {
+        web.appendChild(row('Favicon hash', String(http.favicon_hash) +
+          (http.favicon_framework ? ' (' + http.favicon_framework + ')' : '')));
+      }
+      if (paths) {
+        var tree = fold('paths:' + key, 'names', false);
+        tree.appendChild(el('summary', null, 'Paths (' + pathCount(port.paths, 300) + ')'));
+        tree.appendChild(pathTree(port.paths, { left: 300 }));
+        web.appendChild(tree);
+      }
+      if (http.js_endpoints && http.js_endpoints.length) {
         var named = fold('js-endpoints:' + key, 'names', false);
         named.appendChild(el('summary', null, 'JS endpoints (' + http.js_endpoints.length + ')'));
-        var list = named.appendChild(el('pre', 'reply'));
-        list.textContent = http.js_endpoints.join('\n');
+        named.appendChild(el('pre', 'reply', http.js_endpoints.join('\n')));
         web.appendChild(named);
       }
-      if (http && http.scripts && http.scripts.length) {
+      if (http.scripts && http.scripts.length) {
         var files = fold('js-files:' + key, 'names', false);
         files.appendChild(el('summary', null, 'Script files (' + http.scripts.length + ')'));
-        var fileList = files.appendChild(el('pre', 'reply'));
-        fileList.textContent = http.scripts.join('\n');
+        files.appendChild(el('pre', 'reply', http.scripts.join('\n')));
         web.appendChild(files);
       }
-      // The stack already names the server and what powers it.
-      var stacked = http && http.tech && http.tech.length;
-      if (http && http.server && !stacked) { web.appendChild(row('Server', http.server)); }
-      if (http && http.powered_by && !stacked) { web.appendChild(row('Powered by', http.powered_by)); }
-      if (http && http.title) { web.appendChild(row('Title', http.title)); }
-      if (http && http.waf) { web.appendChild(row('WAF / CDN', marked(http.waf, 'info'))); }
-      if (http && http.favicon_hash !== null && http.favicon_hash !== undefined) {
-        var fav = String(http.favicon_hash) + (http.favicon_framework ? ' (' + http.favicon_framework + ')' : '');
-        web.appendChild(row('Favicon hash', fav));
-      }
-      if (http && http.location) { web.appendChild(row('Redirects to', http.location)); }
-      if (http && http.security_headers && !http.header_grade) {
-        var secHdrs = Array.isArray(http.security_headers)
-          ? http.security_headers
-          : Object.keys(http.security_headers).filter(function (k) {
-              return own(http.security_headers, k) !== undefined;
-            });
-        if (secHdrs.length) {
-          web.appendChild(row('Security headers', marked(secHdrs.join(', '), 'ok')));
-        }
-      }
-      if (http && http.missing_headers && http.missing_headers.length && !http.header_grade) {
-        web.appendChild(row('Missing headers', marked(http.missing_headers.join(', '), 'warn')));
-      }
-      if (http && http.tls_versions && http.tls_versions.length) {
-        var hasLegacy = http.tls_versions.some(function (v) { return v === 'TLS 1.0' || v === 'TLS 1.1'; });
-        web.appendChild(row('TLS versions', marked(http.tls_versions.join(', '), hasLegacy ? 'warn' : 'ok')));
-      }
-      if (http && http.tls_weak_ciphers && http.tls_weak_ciphers.length) {
-        web.appendChild(row('Weak ciphers', marked(http.tls_weak_ciphers.join(', '), 'warn')));
-      }
-      if (http && (http.tls_subject || http.tls_issuer)) {
-        var certParts = [http.tls_subject, http.tls_issuer ? 'issuer ' + http.tls_issuer : null].filter(Boolean);
-        web.appendChild(row('Certificate', certParts.join(' · ')));
-      }
-      if (http && (http.tls_not_before || http.tls_not_after)) {
-        web.appendChild(row('Valid', [http.tls_not_before || '?', http.tls_not_after || '?'].join(' \u2192 ')));
-      }
-      sans.forEach(function (name) { web.appendChild(row('Certificate name', name)); });
-      if (http && http.robots_disallow && http.robots_disallow.length) {
-        web.appendChild(row('robots.txt disallow', http.robots_disallow.join(', ')));
-      }
-      if (http && http.security_txt) {
-        web.appendChild(row('security.txt', http.security_txt));
-      }
-      if (paths) { web.appendChild(pathTree(port.paths, { left: 300 })); }
     });
 
+    // Ask an AI: where each one runs and what it costs are on its button.
     var ai = card('Ask AI');
     var hasCves = (host.advisories || []).length > 0;
     var ask = ai.appendChild(el('div', 'actions'));
-    [['local', '[L] Local'], ['cloud', '[C] Cloud triage'], ['research', '[R] Deep research']].forEach(function (tier) {
+    [['local', 'Local AI', 'Your local AI server (meow setup) \u00b7 $0'],
+     ['cloud', 'Cloud AI', 'Private values are masked before they leave; counts against the daily cap'],
+     ['research', 'Research', 'Cloud AI that also looks up each CVE: masked first, counts against the daily cap']
+    ].forEach(function (tier) {
       var button = ask.appendChild(el('button', null, tier[1]));
+      button.type = 'button';
+      button.title = tier[2];
       if (tier[0] === 'research' && !hasCves) {
         button.disabled = true;
-        button.title = 'No CVEs found for this host yet.';
+        button.title = 'No CVEs found for this host yet';
       }
       button.addEventListener('click', function () {
         pendingAiScroll = true;
@@ -2415,20 +2686,31 @@
     });
     var budget = state.budget || {};
     if (budget.has_key) {
-      ai.appendChild(row('Cloud today', '$' + (budget.spent_usd || 0).toFixed(4) + ' of $' +
-        (budget.max_usd || 0).toFixed(2) + ', ' + (budget.calls || 0) + ' of ' + (budget.max_calls || 0) + ' calls'));
-    } else if (budget.setup_unreadable) {
-      ai.appendChild(hint(el('p', 'note', 'Cloud off: ~/.meow/ai.toml cannot be read.'),
-        'Fix the file or run `meow setup`. Until then [C] answers with the local model and [R] is unavailable.'));
+      ai.appendChild(hint(row('Cloud AI today', '$' + (budget.spent_usd || 0).toFixed(2) + ' of $' +
+        (budget.max_usd || 0).toFixed(2) + ' \u00b7 ' + (budget.calls || 0) + '/' + (budget.max_calls || 0) +
+        ' calls \u00b7 masked first'),
+        'Spent today, and the daily cap. Past it, Cloud AI answers with the local AI.'));
     } else {
-      ai.appendChild(hint(el('p', 'note', 'No cloud key: run `meow setup`.'),
-        '[C] answers with the local model and [R] is unavailable until a key is added. ' +
-        'It applies to this session at once.'));
+      // No key, or the file with it cannot be read: the local AI answers.
+      var why = el('span', null, budget.setup_unreadable ? 'ai.toml unreadable (' : 'no key (');
+      why.appendChild(el('code', null, 'meow setup'));
+      why.appendChild(document.createTextNode(') \u00b7 local AI answers instead'));
+      ai.appendChild(hint(row('Cloud AI', why), budget.setup_unreadable
+        ? '~/.meow/ai.toml cannot be read. Research is off until it is fixed.'
+        : 'Research is off until a key is added. A key added applies to this session at once.'));
     }
 
-    var note = card('Add a note');
+    // Notes: the ones saved for this host, then a box for the next.
+    var note = card('Notes');
+    (host.facts || []).filter(function (fact) { return fact && fact.source === 'manual_note'; })
+      .slice(-20).forEach(function (fact) {
+        var line = note.appendChild(el('div', 'fact'));
+        line.appendChild(el('span', 'dim', sinceText(fact.timestamp_utc) + ' '));
+        line.appendChild(document.createTextNode(String(fact.claim || '')));
+      });
     var box = note.appendChild(el('textarea'));
-    box.placeholder = 'What you found by hand: credentials tried, versions seen, pkg:npm/name@1.2.3 ...';
+    box.placeholder = 'Found by hand: logins tried, versions seen, pkg:npm/name@1.2.3';
+    box.setAttribute('aria-label', 'Note');
     if (hasOwn.call(noteDrafts, host.address)) {
       box.value = noteDrafts[host.address];
     }
@@ -2439,7 +2721,9 @@
         delete noteDrafts[host.address];
       }
     });
-    var save = note.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Save note'));
+    var save = note.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Save'));
+    save.type = 'button';
+    save.title = 'Kept in this session and listed in the report';
     save.addEventListener('click', function () {
       if (box.value.trim()) {
         send({ cmd: 'note', address: host.address, text: box.value });
@@ -2447,7 +2731,7 @@
         delete noteDrafts[host.address];
       }
     });
-    return { status: statusCard(host), ports: ports, web: web.childNodes.length > 1 ? web : null,
+    return { status: statusCard(host), ports: ports, web: web.childNodes.length ? web : null,
       ai: ai, note: note };
   }
 
@@ -2463,18 +2747,19 @@
   }
 
   // DNS & Mail: the graded checks, the services the domain publishes, and
-  // whether made-up names answer (wildcard DNS).
+  // whether made-up names answer (wildcard DNS). The domain is its title.
   function dnsCard(info) {
-    var box = card('DNS & Mail \u2014 ' + info.domain);
+    var box = card(info.domain);
     var badge = el('span', 'grade-inline');
     badge.appendChild(el('span', 'grade small ' + gradeKind(info.grade), info.grade || '?'));
-    box.appendChild(hint(row('Grade', badge), 'SPF, DMARC, DKIM, CAA and DNSSEC graded together.'));
+    box.appendChild(hint(row('Grade', badge), 'SPF, DMARC, DKIM, CAA and DNSSEC graded together'));
     (info.checks || []).forEach(function (check) {
       box.appendChild(hint(row(check.name, marked(check.value, check.status)), check.advice));
     });
-    box.appendChild((info.wildcard || []).length
-      ? hint(row('Wildcard', marked(info.wildcard.join(', '), 'warn')), 'Made-up names under the domain resolve.')
-      : row('Wildcard', marked('none', 'ok')));
+    if ((info.wildcard || []).length) {
+      box.appendChild(hint(row('Wildcard', marked(info.wildcard.join(', '), 'warn')),
+        'Made-up names under the domain resolve'));
+    }
     var services = info.services || [];
     if (services.length) {
       box.appendChild(el('h3', null, 'Services (' + services.length + ')'));
@@ -2514,9 +2799,9 @@
     });
   }
 
-  // Overview: one line per tab, each a link to it.
+  // Overview: what each tab found, in a few words, each a link to it.
   function glanceCard(host, made, cves) {
-    var box = card('At a Glance');
+    var box = card('Findings');
     box.className += ' glance';
     function go(key, text, kind) {
       var holder = el('span', 'go');
@@ -2532,12 +2817,15 @@
     }).sort(function (a, b) { return a.number - b.number; });
     var list = open.slice(0, 10).map(function (port) {
       return port.number + (port.protocol && port.protocol !== 'tcp' ? '/' + port.protocol : '') +
-        (port.service ? ' ' + port.service : '');
-    }).join(', ') + (open.length > 10 ? ', +' + (open.length - 10) + ' more' : '');
-    box.appendChild(row('Open ports', go('ports', open.length ? list : 'none seen yet')));
+        (serviceName(port) ? ' ' + serviceName(port) : '');
+    }).join(', ') + (open.length > 10 ? ', +' + (open.length - 10) : '');
+    box.appendChild(row('Ports', go('ports', open.length ? list : 'none open yet')));
 
-    box.appendChild(row('CVEs', go('cves', cveWords(cves) || 'none found',
-      cves.serious ? 'bad' : cves.total ? 'warn' : 'ok')));
+    // "5 · 1 exploited", or why there are none.
+    var none = state.cve_lookups === false ? 'lookups off' : !hasVersions(host) ? 'no versions seen yet' : 'none found';
+    box.appendChild(row('CVEs', go('cves', cves.total ? cves.total + (cves.kev ? ' · ' + cves.kev + ' exploited' : '')
+      : none,
+      cves.serious ? 'bad' : cves.total ? 'warn' : state.cve_lookups === false ? 'info' : 'ok')));
     if (made.web) {
       // One short phrase per kind of problem, with the ports it was seen on.
       var oldTls = [], weak = [], missing = [], edges = [], oldLibs = [], keyCount = 0, worstGrade = '';
@@ -2558,23 +2846,23 @@
         });
       });
       var flagged = [];
-      if (keyCount) { flagged.push(keyCount + (keyCount === 1 ? ' exposed key' : ' exposed keys') + ' in scripts'); }
-      if (worstGrade && worstGrade !== 'A') { flagged.push('headers grade ' + worstGrade); }
+      if (keyCount) { flagged.push(keyCount + (keyCount === 1 ? ' exposed key' : ' exposed keys')); }
+      if (worstGrade && worstGrade !== 'A') { flagged.push('headers ' + worstGrade); }
       if (oldLibs.length) { flagged.push('outdated ' + oldLibs.join(', ')); }
       if (oldTls.length) { flagged.push('TLS 1.0/1.1 on ' + oldTls.join(', ')); }
       if (weak.length) { flagged.push('weak ciphers on ' + weak.join(', ')); }
       if (missing.length && !worstGrade) { flagged.push('headers missing on ' + missing.join(', ')); }
       var said = flagged.concat(edges);
-      var webLink = go('web', said.slice(0, 3).join(' \u00b7 ') + (said.length > 3 ? ' +' + (said.length - 3) : '') ||
+      var webLink = go('web', said.slice(0, 3).join(' · ') + (said.length > 3 ? ' +' + (said.length - 3) : '') ||
         'nothing flagged', keyCount ? 'bad' : flagged.length ? 'warn' : 'ok');
       box.appendChild(hint(row('Web & TLS', webLink), said.join('\n')));
     }
     if (host.dns_security) {
       var dnsInfo = host.dns_security;
-      var weak = (dnsInfo.checks || []).filter(function (c) { return c.status === 'bad' || c.status === 'warn'; })
+      var toFix = (dnsInfo.checks || []).filter(function (c) { return c.status === 'bad' || c.status === 'warn'; })
         .map(function (c) { return c.name; });
       box.appendChild(hint(row('DNS & Mail', go('dns', 'grade ' + (dnsInfo.grade || '?') +
-        (weak.length ? ' \u00b7 ' + weak.length + ' to fix' : ''), gradeKind(dnsInfo.grade))), weak.join(', ')));
+        (toFix.length ? ' · ' + toFix.length + ' to fix' : ''), gradeKind(dnsInfo.grade))), toFix.join(', ')));
     }
     return box;
   }
@@ -2625,11 +2913,11 @@
       dns: host.dns_security ? [host.dns_security.grade || '?',
         { ok: '', warn: 'warn', bad: 'bad', info: '' }[gradeKind(host.dns_security.grade)]] : null,
       cves: cves.total ? [String(cves.total), cves.serious ? 'bad' : 'warn'] : null,
-      notes: aiHere ? [reply.running ? 'AI\u2026' : 'AI', reply.error ? 'bad' : 'info'] : null
+      notes: aiHere ? [reply.running ? '\u2026' : '\u2022', reply.error ? 'bad' : 'info'] : null
     };
     var names = associatedNamesFor(host, data);
-    byId('host-title').textContent = (names.hosts[0] && names.hosts[0] !== host.address
-      ? names.hosts[0] + ' \u00b7 ' : '') + host.address;
+    var name = hostName(host, data) || (names.hosts[0] !== host.address ? names.hosts[0] : '');
+    byId('host-title').textContent = (name ? name + ' \u00b7 ' : '') + host.address;
     var tabs = clear(byId('host-tabs')), panels = byId('host-panels');
     HOST_TABS.forEach(function (entry) {
       var key = entry[0], items = content[key];
@@ -2687,28 +2975,22 @@
     document.body.removeChild(link);
   }
 
+  // "1 · 192.0.2.1 · 0.4 ms — Fremont, California"
   function formatHopLine(hop) {
-    var line;
-    if (hop && hop.formatted) {
-      line = hop.formatted;
-    } else {
-      var rtt = (hop && hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
-      var lbl = (hop && hop.label) ? (' (' + hop.label + ') ') : ' ';
-      line = 'Hop ' + (hop ? hop.hop : '?') + ': ' + (hop ? hop.address : '?') + lbl + rtt;
-    }
+    var rtt = (hop && hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? (hop.rtt_ms.toFixed(1) + ' ms') : '—';
+    var line = (hop ? hop.hop : '?') + ' · ' + (hop ? hop.address : '?') + ' · ' + rtt;
     var where = hop ? hopPlace(hop) : '';
-    return line + (where ? '  \u2014 ' + where : '');
+    return line + (where ? '  — ' + where : '');
   }
 
   function appendTracerouteSection(container, traceHops, openByDefault) {
     if (!traceHops || !traceHops.length) { return; }
     var section = container.appendChild(fold('trace:hops', 'names', openByDefault));
-    section.appendChild(el('summary', null, 'Traceroute hops (' + traceHops.length + ')'));
-    var pre = section.appendChild(el('pre', 'reply'));
-    pre.textContent = traceHops.map(formatHopLine).join('\n');
+    section.appendChild(el('summary', null, 'Hops (' + traceHops.length + ')'));
+    section.appendChild(el('pre', 'reply', traceHops.map(formatHopLine).join('\n')));
     var toggleWrap = section.appendChild(el('div', 'actions'));
-    var btn = toggleWrap.appendChild(el('button', null,
-      traceExpanded ? 'Collapse traceroute on map' : 'Expand traceroute on map'));
+    var btn = toggleWrap.appendChild(el('button', null, traceExpanded ? 'Hide on map' : 'Show on map'));
+    btn.type = 'button';
     btn.addEventListener('click', function () {
       traceExpanded = !traceExpanded;
       drawn = '';
@@ -2717,8 +2999,28 @@
     });
   }
 
-  // The selected node: its facts in the card beside the map, and for a host
-  // one card per subject at the head of the cards below.
+  // The report buttons: for the selected host, or for the whole session.
+  function reportButtons(detail, address) {
+    var actions = detail.appendChild(el('div', 'actions'));
+    var md = actions.appendChild(el('button', null, address ? 'Host report .md' : 'Download .md'));
+    md.type = 'button';
+    md.title = address ? 'The report on ' + address + ', as Markdown' : 'The report on every host, as Markdown';
+    md.addEventListener('click', function () {
+      if (address) {
+        downloadReport('/api/report/' + encodeURIComponent(address), 'report-' + address + '.md');
+      } else {
+        downloadReport('/api/report', 'engagement-report.md');
+      }
+    });
+    var print = actions.appendChild(el('button', null, 'Print / PDF'));
+    print.type = 'button';
+    print.title = 'Print this page, or save it as a PDF';
+    print.addEventListener('click', function () { window.print(); });
+  }
+
+  // The selected node: what it is, in the card beside the map; for a host
+  // its findings are the tabs under the map. With nothing selected, the
+  // card is the report.
   var lastDetailId = null;
   function renderDetail() {
     var detail = byId('detail');
@@ -2734,21 +3036,16 @@
       document.activeElement.getAttribute && document.activeElement.getAttribute('role') === 'tab';
     lastDetailId = selected;
     clear(detail);
+    detail.title = '';
     parkMovables();
     clear(panels);
     clear(byId('host-tabs'));
     byId('card-host').hidden = true;
     var data = selectedNodeData();
+    var title = byId('detail-title');
     if (!data) {
-      byId('detail-title').textContent = 'Selected';
-      detail.appendChild(el('p', 'note', 'Click a node or host for details.'));
-      var wsExport = detail.appendChild(el('div', 'actions'));
-      var expAll = wsExport.appendChild(el('button', null, 'Export report (.md)'));
-      expAll.addEventListener('click', function () {
-        downloadReport('/api/report', 'engagement-report.md');
-      });
-      var printAll = wsExport.appendChild(el('button', null, 'Print / PDF'));
-      printAll.addEventListener('click', function () { window.print(); });
+      title.textContent = 'Report';
+      reportButtons(detail, null);
       return;
     }
     var host = data.address && state.graph ? own(state.graph.hosts, data.address) : null;
@@ -2756,65 +3053,56 @@
       if (sameHost && draftText) {
         noteDrafts[host.address] = draftText;
       }
-      byId('detail-title').textContent = 'Host Info';
-      // address -> type -> OS -> version, one row each.
+      // Who the host is. Its address and name head its tabs below; in
+      // Expand, where the tabs are hidden, they head this card.
+      title.textContent = 'Host';
+      var names = associatedNamesFor(host, data).hosts;
+      var shown = hostName(host, data);
+      var others = names.filter(function (name) { return name !== shown; });
+      detail.appendChild(row('Address', host.address)).className += ' full-only';
+      if (names.length) {
+        detail.appendChild(row(names.length === 1 ? 'Name' : 'Names', names.join('\n'))).className += ' full-only';
+      }
+      if (others.length) {
+        detail.appendChild(row(shown ? 'Other names' : 'Names', others.join('\n'))).className += ' not-full';
+      }
+      // address -> type -> OS -> version: what is known of it.
       var parts = String(data.headline || '').split(' -> ');
       var guessed = / \(OS read off a service banner\)$/;
-      var version = (parts[3] || '').replace(guessed, '');
-      // Open ports have a card of their own; why the node is drawn as it is
-      // and where the system came from are tooltips here.
-      detail.appendChild(row('Address', parts[0] || host.address));
-      var typeRow = detail.appendChild(row('Type', parts[1] || 'not known'));
-      if (data.why) { typeRow.title = 'Drawn this way because ' + data.why + '.'; }
       var banner = guessed.test(parts[3] || '');
-      var system = detail.appendChild(row('System', banner ? marked(parts[2] || 'not known', 'info') : (parts[2] || 'not known')));
-      if (banner) { system.title = 'Read off a service banner, not reported by an OS scan.'; }
-      detail.appendChild(row('Version', version || 'not known'));
-      var assoc = associatedNamesFor(host, data);
-      if (assoc.domains.length || assoc.hosts.length) {
-        detail.appendChild(el('h3', null, 'Associated Hosts'));
-        if (assoc.domains.length) {
-          detail.appendChild(row('Domains', assoc.domains.join('\n')));
-        }
-        if (assoc.hosts.length) {
-          detail.appendChild(row('Hosts', assoc.hosts.join('\n')));
-        }
+      var known = function (text) { return text && !/^(not known|OS not known|version not known)$/.test(text) ? text : ''; };
+      if (known(parts[1])) {
+        detail.appendChild(hint(row('Type', parts[1]), data.why ? 'Drawn this way because ' + data.why + '.' : ''));
+      }
+      var system = [known(parts[2]), known((parts[3] || '').replace(guessed, ''))].filter(Boolean).join(' ');
+      if (system) {
+        var systemRow = detail.appendChild(row('System', banner ? marked(system, 'info') : system));
+        if (banner) { systemRow.title = 'Read off a service banner, not reported by an OS scan.'; }
       }
       if (data.city) { detail.appendChild(row('Location', data.city)); }
-      if (host.mac) { detail.appendChild(row('Hardware address', host.mac)); }
+      if (host.mac) { detail.appendChild(row('MAC', host.mac)); }
       if (host.asn) {
-        var asnText = host.asn + (host.country ? ' (' + host.country + ')' : '');
-        detail.appendChild(row('ASN / Org', asnText));
+        detail.appendChild(hint(row('Network', [host.asn, host.bgp_prefix, host.country].filter(Boolean).join(' · ')),
+          'Its autonomous system (ASN), address block and registry country'));
       }
-      if (host.bgp_prefix) {
-        detail.appendChild(row('BGP prefix', host.bgp_prefix));
+      if (host.ipv6_dns && host.ipv6_dns.indexOf('no AAAA') === -1) {
+        detail.appendChild(row('IPv6', host.ipv6_dns));
       }
-      if (host.ipv6_dns) {
-        var hasV6 = host.ipv6_dns.indexOf('no AAAA') === -1;
-        detail.appendChild(row('IPv6 DNS', marked(host.ipv6_dns, hasV6 ? 'ok' : 'info')));
-      }
-      if (host.waf_cdn) {
-        detail.appendChild(row('WAF / CDN', marked(host.waf_cdn, 'info')));
-      }
+      if (host.waf_cdn) { detail.appendChild(row('WAF', marked(host.waf_cdn, 'info'))); }
       var traceHops = data.trace_hops || [];
       var hops = host.hops || data.hops || [];
       var hopTotal = data.hop_count || traceHops.length || hops.length;
       if (hopTotal) {
-        var rttSuffix = (data.rtt_ms !== undefined && data.rtt_ms !== null) ? (' · ' + data.rtt_ms.toFixed(1) + ' ms') : '';
-        var routeRow = detail.appendChild(row('Route', marked(hopTotal + (hopTotal === 1 ? ' hop' : ' hops') + rttSuffix + ' -> ' + host.address, 'ok')));
-        if (hops.length) { routeRow.title = hops.concat([host.address]).join(' -> '); }
+        var route = [hopTotal + (hopTotal === 1 ? ' hop' : ' hops')];
+        if (data.rtt_ms !== undefined && data.rtt_ms !== null) { route.push(data.rtt_ms.toFixed(1) + ' ms'); }
+        var routeRow = detail.appendChild(row('Route', route.join(' · ')));
+        if (hops.length) { routeRow.title = 'Through ' + hops.join(', '); }
         appendTracerouteSection(detail, traceHops, false);
-      } else {
-        detail.appendChild(row('Route', data.reachable ? marked('known', 'ok')
-          : marked(data.by_name ? 'address not known' : 'none known', 'warn')));
+      } else if (!data.reachable) {
+        detail.appendChild(hint(row('Route', marked(data.by_name ? 'address not known' : 'none', 'warn')),
+          'No route from this machine is known'));
       }
-      var exportActions = detail.appendChild(el('div', 'actions'));
-      var exportMd = exportActions.appendChild(el('button', null, 'Export report (.md)'));
-      exportMd.addEventListener('click', function () {
-        downloadReport('/api/report/' + encodeURIComponent(host.address), 'report-' + host.address + '.md');
-      });
-      var exportPdf = exportActions.appendChild(el('button', null, 'Print / PDF'));
-      exportPdf.addEventListener('click', function () { window.print(); });
+      reportButtons(detail, host.address);
       buildHostTabs(host, data, tabFocused);
       var box = panels.querySelector('textarea');
       if (box && hadFocus) {
@@ -2825,64 +3113,75 @@
       }
       return;
     }
-    byId('detail-title').textContent = String(data.caption || data.label || data.id || 'Selected').split('\n')[0];
+    title.textContent = String(data.caption || data.label || data.id || 'Selected').split('\n')[0];
     if (data.kind === 'interface') {
       var name = String(data.id || '').slice(3);
       if (data.network) { detail.appendChild(row('Network', data.network)); }
       ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
         if (iface.name !== name) { return; }
-        detail.appendChild(row('Interface', name + ' (' + iface.kind + (iface.up ? ', up' : ', down') + ')'));
-        (iface.addresses || []).forEach(function (address) { detail.appendChild(row('This machine', address)); });
+        detail.appendChild(row('Interface', name + ' · ' + iface.kind + ' · ' + (iface.up ? 'up' : 'down')));
+        (iface.addresses || []).forEach(function (address) { detail.appendChild(row('Your address', address)); });
       });
       if (data.hidden_neighbours) {
         detail.appendChild(el('p', 'note', '+' + data.hidden_neighbours + ' more not drawn'));
       }
     } else if (data.kind === 'neighbour') {
-      detail.appendChild(row('Address', data.label || ''));
-      detail.appendChild(row('Hardware address', data.mac || ''));
-      detail.appendChild(row('Seen on', data.interface || ''));
-
+      title.textContent = data.label || 'Device';
+      if (data.mac) { detail.appendChild(row('MAC', data.mac)); }
+      if (data.interface) { detail.appendChild(row('Seen on', data.interface)); }
     } else if (data.kind === 'egress') {
-      byId('detail-title').textContent = data.vpn ? 'VPN Exit' : 'Public WAN Egress';
+      // Where your traffic leaves: what remote hosts see.
       if (data.vpn) {
-        detail.appendChild(row('Tunnel', marked(data.vpn, 'ok')));
-        detail.appendChild(row('OPSEC status', marked('VPN active', 'ok')));
+        title.textContent = 'VPN exit ' + data.vpn;
+        if (data.vpn_all) {
+          detail.appendChild(row('Carries', marked('all traffic', 'ok')));
+        } else {
+          if (data.carries) { detail.appendChild(row('Carries', data.carries)); }
+          detail.appendChild(hint(row('Other traffic', marked('direct', 'warn')),
+            'Hosts outside these networks see your real address'));
+        }
       } else {
-        detail.appendChild(row('Public IP', data.public_address || 'resolving...'));
-        detail.appendChild(row('ISP / Network', data.isp || 'not known'));
-        detail.appendChild(row('OPSEC status', marked('no VPN (direct WAN egress)', 'warn')));
+        title.textContent = 'Public address';
+        detail.appendChild(row('Address', data.public_address || 'looking it up…'));
+        if (data.isp) { detail.appendChild(row('Network', data.isp)); }
+        detail.appendChild(hint(row('VPN', marked('none', 'warn')), 'Remote hosts see this address'));
       }
-
     } else if (data.kind === 'internet') {
-      byId('detail-title').textContent = 'Internet Transit';
+      title.textContent = 'Internet';
       var netHops = data.trace_hops || [];
-      if (data.hop_count) {
-        detail.appendChild(row('Transit hops', String(data.hop_count)));
-      }
-      if (data.rtt_ms !== undefined && data.rtt_ms !== null) {
-        detail.appendChild(row('Round-trip latency', data.rtt_ms.toFixed(1) + ' ms'));
-      }
+      var path = [];
+      if (data.hop_count) { path.push(data.hop_count + (data.hop_count === 1 ? ' hop' : ' hops')); }
+      if (data.rtt_ms !== undefined && data.rtt_ms !== null) { path.push(data.rtt_ms.toFixed(1) + ' ms'); }
+      if (path.length) { detail.appendChild(hint(row('Route', path.join(' · ')), 'Hops and round-trip time')); }
       if (netHops.length) {
         appendTracerouteSection(detail, netHops, true);
       } else {
-        detail.appendChild(el('p', 'note', 'Run `recon <target>` for hops.'));
+        var how = detail.appendChild(el('p', 'note', 'No hops yet'));
+        if (state.mode === 'light') {
+          how.appendChild(document.createTextNode(' \u00b7 recon needs '));
+          how.appendChild(el('code', null, 'meow mode mild'));
+        } else {
+          how.appendChild(document.createTextNode(': '));
+          how.appendChild(el('code', null, 'meow recon <target>'));
+        }
       }
     } else if (data.kind === 'hop' && data.hop) {
       appendHopDetail(detail, data.hop);
     } else if (data.kind === 'waf') {
-      byId('detail-title').textContent = 'WAF / CDN Edge';
+      title.textContent = 'WAF';
       detail.appendChild(row('Provider', marked(data.waf || 'WAF / CDN', 'info')));
-      if (data.target) { detail.appendChild(row('Protected origin', data.target)); }
-
+      if (data.target) { detail.appendChild(row('In front of', data.target)); }
     } else if (data.kind === 'asn') {
-      byId('detail-title').textContent = 'Cloud / ASN Group';
-      detail.appendChild(row('ASN / Provider', data.asn || data.label || ''));
-      if (data.bgp_prefix) { detail.appendChild(row('BGP prefix', data.bgp_prefix)); }
-
+      title.textContent = 'Network';
+      detail.appendChild(row('ASN', data.asn || data.label || ''));
+      if (data.bgp_prefix) { detail.appendChild(row('Prefix', data.bgp_prefix)); }
+    } else if (data.kind === 'local') {
+      detail.title = 'See This machine';
     } else {
       detail.appendChild(row('Name', data.label || data.id || ''));
     }
-    detail.appendChild(drawnAs(data));
+    // Why it is drawn as it is: a hint, not a finding.
+    if (!detail.title) { detail.title = drawnAs(data); }
   }
 
   // Where a hop's address is, in words: "Fremont, California, United States".
@@ -2896,48 +3195,40 @@
   // it is, what kind of address, the latency it adds; for the last hop, what
   // recon found about the target.
   function appendHopDetail(detail, hop) {
-    byId('detail-title').textContent = hop.is_target
-      ? 'Traceroute Hop ' + hop.hop + ' (target)'
-      : 'Traceroute Hop ' + hop.hop;
-    detail.appendChild(row('Hop', String(hop.hop)));
+    byId('detail-title').textContent = 'Hop ' + hop.hop + (hop.is_target ? ' · target' : '');
     detail.appendChild(row('Address', hop.address || '* * *'));
-    if (hop.scope) { detail.appendChild(row('Address type', hop.scope)); }
+    if (hop.scope) { detail.appendChild(row('Type', hop.scope)); }
     if (hop.label && hop.label !== hop.network && hop.label !== hop.reverse_dns) {
-      detail.appendChild(row('Node / Role', hop.label));
+      detail.appendChild(row('Role', hop.label));
     }
     if (hop.reverse_dns) { detail.appendChild(row('Reverse DNS', hop.reverse_dns)); }
     var place = hopPlace(hop);
     if (place) {
-      detail.appendChild(row('Location', place));
-      var loc = hop.location;
+      var loc = hop.location, placeRow = detail.appendChild(row('Location', place));
       if (typeof loc.latitude === 'number' && typeof loc.longitude === 'number') {
-        detail.appendChild(row('Coordinates', loc.latitude.toFixed(3) + ', ' + loc.longitude.toFixed(3) + ' (approximate)'));
+        placeRow.title = loc.latitude.toFixed(3) + ', ' + loc.longitude.toFixed(3) + ' (approximate)';
       }
-    } else if (hop.scope && /^public/.test(hop.scope)) {
-      detail.appendChild(row('Location', 'not in the location database'));
-    } else if (hop.scope && hop.address && hop.address.indexOf('*') < 0) {
-      detail.appendChild(row('Location', 'none: not a public address'));
     }
-    if (hop.network) { detail.appendChild(row('Network / ASN', hop.network)); }
-    var rtt = (hop.rtt_ms !== null && hop.rtt_ms !== undefined) ? hop.rtt_ms.toFixed(1) + ' ms' : '—';
-    detail.appendChild(row('RTT latency', rtt));
-    if (typeof hop.rtt_delta_ms === 'number') {
-      var delta = hop.rtt_delta_ms;
-      var deltaText = (delta >= 0 ? '+' : '') + delta.toFixed(1) + ' ms vs previous hop';
-      detail.appendChild(row('Added latency', delta >= 40 ? marked(deltaText + ' (long link)', 'info') : deltaText));
+    if (hop.network) { detail.appendChild(row('Network', hop.network)); }
+    if (hop.rtt_ms !== null && hop.rtt_ms !== undefined) {
+      var latency = hop.rtt_ms.toFixed(1) + ' ms';
+      var delta = typeof hop.rtt_delta_ms === 'number' ? hop.rtt_delta_ms : null;
+      if (delta !== null) { latency += ' · ' + (delta >= 0 ? '+' : '') + delta.toFixed(1) + ' ms'; }
+      detail.appendChild(hint(row('Latency', delta !== null && delta >= 40 ? marked(latency, 'info') : latency),
+        delta === null ? '' : 'Round trip, and what this hop adds' + (delta >= 40 ? ': a long link' : '')));
     }
     var target = hop.target;
     if (target) {
       detail.appendChild(el('h3', null, 'Target'));
       if (target.hostnames && target.hostnames.length) { detail.appendChild(row('Names', target.hostnames.join(', '))); }
-      if (target.asn) { detail.appendChild(row('ASN / Provider', target.asn)); }
-      if (target.bgp_prefix) { detail.appendChild(row('BGP prefix', target.bgp_prefix)); }
-      if (target.country) { detail.appendChild(row('Country (registry)', target.country)); }
-      if (target.waf_cdn) { detail.appendChild(row('WAF / CDN', marked(target.waf_cdn, 'info'))); }
-      if (target.os) { detail.appendChild(row('Operating system', target.os)); }
+      if (target.asn) { detail.appendChild(row('Network', [target.asn, target.bgp_prefix].filter(Boolean).join(' · '))); }
+      if (target.country) { detail.appendChild(row('Country', target.country)); }
+      if (target.waf_cdn) { detail.appendChild(row('WAF', marked(target.waf_cdn, 'info'))); }
+      if (target.os) { detail.appendChild(row('System', target.os)); }
       detail.appendChild(row('Open ports', String(target.open_ports || 0)));
       var pick = detail.appendChild(el('div', 'actions'));
       var go = pick.appendChild(el('button', null, 'Show host'));
+      go.type = 'button';
       go.addEventListener('click', function () { select('host:' + hop.address); });
     }
     if (hop.location) {
@@ -3340,17 +3631,17 @@
   }
 
   var TIER_TITLES = {
-    local: '[L] Local Triage',
-    cloud: '[C] Cloud Triage',
-    research: '[R] Grounded Research'
+    local: 'Local AI',
+    cloud: 'Cloud AI',
+    research: 'Research'
   };
 
   // A triage answer has a red-team part and a blue-team part. Each goes in
   // its own panel, side by side; anything before them stays above. An answer
   // without them (research, an older reply) is shown as it is.
   var TEAM_HEADINGS = [
-    { re: /^##\s+Red Team\b.*$/m, cls: 'team-red', title: 'Red Team \u2014 Authorized Pen Test' },
-    { re: /^##\s+Blue Team\b.*$/m, cls: 'team-blue', title: 'Blue Team \u2014 SOC Defense' }
+    { re: /^##\s+Red Team\b.*$/m, cls: 'team-red', title: 'Red team \u00b7 authorized tests only' },
+    { re: /^##\s+Blue Team\b.*$/m, cls: 'team-blue', title: 'Blue team \u00b7 defense' }
   ];
   // Formatting is for a reply of some pages. Past that, the rest is shown
   // as it is: no reply keeps the page busy, however it is written.
@@ -3396,6 +3687,9 @@
     }
     panel.hidden = false;
     var onSameHost = !!(reply.address && selectedAddress() === reply.address);
+    // While another host is selected, the answer folds to its head line.
+    var elsewhere = !!(selectedAddress() && reply.address && !onSameHost);
+    panel.classList.toggle('folded', elsewhere);
     var aiKey = JSON.stringify([
       !!reply.running,
       reply.tier || '',
@@ -3407,20 +3701,22 @@
     ]);
     if (aiKey !== lastAiKey) {
       lastAiKey = aiKey;
-      var tierLabel = own(TIER_TITLES, reply.tier) || 'AI Triage';
-      byId('ai-title').textContent = tierLabel + (reply.address ? ' \u2014 ' + reply.address : '');
+      // "Local AI · 192.0.2.10"; in the host's own tab, its tab says which.
+      var tierLabel = own(TIER_TITLES, reply.tier) || 'AI';
+      byId('ai-title').textContent = tierLabel + (reply.address && !onSameHost ? ' \u00b7 ' + reply.address : '');
 
       var badges = clear(byId('ai-badges'));
       if (reply.running) {
-        badges.appendChild(el('span', 'badge warn', 'streaming\u2026'));
+        badges.appendChild(el('span', 'badge warn', 'running\u2026'));
       } else if (reply.error) {
-        badges.appendChild(el('span', 'badge bad', 'error'));
+        badges.appendChild(el('span', 'badge bad', 'failed'));
       } else {
-        badges.appendChild(el('span', 'badge ok', 'complete'));
+        badges.appendChild(el('span', 'badge ok', 'done'));
       }
 
       if (reply.address && !onSameHost) {
-        var hostBtn = badges.appendChild(el('button', null, 'Select ' + reply.address));
+        var hostBtn = badges.appendChild(el('button', null, 'Show host'));
+        hostBtn.type = 'button';
         hostBtn.addEventListener('click', function () {
           select('host:' + reply.address);
         });
@@ -3428,38 +3724,37 @@
 
       if (reply.text) {
         var rawCopy = String(reply.text);
-        var copyBtn = badges.appendChild(el('button', null, 'Copy Markdown'));
+        var copyBtn = badges.appendChild(el('button', null, 'Copy'));
+        copyBtn.type = 'button';
+        copyBtn.title = 'Copy the answer as Markdown';
         copyBtn.addEventListener('click', function () {
           if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
             navigator.clipboard.writeText(rawCopy).then(function () {
               copyBtn.textContent = 'Copied';
-              setTimeout(function () { copyBtn.textContent = 'Copy Markdown'; }, 1800);
+              setTimeout(function () { copyBtn.textContent = 'Copy'; }, 1800);
             }, function () {
-              flash('Clipboard copy was blocked by the browser.');
+              flash('The browser blocked the copy.');
             });
           } else {
-            flash('Clipboard API is unavailable in this browser.');
+            flash('This browser cannot copy.');
           }
         });
       }
 
+      // Who answered, what it cost and where it is saved. The tier and
+      // the host it begins with are the title already.
       var meta = byId('ai-meta');
-      if (reply.summary) {
-        meta.hidden = false;
-        meta.textContent = reply.summary;
-      } else if (reply.running) {
-        meta.hidden = false;
-        meta.textContent = 'Streaming response for ' + (reply.address || 'selected host') + '\u2026';
-      } else {
-        meta.hidden = true;
-        meta.textContent = '';
-      }
+      // "by stub-model · $0.0000 · chats/192.0.2.10.md"
+      var summary = String(reply.summary || '').replace(/^\[[LCR]\] for \S+ /, '')
+        .replace(/^(?:Local AI|Cloud AI|Research) \u00b7 \S+ \u00b7 (?:done \u00b7 )?/, '');
+      meta.hidden = !summary;
+      meta.textContent = summary ? capital(summary) : '';
 
       var body = clear(byId('ai-body'));
       if (reply.text) {
         renderTriage(body, String(reply.text));
       } else if (reply.running) {
-        body.appendChild(el('p', 'dim', 'Waiting for first tokens from model\u2026'));
+        body.appendChild(el('p', 'dim', 'Waiting for the answer\u2026'));
       }
 
       var errBox = byId('ai-error');

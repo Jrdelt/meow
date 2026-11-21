@@ -1031,7 +1031,7 @@ impl State {
                         ..AiStatus::default()
                     };
                 }
-                self.notice(format!("{} asked about {}", tier.name(), host.address));
+                self.notice(format!("{} · {} · running", tier.name(), host.address));
                 let state = Arc::clone(self);
                 self.handle
                     .spawn(async move { state.run_ai(tier, graph, host).await });
@@ -1062,18 +1062,20 @@ impl State {
                 let saved = ai::append_chat(&self.workspace_dir().join("chats"), &host, &outcome);
                 let file = match &saved {
                     Ok(path) => format!(
-                        "saved to chats/{}",
+                        "chats/{}",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ),
                     Err(error) => format!("not saved: {error:#}"),
                 };
                 let how = match (&outcome.fallback_reason, outcome.cached) {
-                    (Some(reason), _) => format!("answered locally ({reason})"),
-                    (None, true) => "answered from the prompt cache".to_owned(),
-                    (None, false) => format!("answered by {}", outcome.model),
+                    (Some(reason), _) => format!("local AI instead ({reason})"),
+                    (None, true) => "from cache".to_owned(),
+                    (None, false) => format!("by {}", outcome.model),
                 };
+                // "Local AI · 192.0.2.10 · done · by stub-model · $0.0000 ·
+                // chats/192.0.2.10.md": the words the map and the HUD use.
                 let line = format!(
-                    "{} for {}: {how} \u{b7} ${:.4} \u{b7} {file}",
+                    "{} · {} · done · {how} · ${:.4} · {file}",
                     tier.name(),
                     host.address,
                     outcome.cost_usd
@@ -1085,7 +1087,7 @@ impl State {
                 line
             }
             Err(error) => {
-                let line = format!("{} for {} failed: {error:#}", tier.name(), host.address);
+                let line = format!("{} · {} · failed: {error:#}", tier.name(), host.address);
                 let mut status = lock(&self.ai_status);
                 status.running = false;
                 status.error = Some(format!("{error:#}"));
@@ -4479,7 +4481,7 @@ mod tests {
                 assert!(status["summary"]
                     .as_str()
                     .unwrap()
-                    .contains("saved to chats/10.0.0.5.md"));
+                    .contains("· chats/10.0.0.5.md"));
                 break;
             }
             assert!(status["error"].is_null(), "{status}");
@@ -4498,7 +4500,7 @@ mod tests {
         assert_eq!(snapshot["budget"]["max_calls"], 20);
         assert!(snapshot["notices"]
             .to_string()
-            .contains("Local AI for 10.0.0.5: answered by local"));
+            .contains("Local AI · 10.0.0.5 · done · by local"));
 
         // With a CVE found, [R] starts. No key is set here, so it ends
         // without asking anyone.

@@ -156,7 +156,7 @@ When you are ready to export your findings:
 meow report
 ```
 
-This writes `REPORT.md` inside the session folder (for example `./meow/acme/REPORT.md`). You can also export the full workspace report or a single-host report directly from the browser map using **Export report (.md)** or **Print / PDF**.
+This writes `REPORT.md` inside the session folder (for example `./meow/acme/REPORT.md`). You can also export the full workspace report or a single-host report directly from the browser map using **Download .md** (**Host report .md** for a selected host) or **Print / PDF**.
 
 ---
 
@@ -245,13 +245,14 @@ Good to know:
 
 `meow map` opens the map in your browser (`127.0.0.1`, protected by a per-session token).
 
-- **Path** — You → gateway → WAN or VPN exit → Internet (click for each hop's location, network and latency) → WAF/CDN → provider → target hosts.
-- **Location** — a small satellite map floats top right; **−** folds it. **Expand** fills the window; **Esc** goes back.
+- **Map** — you, your router, your public address or VPN, the Internet (click it for each hop's place, network and latency), then the hosts by network and provider. Each host shows its address, open ports and CVEs; a red glow is a CVE that is known exploited, critical or high. The legend lists only what is drawn.
+- **Location** — a small satellite map floats top right; **−** folds it, and it folds by itself when it would cover a device. **Expand** fills the window; **Esc** goes back.
+- **This machine** — only what could be read: system, interfaces with their gateway, listening ports. Routes, neighbours and every interface fold away below.
 - **Host tabs** — Overview, Ports, Web & TLS, DNS & Mail, CVEs, and Notes & AI. Use ←/→ or `1`–`6`. Hover a row for details.
 - **Check now** — one connection to each of a host's known open ports, to see if it is up (mild and aggressive mode).
-- **CVEs** — found by software version and listed per software, known exploited first, with the release that fixes them.
-- **AI triage** — `[L]` local, `[C]` cloud, `[R]` research. Answers come as a **Red Team** plan (authorized testing, no exploit code) and a **Blue Team** plan (defense). Private addresses, names and secrets are masked before anything leaves your machine. Answers get back only the host's own address and names, and not on a line that names another host; anything else stays a placeholder (the report lists secrets to rotate).
-- **Export** — **Export report (.md)** or **Print / PDF**, for the whole workspace or one host.
+- **CVEs** — one line per update to make (`Update nginx 1.18.0 to 1.20.1 or later, or close 443/tcp`), the host with known exploited CVEs first; each line unfolds into its CVEs.
+- **AI** — **Local AI**, **Cloud AI** and **Research** (`L`, `C`, `R` in the HUD); the cloud's spend today and its daily cap are under the buttons. Answers come as a **Red team** plan (authorized testing, no exploit code) and a **Blue team** plan (defense). Private addresses, names and secrets are masked before anything leaves your machine. Answers get back only the host's own address and names, and not on a line that names another host; anything else stays a placeholder (the report lists secrets to rotate). Saved notes are listed under the host and in the report.
+- **Report** — **Download .md** or **Print / PDF** for the whole session; **Host report .md** on a selected host's card.
 
 ---
 
