@@ -170,6 +170,10 @@ pub struct HttpInfo {
     pub tls_versions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tls_weak_ciphers: Vec<String>,
+    /// Set by a TLS audit whose checks all answered: its versions and weak
+    /// ciphers are all the port offers now. Not kept.
+    #[serde(skip)]
+    pub tls_complete: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub robots_disallow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,8 +373,15 @@ impl HttpInfo {
         self.js_secrets.truncate(32);
     }
 
-    pub fn absorb(&mut self, mut other: HttpInfo) -> bool {
+    pub fn absorb(&mut self, other: HttpInfo) -> bool {
+        self.absorb_from(other, false)
+    }
+
+    /// [`Self::absorb`]; `page` when `other` is the headers stage's reading
+    /// of the page, whose software stack is all the page shows now.
+    fn absorb_from(&mut self, mut other: HttpInfo, page: bool) -> bool {
         other.sanitize();
+        let tls_complete = std::mem::take(&mut other.tls_complete);
         let before = self.clone();
         if self.scheme.is_empty() || other.scheme == "https" {
             self.scheme = other.scheme;
@@ -403,24 +414,29 @@ impl HttpInfo {
         if !other.missing_headers.is_empty() {
             self.missing_headers = other.missing_headers;
         }
-        if !other.tls_versions.is_empty() {
-            // A TLS audit tries every version and reports all it found:
-            // what it no longer finds was turned off.
+        if tls_complete && !other.tls_versions.is_empty() {
+            // A TLS audit whose checks all answered found all the port
+            // offers: what it no longer finds was turned off.
             self.tls_versions = other.tls_versions;
             self.tls_weak_ciphers = other.tls_weak_ciphers;
         } else {
-            for c in other.tls_weak_ciphers {
-                if !self.tls_weak_ciphers.contains(&c) && self.tls_weak_ciphers.len() < 32 {
-                    self.tls_weak_ciphers.push(c);
-                }
-            }
+            // A check that did not answer says nothing: what was found
+            // before stays.
+            merge_list(&mut self.tls_versions, other.tls_versions, 8);
+            merge_list(&mut self.tls_weak_ciphers, other.tls_weak_ciphers, 32);
         }
         for r in other.robots_disallow {
             if !self.robots_disallow.contains(&r) && self.robots_disallow.len() < 32 {
                 self.robots_disallow.push(r);
             }
         }
-        merge_tech(&mut self.tech, other.tech);
+        if page && !other.tech.is_empty() {
+            // The page as the headers stage read it now: its whole stack.
+            // A library taken off the page is no longer listed.
+            self.tech = other.tech;
+        } else {
+            merge_tech(&mut self.tech, other.tech);
+        }
         // The latest page's cookies and header grade replace the earlier ones.
         if !other.cookies.is_empty() {
             self.cookies = other.cookies;
@@ -2701,7 +2717,7 @@ impl Graph {
                 address,
                 port,
                 http,
-                record: _,
+                record,
             } => {
                 let Some(entry) = self.port_entry(&address, port, "tcp") else {
                     return false;
@@ -2713,11 +2729,13 @@ impl Graph {
                 }
                 match &mut entry.http {
                     Some(existing) => {
-                        changed |= existing.absorb(*http);
+                        let page = record.source == Source::HttpHeader;
+                        changed |= existing.absorb_from(*http, page);
                     }
                     None => {
                         let mut h = *http;
                         h.sanitize();
+                        h.tls_complete = false;
                         entry.http = Some(h);
                         changed = true;
                     }
@@ -2787,14 +2805,19 @@ impl Graph {
             Some(existing) => {
                 let before = existing.clone();
                 let before_weight = advisory_weight(&before);
-                // The port it was found on is closed now: it is named by
-                // the one it is found on today.
-                let closed = existing
-                    .port
-                    .as_ref()
-                    .is_some_and(|key| !host.ports.get(key).is_some_and(Port::is_open));
-                if closed && advisory.port.is_some() {
+                // The port it was found on is closed now, or a lookup's
+                // match runs other software there now (updated): it is
+                // named by the port and query it is found by today.
+                let looked_up = matches!(existing.record.source, Source::NvdApi | Source::OsvApi);
+                let gone = existing.port.as_ref().is_some_and(|key| {
+                    !host.ports.get(key).is_some_and(|port| {
+                        port.is_open()
+                            && (!looked_up || crate::cve::port_asks(port, &existing.matched))
+                    })
+                });
+                if gone && advisory.port.is_some() {
                     existing.port = advisory.port;
+                    existing.matched = advisory.matched;
                 }
                 existing.kev |= advisory.kev;
                 if existing.title.is_empty() {
@@ -4508,17 +4531,38 @@ mod tests {
     #[test]
     fn a_retest_shows_what_tls_and_the_page_offer_now() {
         let mut graph = Graph::default();
-        let web = |versions: &[&str], weak: &[&str], tech: &[&str]| Observation::WebMeta {
+        let web = |http: HttpInfo, source: Source| Observation::WebMeta {
             address: "192.0.2.80".into(),
             port: 443,
             http: Box::new(HttpInfo {
                 scheme: "https".into(),
-                tls_versions: versions.iter().map(|v| v.to_string()).collect(),
-                tls_weak_ciphers: weak.iter().map(|v| v.to_string()).collect(),
-                tech: tech.iter().map(|v| v.to_string()).collect(),
-                ..HttpInfo::default()
+                ..http
             }),
-            record: rec(Source::TlsCert),
+            record: rec(source),
+        };
+        let words = |list: &[&str]| list.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // A TLS audit: `complete` when every handshake answered.
+        let tls = |versions: &[&str], weak: &[&str], complete: bool| {
+            web(
+                HttpInfo {
+                    tls_versions: words(versions),
+                    tls_weak_ciphers: words(weak),
+                    tls_complete: complete,
+                    ..HttpInfo::default()
+                },
+                Source::TlsCert,
+            )
+        };
+        // The headers stage's reading of the page.
+        let page = |tech: &[&str]| {
+            web(
+                HttpInfo {
+                    tech: words(tech),
+                    header_grade: Some("C".into()),
+                    ..HttpInfo::default()
+                },
+                Source::HttpHeader,
+            )
         };
         let http = |graph: &Graph| {
             graph.hosts["192.0.2.80"].ports["443/tcp"]
@@ -4526,32 +4570,56 @@ mod tests {
                 .clone()
                 .unwrap()
         };
-        graph.apply(web(
-            &["TLSv1.0", "TLSv1.2"],
-            &["DES-CBC3-SHA"],
-            &[
-                "nginx 1.18.0",
-                "jQuery 1.12.4 (older than 3.5.0: XSS)",
-                "Drupal",
-            ],
-        ));
+        graph.apply(tls(&["TLSv1.0", "TLSv1.2"], &["DES-CBC3-SHA"], true));
+        assert!(!http(&graph).tls_complete, "not kept");
+        graph.apply(page(&[
+            "nginx 1.18.0",
+            "jQuery 1.12.4 (older than 3.5.0: XSS)",
+            "Drupal",
+        ]));
         // After hardening: TLS 1.0 and 3DES are off, jQuery is updated.
-        assert!(graph.apply(web(
-            &["TLSv1.2", "TLSv1.3"],
-            &[],
-            &["nginx", "jQuery 3.7.1", "PHP 8.2.1"],
-        )));
+        assert!(graph.apply(tls(&["TLSv1.2", "TLSv1.3"], &[], true)));
+        assert!(graph.apply(page(&["nginx", "jQuery 3.7.1", "PHP 8.2.1"])));
         let now = http(&graph);
         assert_eq!(now.tls_versions, ["TLSv1.2", "TLSv1.3"]);
         assert!(now.tls_weak_ciphers.is_empty());
-        assert_eq!(
-            now.tech,
-            ["nginx 1.18.0", "jQuery 3.7.1", "Drupal", "PHP 8.2.1"]
-        );
-        // A weak cipher seen without a version probe is added.
-        graph.apply(web(&[], &["RC4-MD5"], &[]));
+        assert!(!now.tls_complete);
+        assert_eq!(now.tech, ["nginx", "jQuery 3.7.1", "PHP 8.2.1"]);
+        // A library taken off the page is no longer listed.
+        graph.apply(page(&["nginx", "PHP 8.2.1"]));
+        assert_eq!(http(&graph).tech, ["nginx", "PHP 8.2.1"]);
+        // A page read that named nothing says nothing about the stack.
+        graph.apply(page(&[]));
+        assert_eq!(http(&graph).tech, ["nginx", "PHP 8.2.1"]);
+        // Another source's stack is added to it: a newer version of a
+        // library replaces the one listed, a vaguer name adds nothing.
+        graph.apply(web(
+            HttpInfo {
+                tech: words(&["PHP 8.3.0", "nginx", "Varnish"]),
+                ..HttpInfo::default()
+            },
+            Source::Favicon,
+        ));
+        assert_eq!(http(&graph).tech, ["nginx", "PHP 8.3.0", "Varnish"]);
+
+        // An audit whose version checks did not all answer (a slow or
+        // rate-limited server): what it found is added, nothing removed.
+        graph.apply(tls(&["TLSv1.0", "TLSv1.2", "TLSv1.3"], &["RC4-MD5"], true));
+        assert!(!graph.apply(tls(&["TLSv1.3"], &[], false)));
+        assert_eq!(http(&graph).tls_versions, ["TLSv1.0", "TLSv1.2", "TLSv1.3"]);
         assert_eq!(http(&graph).tls_weak_ciphers, ["RC4-MD5"]);
-        assert_eq!(http(&graph).tls_versions, ["TLSv1.2", "TLSv1.3"]);
+        graph.apply(tls(&["TLSv1.1"], &["DES-CBC3-SHA"], false));
+        assert_eq!(
+            http(&graph).tls_versions,
+            ["TLSv1.0", "TLSv1.2", "TLSv1.3", "TLSv1.1"]
+        );
+        assert_eq!(http(&graph).tls_weak_ciphers, ["RC4-MD5", "DES-CBC3-SHA"]);
+        // A weak cipher seen without a version check is added too.
+        graph.apply(tls(&[], &["NULL-MD5"], true));
+        assert_eq!(
+            http(&graph).tls_weak_ciphers,
+            ["RC4-MD5", "DES-CBC3-SHA", "NULL-MD5"]
+        );
     }
 
     #[test]
@@ -4604,12 +4672,39 @@ mod tests {
             graph.hosts["192.0.2.60"].advisories[0].port.as_deref(),
             Some("80/tcp")
         );
-        // Found on an open port, it stays where it was found.
+        // Found on an open port that still runs what found it, it stays
+        // where it was found.
         graph.apply(named(443, "nginx", "1.18.0", &[], Confidence::High));
         assert!(!graph.add_advisory("192.0.2.60", found_on("443/tcp")));
         assert_eq!(
             graph.hosts["192.0.2.60"].advisories[0].port.as_deref(),
             Some("80/tcp")
         );
+        // The nginx on 80 is updated: found again from 443/tcp, it is
+        // named by that port and the query that found it there.
+        graph.apply(named(80, "nginx", "1.25.3", &[], Confidence::High));
+        let by_cpe = Advisory {
+            matched: "cpeName=cpe:2.3:a:f5:nginx:1.18.0:*:*:*:*:*:*:*".into(),
+            ..found_on("443/tcp")
+        };
+        graph.apply(named(
+            443,
+            "nginx",
+            "1.18.0",
+            &["cpe:2.3:a:f5:nginx:1.18.0:*:*:*:*:*:*:*"],
+            Confidence::High,
+        ));
+        assert!(graph.add_advisory("192.0.2.60", by_cpe));
+        let stored = &graph.hosts["192.0.2.60"].advisories[0];
+        assert_eq!(stored.port.as_deref(), Some("443/tcp"));
+        assert!(stored.matched.starts_with("cpeName="), "{}", stored.matched);
+        // A match that no lookup made (graph.json, by hand) is moved only
+        // when its port is closed.
+        let mut imported = found_on("443/tcp");
+        imported.id = "CVE-2021-3618".into();
+        imported.record = rec(Source::ManualNote);
+        assert!(graph.add_advisory("192.0.2.60", imported.clone()));
+        imported.port = Some("80/tcp".into());
+        assert!(!graph.add_advisory("192.0.2.60", imported));
     }
 }

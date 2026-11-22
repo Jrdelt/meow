@@ -901,6 +901,17 @@ fn software_lookups(port: &Port) -> Vec<Lookup> {
     software
 }
 
+/// Whether a port's lookups ask what found an advisory (its `matched`):
+/// not when the port runs other software now.
+pub(crate) fn port_asks(port: &Port, matched: &str) -> bool {
+    let lookups = if matched.starts_with("cpeName=") || matched.starts_with("keywordSearch=") {
+        software_lookups(port)
+    } else {
+        script_guesses(port)
+    };
+    lookups.iter().any(|lookup| lookup.matched() == matched)
+}
+
 /// The libraries named by one port's script files that answered.
 fn script_guesses(port: &Port) -> Vec<Lookup> {
     let key = port.key();
@@ -2115,11 +2126,23 @@ fn port_software(port: &Port) -> Option<String> {
     })
 }
 
-/// The name and version of the software a CVE was found from.
-fn software_of(host: &Host, advisory: &Advisory) -> String {
-    let seen = advisory
-        .port
-        .as_ref()
+/// The name and version of the software a CVE was found from: that of
+/// the port it was found on, or, when that port asks it no more (its
+/// software was updated) and others still do, of the first of those.
+fn software_of(
+    host: &Host,
+    advisory: &Advisory,
+    asking: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let askers = asking
+        .get(&advisory.matched)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let port = match &advisory.port {
+        Some(own) if !askers.is_empty() && !askers.contains(own) => askers.first(),
+        own => own.as_ref(),
+    };
+    let seen = port
         .and_then(|key| host.ports.get(key))
         .and_then(port_software);
     if let Some(cpe) = advisory.matched.strip_prefix("cpeName=") {
@@ -2190,7 +2213,7 @@ pub fn by_software(host: &Host) -> Vec<CveGroup<'_>> {
     }
     let mut groups: Vec<CveGroup> = Vec::new();
     for advisory in &host.advisories {
-        let software = software_of(host, advisory);
+        let software = software_of(host, advisory, &asking);
         let port = ports_of(host, advisory, &software, &asking);
         match groups
             .iter_mut()
@@ -3767,5 +3790,62 @@ mod tests {
             "22/tcp, 80/tcp and 443/tcp"
         );
         assert_eq!(port_words("80/tcp"), "80/tcp");
+    }
+
+    #[tokio::test]
+    async fn a_cve_follows_the_port_that_still_runs_the_old_version() {
+        let (base, _) = per_cpe_nvd("1.0").await;
+        let client = client(&base, None).with_nvd_pace(Duration::from_millis(1));
+        let address = "192.0.2.91";
+        let mut graph = Graph::default();
+        let runs = |graph: &mut Graph, number: u16, version: &str| {
+            graph.apply(Observation::Port {
+                address: address.into(),
+                port: number,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("http".into()),
+                product: Some("p7".into()),
+                version: Some(version.into()),
+                extra_info: None,
+                cpes: vec![format!("cpe:/a:v7:p7:{version}")],
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        };
+        runs(&mut graph, 80, "1.0");
+        runs(&mut graph, 443, "1.0");
+        let first = client.ground(&graph.hosts[address].clone()).await;
+        merge(&mut graph, address, &first);
+        let stored = |graph: &Graph| {
+            let advisory = &graph.hosts[address].advisories[0];
+            (advisory.port.clone(), advisory.matched.clone())
+        };
+        assert_eq!(stored(&graph).0.as_deref(), Some("443/tcp"));
+        let fix = |graph: &Graph| fix_plan(&graph.hosts[address])[0].action.clone();
+        let only_80 =
+            "Update p7 1.0 to 9.0 or later, or close 80/tcp if the service is not needed.";
+
+        // The p7 on 443 is updated, the one on 80 is not: the CVE is the
+        // old version's, on the port that still runs it, at once.
+        runs(&mut graph, 443, "2.0");
+        assert_eq!(fix(&graph), only_80);
+        let groups = by_software(&graph.hosts[address]);
+        assert_eq!(
+            groups[0].heading(),
+            "p7 1.0 \u{b7} 80/tcp \u{b7} fixed in 9.0"
+        );
+        // And after the next lookup, which finds it from 80/tcp.
+        let second = client.ground(&graph.hosts[address].clone()).await;
+        assert_eq!(merge(&mut graph, address, &second).dropped, 0);
+        let (port, matched) = stored(&graph);
+        assert_eq!(port.as_deref(), Some("80/tcp"));
+        assert!(matched.ends_with(":p7:1.0"), "{matched}");
+        assert_eq!(fix(&graph), only_80);
+
+        // Both updated: the next lookup removes it.
+        runs(&mut graph, 80, "2.0");
+        let third = client.ground(&graph.hosts[address].clone()).await;
+        assert_eq!(merge(&mut graph, address, &third).dropped, 1);
+        assert!(graph.hosts[address].advisories.is_empty());
     }
 }

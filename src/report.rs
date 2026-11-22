@@ -874,11 +874,7 @@ pub fn render(inputs: &Inputs) -> String {
     }
     if !mentioned.is_empty() {
         let names: Vec<String> = mentioned.iter().map(|host| md(&host.label())).collect();
-        let _ = writeln!(
-            out,
-            "Only mentioned, not looked at: {}.\n",
-            names.join(", ")
-        );
+        let _ = writeln!(out, "Only mentioned, not scanned: {}.\n", names.join(", "));
     }
     for host in &seen {
         render_host(&mut out, host);
@@ -2328,10 +2324,83 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains(
-            "## Hosts\n\nOnly mentioned, not looked at: api.example.org, cdn.example.net, \
+            "## Hosts\n\nOnly mentioned, not scanned: api.example.org, cdn.example.net, \
              docs.example.com.\n\n### 10.10.10.5"
         ));
         assert!(!rendered.contains("### docs.example.com"));
+    }
+
+    #[test]
+    fn a_name_whose_dns_was_read_or_that_has_a_note_keeps_its_section() {
+        let mut custom = inputs();
+        // A mail-only domain: no address, so the mail-dns stage keeps its
+        // checks on the name.
+        custom.graph.apply(Observation::DnsSecurity {
+            address: "example.org".into(),
+            info: Box::new(DnsSecurity {
+                domain: "example.org".into(),
+                grade: "D".into(),
+                ..DnsSecurity::default()
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "mail-dns"),
+        });
+        custom.graph.apply(Observation::Note {
+            address: Some("admin.example.net".into()),
+            text: "default credentials admin/admin work on the login page".into(),
+            record: EvidenceRecord::observed(Source::ManualNote, Confidence::High, "meow note"),
+        });
+        // A certificate-log name looked up in DNS, and a printed URL: only
+        // mentioned. The domain's section lists what the lookup found.
+        for (claim, source) in [
+            (
+                "discovered in Certificate Transparency logs for example.org",
+                Source::CtLog,
+            ),
+            (
+                "DNS: no address record now (seen only in certificate logs)",
+                Source::Dns,
+            ),
+        ] {
+            custom.graph.apply(Observation::Fact {
+                address: "old.example.org".into(),
+                port: None,
+                protocol: "ip".into(),
+                claim: claim.into(),
+                record: EvidenceRecord::observed(source, Confidence::High, "x"),
+            });
+        }
+        let printed = crate::parsers::parse_text("see https://docs.example.com/a").unwrap();
+        custom.graph.apply_all(printed.observations);
+
+        let rendered = render(&custom);
+        assert!(
+            rendered.contains("|---|---|---|---|\n| 4 | 4 | 1 | 1 |\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "## Hosts\n\nOnly mentioned, not scanned: docs.example.com, old.example.org.\n"
+            ),
+            "{rendered}"
+        );
+        for kept in [
+            "### example.org\n",
+            "DNS & Mail for example.org: grade D.",
+            "### admin.example.net\n",
+            "- default credentials admin/admin work on the login page _(",
+        ] {
+            assert!(rendered.contains(kept), "{kept:?} missing in:\n{rendered}");
+        }
+        // The report of that one host, as the map offers it.
+        let single = render_host_report(&custom, "example.org").unwrap();
+        assert!(single.contains("| 1 | 0 | 0 | 0 |"), "{single}");
+        assert!(single.contains("DNS & Mail for example.org: grade D."));
+        assert!(!single.contains("No hosts recorded."));
+        let single = render_host_report(&custom, "admin.example.net").unwrap();
+        assert!(
+            single.contains("default credentials admin/admin"),
+            "{single}"
+        );
     }
 
     #[test]

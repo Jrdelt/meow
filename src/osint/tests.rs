@@ -1705,6 +1705,112 @@ fn pid_in(file: &std::path::Path) -> libc::pid_t {
     }
 }
 
+/// A TLS audit says whether every handshake answered. Only then do the
+/// versions and weak ciphers it found replace those listed: a check that
+/// could not connect, or did not finish, keeps what was found before.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tls_audit_replaces_what_was_listed_only_when_every_check_answered() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `openssl s_client`: the default handshake (TLS 1.3, a weak cipher
+    // before), TLS 1.2 and 1.3 taken, TLS 1.1 refused, TLS 1.0 as `tls1`.
+    let openssl = |name: &str, tls1: &str| {
+        stand_in(
+            tmp.path(),
+            name,
+            &format!(
+                "case \"$*\" in\n\
+                 *-tls1_2*|*-tls1_3*) printf 'CONNECTED(00000003)\\nNew, TLSv1.2, Cipher is ECDHE-RSA-AES128-GCM-SHA256\\n' ;;\n\
+                 *-tls1_1*) printf 'CONNECTED(00000003)\\nNew, (NONE), Cipher is (NONE)\\n' ;;\n\
+                 *-tls1*) {tls1} ;;\n\
+                 *) printf 'CONNECTED(00000003)\\n    Protocol  : TLSv1.3\\n    Cipher    : TLS_AES_256_GCM_SHA384\\n' ;;\n\
+                 esac"
+            ),
+        )
+    };
+    let refused = openssl(
+        "refused",
+        "printf 'CONNECTED(00000003)\\nNew, (NONE), Cipher is (NONE)\\n'",
+    );
+    // A check that could not connect (a rate limit, a dropped packet).
+    let silent = openssl("silent", "exit 1");
+    let tools = Tracker::new();
+    let audit = |openssl: std::path::PathBuf| {
+        let tools = &tools;
+        async move {
+            let (observations, _) = super::tls::run_tls_audit_with(
+                tools,
+                Some(openssl),
+                "192.0.2.40",
+                Some("www.example.com"),
+                443,
+            )
+            .await
+            .unwrap();
+            observations
+        }
+    };
+    let http = |observations: &[Observation]| {
+        observations
+            .iter()
+            .find_map(|observation| match observation {
+                Observation::WebMeta { http, .. } => Some((**http).clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let earlier = || Observation::WebMeta {
+        address: "192.0.2.40".into(),
+        port: 443,
+        http: Box::new(HttpInfo {
+            scheme: "https".into(),
+            tls_versions: vec!["TLSv1.0".into(), "TLSv1.2".into(), "TLSv1.3".into()],
+            tls_weak_ciphers: vec!["DES-CBC3-SHA".into()],
+            ..HttpInfo::default()
+        }),
+        record: EvidenceRecord::observed(Source::TlsCert, Confidence::High, "x"),
+    };
+    let listed = |graph: &crate::graph::Graph| {
+        let http = graph.hosts["192.0.2.40"].ports["443/tcp"]
+            .http
+            .clone()
+            .unwrap();
+        (http.tls_versions, http.tls_weak_ciphers)
+    };
+
+    // TLS 1.0 and 3DES were turned off: every check answered.
+    let found = audit(refused).await;
+    assert!(http(&found).tls_complete);
+    assert_eq!(http(&found).tls_versions, ["TLSv1.3", "TLSv1.2"]);
+    let mut graph = crate::graph::Graph::default();
+    graph.apply(earlier());
+    graph.apply_all(found);
+    assert_eq!(
+        listed(&graph),
+        (vec!["TLSv1.3".to_owned(), "TLSv1.2".to_owned()], vec![])
+    );
+
+    // The TLS 1.0 check did not answer: nothing is taken off the list.
+    let found = audit(silent).await;
+    assert!(!http(&found).tls_complete);
+    assert_eq!(http(&found).tls_versions, ["TLSv1.3", "TLSv1.2"]);
+    let mut graph = crate::graph::Graph::default();
+    graph.apply(earlier());
+    graph.apply_all(found);
+    assert_eq!(
+        listed(&graph),
+        (
+            vec![
+                "TLSv1.0".to_owned(),
+                "TLSv1.2".to_owned(),
+                "TLSv1.3".to_owned()
+            ],
+            vec!["DES-CBC3-SHA".to_owned()]
+        )
+    );
+    assert_eq!(tools.running(), 0);
+}
+
 /// A program still printing at its deadline: what it printed is kept, but
 /// for the line it had not finished, and it ends with all it started.
 #[cfg(unix)]

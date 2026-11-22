@@ -76,6 +76,25 @@ pub async fn run_tls_audit(
     hostname: Option<&str>,
     port: u16,
 ) -> Result<(Vec<Observation>, String)> {
+    let openssl = crate::tools::find_program("openssl");
+    run_tls_audit_with(tools, openssl, address, hostname, port).await
+}
+
+/// Whether an `openssl s_client` run answered: it connected and ended in
+/// time, so the handshake was made or refused. One that could not start,
+/// connect or finish says nothing about what the port offers.
+fn answered(printed: &Printed) -> bool {
+    !printed.timed_out && printed.text.contains("CONNECTED(")
+}
+
+/// [`run_tls_audit`] with the `openssl` program at `openssl_bin`.
+pub(super) async fn run_tls_audit_with(
+    tools: &Tracker,
+    openssl_bin: Option<std::path::PathBuf>,
+    address: &str,
+    hostname: Option<&str>,
+    port: u16,
+) -> Result<(Vec<Observation>, String)> {
     let sni = hostname.unwrap_or(address);
     if address.is_empty()
         || address.starts_with('-')
@@ -100,7 +119,9 @@ pub async fn run_tls_audit(
 
     let mut result = TlsAuditResult::default();
     let mut openssl_available = false;
-    let openssl_bin = crate::tools::find_program("openssl");
+    // Whether every handshake below answered: only then are the versions
+    // and weak ciphers found all that the port offers.
+    let mut complete = true;
 
     // 1. Inspect certificate + default negotiated TLS protocol via `openssl s_client`.
     if let Some(ref openssl_path) = openssl_bin {
@@ -110,9 +131,9 @@ pub async fn run_tls_audit(
 
         if let Ok((child, group)) = tools.spawn(&mut s_client) {
             openssl_available = true;
-            if let Some(stdout) =
-                wait_bounded_stdout(child, group, 128 * 1024, Duration::from_secs(6)).await
-            {
+            let printed = read_bounded(child, group, 128 * 1024, Duration::from_secs(6)).await;
+            complete &= printed.as_ref().is_some_and(answered);
+            if let Some(stdout) = printed.map(|printed| printed.text) {
                 result = parse_openssl_cert_output(&stdout);
 
                 // If a PEM certificate block was returned, parse Subject/Issuer/Dates/SANs with `openssl x509`.
@@ -192,16 +213,18 @@ pub async fn run_tls_audit(
                     flag,
                 ]);
                 configure_osint_command(&mut probe);
-                if let Ok((child, group)) = tools.spawn(&mut probe) {
-                    if let Some(text) =
-                        wait_bounded_stdout(child, group, 64 * 1024, Duration::from_secs(4)).await
+                let Ok((child, group)) = tools.spawn(&mut probe) else {
+                    complete = false;
+                    continue;
+                };
+                let printed = read_bounded(child, group, 64 * 1024, Duration::from_secs(4)).await;
+                complete &= printed.as_ref().is_some_and(answered);
+                if let Some(text) = printed.map(|printed| printed.text) {
+                    if (text.contains("BEGIN CERTIFICATE")
+                        || (text.contains("Cipher is ") && !text.contains("Cipher is (NONE)")))
+                        && !result.supported_versions.iter().any(|v| v == label)
                     {
-                        if (text.contains("BEGIN CERTIFICATE")
-                            || (text.contains("Cipher is ") && !text.contains("Cipher is (NONE)")))
-                            && !result.supported_versions.iter().any(|v| v == label)
-                        {
-                            result.supported_versions.push(label.to_owned());
-                        }
+                        result.supported_versions.push(label.to_owned());
                     }
                 }
             }
@@ -294,6 +317,7 @@ pub async fn run_tls_audit(
                 tls_not_after: result.not_after,
                 tls_versions: result.supported_versions.clone(),
                 tls_weak_ciphers: result.weak_ciphers,
+                tls_complete: complete && openssl_available,
                 ..HttpInfo::default()
             }),
             record: EvidenceRecord::observed(Source::TlsCert, Confidence::High, &ev),

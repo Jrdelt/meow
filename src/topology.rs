@@ -254,21 +254,47 @@ fn is_single_device(address: &str, mac: &str) -> bool {
 /// The role of a host and what it was derived from. Text evidence wins over
 /// position: a gateway whose OS guess says it is a firewall is a firewall.
 /// A host known by a name alone, with nothing seen on it: the name was
-/// printed in the session shell or a log, usually inside a URL, and nobody
-/// looked at the machine. There is no address to place it by, so it is
-/// listed and never drawn.
+/// printed in the session shell or a log, usually inside a URL, or listed
+/// in the certificate logs, and nobody looked at the machine. There is no
+/// address to place it by, so it is listed and never drawn. A name whose
+/// own DNS records or mail checks were read, or that has the operator's
+/// note, was looked at.
 pub fn only_mentioned(host: &Host) -> bool {
     parse_host_ip(&host.address).is_none()
         && host.open_ports().count() == 0
         && host.advisories.is_empty()
         && host.os.is_none()
         && host.mac.is_none()
+        && host.dns_security.is_none()
+        && host.asn.is_none()
+        && host.country.is_none()
+        && host.ipv6_dns.is_none()
+        && host.waf_cdn.is_none()
+        && host.hops.is_empty()
+        && host.not_open.is_empty()
+        && host
+            .facts
+            .iter()
+            .chain(host.ports.values().flat_map(|port| &port.facts))
+            .all(is_mention)
         // A server or redirect header means something answered.
         && host.ports.values().all(|port| {
             port.http
                 .as_ref()
                 .is_none_or(|http| http.server.is_none() && http.location.is_none())
         })
+}
+
+/// A fact that only says a name came up: in the terminal, a log or the
+/// certificate logs, or how such a name answers in DNS (the `mail-dns`
+/// stage's `DNS: ` line on a certificate-log name).
+fn is_mention(fact: &crate::graph::Fact) -> bool {
+    use crate::evidence::Source;
+    match fact.record.source {
+        Source::PtyRegex | Source::LogRegex | Source::CtLog => true,
+        Source::Dns => fact.claim.starts_with("DNS: "),
+        _ => false,
+    }
 }
 
 pub fn host_role(graph: &Graph, host: &Host) -> (Role, String) {
@@ -1789,6 +1815,71 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("only the wildcard"));
+        assert!(only_mentioned(&graph.hosts["old.example.test"]));
+    }
+
+    #[test]
+    fn a_name_whose_dns_was_read_or_that_has_a_note_was_looked_at() {
+        let mut graph = Graph::default();
+        let fact = |address: &str, claim: &str, source: Source| Observation::Fact {
+            address: address.into(),
+            port: None,
+            protocol: "ip".into(),
+            claim: claim.into(),
+            record: EvidenceRecord::observed(source, Confidence::High, "x"),
+        };
+        // A mail-only domain: no address, so the dns and mail-dns stages
+        // keep what they found on the name.
+        graph.apply(fact(
+            "example.org",
+            "CT log subdomains for example.org (1): www.example.org",
+            Source::CtLog,
+        ));
+        assert!(only_mentioned(&graph.hosts["example.org"]));
+        graph.apply(Observation::DnsSecurity {
+            address: "example.org".into(),
+            info: Box::new(crate::graph::DnsSecurity {
+                domain: "example.org".into(),
+                grade: "D".into(),
+                ..crate::graph::DnsSecurity::default()
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "mail-dns"),
+        });
+        // Its own records, before the mail checks ran.
+        graph.apply(fact(
+            "mail.example.net",
+            "MX record: 10 mx.example.net",
+            Source::Dns,
+        ));
+        // The operator's note on a name nobody scanned.
+        graph.apply(Observation::Note {
+            address: Some("admin.example.net".into()),
+            text: "default credentials work on the login page".into(),
+            record: EvidenceRecord::observed(Source::ManualNote, Confidence::High, "meow note"),
+        });
+        // A certificate-log name, looked up in DNS: still only mentioned.
+        graph.apply(fact(
+            "www.example.org",
+            "discovered in Certificate Transparency logs for example.org",
+            Source::CtLog,
+        ));
+        graph.apply(fact(
+            "www.example.org",
+            "DNS: resolves to 192.0.2.7",
+            Source::Dns,
+        ));
+        for looked_at in ["example.org", "mail.example.net", "admin.example.net"] {
+            assert!(!only_mentioned(&graph.hosts[looked_at]), "{looked_at}");
+        }
+        assert!(only_mentioned(&graph.hosts["www.example.org"]));
+        let drawn = Topology::build(&graph).cytoscape(&graph);
+        let mentioned: Vec<&str> = drawn["mentioned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(mentioned, ["www.example.org"]);
     }
 
     #[test]
