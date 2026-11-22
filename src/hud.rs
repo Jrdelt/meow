@@ -796,7 +796,7 @@ fn inspector_lines(host: &Host, room: usize) -> Vec<Line<'static>> {
         let close = fix
             .port
             .as_ref()
-            .map(|port| format!("or close {}", sanitize(port, 80)));
+            .map(|port| format!("or close {}", sanitize(&cve::port_words(port), 80)));
         let cves = Span::styled(count(fix.advisories, "CVE", "CVEs"), DIM);
         let kev = (fix.kev > 0).then(|| Span::styled(format!("{} exploited", fix.kev), BAD));
         // As the map says it, on one row where it fits.
@@ -954,15 +954,15 @@ fn advisory_detail(host: &Host, advisory: &Advisory, listed: bool) -> Vec<Line<'
     if advisory.kev && !listed {
         head.push(Span::styled("exploited", BAD));
     }
-    // The software and version it was found from.
-    let found_from = cve::by_software(host)
+    // The software and version it was found from, and every port it runs on.
+    let (found_from, ports) = cve::by_software(host)
         .into_iter()
         .find(|group| group.cves.iter().any(|a| a.id == advisory.id))
-        .map(|group| group.software)
-        .unwrap_or_else(|| advisory.matched.clone());
+        .map(|group| (group.software, group.port))
+        .unwrap_or_else(|| (advisory.matched.clone(), advisory.port.clone()));
     let mut from = vec![Span::styled(sanitize(&found_from, 200), DIM)];
-    if let Some(port) = &advisory.port {
-        from.push(Span::styled(sanitize(port, 40), DIM));
+    if let Some(ports) = &ports {
+        from.push(Span::styled(sanitize(ports, 80), DIM));
     }
     let mut lines = vec![
         Line::from(joined(head)),

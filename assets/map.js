@@ -2276,6 +2276,13 @@
     return item;
   }
 
+  // "80/tcp, 443/tcp" as "80/tcp and 443/tcp".
+  function portWords(ports) {
+    var text = String(ports);
+    var at = text.lastIndexOf(', ');
+    return at < 0 ? text : text.slice(0, at) + ' and ' + text.slice(at + 2);
+  }
+
   // What to do about the CVEs of one piece of software: "Update nginx
   // 1.18.0 to 1.20.1 or later, or close 443/tcp", "3 CVEs · 1 exploited"
   // under it. It unfolds into each CVE, the most urgent first: at most
@@ -2288,7 +2295,7 @@
     var summary = section.appendChild(el('summary'));
     var action = 'Update ' + group.software + (fix && fix.target ? ' to ' + fix.target
       : group.fix ? ' (' + group.fix + ')' : '');
-    if (group.port) { action += ', or close ' + group.port; }
+    if (group.port) { action += ', or close ' + portWords(group.port); }
     summary.appendChild(el('span', 'name', action));
     summary.appendChild(el('span', 'sub dim', cveWords({ total: entries.length, kev: group.kev || 0 })));
     if (group.note) {
