@@ -36,6 +36,10 @@ use crate::tools;
 use crate::workspace::{read_private_bounded, validate_name, Config, MeowHome};
 
 const MAX_EDIT_CHARS: usize = 4096;
+/// The fewest characters a key box opened by typing on its row (not with
+/// Enter) takes: a step key or two typed there by habit is not a key.
+/// Real keys are 32 characters or more.
+const MIN_TYPED_KEY_CHARS: usize = 16;
 const MAX_WIZARD_CONFIG_BYTES: u64 = 256 * 1024;
 
 /// Crisp 7-bit Cat + wordmark ASCII banner for `meow --help` and `--plain`.
@@ -184,6 +188,9 @@ pub struct EditState {
     pub paste_hint: bool,
     /// Why Enter did not take the text; said in the edit box, which stays.
     pub problem: String,
+    /// The box was opened by typing or pasting on its row, not with Enter:
+    /// a key box then takes only a whole key (see `MIN_TYPED_KEY_CHARS`).
+    pub typed: bool,
 }
 
 /// Whether a scanner, the wordlist or the location database is on this
@@ -416,6 +423,33 @@ impl Wizard {
         self.env_key_source = settings.key_source().map(|source| sanitize(&source, 80));
     }
 
+    /// The environment variable a session takes the key from for the
+    /// service chosen now, before any key set here.
+    fn env_key_variable(&self) -> Option<&str> {
+        self.env_key_source
+            .as_deref()?
+            .strip_prefix("the ")?
+            .strip_suffix(" environment variable")
+    }
+
+    /// The Key row's value: the key's ending, or where a session takes the
+    /// key from; `None` when there is none. A key in the environment is
+    /// taken first, so it is named even when a key is set here.
+    fn key_summary(&self) -> Option<String> {
+        let own = self
+            .cloud_api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty());
+        match (own, self.env_key_variable(), self.env_key_source.as_deref()) {
+            (Some(_), Some(variable), _) => {
+                Some(format!("from ${variable} · ai.toml key not used"))
+            }
+            (Some(key), None, _) => Some(setup::masked(key)),
+            (None, _, Some(source)) => Some(setup::key_origin(source)),
+            (None, _, None) => None,
+        }
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursors[self.step.index()]
     }
@@ -486,11 +520,13 @@ impl Wizard {
     fn select_cloud_choice(&mut self, choice: CloudChoice) {
         let prev = self.cloud_choice;
         self.cloud_choice = choice;
-        // A key stays with the service it was entered for.
+        // A key stays with the service it was entered for, and with its
+        // address: a gateway's key does not go to the service behind it.
         let removed = format!(
             "Key removed: it was for {}",
             crate::location::source(&self.cloud_url)
         );
+        let host = setup::url_host(&self.cloud_url);
         match choice {
             CloudChoice::LocalOnly => {
                 let msg = if self.cloud_api_key.take().is_some() {
@@ -503,8 +539,9 @@ impl Wizard {
                 self.set_status(msg, false);
             }
             CloudChoice::Claude => {
-                let cleared = prev != CloudChoice::Claude && self.cloud_api_key.take().is_some();
                 self.cloud_url = anthropic::API_URL.to_owned();
+                let moved = prev != CloudChoice::Claude || setup::url_host(&self.cloud_url) != host;
+                let cleared = moved && self.cloud_api_key.take().is_some();
                 if !self.cloud_model.starts_with("claude-") {
                     self.cloud_model = anthropic::DEFAULT_MODEL.to_owned();
                 }
@@ -520,12 +557,13 @@ impl Wizard {
                 self.set_status(if cleared { removed } else { String::new() }, false);
             }
             CloudChoice::OpenRouter => {
-                let cleared =
-                    prev != CloudChoice::OpenRouter && self.cloud_api_key.take().is_some();
                 let defaults = AiSettings::default();
                 if anthropic::is_claude_api(&self.cloud_url) || self.cloud_url.trim().is_empty() {
                     self.cloud_url = defaults.cloud_url;
                 }
+                let moved =
+                    prev != CloudChoice::OpenRouter || setup::url_host(&self.cloud_url) != host;
+                let cleared = moved && self.cloud_api_key.take().is_some();
                 if self.cloud_model.starts_with("claude-") {
                     self.cloud_model = defaults.cloud_model;
                 }
@@ -541,7 +579,9 @@ impl Wizard {
     }
 
     /// A key made for one service picks that service: a Claude key the
-    /// Claude API, an OpenRouter key OpenRouter.
+    /// Claude API, an OpenRouter key OpenRouter. An address the user set,
+    /// such as a gateway, stays while it speaks the key's protocol and is
+    /// not the other service.
     fn use_service_of(&mut self, key: &str) {
         let Some((made_for, _)) = setup::key_service(key) else {
             return;
@@ -550,7 +590,7 @@ impl Wizard {
             CloudChoice::Claude => CloudProvider::Anthropic,
             CloudChoice::OpenRouter | CloudChoice::LocalOnly => CloudProvider::OpenAi,
         };
-        if setup::key_belongs(key, provider, &self.cloud_url) {
+        if made_for == provider && setup::key_fits(key, &self.cloud_url) {
             return;
         }
         match made_for {
@@ -584,6 +624,7 @@ impl Wizard {
             buffer: initial,
             paste_hint: false,
             problem: String::new(),
+            typed: false,
         });
     }
 
@@ -592,6 +633,9 @@ impl Wizard {
             return;
         };
         let trimmed = edit.buffer.trim();
+        // A key box opened by typing on its row: what a stray step key or
+        // two put there replaces no key, and removes none.
+        let stray = edit.typed && trimmed.chars().count() < MIN_TYPED_KEY_CHARS;
         match edit.field {
             EditField::LocalUrl => match ai::checked_local_url(trimmed) {
                 Ok(url) => {
@@ -608,7 +652,9 @@ impl Wizard {
                 self.clear_status();
             }
             EditField::CloudApiKey => {
-                if trimmed.is_empty() {
+                if stray {
+                    self.set_status("Key refused: too short", true);
+                } else if trimmed.is_empty() {
                     // The box said so while a key was stored.
                     let removed = self.cloud_api_key.take().is_some();
                     self.set_status(if removed { "Key removed" } else { "" }, false);
@@ -619,11 +665,22 @@ impl Wizard {
                     let service = (self.cloud_choice, self.cloud_url.clone());
                     self.use_service_of(&key);
                     self.cloud_api_key = Some(key);
-                    // The key chose its service: that is worth a line.
-                    if (self.cloud_choice, &self.cloud_url) == (service.0, &service.1) {
-                        self.clear_status();
-                    } else {
-                        self.set_status("Service changed to match the key", false);
+                    // The key chose its service: that is worth a line. So is
+                    // a key in the environment, which a session takes first.
+                    let moved = (self.cloud_choice, &self.cloud_url) != (service.0, &service.1);
+                    let unused = self
+                        .env_key_variable()
+                        .map(|variable| format!("Not used while ${variable} is set"));
+                    match (moved, unused) {
+                        (false, None) => self.clear_status(),
+                        (true, None) => {
+                            self.set_status("Service changed to match the key", false);
+                        }
+                        (false, Some(unused)) => self.set_status(unused, true),
+                        (true, Some(unused)) => self.set_status(
+                            format!("Service changed to match the key · {unused}"),
+                            true,
+                        ),
                     }
                 }
             }
@@ -674,7 +731,9 @@ impl Wizard {
                 self.clear_status();
             }
             EditField::NvdApiKey => {
-                if trimmed.is_empty() {
+                if stray {
+                    self.set_status("NVD key refused: too short", true);
+                } else if trimmed.is_empty() {
                     let removed = self.nvd_api_key.take().is_some();
                     self.set_status(if removed { "NVD key removed" } else { "" }, false);
                 } else if trimmed.len() > 512 || trimmed.chars().any(char::is_control) {
@@ -724,6 +783,9 @@ impl Wizard {
         if self.editing.is_none() {
             if let Some(field) = self.focused_key_field() {
                 self.start_edit(field);
+                if let Some(edit) = &mut self.editing {
+                    edit.typed = true;
+                }
             }
         }
         if let Some(edit) = &mut self.editing {
@@ -794,6 +856,7 @@ impl Wizard {
                 self.start_edit(field);
                 if let Some(edit) = &mut self.editing {
                     edit.buffer.push(ch);
+                    edit.typed = true;
                 }
                 return WizardAction::None;
             }
@@ -1534,16 +1597,6 @@ impl Row {
     }
 }
 
-/// A key is shown by its ending, or by where it comes from; `None` when
-/// there is none.
-fn key_summary(secret: Option<&str>, env_source: Option<&str>) -> Option<String> {
-    match (secret, env_source) {
-        (Some(key), _) if !key.trim().is_empty() => Some(setup::masked(key)),
-        (None, Some(src)) => Some(setup::key_origin(src)),
-        _ => None,
-    }
-}
-
 /// The question of the step (its parts after a ` · ` are left out where
 /// the box is too narrow) and its rows, in the order of `activate_row`.
 fn step_rows(wizard: &Wizard) -> (&'static str, Vec<Row>) {
@@ -1621,11 +1674,7 @@ fn step_rows(wizard: &Wizard) -> (&'static str, Vec<Row>) {
                 ),
             ];
             if wizard.cloud_choice != CloudChoice::LocalOnly {
-                let key = key_summary(
-                    wizard.cloud_api_key.as_deref(),
-                    wizard.env_key_source.as_deref(),
-                );
-                rows.push(match key {
+                rows.push(match wizard.key_summary() {
                     Some(key) => Row::new(Mark::None, "Key", key, "edit").styled(GOOD),
                     None => Row::new(Mark::None, "Key", setup::KEY_MISSING, "edit").styled(WARN),
                 });
@@ -2018,11 +2067,7 @@ fn review_lines(wizard: &Wizard, width: usize) -> Vec<Line<'static>> {
                 &format!("{service} · {}", wizard.cloud_model),
                 plain,
             );
-            let key = key_summary(
-                wizard.cloud_api_key.as_deref(),
-                wizard.env_key_source.as_deref(),
-            );
-            match key {
+            match wizard.key_summary() {
                 Some(key) => row("Key", &key, GOOD),
                 None => row("Key", setup::KEY_MISSING, WARN),
             }
@@ -2172,9 +2217,17 @@ fn help_lines(wizard: &Wizard, width: usize) -> Vec<Line<'static>> {
     } else {
         ""
     };
+    // There a pasted key may arrive as key presses.
+    let key_rows = match wizard.step {
+        Step::CloudAi if wizard.cloud_choice != CloudChoice::LocalOnly => {
+            ". On the Key row, typing goes into the key"
+        }
+        Step::Toolkit => ". On the NVD key row, typing goes into the key",
+        _ => "",
+    };
     topics.push((
         "Keys",
-        format!("1-5 Tab step · Space pick · p find servers · t test{tools_key}"),
+        format!("1-5 Tab step · Space pick · p find servers · t test{tools_key}{key_rows}"),
     ));
     topics
         .iter()
@@ -2432,11 +2485,13 @@ fn footer(wizard: &Wizard, enter: &str, width: u16) -> Footer {
             lines.push(Line::styled(part, WARN));
         }
     }
-    let stored = match edit.field {
-        EditField::CloudApiKey => wizard.cloud_api_key.is_some(),
-        EditField::NvdApiKey => wizard.nvd_api_key.is_some(),
-        _ => false,
-    };
+    // A box opened by typing on its row does not remove the key.
+    let stored = !edit.typed
+        && match edit.field {
+            EditField::CloudApiKey => wizard.cloud_api_key.is_some(),
+            EditField::NvdApiKey => wizard.nvd_api_key.is_some(),
+            _ => false,
+        };
     let (keys, style) = if edit.paste_hint {
         (setup::PASTE_HINT, WARN)
     } else if stored {
@@ -3341,14 +3396,75 @@ mod tests {
         assert_eq!(wiz.preview().openrouter_api_key, None);
         assert!(render(&wiz, 100, 30).contains(setup::KEY_MISSING));
 
-        // An OpenRouter key typed for that address goes to OpenRouter.
+        // An OpenRouter key typed for an address the user set (a gateway,
+        // say) stays with it; the box said where it goes.
         wiz.cursors[Step::CloudAi.index()] = 3;
         wiz.on_key(key(KeyCode::Enter));
+        assert!(render(&wiz, 100, 30).contains("sent only to llm.example.com"));
         wiz.on_paste("sk-or-v1-typed-for-another-host-aaaa");
         wiz.on_key(key(KeyCode::Enter));
-        assert_eq!(wiz.cloud_url, AiSettings::default().cloud_url);
-        assert_eq!(wiz.status, "Service changed to match the key");
+        assert_eq!(wiz.cloud_url, "https://llm.example.com/v1");
+        assert_eq!(wiz.status, "");
         assert!(wiz.cloud_api_key.is_some());
+        // A Claude key there picks the Claude API.
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste("sk-ant-api03-typed-for-another-host-bbbb");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_choice, CloudChoice::Claude);
+        assert_eq!(wiz.cloud_url, anthropic::API_URL);
+        assert_eq!(wiz.status, "Service changed to match the key");
+    }
+
+    /// A gateway named by hand that passes the service's own key on (set
+    /// with `meow setup --cloud-url`): its key is kept when the setup opens
+    /// and saved again, and goes when the address changes.
+    #[test]
+    fn a_gateway_keeps_the_key_of_the_service_behind_it() {
+        const GATEWAY: &str = "https://gateway.example.com/v1/anthropic";
+        const KEY: &str = "sk-ant-api03-passed-on-by-a-gateway-3333";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        std::fs::create_dir_all(home.root()).unwrap();
+        let gateway = AiOverrides {
+            cloud_url: Some(GATEWAY.into()),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            api_key: Some(KEY.into()),
+            ..AiOverrides::default()
+        };
+        gateway.save(&home.ai_path()).unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+        assert_eq!(wiz.cloud_choice, CloudChoice::Claude);
+        assert_eq!(wiz.cloud_url, GATEWAY);
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(KEY));
+        assert_eq!(wiz.status, "");
+        // Only the mode changed: the key and the gateway are saved again.
+        wiz.cursors[Step::Mode.index()] = 1;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.save(&home).unwrap();
+        let saved = AiOverrides::load(&home.ai_path()).unwrap();
+        assert_eq!(saved.api_key.as_deref(), Some(KEY));
+        assert_eq!(saved.cloud_url.as_deref(), Some(GATEWAY));
+
+        // The key typed again there stays with the gateway.
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste(KEY);
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_url, GATEWAY);
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(KEY));
+        // Claude API picked again: the address is the Claude API's now, and
+        // the gateway's key is not taken there.
+        wiz.cursors[Step::CloudAi.index()] = 1;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_url, anthropic::API_URL);
+        assert_eq!(wiz.cloud_api_key, None);
+        assert_eq!(wiz.status, "Key removed: it was for gateway.example.com");
+        // Picked once more, nothing moves and nothing is said.
+        wiz.cloud_api_key = Some(KEY.into());
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(KEY));
+        assert_eq!(wiz.status, "");
     }
 
     /// A key pasted as key presses on its row (Windows, or a terminal
@@ -3357,6 +3473,7 @@ mod tests {
     #[test]
     fn a_key_typed_on_its_row_goes_into_its_box_not_to_the_keys() {
         const PASTED: &str = "sk-or-v1-qstp?hjkl12345~-9f3a";
+        const NVD: &str = "5f1e0c2a-qs00-4b7d-9e21-3c4d5e6f7a8b";
         let tmp = tempfile::tempdir().unwrap();
         let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
         let mut wiz = Wizard::load(&home, false).unwrap();
@@ -3399,11 +3516,11 @@ mod tests {
         wiz.on_key(key(KeyCode::Char('4')));
         wiz.on_key(key(KeyCode::Down));
         assert_eq!(wiz.focused_key_field(), Some(EditField::NvdApiKey));
-        for ch in "5f1e-qs".chars() {
+        for ch in NVD.chars() {
             assert_eq!(wiz.on_key(key(KeyCode::Char(ch))), WizardAction::None);
         }
         wiz.on_key(key(KeyCode::Enter));
-        assert_eq!(wiz.nvd_api_key.as_deref(), Some("5f1e-qs"));
+        assert_eq!(wiz.nvd_api_key.as_deref(), Some(NVD));
         wiz.on_paste("nvd-pasted-on-its-row");
         assert_eq!(
             wiz.editing.as_ref().map(|edit| edit.buffer.as_str()),
@@ -3411,7 +3528,7 @@ mod tests {
         );
         assert!(!render(&wiz, 100, 30).contains("nvd-pasted"));
         wiz.on_key(key(KeyCode::Esc));
-        assert_eq!(wiz.nvd_api_key.as_deref(), Some("5f1e-qs"));
+        assert_eq!(wiz.nvd_api_key.as_deref(), Some(NVD));
 
         // Off a key's row the keys keep their meaning, and a paste there
         // goes nowhere.
@@ -3426,6 +3543,123 @@ mod tests {
         wiz.on_key(key(KeyCode::Enter));
         wiz.cursors[Step::CloudAi.index()] = 3;
         assert_eq!(wiz.focused_key_field(), None);
+    }
+
+    /// A step key or two typed by habit on a key's row (`4` to go on, `5`
+    /// then Enter to save, `j j` to move) opens the key's box, but Enter
+    /// there replaces no key and removes none.
+    #[test]
+    fn a_step_key_typed_on_a_key_row_replaces_no_key() {
+        const REAL: &str = "sk-or-v1-the-real-key-just-pasted-7777";
+        const NVD: &str = "0c1d2e3f-4a5b-4c6d-8e7f-90a1b2c3d4e5";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_key(key(KeyCode::Down));
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste(REAL);
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(REAL));
+        assert_eq!(wiz.focused_key_field(), Some(EditField::CloudApiKey));
+
+        let strays: [&[KeyCode]; 4] = [
+            &[KeyCode::Char('4')],
+            &[KeyCode::Char('5')],
+            &[KeyCode::Char('j'), KeyCode::Char('j')],
+            &[KeyCode::Char('5'), KeyCode::Backspace],
+        ];
+        for typed in strays {
+            for code in typed {
+                assert_eq!(wiz.on_key(key(*code)), WizardAction::None);
+            }
+            // The box opened by typing does not offer to remove the key.
+            let frame = render(&wiz, 100, 30);
+            assert!(frame.contains("hidden"), "{frame}");
+            assert!(!frame.contains("empty removes the key"), "{frame}");
+            assert_eq!(wiz.on_key(key(KeyCode::Enter)), WizardAction::None);
+            assert!(wiz.editing.is_none());
+            assert_eq!(wiz.cloud_api_key.as_deref(), Some(REAL), "{typed:?}");
+            assert_eq!(wiz.status, "Key refused: too short");
+            assert!(wiz.status_warn);
+            let frame = render(&wiz, 100, 30);
+            assert!(frame.contains("ends in 7777"), "{frame}");
+        }
+        // A short paste on the row the same.
+        wiz.on_paste("gpt-4o-mini");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(REAL));
+        // A whole key typed there is taken.
+        for ch in "sk-or-v1-typed-on-its-row-8888".chars() {
+            wiz.on_key(key(KeyCode::Char(ch)));
+        }
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            wiz.cloud_api_key.as_deref(),
+            Some("sk-or-v1-typed-on-its-row-8888")
+        );
+        // Opened with Enter, a short key is the user's own choice (a server
+        // of their own), and an empty box removes the key.
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste("token-abc123");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some("token-abc123"));
+        wiz.on_key(key(KeyCode::Enter));
+        assert!(render(&wiz, 100, 30).contains("empty removes the key"));
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key, None);
+        assert_eq!(wiz.status, "Key removed");
+
+        // The NVD key's row: `r` (check tools elsewhere) then Enter.
+        wiz.on_key(key(KeyCode::Up));
+        wiz.on_key(key(KeyCode::Char('4')));
+        wiz.on_key(key(KeyCode::Down));
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste(NVD);
+        wiz.on_key(key(KeyCode::Enter));
+        for typed in ["r", "5", "kk"] {
+            for ch in typed.chars() {
+                wiz.on_key(key(KeyCode::Char(ch)));
+            }
+            wiz.on_key(key(KeyCode::Enter));
+            assert_eq!(wiz.nvd_api_key.as_deref(), Some(NVD), "{typed}");
+            assert_eq!(wiz.status, "NVD key refused: too short");
+        }
+        // The help of these steps says so.
+        wiz.on_key(key(KeyCode::Up));
+        wiz.on_key(key(KeyCode::Char('?')));
+        let help = render(&wiz, 120, 40);
+        assert!(help.contains("On the NVD key row, typing goes"), "{help}");
+        wiz.on_key(key(KeyCode::Char('3')));
+        let help = render(&wiz, 120, 40);
+        assert!(help.contains("On the Key row, typing goes"), "{help}");
+
+        // A key in ai.toml: `5` then Enter on its row keeps it.
+        let stored = AiOverrides {
+            cloud_url: Some(AiSettings::default().cloud_url),
+            cloud_provider: Some(CloudProvider::OpenAi),
+            api_key: Some(format!("sk-or-v1-{}", "a".repeat(64))),
+            ..AiOverrides::default()
+        };
+        std::fs::create_dir_all(home.root()).unwrap();
+        stored.save(&home.ai_path()).unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+        for code in [
+            KeyCode::Char('3'),
+            KeyCode::Down,
+            KeyCode::Char('5'),
+            KeyCode::Enter,
+        ] {
+            assert_eq!(wiz.on_key(key(code)), WizardAction::None);
+        }
+        assert_eq!(wiz.cloud_api_key, stored.api_key);
+        wiz.save(&home).unwrap();
+        assert_eq!(
+            AiOverrides::load(&home.ai_path()).unwrap().api_key,
+            stored.api_key
+        );
     }
 
     /// What was typed or pasted and not read yet is dropped as the setup

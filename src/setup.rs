@@ -145,17 +145,26 @@ pub(crate) fn key_service(key: &str) -> Option<(CloudProvider, &'static str)> {
     }
 }
 
-/// Whether `key` may be sent to `url`: a key made for one service goes to
-/// that service only, or to a server on this machine.
+/// The hosts of the services [`key_service`] knows keys of.
+const KEY_HOSTS: [&str; 2] = ["api.anthropic.com", "openrouter.ai"];
+
+/// Whether `key` may be sent to `url`: a key made for one of the services
+/// [`key_service`] knows never goes to the other. Any other address was
+/// named by the user, such as a gateway or a server on this machine.
 pub(crate) fn key_fits(key: &str, url: &str) -> bool {
-    key_service(key)
-        .is_none_or(|(_, host)| url_host(url) == host || crate::ai::is_loopback_url(url))
+    let host = url_host(url);
+    // `openrouter.ai.` is `openrouter.ai`.
+    let host = host.trim_end_matches('.');
+    key_service(key).is_none_or(|(_, home)| host == home || !KEY_HOSTS.contains(&host))
 }
 
-/// Whether `key` is for the service at `url` that speaks `provider`. A key
-/// that is not picks its own service where the user named none.
+/// Whether `key` is for the service at `url` that speaks `provider`: its
+/// own service, or a server on this machine. A key that is not picks its
+/// own service where the user named none.
 pub(crate) fn key_belongs(key: &str, provider: CloudProvider, url: &str) -> bool {
-    key_service(key).is_none_or(|(made_for, _)| made_for == provider) && key_fits(key, url)
+    key_service(key).is_none_or(|(made_for, home)| {
+        made_for == provider && (url_host(url) == home || crate::ai::is_loopback_url(url))
+    })
 }
 
 /// Whether the user's file asks for a cloud AI: not switched off, and a
@@ -576,8 +585,9 @@ fn apply(
             bail!("key refused: over 512 bytes or control characters");
         }
         // A Claude key goes to the Claude API, an OpenRouter key to
-        // OpenRouter: with no service named, the key picks its own; with
-        // one named, another service's key is refused.
+        // OpenRouter: with no service named, the key picks its own. A
+        // service named here is kept (a gateway, say), but neither key is
+        // sent to the other one's service.
         let url = own.cloud_url.clone().unwrap_or(current.cloud_url.clone());
         let provider = AiSettings {
             cloud_url: url.clone(),
@@ -942,8 +952,8 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
              \x20 2  Claude key\n\
              \x20 3  OpenRouter or other key\n\
              \x20 4  Remove key\n\
-             \x20 5  Cloud AI off (local AI only)\n\
-             \x20 6  Test\n\
+             \x20 5  Test\n\
+             \x20 6  Cloud AI off (local AI only)\n\
              \x20 q  Done"
         );
         let Some(answer) = ask("> ")? else {
@@ -961,13 +971,13 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
                 }
                 Ok(stored)
             }
-            "5" => {
+            "5" => check(settings, &mut std::io::stdout()).map(|_| false),
+            "6" => {
                 if let Some(said) = turn_cloud_off(own) {
                     println!("{said}");
                 }
                 Ok(true)
             }
-            "6" => check(settings, &mut std::io::stdout()).map(|_| false),
             "q" | "Q" | "" => {
                 done(saved_any);
                 return Ok(());
@@ -1981,8 +1991,8 @@ mod tests {
         apply(&piped, &stand_in, &mut own, Some(CLAUDE.into())).unwrap();
         assert_eq!(own.cloud_url.as_deref(), Some("http://127.0.0.1:9/v1"));
 
-        // A service named in the same call and another service's key: the
-        // key is refused, and nothing is changed.
+        // The other service named in the same call: the key is refused, and
+        // nothing is changed.
         for (args, key, said) in [
             (
                 SetupArgs {
@@ -2002,16 +2012,26 @@ mod tests {
             ),
             (
                 SetupArgs {
-                    cloud_url: Some("https://llm.example.com/v1".into()),
+                    cloud_url: Some("https://openrouter.ai/api/v1".into()),
+                    ..piped.clone()
+                },
+                CLAUDE,
+                "key refused: it is for api.anthropic.com, not openrouter.ai",
+            ),
+            (
+                SetupArgs {
+                    cloud_url: Some("https://API.Anthropic.com/v1".into()),
                     ..piped.clone()
                 },
                 OPENROUTER,
-                "key refused: it is for openrouter.ai, not llm.example.com",
+                "key refused: it is for openrouter.ai, not api.anthropic.com",
             ),
         ] {
             let mut own = chosen(&openrouter);
+            let before = own.clone();
             let error = apply(&args, &openrouter, &mut own, Some(key.into())).unwrap_err();
             assert_eq!(format!("{error:#}"), said);
+            assert_eq!(own.api_key, before.api_key);
         }
         // Named, on this machine: the user's own server, as they asked.
         let mut own = AiOverrides::default();
@@ -2021,12 +2041,79 @@ mod tests {
         };
         apply(&local, &openrouter, &mut own, Some(CLAUDE.into())).unwrap();
         assert_eq!(own.api_key.as_deref(), Some(CLAUDE));
+        // Named, a gateway that passes the service's own key on: kept there,
+        // with the protocol named.
+        for (provider, url, key, speaks) in [
+            (
+                Some("claude"),
+                "https://gateway.example.com/v1/anthropic",
+                CLAUDE,
+                CloudProvider::Anthropic,
+            ),
+            (
+                None,
+                "https://gateway.example.com/v1/openrouter",
+                OPENROUTER,
+                CloudProvider::OpenAi,
+            ),
+        ] {
+            let mut own = chosen(&openrouter);
+            let gateway = SetupArgs {
+                provider: provider.map(Into::into),
+                cloud_url: Some(url.into()),
+                ..piped.clone()
+            };
+            let notes = apply(&gateway, &openrouter, &mut own, Some(key.into())).unwrap();
+            assert_eq!(own.cloud_url.as_deref(), Some(url));
+            assert_eq!(own.cloud_provider, Some(speaks));
+            assert_eq!(own.api_key.as_deref(), Some(key));
+            assert_eq!(notes, ["[+] Key saved for gateway.example.com"]);
+            // Unnamed again, the key picks its own service.
+            let current = AiSettings {
+                cloud_url: url.into(),
+                cloud_provider: Some(speaks),
+                ..AiSettings::default()
+            };
+            let mut again = own.clone();
+            apply(&piped, &current, &mut again, Some(key.into())).unwrap();
+            assert_ne!(again.cloud_url.as_deref(), Some(url));
+        }
 
         assert!(key_fits(CLAUDE, "https://api.anthropic.com/v1"));
         assert!(!key_fits(CLAUDE, "https://openrouter.ai/api/v1"));
         assert!(key_fits(OPENROUTER, "http://localhost:8080/v1"));
         assert!(!key_fits(OPENROUTER, "https://api.anthropic.com/v1"));
+        assert!(!key_fits(OPENROUTER, "https://API.anthropic.com./v1"));
+        assert!(key_fits(OPENROUTER, "https://gateway.example.com/v1"));
+        assert!(key_fits(CLAUDE, "https://gateway.example.com/v1"));
         assert!(key_fits(GOOD_KEY, "https://llm.example.com/v1"));
+        assert!(key_fits(GOOD_KEY, "https://openrouter.ai/api/v1"));
+        // The unnamed switch: a key's own service or this machine only.
+        assert!(key_belongs(
+            CLAUDE,
+            CloudProvider::Anthropic,
+            anthropic::API_URL
+        ));
+        assert!(key_belongs(
+            CLAUDE,
+            CloudProvider::Anthropic,
+            "http://[::1]:9/v1"
+        ));
+        assert!(!key_belongs(
+            CLAUDE,
+            CloudProvider::Anthropic,
+            "https://gateway.example.com/v1"
+        ));
+        assert!(!key_belongs(
+            CLAUDE,
+            CloudProvider::OpenAi,
+            anthropic::API_URL
+        ));
+        assert!(key_belongs(
+            GOOD_KEY,
+            CloudProvider::OpenAi,
+            "https://llm.example.com/v1"
+        ));
     }
 
     /// `--cloud-off`: local AI only, also with a key in the environment,
