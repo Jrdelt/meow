@@ -67,25 +67,39 @@ pub fn parse_crtsh_json(json_text: &str, root: &str, limit: usize) -> Result<Vec
     Ok(out)
 }
 
+/// The certificate log asked about public names.
+pub const CRT_SH: &str = "https://crt.sh/";
+
 /// Queries `https://crt.sh/?q=%25.<root_domain>&output=json` passively.
+/// `internal`: the target is internal (see [`is_internal_target`]), and
+/// nothing about it is sent. What is found is recorded on
+/// `primary_address`.
 pub async fn run_subdomains(
     domain: &str,
     primary_address: &str,
+    internal: bool,
+) -> Result<(Vec<Observation>, String)> {
+    run_subdomains_at(CRT_SH, domain, primary_address, internal).await
+}
+
+/// [`run_subdomains`] with the log at `crt_sh`.
+pub async fn run_subdomains_at(
+    crt_sh: &str,
+    domain: &str,
+    primary_address: &str,
+    internal: bool,
 ) -> Result<(Vec<Observation>, String)> {
     let Some(root) = root_domain(domain) else {
         bail!("'{domain}' has no registrable root domain");
     };
     // A public log knows only public names; an internal one is not sent.
-    let internal_address = primary_address
-        .parse::<IpAddr>()
-        .is_ok_and(is_non_public_ip);
-    if !may_ask_public_services(&root) || internal_address {
+    if internal || !may_ask_public_services(&root) {
         bail!("'{domain}' is an internal name; it is not sent to crt.sh");
     }
     let client = build_http_client(Duration::from_secs(10))?;
     let query = format!("%.{root}");
     let resp = client
-        .get("https://crt.sh/")
+        .get(crt_sh)
         .query(&[("q", query.as_str()), ("output", "json")])
         .send()
         .await

@@ -2277,6 +2277,13 @@
     return item;
   }
 
+  // "80/tcp, 443/tcp" as "80/tcp and 443/tcp".
+  function portWords(ports) {
+    var text = String(ports);
+    var at = text.lastIndexOf(', ');
+    return at < 0 ? text : text.slice(0, at) + ' and ' + text.slice(at + 2);
+  }
+
   // What to do about the CVEs of one piece of software: "Update nginx
   // 1.18.0 to 1.20.1 or later, or close 443/tcp", "3 CVEs · 1 exploited"
   // under it. It unfolds into each CVE, the most urgent first: at most
@@ -2289,7 +2296,7 @@
     var summary = section.appendChild(el('summary'));
     var action = 'Update ' + group.software + (fix && fix.target ? ' to ' + fix.target
       : group.fix ? ' (' + group.fix + ')' : '');
-    if (group.port) { action += ', or close ' + group.port; }
+    if (group.port) { action += ', or close ' + portWords(group.port); }
     summary.appendChild(el('span', 'name', action));
     summary.appendChild(el('span', 'sub dim', cveWords({ total: entries.length, kev: group.kev || 0 })));
     if (group.note) {
@@ -2686,21 +2693,7 @@
         send({ cmd: 'ai', tier: tier[0], address: host.address });
       });
     });
-    var budget = state.budget || {};
-    if (budget.has_key) {
-      ai.appendChild(hint(row('Cloud AI today', '$' + (budget.spent_usd || 0).toFixed(2) + ' of $' +
-        (budget.max_usd || 0).toFixed(2) + ' \u00b7 ' + (budget.calls || 0) + '/' + (budget.max_calls || 0) +
-        ' calls \u00b7 masked first'),
-        'Spent today, and the daily cap. Past it, Cloud AI answers with the local AI.'));
-    } else {
-      // No key, or the file with it cannot be read: the local AI answers.
-      var why = el('span', null, budget.setup_unreadable ? 'ai.toml unreadable (' : 'no key (');
-      why.appendChild(el('code', null, 'meow setup'));
-      why.appendChild(document.createTextNode(') \u00b7 local AI answers instead'));
-      ai.appendChild(hint(row('Cloud AI', why), budget.setup_unreadable
-        ? '~/.meow/ai.toml cannot be read. Research is off until it is fixed.'
-        : 'Research is off until a key is added. A key added applies to this session at once.'));
-    }
+    ai.appendChild(cloudAiLine(state.budget || {}));
 
     // Notes: the ones saved for this host, then a box for the next.
     var note = card('Notes');
@@ -2756,7 +2749,9 @@
     badge.appendChild(el('span', 'grade small ' + gradeKind(info.grade), info.grade || '?'));
     box.appendChild(hint(row('Grade', badge), 'SPF, DMARC, DKIM, CAA and DNSSEC graded together'));
     (info.checks || []).forEach(function (check) {
-      box.appendChild(hint(row(check.name, marked(check.value, check.status)), check.advice));
+      // 'unknown': its lookups got no answer.
+      var kind = check.status === 'unknown' ? 'info' : check.status;
+      box.appendChild(hint(row(check.name, marked(check.value, kind)), check.advice));
     });
     if ((info.wildcard || []).length) {
       box.appendChild(hint(row('Wildcard', marked(info.wildcard.join(', '), 'warn')),
@@ -2775,6 +2770,7 @@
       subs.forEach(function (sub) {
         var value = sub.status === 'wildcard' ? marked('wildcard only', 'warn')
           : sub.status === 'gone' ? marked('no record', 'info')
+          : sub.status === 'unknown' ? marked('lookup failed', 'info')
           : marked((sub.addresses || []).join(', '), 'ok');
         var line = box.appendChild(row(sub.name, value));
         if (sub.status !== 'resolves') { line.className += ' faded'; }
@@ -3024,6 +3020,29 @@
   // its findings are the tabs under the map. With nothing selected, the
   // card is the report.
   var lastDetailId = null;
+  // The Ask AI card's line on the cloud: today's spend and the cap, or why
+  // the local AI answers instead.
+  function cloudAiLine(budget) {
+    if (budget.has_key && budget.usage_unreadable) {
+      // What all sessions spent today is unknown: no cloud call is made.
+      return hint(row('Cloud AI', 'off \u00b7 ai-usage unreadable \u00b7 local AI answers instead'),
+        '~/.meow/ai-usage cannot be read. Research is off until it is fixed.');
+    }
+    if (budget.has_key) {
+      return hint(row('Cloud AI today', '$' + (budget.spent_usd || 0).toFixed(2) + ' of $' +
+        (budget.max_usd || 0).toFixed(2) + ' \u00b7 ' + (budget.calls || 0) + '/' + (budget.max_calls || 0) +
+        ' calls \u00b7 masked first'),
+        'Spent today by all sessions, and the daily cap. Past it, Cloud AI answers with the local AI.');
+    }
+    // No key, or the file with it cannot be read: the local AI answers.
+    var why = el('span', null, budget.setup_unreadable ? 'ai.toml unreadable (' : 'no key (');
+    why.appendChild(el('code', null, 'meow setup'));
+    why.appendChild(document.createTextNode(') \u00b7 local AI answers instead'));
+    return hint(row('Cloud AI', why), budget.setup_unreadable
+      ? '~/.meow/ai.toml cannot be read. Research is off until it is fixed.'
+      : 'Research is off until a key is added. A key added applies to this session at once.');
+  }
+
   function renderDetail() {
     var detail = byId('detail');
     var panels = byId('host-panels');

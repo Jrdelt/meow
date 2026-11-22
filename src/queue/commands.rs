@@ -59,6 +59,18 @@ pub struct ReconFlags {
     pub shared: Vec<String>,
 }
 
+impl ReconFlags {
+    /// Whether nmap is asked for IPv6 (`-6`, unless a later `-4`): a name
+    /// is then scanned at its first IPv6 address.
+    pub fn ipv6(&self) -> bool {
+        self.shared
+            .iter()
+            .rev()
+            .find(|flag| *flag == "-4" || *flag == "-6")
+            .is_some_and(|flag| flag == "-6")
+    }
+}
+
 pub fn split_recon_flags(flags: &[String]) -> ReconFlags {
     let mut out = ReconFlags::default();
     let add_scripts = |out: &mut ReconFlags, list: &str| {
@@ -661,9 +673,12 @@ pub fn udp_note(port: u16) -> Option<&'static str> {
 
 /// The UDP scan (aggressive mode, as root): the services in [`UDP_PORTS`]
 /// on `targets`, with a light version probe to tell open from no answer.
+/// `shared`: the up-check, DNS and address-family flags the port scan ran
+/// with (see [`ReconFlags::shared`]).
 pub fn udp_command(
     settings: &ReconSettings,
     targets: &[String],
+    shared: &[String],
     ipv6: bool,
     output: &Path,
 ) -> ToolCommand {
@@ -683,7 +698,12 @@ pub fn udp_command(
     .iter()
     .map(|a| (*a).to_owned())
     .collect();
-    if ipv6 {
+    for flag in shared {
+        if !args.contains(flag) {
+            args.push(flag.clone());
+        }
+    }
+    if ipv6 && !args.iter().any(|a| a == "-6") {
         args.push("-6".to_owned());
     }
     args.extend(strings(&NMAP_STATS));

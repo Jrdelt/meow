@@ -1124,6 +1124,7 @@ impl Config {
         let mut config: Config = parse_toml(&text, &path)?;
         // Each user's own AI setup lives beside the config, not in it.
         config.ai.user_file = Some(home.ai_path());
+        config.ai.usage_file = Some(home.root().join(crate::usage::FILE));
         config.recon.wordlist_dir = Some(home.root().join("wordlists"));
         Ok(config)
     }
@@ -5480,6 +5481,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         // A loaded config also knows where this user's own AI setup lives.
         let mut expected = Config::default();
         expected.ai.user_file = Some(fx.home.root().join("ai.toml"));
+        expected.ai.usage_file = Some(fx.home.root().join("ai-usage"));
         expected.recon.wordlist_dir = Some(fx.home.root().join("wordlists"));
         assert_eq!(Config::load_or_create(&fx.home).unwrap(), expected);
         assert_eq!(

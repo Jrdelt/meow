@@ -128,7 +128,8 @@ pub struct AiSettings {
     pub cloud_url: String,
     pub cloud_model: String,
     pub research_model: String,
-    /// Hard caps for the cloud tiers, per UTC day.
+    /// Hard caps for the cloud tiers, per day and for all sessions of the
+    /// user together (see [`AiSettings::usage_file`]).
     pub max_daily_usd: f64,
     pub max_daily_calls: u32,
     /// Prefer `meow setup` or the `OPENROUTER_API_KEY` environment variable
@@ -159,6 +160,11 @@ pub struct AiSettings {
     /// then off: that file may be what turned them off.
     #[serde(skip)]
     pub setup_error: Option<String>,
+    /// The day's cloud use of all the user's sessions (`~/.meow/ai-usage`,
+    /// see [`crate::usage`]), which the daily caps count. Without it (tests)
+    /// they count this session's own record.
+    #[serde(skip)]
+    pub usage_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for AiSettings {
@@ -181,6 +187,7 @@ impl std::fmt::Debug for AiSettings {
             .field("cloud_notes", &self.cloud_notes)
             .field("user_file", &self.user_file)
             .field("setup_error", &self.setup_error)
+            .field("usage_file", &self.usage_file)
             .finish()
     }
 }
@@ -202,6 +209,7 @@ impl Default for AiSettings {
             cloud_notes: false,
             user_file: None,
             setup_error: None,
+            usage_file: None,
         }
     }
 }
@@ -976,11 +984,16 @@ pub struct Budget {
     /// so the cloud tiers are off.
     #[serde(default)]
     pub setup_unreadable: bool,
+    /// The day's use of all sessions (`~/.meow/ai-usage`) cannot be read,
+    /// so the cloud tiers are off.
+    #[serde(default)]
+    pub usage_unreadable: bool,
 }
 
 impl Budget {
     pub fn exhausted(&self) -> bool {
-        !self.spent_usd.is_finite()
+        self.usage_unreadable
+            || !self.spent_usd.is_finite()
             || !self.max_usd.is_finite()
             || self.spent_usd >= self.max_usd
             || self.calls >= self.max_calls
@@ -1034,12 +1047,35 @@ fn record_usage(db: &Db, tier: Tier, model: &str, usage: &Usage) -> Result<()> {
 
 /// A request stopped because its next API call would go past the daily
 /// cloud budget.
-#[derive(Debug)]
-pub struct BudgetReached;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BudgetReached {
+    /// The most the call could cost (0 where that is not known).
+    pub most_usd: f64,
+    /// What was left of the day's budget for it.
+    pub left_usd: f64,
+    /// The day's calls were used up.
+    pub calls: bool,
+}
+
+impl BudgetReached {
+    /// Whether money is left today, only not enough for one more call:
+    /// the cap is then too low for the model, not used up.
+    pub fn too_dear(&self) -> bool {
+        !self.calls && self.left_usd >= 0.01 && self.most_usd > self.left_usd
+    }
+}
 
 impl std::fmt::Display for BudgetReached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("daily cloud budget reached")
+        if self.too_dear() {
+            write!(
+                f,
+                "one call could cost up to ${:.2}; ${:.2} left today (raise max_daily_usd)",
+                self.most_usd, self.left_usd
+            )
+        } else {
+            f.write_str("daily cloud budget reached")
+        }
     }
 }
 
@@ -1047,13 +1083,71 @@ impl std::error::Error for BudgetReached {}
 
 /// What today's cloud budget still allows one request. Every API call it
 /// makes (a model asked after another declined, a resumed research turn)
-/// is checked against it first, and counted.
-#[derive(Debug, Clone, Copy)]
+/// is checked against it first, and counted. With the day-wide record of
+/// all the user's sessions, each call is also set aside there first.
+#[derive(Debug)]
 pub struct Allowance {
     calls_left: u32,
     usd_left: f64,
     /// The API calls this request has made.
     pub calls: u32,
+    shared: Option<Shared>,
+}
+
+/// A request's part of the day-wide record ([`crate::usage`]): what it
+/// has set aside or spent there, and on which day.
+#[derive(Debug)]
+struct Shared {
+    ledger: crate::usage::Ledger,
+    max_usd: f64,
+    max_calls: u32,
+    day: String,
+    held: f64,
+    /// What the request is known to cost should it end before it is
+    /// settled (the session closed during a call): what it cost before
+    /// that call, and that call's input. Set aside in place of the most.
+    floor: f64,
+    settled: bool,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if !self.settled {
+            // Kept set aside as it is if the record cannot be written.
+            let _ = self.hold(self.floor, 0.0, false);
+        }
+    }
+}
+
+impl Shared {
+    /// This request now holds `spent + most` of the day: what it has cost
+    /// so far and the most its next call can add. `call` counts that call,
+    /// if the caps allow it; without it this settles what was set aside.
+    fn hold(&mut self, spent: f64, most: f64, call: bool) -> Result<()> {
+        let (max_usd, max_calls) = (self.max_usd, self.max_calls);
+        let (held, day) = (self.held, self.day.clone());
+        let total = spent + most;
+        let outcome = self.ledger.update(|today| {
+            // Another day's share is no longer in the record.
+            let mine = if today.day == day { held } else { 0.0 };
+            let others = (today.usd - mine).max(0.0);
+            // Written so that a NaN anywhere refuses.
+            let fits = others + total <= max_usd;
+            if call && (today.calls >= max_calls || !fits) {
+                return Err(BudgetReached {
+                    most_usd: most,
+                    left_usd: max_usd - others - spent,
+                    calls: today.calls >= max_calls,
+                });
+            }
+            today.usd = others + total;
+            today.calls += u32::from(call);
+            Ok(today.day.clone())
+        })?;
+        self.day = outcome?;
+        self.held = total;
+        Ok(())
+    }
 }
 
 impl Allowance {
@@ -1062,6 +1156,24 @@ impl Allowance {
             calls_left: budget.max_calls.saturating_sub(budget.calls),
             usd_left: budget.max_usd - budget.spent_usd,
             calls: 0,
+            shared: None,
+        }
+    }
+
+    /// [`Allowance::new`] where `budget` is the day of all the user's
+    /// sessions, kept by `ledger`: each call is set aside there first.
+    pub fn shared(budget: &Budget, ledger: crate::usage::Ledger) -> Self {
+        Self {
+            shared: Some(Shared {
+                ledger,
+                max_usd: budget.max_usd,
+                max_calls: budget.max_calls,
+                day: String::new(),
+                held: 0.0,
+                floor: 0.0,
+                settled: true,
+            }),
+            ..Self::new(budget)
         }
     }
 
@@ -1071,19 +1183,53 @@ impl Allowance {
             calls_left: u32::MAX,
             usd_left: f64::INFINITY,
             calls: 0,
+            shared: None,
         }
     }
 
     /// Before an API call: `spent` is what this request has cost so far,
-    /// `most` the most the call can cost where that is known (0 where not).
-    pub fn take_call(&mut self, spent: f64, most: f64) -> Result<()> {
+    /// `most` the most the call can cost where that is known (0 where not),
+    /// `least` what it costs once sent (its input; 0 where not known). If
+    /// the request ends before [`Allowance::settle`] (the session closed),
+    /// `spent + least` takes the place of what was set aside.
+    pub fn take_call(&mut self, spent: f64, most: f64, least: f64) -> Result<()> {
         // Written so that a NaN anywhere refuses.
         let fits = spent + most <= self.usd_left;
         if self.calls >= self.calls_left || !fits {
-            return Err(BudgetReached.into());
+            return Err(BudgetReached {
+                most_usd: most,
+                left_usd: self.usd_left - spent,
+                calls: self.calls >= self.calls_left,
+            }
+            .into());
+        }
+        if let Some(shared) = &mut self.shared {
+            shared.hold(spent, most, true)?;
+            shared.floor = spent + least.clamp(0.0, most.max(0.0));
+            shared.settled = false;
         }
         self.calls += 1;
         Ok(())
+    }
+
+    /// After the request: what its calls cost (`cost`) takes the place of
+    /// what was set aside for them in the day-wide record. A cost that is
+    /// not a number, or below 0, leaves what was set aside.
+    pub fn settle(&mut self, cost: f64) -> Result<()> {
+        match &mut self.shared {
+            Some(shared) if self.calls > 0 && cost.is_finite() && cost >= 0.0 => {
+                // Tried again when the request ends if it fails now.
+                shared.floor = cost;
+                shared.hold(cost, 0.0, false)?;
+                shared.settled = true;
+                Ok(())
+            }
+            Some(shared) => {
+                shared.settled = true;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -1105,14 +1251,21 @@ fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &
     prefix
 }
 
-/// Today's cloud spending against the configured caps.
+/// Today's cloud spending against the configured caps: of all the user's
+/// sessions (see [`AiSettings::usage_file`]), or else of this one.
 pub fn budget(db: &Db, settings: &AiSettings) -> Result<Budget> {
-    let (spent, calls): (f64, i64) = db.conn().query_row(
-        "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM ai_usage
-         WHERE day_utc = ?1 AND tier IN ('cloud', 'research')",
-        [today_utc()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (spent, calls): (f64, i64) = match &settings.usage_file {
+        Some(path) => {
+            let today = crate::usage::Ledger::at(path).today()?;
+            (today.usd, i64::from(today.calls))
+        }
+        None => db.conn().query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM ai_usage
+             WHERE day_utc = ?1 AND tier IN ('cloud', 'research')",
+            [today_utc()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?,
+    };
     Ok(Budget {
         spent_usd: spent,
         calls: calls.max(0) as u32,
@@ -1120,7 +1273,17 @@ pub fn budget(db: &Db, settings: &AiSettings) -> Result<Budget> {
         max_calls: settings.max_daily_calls,
         has_key: settings.api_key().is_some(),
         setup_unreadable: settings.setup_error.is_some(),
+        usage_unreadable: false,
     })
+}
+
+/// Why the cloud is off when the day's use of all sessions cannot be read.
+fn usage_unreadable(error: &anyhow::Error) -> String {
+    format!(
+        "{} cannot be read ({}): cloud AI is off until it is fixed",
+        crate::usage::FILE,
+        sanitize(&format!("{error:#}"), 200)
+    )
 }
 
 fn cache_key(tier: Tier, model: &str, system: &str, user: &str) -> String {
@@ -2055,6 +2218,7 @@ fn mask_prompt(
     let mut vault = vault.lock().unwrap_or_else(|p| p.into_inner());
     vault.register_graph(graph);
     vault.register_operator();
+    vault.scope_to(host);
     // Everything is masked, the notes too: a secret in a note is then on
     // the list of what to rotate, whether or not the note is sent.
     let mut user = vault.mask_json(&prompt.user);
@@ -2082,15 +2246,7 @@ fn mask_prompt(
     }
     // Only this host's address and names are filled back into the reply,
     // and a link straight to it is the user's own target.
-    let own: Vec<&str> = std::iter::once(host.address.as_str())
-        .chain(host.hostnames.iter().map(String::as_str))
-        .chain(
-            host.ports
-                .values()
-                .flat_map(|port| port.tls_sans.iter().map(String::as_str)),
-        )
-        .collect();
-    let unmasker = vault.stream_for(&masked, &own);
+    let unmasker = vault.stream_about(&masked, host);
     Ok((masked, unmasker))
 }
 
@@ -2138,7 +2294,15 @@ impl AiEngine {
     }
 
     pub fn budget(&self) -> Budget {
-        budget(&lock_db(&self.db), &self.settings.effective()).unwrap_or_default()
+        let settings = self.settings.effective();
+        budget(&lock_db(&self.db), &settings).unwrap_or_else(|_| Budget {
+            max_usd: settings.max_daily_usd,
+            max_calls: settings.max_daily_calls,
+            has_key: settings.api_key().is_some(),
+            setup_unreadable: settings.setup_error.is_some(),
+            usage_unreadable: true,
+            ..Budget::default()
+        })
     }
 
     /// One streamed chat completion. `on_delta` receives each piece of the
@@ -2460,7 +2624,17 @@ impl AiEngine {
             });
         }
 
-        let budget = self.budget();
+        let today = budget(&lock_db(&self.db), &settings);
+        let budget = match today {
+            Ok(budget) => budget,
+            Err(error) => {
+                // Fail closed: what other sessions spent today is unknown.
+                let reason = unavailable(&usage_unreadable(&error))?;
+                return self
+                    .run_local(tier, graph, host, vault, &prompt, reason, on_text)
+                    .await;
+            }
+        };
         let budget_reached = format!(
             "daily cloud budget reached (${:.4} of ${:.2}, {} of {} calls)",
             budget.spent_usd, budget.max_usd, budget.calls, budget.max_calls
@@ -2471,7 +2645,10 @@ impl AiEngine {
                 .run_local(tier, graph, host, vault, &prompt, reason, on_text)
                 .await;
         }
-        let mut allowance = Allowance::new(&budget);
+        let mut allowance = match &settings.usage_file {
+            Some(path) => Allowance::shared(&budget, crate::usage::Ledger::at(path)),
+            None => Allowance::new(&budget),
+        };
 
         let shared_unmasker = Mutex::new(unmasker);
         let shared_shown = Mutex::new(String::new());
@@ -2545,7 +2722,7 @@ impl AiEngine {
                         "parameters": { "max_uses": 2, "max_results": 5, "search_context_size": "low" },
                     }]);
                 }
-                match allowance.take_call(0.0, 0.0) {
+                match allowance.take_call(0.0, 0.0, 0.0) {
                     Ok(()) => self
                         .chat(
                             &settings.cloud_url,
@@ -2568,9 +2745,16 @@ impl AiEngine {
                 if allowance.calls > 0 {
                     let db = lock_db(&self.db);
                     let _ = record_calls(db.conn(), tier, &model, &failed_spend, allowance.calls);
-                } else if error.downcast_ref::<BudgetReached>().is_some() {
-                    // Not even the first call fits: as when it is spent.
-                    let reason = unavailable(&budget_reached)?;
+                    // Left set aside if it cannot be settled: the next
+                    // call has to write the record first anyway.
+                    let _ = allowance.settle(failed_spend.cost_usd);
+                } else if let Some(reached) = error.downcast_ref::<BudgetReached>() {
+                    // Not even the first call fits: as when it is spent,
+                    // or the cap is below what one call could cost.
+                    let reason = match reached.too_dear() {
+                        true => unavailable(&reached.to_string())?,
+                        false => unavailable(&budget_reached)?,
+                    };
                     let on_text = shared_out.into_inner().unwrap_or_else(|p| p.into_inner());
                     return self
                         .run_local(tier, graph, host, vault, &prompt, reason, on_text)
@@ -2588,6 +2772,9 @@ impl AiEngine {
         out_cb(&rest);
         shown.push_str(&rest);
 
+        // Left set aside if it cannot be settled: the next call has to
+        // write the record first anyway.
+        let _ = allowance.settle(usage.cost_usd);
         {
             let db = lock_db(&self.db);
             let tx = db.conn().unchecked_transaction()?;
@@ -3639,7 +3826,7 @@ mod tests {
                     // The reply talks about the masked host, split so that a
                     // placeholder straddles two stream events.
                     sse(
-                        &["## 1. Risk\nPatch <<HO", "ST_01>> (", "<<DOM_01>>", ") now.\n## 2. Fix\nUpgrade nginx.\n## 3. Rule\nalert"],
+                        &["## 1. Risk\nPatch <<HO", "ST_01>> now.\nIts name: ", "<<DOM_01>>", ".\n## 2. Fix\nUpgrade nginx.\n## 3. Rule\nalert"],
                         Some(json!({ "prompt_tokens": 800, "completion_tokens": 120, "cost": 0.0042,
                                      "server_tool_use": { "web_search_requests": if body.get("tools").is_some() { 2 } else { 0 } } })),
                     )
@@ -3745,7 +3932,7 @@ mod tests {
         assert!(
             outcome
                 .text
-                .contains("Patch 10.10.10.5 (portal.corp-acme.com) now."),
+                .contains("Patch 10.10.10.5 now.\nIts name: portal.corp-acme.com."),
             "{}",
             outcome.text
         );
@@ -4795,6 +4982,7 @@ mod tests {
             max_calls: 20,
             has_key: true,
             setup_unreadable: false,
+            usage_unreadable: false,
         }
         .exhausted());
 
@@ -5304,7 +5492,8 @@ mod tests {
         };
         let graph = lab();
         let vault = Mutex::new(Vault::ephemeral());
-        // $1 a day: one turn costs $0.58, so a second does not fit.
+        // $1 a day: one turn costs $0.58, so a second does not fit, and
+        // the refusal says why.
         let engine = AiEngine::new(
             claude(1.0, 20),
             Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
@@ -5312,7 +5501,11 @@ mod tests {
         .unwrap();
         let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
         let error = format!("{:#}", outcome.unwrap_err());
-        assert!(error.contains("daily cloud budget reached"), "{error}");
+        let too_dear = |error: &str| {
+            error.contains("one call could cost up to $0.5")
+                && error.ends_with("; $0.42 left today (raise max_daily_usd)")
+        };
+        assert!(too_dear(&error), "{error}");
         assert_eq!(seen.lock().unwrap().len(), 1);
         let budget = engine.budget();
         assert_eq!(budget.calls, 1);
@@ -5320,7 +5513,11 @@ mod tests {
         assert!(budget.spent_usd <= budget.max_usd);
         // The next request does not even start.
         let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
-        assert!(format!("{:#}", outcome.unwrap_err()).contains("daily cloud budget reached"));
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("Research is off: one call") && too_dear(&error),
+            "{error}"
+        );
         assert_eq!(seen.lock().unwrap().len(), 1);
 
         // Plenty of money, three calls a day: the fourth turn is not asked.
@@ -5362,10 +5559,246 @@ mod tests {
         let (outcome, _) = run(&tight, Tier::Cloud, &graph, &vault).await;
         let error = format!("{:#}", outcome.unwrap_err());
         assert!(
-            error.starts_with("the cloud was not used: daily cloud budget reached"),
+            error.starts_with("the cloud was not used: one call could cost up to $0.3"),
+            "{error}"
+        );
+        assert!(
+            error.contains("; $0.05 left today (raise max_daily_usd)"),
             "{error}"
         );
         assert_eq!(tight.budget().calls, 0);
+    }
+
+    /// Audit 4: the daily caps are the user's, not each session's. Three
+    /// sessions (each its own `state.db`) share one day of `ai-usage`.
+    #[tokio::test]
+    async fn the_daily_caps_hold_for_all_sessions_together() {
+        if !no_env_key() || std::env::var(anthropic::KEY_ENV).is_ok() {
+            return;
+        }
+        let (base, mock) = mock_models().await;
+        let dir = tempfile::tempdir().unwrap();
+        let usage = dir.path().join(crate::usage::FILE);
+        let session = |max_calls: u32| {
+            let settings = AiSettings {
+                local_url: "http://127.0.0.1:1/v1".into(),
+                cloud_url: format!("{base}/claude"),
+                cloud_provider: Some(CloudProvider::Anthropic),
+                cloud_model: "claude-opus-5-5".into(),
+                cloud_fallbacks: Some(Vec::new()),
+                openrouter_api_key: Some("sk-ant-test".into()),
+                max_daily_usd: 1.0,
+                max_daily_calls: max_calls,
+                usage_file: Some(usage.clone()),
+                ..AiSettings::default()
+            };
+            let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+            AiEngine::new(settings, db).unwrap()
+        };
+        let graph = lab();
+        let (first, second, third) = (session(2), session(2), session(2));
+        for engine in [&first, &second] {
+            let vault = Mutex::new(Vault::ephemeral());
+            let (outcome, _) = run(engine, Tier::Cloud, &graph, &vault).await;
+            assert_eq!(outcome.unwrap().tier, Tier::Cloud);
+        }
+        assert_eq!(mock.cloud.lock().unwrap().len(), 2);
+        // Each session sees the day of all of them: 2 calls at $0.008.
+        for engine in [&first, &second, &third] {
+            let budget = engine.budget();
+            assert_eq!(budget.calls, 2, "{budget:?}");
+            assert!((budget.spent_usd - 0.016).abs() < 1e-9, "{budget:?}");
+            assert!(budget.exhausted());
+        }
+        let day = crate::usage::Ledger::at(&usage).today().unwrap();
+        assert_eq!(day.calls, 2);
+        // A third session gets no fresh allowance.
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&third, Tier::Cloud, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("the cloud was not used: daily cloud budget reached ($0.0160 of $1.00, 2 of 2 calls)"),
+            "{error}"
+        );
+        assert_eq!(mock.cloud.lock().unwrap().len(), 2);
+        // Each session keeps its own record for its reports.
+        let own: i64 = lock_db(&first.db)
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ai_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(own, 1);
+
+        // Money too: a research turn set aside in one session is counted
+        // by the next before it has even been settled.
+        let (base, seen) = pausing_claude().await;
+        let dir = tempfile::tempdir().unwrap();
+        let usage = dir.path().join(crate::usage::FILE);
+        let researcher = || {
+            let settings = AiSettings {
+                local_url: "http://127.0.0.1:1/v1".into(),
+                cloud_url: format!("{base}/claude"),
+                cloud_provider: Some(CloudProvider::Anthropic),
+                research_model: "claude-opus-5-5".into(),
+                cloud_fallbacks: Some(Vec::new()),
+                openrouter_api_key: Some("sk-ant-test".into()),
+                max_daily_usd: 1.0,
+                usage_file: Some(usage.clone()),
+                ..AiSettings::default()
+            };
+            let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+            AiEngine::new(settings, db).unwrap()
+        };
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&researcher(), Tier::Research, &graph, &vault).await;
+        assert!(outcome.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1, "one $0.58 turn fits $1");
+        let (outcome, _) = run(&researcher(), Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("Research is off: one call could cost up to $0.5")
+                && error.ends_with("; $0.42 left today (raise max_daily_usd)"),
+            "{error}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the second session asks nothing"
+        );
+    }
+
+    /// Audit 4: without the day's record of all sessions, no cloud call
+    /// is made, and the session says why.
+    #[tokio::test]
+    async fn an_unreadable_usage_record_turns_the_cloud_off() {
+        if !no_env_key() {
+            return;
+        }
+        let (base, mock) = mock_models().await;
+        let dir = tempfile::tempdir().unwrap();
+        let usage = dir.path().join(crate::usage::FILE);
+        crate::workspace::write_private_atomic(&usage, b"{ not a record").unwrap();
+        let settings = AiSettings {
+            local_url: "http://127.0.0.1:1/v1".into(),
+            cloud_url: format!("{base}/cloud"),
+            openrouter_api_key: Some("sk-or-test".into()),
+            usage_file: Some(usage.clone()),
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(
+            settings,
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let budget = engine.budget();
+        assert!(budget.usage_unreadable && budget.exhausted(), "{budget:?}");
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("Research is off: ai-usage cannot be read (")
+                && error.ends_with("): cloud AI is off until it is fixed"),
+            "{error}"
+        );
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("the cloud was not used: ai-usage cannot be read ("),
+            "{error}"
+        );
+        assert!(mock.cloud.lock().unwrap().is_empty());
+        // A record that cannot be written stops the call before it is made.
+        std::fs::remove_file(&usage).unwrap();
+        let mut allowance = Allowance::shared(
+            &Budget {
+                max_usd: 1.0,
+                max_calls: 20,
+                ..Budget::default()
+            },
+            crate::usage::Ledger::at(dir.path().join("missing").join(crate::usage::FILE)),
+        );
+        assert!(allowance.take_call(0.0, 0.1, 0.01).is_err());
+        assert_eq!(allowance.calls, 0);
+    }
+
+    /// Audit 4 review: a request that ends before it is settled (the
+    /// session closed during a call) leaves its input, not the most its
+    /// call could cost, in the day's record.
+    #[test]
+    fn a_request_cut_off_keeps_its_input_not_the_most_it_could_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = crate::usage::Ledger::at(dir.path().join(crate::usage::FILE));
+        let budget = Budget {
+            max_usd: 1.0,
+            max_calls: 20,
+            ..Budget::default()
+        };
+        let mut allowance = Allowance::shared(&budget, ledger.clone());
+        allowance.take_call(0.0, 0.54, 0.04).unwrap();
+        assert!((ledger.today().unwrap().usd - 0.54).abs() < 1e-9);
+        drop(allowance);
+        let day = ledger.today().unwrap();
+        assert!((day.usd - 0.04).abs() < 1e-9, "{day:?}");
+        assert_eq!(day.calls, 1);
+        // A second call after a first that cost 0.10: that, and its input.
+        let mut allowance = Allowance::shared(&budget, ledger.clone());
+        allowance.take_call(0.0, 0.3, 0.02).unwrap();
+        allowance.take_call(0.1, 0.3, 0.02).unwrap();
+        drop(allowance);
+        let day = ledger.today().unwrap();
+        assert!((day.usd - 0.16).abs() < 1e-9, "{day:?}");
+        assert_eq!(day.calls, 3);
+        // Settled, it keeps what it cost; with no call, nothing changes.
+        let mut allowance = Allowance::shared(&budget, ledger.clone());
+        allowance.take_call(0.0, 0.3, 0.02).unwrap();
+        allowance.settle(0.25).unwrap();
+        drop(allowance);
+        assert!((ledger.today().unwrap().usd - 0.41).abs() < 1e-9);
+        drop(Allowance::shared(&budget, ledger.clone()));
+        assert!((ledger.today().unwrap().usd - 0.41).abs() < 1e-9);
+    }
+
+    /// Audit 4: a model whose one call could cost more than the whole cap
+    /// is refused before it is asked, and the refusal says so plainly.
+    #[tokio::test]
+    async fn a_call_dearer_than_the_cap_is_refused_in_plain_words() {
+        if std::env::var(anthropic::KEY_ENV).is_ok() {
+            return;
+        }
+        let (base, seen) = pausing_claude().await;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        for model in ["claude-fable-5", "claude-mythos-5", "claude-opus-9"] {
+            let settings = AiSettings {
+                local_url: "http://127.0.0.1:1/v1".into(),
+                cloud_url: format!("{base}/claude"),
+                cloud_provider: Some(CloudProvider::Anthropic),
+                research_model: model.into(),
+                cloud_fallbacks: Some(Vec::new()),
+                openrouter_api_key: Some("sk-ant-test".into()),
+                usage_file: Some(dir.path().join(crate::usage::FILE)),
+                ..AiSettings::default()
+            };
+            let engine = AiEngine::new(
+                settings,
+                Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+            )
+            .unwrap();
+            let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+            let error = format!("{:#}", outcome.unwrap_err());
+            assert!(
+                error.starts_with("Research is off: one call could cost up to $1.")
+                    && error.ends_with("; $1.00 left today (raise max_daily_usd)"),
+                "{model}: {error}"
+            );
+            assert!(!error.contains("budget reached"), "{error}");
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        let day = crate::usage::Ledger::at(dir.path().join(crate::usage::FILE))
+            .today()
+            .unwrap();
+        assert_eq!((day.usd, day.calls), (0.0, 0), "nothing was set aside");
     }
 
     /// An `ai.toml` that is there but cannot be read (a typo, a link, a
@@ -5524,8 +5957,14 @@ mod tests {
             token("portal.corp-acme.com"),
             token("collect.attacker.example"),
         );
+        // The certificate's name and the address are filled in each on a
+        // line of its own, never together, however the line reads (audit 4).
         let reply = format!(
             "Open https://{own}/admin and https://{name}/.\n\
+             Patch {own} ({name}) now.\n\
+             Patch {own} now.\n\
+             Renew the certificate of {name}.\n\
+             Then https://{name}/?h={own}\n\
              See [status](https://{other}/?h={own})\n"
         );
         let mut shown = unmasker.push(&reply);
@@ -5533,9 +5972,14 @@ mod tests {
         assert_eq!(
             shown,
             format!(
-                "Open https://10.10.10.5/admin and https://portal.corp-acme.com/.\n\
-                 See [status](https://{other}/?h={own})\n{}",
-                crate::vault::KEPT_NOTE
+                "Open https://{own}/admin and https://{name}/.\n\
+                 Patch {own} ({name}) now.\n\
+                 Patch 10.10.10.5 now.\n\
+                 Renew the certificate of portal.corp-acme.com.\n\
+                 Then https://{name}/?h={own}\n\
+                 See [status](https://{other}/?h={own})\n{}{}",
+                crate::vault::KEPT_NOTE,
+                crate::vault::CODE_NOTE
             )
         );
     }

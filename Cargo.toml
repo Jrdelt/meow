@@ -57,9 +57,10 @@ signal-hook = "0.4"
 crossterm_winapi = "0.9"
 # Job Objects (kill a tool with everything it started), the elevation check,
 # the system's DNS servers and who listens on a loopback port (IpHelper,
-# Threading), which file a session file is (FileSystem), and a closed
-# console window (Console).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell"] }
+# Threading), which file a session file is (FileSystem), a closed console
+# window (Console), and the DNS routing rules (NRPT) in the registry
+# (Registry).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [build-dependencies]
 cc = "1.2"

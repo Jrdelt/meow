@@ -18,7 +18,7 @@ use crate::graph::{Advisory, DnsSecurity, Fact, Graph, Host, HttpInfo};
 use crate::mode::Mode;
 use crate::queue::{self, TaskRow};
 use crate::timeutil::now_rfc3339;
-use crate::topology::Topology;
+use crate::topology::{only_mentioned, Topology};
 use crate::vault::{ExposedSecret, Vault};
 use crate::workspace::{write_private_atomic, Workspace};
 
@@ -291,6 +291,23 @@ fn is_fence_closing(line: &str, marker: u8, min_len: usize) -> bool {
     len >= min_len && rest[len..].iter().all(|&b| b == b' ' || b == b'\t')
 }
 
+/// Writes `line` with a heading in it nested below the chat's section, also
+/// one that is moved in, or sits in a quote or a list item (`- # Hosts`,
+/// `> 1. ## Fix`, a nested item's next line). Lines of code get the same
+/// marks, fenced or indented: a dialect without that kind of code block
+/// reads them as text, and a `# Secrets to rotate` there would be a
+/// section of the report.
+fn push_nested_heading(out: &mut String, line: &str) {
+    let text_at = crate::evidence::nested_text_start(line);
+    if line.as_bytes().get(text_at) == Some(&b'#') {
+        out.push_str(&line[..text_at]);
+        out.push_str("###");
+        out.push_str(&line[text_at..]);
+    } else {
+        out.push_str(line);
+    }
+}
+
 /// Writes a chat file into the report: its own headings one level down, and
 /// nothing in it live (see [`inert_markdown`]). A code block the text left
 /// open is closed, so that it cannot take the rest of the report with it.
@@ -317,13 +334,15 @@ fn render_chat_markdown(out: &mut String, text: &str) {
                     // Moved left as far as its fence was.
                     let spaces = rest.bytes().take(indent).take_while(|&b| b == b' ').count();
                     let content = &rest[spaces..];
+                    out.push_str(qprefix);
                     if is_fence_closing(content, open, length) {
                         open_fence = None;
+                        out.push_str(content);
+                    } else {
+                        push_nested_heading(out, content);
                     }
-                    out.push_str(qprefix);
-                    out.push_str(content);
                 } else {
-                    out.push_str(line);
+                    push_nested_heading(out, line);
                 }
                 out.push('\n');
                 continue;
@@ -339,19 +358,7 @@ fn render_chat_markdown(out: &mut String, text: &str) {
             out.push('\n');
             continue;
         }
-        let sanitized = neutralize_unmatched_inline_backticks(line);
-        let text_at = crate::evidence::nested_text_start(&sanitized);
-        // Nest the file's own headings below this section, also one that
-        // is moved in, or sits in a quote or a list item (`- # Hosts`,
-        // `> 1. ## Fix`, a nested item's next line). A `#` line of code
-        // indented without a fence gets the same marks.
-        if sanitized.as_bytes().get(text_at) == Some(&b'#') {
-            out.push_str(&sanitized[..text_at]);
-            out.push_str("###");
-            out.push_str(&sanitized[text_at..]);
-        } else {
-            out.push_str(&sanitized);
-        }
+        push_nested_heading(out, &neutralize_unmatched_inline_backticks(line));
         out.push('\n');
     }
     if let Some((marker, length, fence_qdepth, _)) = open_fence {
@@ -584,9 +591,11 @@ fn render_dns(out: &mut String, dns: &DnsSecurity) {
         }
         out.push('\n');
     }
-    if dns.wildcard.is_empty() {
+    // Its lookups failed: the check in the table says so.
+    let unchecked = dns.checks.iter().any(|check| check.name == "Wildcard");
+    if dns.wildcard.is_empty() && !unchecked {
         out.push_str("Wildcard DNS: none.\n\n");
-    } else {
+    } else if !dns.wildcard.is_empty() {
         let addresses: Vec<String> = dns.wildcard.iter().map(|a| md(a)).collect();
         let _ = writeln!(
             out,
@@ -604,6 +613,7 @@ fn render_dns(out: &mut String, dns: &DnsSecurity) {
                 "resolves" => "resolves".to_owned(),
                 "wildcard" => "wildcard only (may not exist)".to_owned(),
                 "gone" => "no record".to_owned(),
+                "unknown" => "lookup failed".to_owned(),
                 other => md_cell(other),
             };
             let addresses: Vec<String> = sub.addresses.iter().map(|a| md(a)).collect();
@@ -784,11 +794,14 @@ pub fn render(inputs: &Inputs) -> String {
         env!("CARGO_PKG_VERSION"),
         inputs.mode
     );
+    // The hosts on the map: not the names only printed somewhere.
+    let (mentioned, seen): (Vec<&Host>, Vec<&Host>) =
+        graph.hosts.values().partition(|host| only_mentioned(host));
     let _ = writeln!(
         out,
         "| Hosts | CVEs | Known exploited | Secrets to rotate |\n\
          |---|---|---|---|\n| {} | {} | {kev} | {} |\n",
-        graph.hosts.len(),
+        seen.len(),
         graph.advisory_count(),
         inputs.secrets.len()
     );
@@ -856,10 +869,14 @@ pub fn render(inputs: &Inputs) -> String {
     }
 
     out.push_str("## Hosts\n\n");
-    if graph.hosts.is_empty() {
+    if seen.is_empty() {
         out.push_str("No hosts recorded.\n\n");
     }
-    for host in graph.hosts.values() {
+    if !mentioned.is_empty() {
+        let names: Vec<String> = mentioned.iter().map(|host| md(&host.label())).collect();
+        let _ = writeln!(out, "Only mentioned, not scanned: {}.\n", names.join(", "));
+    }
+    for host in &seen {
         render_host(&mut out, host);
     }
     if !graph.notes.is_empty() {
@@ -1547,8 +1564,10 @@ mod tests {
         // while inline code spans, fenced code blocks, and unclosed fences are
         // handled cleanly.
         let mut custom = inputs();
-        custom.graph.hosts.get_mut("10.10.10.5").unwrap().advisories[1].port =
-            Some("443/tcp | <img src=x>".into());
+        // Found from software no open port runs: the port it names is shown.
+        let hostile = &mut custom.graph.hosts.get_mut("10.10.10.5").unwrap().advisories[1];
+        hostile.port = Some("443/tcp | <img src=x>".into());
+        hostile.matched = "cpeName=cpe:2.3:a:example:widget:2.0:*:*:*:*:*:*:*".into();
         custom.chats = vec![
             (
                 "192.0.2.1.md".into(),
@@ -1575,12 +1594,12 @@ mod tests {
             ),
         ];
         let rendered = render(&custom);
-        assert!(rendered.contains("#### nginx 1.18.0 \u{b7} 443/tcp \\| &lt;img src=x&gt;\n"));
+        assert!(rendered.contains("#### widget 2.0 \u{b7} 443/tcp \\| &lt;img src=x&gt;\n"));
         // No tag opens anywhere, in or out of code: what counts as code
         // differs between Markdown dialects.
         assert!(rendered.contains("#### Heading &lt;script>alert(1)&lt;/script>"));
         assert!(rendered.contains("> Quote with &lt;b>html&lt;/b> and `&lt;raw>` span"));
-        assert!(rendered.contains("```sh\n# shell comment stays a comment\n"));
+        assert!(rendered.contains("```sh\n#### shell comment stays a comment\n"));
         assert!(rendered.contains("grep '&lt;title>'"));
         assert!(rendered.contains("&lt;div>unclosed fence\n```\n\n### From chats/192.0.2.2.md"));
         assert!(rendered.contains(
@@ -1984,6 +2003,38 @@ mod tests {
     }
 
     #[test]
+    fn dns_lookups_that_failed_are_not_reported_as_absent() {
+        let mut data = inputs();
+        data.graph.hosts.get_mut("10.10.10.9").unwrap().dns_security = Some(DnsSecurity {
+            domain: "example.org".into(),
+            grade: "?".into(),
+            checks: vec![crate::graph::DnsCheck {
+                name: "Wildcard".into(),
+                status: "unknown".into(),
+                value: "could not be checked".into(),
+                advice: "The DNS lookup failed.".into(),
+            }],
+            subdomains: vec![crate::graph::SubdomainCheck {
+                name: "old.example.org".into(),
+                status: "unknown".into(),
+                addresses: Vec::new(),
+            }],
+            ..DnsSecurity::default()
+        });
+        let text = render(&data);
+        let host = host_section(&text, "### 10.10.10.9");
+        assert!(!host.contains("Wildcard DNS: none"), "{host}");
+        assert!(
+            host.contains("| Wildcard | unknown | could not be checked |"),
+            "{host}"
+        );
+        assert!(
+            host.contains("| old.example.org | lookup failed | - |"),
+            "{host}"
+        );
+    }
+
+    #[test]
     fn hostile_web_and_dns_values_stay_text() {
         use crate::graph::{CookieCheck, DnsCheck, DnsService, JsSecret, SubdomainCheck};
         let evil = "a|b `c` \\| d\n## Injected <script>alert(1)</script> [x](javascript:alert(1))";
@@ -2201,19 +2252,178 @@ mod tests {
             "\n> - ###### Quoted item\n",
             "\n    #### Deep\n",
             "\n* > 2) #### Mixed\n",
-            // Code is left as it is, and starts at the left edge, where no
-            // list item can end it early.
-            "```sh\n# a comment in code\n```",
+            // Code starts at the left edge, where no list item can end it
+            // early. Its headings are nested too: a dialect without fenced
+            // code reads them as headings.
+            "```sh\n#### a comment in code\n```",
             "\n1. Check the service\n```sh\nnmap -sV 192.0.2.5\n```\n",
-            "\n- Check it again\n```sh\n# Security notice\nForged section text, outside the chat section.\n```\n\nEnd of reply.\n",
+            "\n- Check it again\n```sh\n#### Security notice\nForged section text, outside the chat section.\n```\n\nEnd of reply.\n",
         ] {
             assert!(chat.contains(nested), "{nested:?} missing in:\n{chat}");
         }
-        for live in ["\n> ===", "\n- # ", "\n1. ## ", "\n    # Deep", "  ```"] {
+        for live in [
+            "\n> ===",
+            "\n- # ",
+            "\n1. ## ",
+            "\n    # Deep",
+            "  ```",
+            "\n# ",
+        ] {
             assert!(!chat.contains(live), "{live:?} is live in:\n{chat}");
         }
         // What the chat leaves open is closed before the next section.
         assert_eq!(chat.matches("```").count() % 2, 0, "{chat}");
+    }
+
+    #[test]
+    fn headings_in_fenced_code_are_nested_for_dialects_without_fences() {
+        let mut custom = inputs();
+        custom.chats = vec![
+            ("192.0.2.5.md".into(), "Text\n\n~~~\n## Hosts\n~~~\n".into()),
+            (
+                "192.0.2.6.md".into(),
+                "Here is a check:\n\n```sh\n\n# Secrets to rotate\n\nNone were found.\n\n```\n\
+                 > ```\n> # Quoted\n> Title\n> =====\n> ```\n"
+                    .into(),
+            ),
+        ];
+        let rendered = render(&custom);
+        let chats = &rendered[rendered.find("### From chats/").unwrap()..];
+        for line in chats.lines() {
+            let at = crate::evidence::nested_text_start(line);
+            let hashes = line[at..].bytes().take_while(|&b| b == b'#').count();
+            assert!(
+                hashes == 0 || hashes >= 3,
+                "{line:?} is a section in:\n{chats}"
+            );
+        }
+        for nested in [
+            "~~~\n##### Hosts\n~~~",
+            "```sh\n\n#### Secrets to rotate\n",
+            "> #### Quoted\n> Title\n> \\=====\n",
+        ] {
+            assert!(chats.contains(nested), "{nested:?} missing in:\n{chats}");
+        }
+        assert_eq!(rendered.matches("\n## Hosts\n").count(), 1);
+        assert_eq!(rendered.matches("\n## Secrets to rotate\n").count(), 1);
+    }
+
+    #[test]
+    fn only_the_hosts_on_the_map_are_counted() {
+        let mut custom = inputs();
+        // URLs printed in the session shell.
+        let printed = crate::parsers::parse_text(
+            "see https://docs.example.com/a https://cdn.example.net/b https://api.example.org/c",
+        )
+        .unwrap();
+        custom.graph.apply_all(printed.observations);
+        assert_eq!(custom.graph.hosts.len(), 5);
+        let rendered = render(&custom);
+        assert!(
+            rendered.contains("|---|---|---|---|\n| 2 | 4 | 1 | 1 |\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(
+            "## Hosts\n\nOnly mentioned, not scanned: api.example.org, cdn.example.net, \
+             docs.example.com.\n\n### 10.10.10.5"
+        ));
+        assert!(!rendered.contains("### docs.example.com"));
+    }
+
+    #[test]
+    fn a_name_whose_dns_was_read_or_that_has_a_note_keeps_its_section() {
+        let mut custom = inputs();
+        // A mail-only domain: no address, so the mail-dns stage keeps its
+        // checks on the name.
+        custom.graph.apply(Observation::DnsSecurity {
+            address: "example.org".into(),
+            info: Box::new(DnsSecurity {
+                domain: "example.org".into(),
+                grade: "D".into(),
+                ..DnsSecurity::default()
+            }),
+            record: EvidenceRecord::observed(Source::Dns, Confidence::High, "mail-dns"),
+        });
+        custom.graph.apply(Observation::Note {
+            address: Some("admin.example.net".into()),
+            text: "default credentials admin/admin work on the login page".into(),
+            record: EvidenceRecord::observed(Source::ManualNote, Confidence::High, "meow note"),
+        });
+        // A certificate-log name looked up in DNS, and a printed URL: only
+        // mentioned. The domain's section lists what the lookup found.
+        for (claim, source) in [
+            (
+                "discovered in Certificate Transparency logs for example.org",
+                Source::CtLog,
+            ),
+            (
+                "DNS: no address record now (seen only in certificate logs)",
+                Source::Dns,
+            ),
+        ] {
+            custom.graph.apply(Observation::Fact {
+                address: "old.example.org".into(),
+                port: None,
+                protocol: "ip".into(),
+                claim: claim.into(),
+                record: EvidenceRecord::observed(source, Confidence::High, "x"),
+            });
+        }
+        let printed = crate::parsers::parse_text("see https://docs.example.com/a").unwrap();
+        custom.graph.apply_all(printed.observations);
+
+        let rendered = render(&custom);
+        assert!(
+            rendered.contains("|---|---|---|---|\n| 4 | 4 | 1 | 1 |\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "## Hosts\n\nOnly mentioned, not scanned: docs.example.com, old.example.org.\n"
+            ),
+            "{rendered}"
+        );
+        for kept in [
+            "### example.org\n",
+            "DNS & Mail for example.org: grade D.",
+            "### admin.example.net\n",
+            "- default credentials admin/admin work on the login page _(",
+        ] {
+            assert!(rendered.contains(kept), "{kept:?} missing in:\n{rendered}");
+        }
+        // The report of that one host, as the map offers it.
+        let single = render_host_report(&custom, "example.org").unwrap();
+        assert!(single.contains("| 1 | 0 | 0 | 0 |"), "{single}");
+        assert!(single.contains("DNS & Mail for example.org: grade D."));
+        assert!(!single.contains("No hosts recorded."));
+        let single = render_host_report(&custom, "admin.example.net").unwrap();
+        assert!(
+            single.contains("default credentials admin/admin"),
+            "{single}"
+        );
+    }
+
+    #[test]
+    fn the_same_software_on_two_ports_names_both_in_what_to_update() {
+        let mut custom = inputs();
+        custom.graph.apply(Observation::Port {
+            address: "10.10.10.5".into(),
+            port: 80,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: Some("nginx".into()),
+            version: Some("1.18.0".into()),
+            extra_info: None,
+            cpes: vec![],
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        let rendered = render(&custom);
+        assert!(
+            rendered.contains("or close 80/tcp and 443/tcp if the service is not needed."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("#### nginx 1.18.0 \u{b7} 80/tcp, 443/tcp \u{b7} "));
     }
 
     #[test]

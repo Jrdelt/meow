@@ -80,6 +80,36 @@ impl<'a> Ctx<'a> {
         .await
     }
 
+    /// The flags the port scan runs with, the mode's preset's and then the
+    /// operator's, sorted as [`split_recon_flags`] does. Their up check,
+    /// DNS and address family (`shared`) hold for every nmap scan and for
+    /// the address a name is scanned at.
+    pub fn scan_flags(&self) -> ReconFlags {
+        let mut flags = self.preset.nmap_ports.clone();
+        flags.extend(self.task.extra_flags.iter().cloned());
+        split_recon_flags(&flags)
+    }
+
+    /// Where the nmap scans go. For a name the dns stage resolved, its
+    /// address of the family scanned (see [`Found::primary`]): the scans,
+    /// the route and what the stages find about the name are then about
+    /// one address, even when the name's addresses change between lookups.
+    /// Otherwise the target as given.
+    pub fn scan_target(&self) -> Target {
+        if let Target::Host(HostAddr::Name(_)) = self.target {
+            let dns = Found::load(&self.state.db_lock(), self.task.id, Stage::Dns, self.target);
+            let ipv6 = self.scan_flags().ipv6();
+            let primary = dns
+                .primary
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+                .filter(|ip| ip.is_ipv6() == ipv6);
+            if let Some(addr) = primary {
+                return Target::Host(HostAddr::Ip { addr, zone: None });
+            }
+        }
+        self.target.clone()
+    }
+
     /// Says how far the stage is, for the map and the HUD.
     pub fn report(&self, progress: Progress) {
         self.state.set_progress(self.task.id, self.stage, progress);

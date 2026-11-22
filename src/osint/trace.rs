@@ -189,16 +189,6 @@ pub fn parse_traceroute_detailed(
     hops
 }
 
-/// Parses intermediate hop IP addresses from `traceroute -n`, `tracepath -n`,
-/// or Windows `tracert -d` output.
-pub fn parse_traceroute_output(text: &str, target_ip: &str) -> Vec<String> {
-    parse_traceroute_detailed(text, target_ip, None, None)
-        .into_iter()
-        .filter(|h| h.address != "* * *" && h.address != target_ip)
-        .map(|h| h.address)
-        .collect()
-}
-
 async fn measure_tcp_rtt_ms(ip: IpAddr) -> Option<f64> {
     for port in [80u16, 443, 22] {
         let addr = SocketAddr::new(ip, port);
@@ -213,9 +203,40 @@ async fn measure_tcp_rtt_ms(ip: IpAddr) -> Option<f64> {
     None
 }
 
+/// How long the `trace` stage's tools may run in all. Each is told to fit
+/// in it (see [`trace_commands`]); one that does not is stopped, and the
+/// hops it printed by then are kept.
+pub const TRACE_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// The programs that find the route to `ip`, in the order they are tried,
+/// with their arguments: at most 15 hops and no name lookups. The ones that
+/// probe one hop after another (BSD traceroute, `tracert`, `tracepath`)
+/// wait for each silent hop, so their waits are short enough for 15 of
+/// them to fit in [`TRACE_TIMEOUT`].
+pub fn trace_commands(ip: &str) -> Vec<(&'static str, Vec<String>)> {
+    #[cfg(unix)]
+    let commands: [(&str, &[&str]); 2] = [
+        // One probe a hop, 1 s for its answer: 15 s at most.
+        ("traceroute", &["-n", "-q", "1", "-w", "1", "-m", "15"]),
+        // Up to three tries of 1 s a hop: 45 s at most.
+        ("tracepath", &["-n", "-m", "15"]),
+    ];
+    // Three probes a hop, 0.5 s each: 22.5 s at most.
+    #[cfg(windows)]
+    let commands: [(&str, &[&str]); 1] = [("tracert", &["-d", "-h", "15", "-w", "500"])];
+    commands
+        .iter()
+        .map(|(program, args)| {
+            let args = args.iter().map(|arg| (*arg).to_owned());
+            (*program, args.chain([ip.to_owned()]).collect())
+        })
+        .collect()
+}
+
 /// Runs a lightweight traceroute (`traceroute`, `tracepath`, or `tracert`) to
-/// `target_ip` with a 10-second cap, as one of the session's `tools`: it
-/// ends with the session.
+/// `target_ip` for at most [`TRACE_TIMEOUT`], as one of the session's
+/// `tools`: it ends with the session. Only what the tool reported is kept:
+/// no observations when it gave no hop, and the summary says so.
 pub async fn run_trace(
     tools: &Tracker,
     target_ip: &str,
@@ -224,108 +245,85 @@ pub async fn run_trace(
     let Ok(ip) = IpAddr::from_str(target_ip) else {
         bail!("invalid IP address '{target_ip}' for traceroute");
     };
-    let ip_str = ip.to_canonical().to_string();
+    let ip = ip.to_canonical();
+    let installed: Vec<(std::path::PathBuf, Vec<String>)> = trace_commands(&ip.to_string())
+        .into_iter()
+        .filter_map(|(program, args)| Some((crate::tools::find_program(program)?, args)))
+        .collect();
+    trace_with(tools, ip, local_gateway, &installed, TRACE_TIMEOUT).await
+}
 
-    #[cfg(unix)]
-    let candidates: &[(&str, &[&str])] = &[
-        (
-            "traceroute",
-            &["-n", "-q", "1", "-w", "1", "-m", "15", &ip_str],
-        ),
-        ("tracepath", &["-n", "-m", "15", &ip_str]),
-    ];
-    #[cfg(windows)]
-    let candidates: &[(&str, &[&str])] = &[("tracert", &["-d", "-h", "15", "-w", "800", &ip_str])];
+/// [`run_trace`] with the `commands` that are installed, tried in order,
+/// for at most `timeout` in all.
+pub(super) async fn trace_with(
+    tools: &Tracker,
+    ip: IpAddr,
+    local_gateway: Option<&str>,
+    commands: &[(std::path::PathBuf, Vec<String>)],
+    timeout: Duration,
+) -> Result<(Vec<Observation>, String)> {
+    let ip_str = ip.to_string();
+    let answered = |hops: &[TraceHop]| hops.iter().any(|h| h.address != "* * *");
 
-    let mut hops = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut raw_out = String::new();
     let mut tool_ran = false;
-
-    for (prog, args) in candidates {
-        let Some(bin) = crate::tools::find_program(prog) else {
-            continue;
-        };
-        let mut cmd = tokio::process::Command::new(&bin);
-        cmd.args(*args);
+    for (bin, args) in commands {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(args);
         configure_osint_command(&mut cmd);
         let Ok((child, group)) = tools.spawn(&mut cmd) else {
             continue;
         };
         tool_ran = true;
-        if let Some(stdout) =
-            wait_bounded_stdout(child, group, 128 * 1024, Duration::from_secs(10)).await
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(printed) = read_bounded(child, group, 128 * 1024, left).await else {
+            continue;
+        };
+        raw_out = printed.text;
+        // Out of time: no other tool gets to start.
+        if printed.timed_out || answered(&parse_traceroute_detailed(&raw_out, &ip_str, None, None))
         {
-            raw_out = stdout;
-            hops = parse_traceroute_output(&raw_out, &ip_str);
-            if !hops.is_empty() {
-                break;
-            }
+            break;
         }
     }
-
-    if hops.is_empty() {
-        if let Some(gw) = local_gateway {
-            if gw != ip_str {
-                hops.push(gw.to_owned());
-            }
-        }
-    }
-
-    let rtt_fallback = measure_tcp_rtt_ms(ip).await;
-
-    if hops.is_empty() && !tool_ran && rtt_fallback.is_none() {
+    if !tool_ran {
         bail!("traceroute/tracepath is not installed");
     }
 
-    let mut detailed = parse_traceroute_detailed(&raw_out, &ip_str, local_gateway, None);
-    if !detailed.iter().any(|h| h.address == ip_str) {
-        if detailed.is_empty() {
-            if let Some(gw) = local_gateway.filter(|gw| *gw != ip_str) {
-                detailed.push(TraceHop {
-                    hop: 1,
-                    address: gw.to_owned(),
-                    label: Some("Local Router".to_owned()),
-                    rtt_ms: Some(1.5),
-                });
-            }
-        }
-        let next_hop = detailed.last().map_or(1, |h| h.hop.saturating_add(1));
-        detailed.push(TraceHop {
-            hop: next_hop,
-            address: ip_str.clone(),
-            label: Some("Target Host".to_owned()),
-            rtt_ms: rtt_fallback,
-        });
-    } else if let Some(last) = detailed.iter_mut().find(|h| h.address == ip_str) {
-        if last.rtt_ms.is_none() {
-            last.rtt_ms = rtt_fallback;
-        }
-    }
-
-    let mut observations = Vec::new();
-    if !hops.is_empty() || !detailed.is_empty() {
-        let mut chain = hops.clone();
+    let detailed = parse_traceroute_detailed(&raw_out, &ip_str, local_gateway, None);
+    let Some(last) = detailed.iter().rev().find(|h| h.address != "* * *") else {
+        return Ok((Vec::new(), "traceroute gave no hops".to_owned()));
+    };
+    let reached = last.address == ip_str;
+    let hops: Vec<String> = detailed
+        .iter()
+        .filter(|h| h.address != "* * *" && h.address != ip_str)
+        .map(|h| h.address.clone())
+        .collect();
+    let mut chain = hops.clone();
+    let rtt = if reached {
         chain.push(ip_str.clone());
-        let rtt_suffix = detailed
-            .iter()
-            .rev()
-            .find_map(|h| h.rtt_ms)
+        last.rtt_ms
             .map(|ms| format!(" ({ms:.1} ms)"))
-            .unwrap_or_default();
-        let hop_total = detailed.len().max(hops.len());
-        let claim = format!(
-            "route path ({hop_total} hops{rtt_suffix}): {}",
-            chain.join(" -> ")
-        );
-        let formatted_lines: Vec<String> = detailed.iter().map(TraceHop::formatted).collect();
-        let ev = if !formatted_lines.is_empty() {
-            sanitize(&formatted_lines.join("\n"), 1200)
-        } else if raw_out.trim().is_empty() {
-            claim.clone()
-        } else {
-            sanitize(&raw_out, 800)
-        };
-        observations.push(Observation::HostMeta {
+            .unwrap_or_default()
+    } else {
+        // Its round trip, if a connection to it can be timed, is said to
+        // be that and nothing more.
+        match measure_tcp_rtt_ms(ip).await {
+            Some(ms) => format!(", target did not answer; TCP connect {ms:.1} ms"),
+            None => ", target did not answer".to_owned(),
+        }
+    };
+    let claim = format!(
+        "route path ({} hops{rtt}): {}",
+        last.hop,
+        chain.join(" -> ")
+    );
+    let formatted_lines: Vec<String> = detailed.iter().map(TraceHop::formatted).collect();
+    let ev = sanitize(&formatted_lines.join("\n"), 1200);
+    let observations = vec![
+        Observation::HostMeta {
             address: ip_str.clone(),
             asn: None,
             bgp_prefix: None,
@@ -334,15 +332,15 @@ pub async fn run_trace(
             waf_cdn: None,
             hops: hops.clone(),
             record: EvidenceRecord::observed(Source::Traceroute, Confidence::Medium, &ev),
-        });
-        observations.push(Observation::Fact {
+        },
+        Observation::Fact {
             address: ip_str,
             port: None,
             protocol: "ip".to_owned(),
             claim,
             record: EvidenceRecord::observed(Source::Traceroute, Confidence::Medium, &ev),
-        });
-    }
+        },
+    ];
     let summary = format!("{} intermediate hops", hops.len());
     Ok((observations, summary))
 }

@@ -32,13 +32,24 @@ fn internal_names_and_private_reverse_names_stay_off_public_services() {
 
 #[tokio::test]
 async fn crt_sh_is_not_asked_about_an_internal_name() {
+    // A stand-in for the log: nothing leaves this machine, whatever the
+    // check decides.
+    let (crt_sh, asked) = stand_in_doh(None).await;
     for (domain, address) in [
         ("db.acme.corp", "10.0.0.5"),
         ("portal.client.com", "10.0.0.7"),
     ] {
-        let error = format!("{:#}", run_subdomains(domain, address).await.unwrap_err());
+        // How the stage decides.
+        let internal = is_internal_target(domain, &[address.to_owned()]).await;
+        let error = format!(
+            "{:#}",
+            run_subdomains_at(&crt_sh, domain, address, internal)
+                .await
+                .unwrap_err()
+        );
         assert!(error.contains("not sent to crt.sh"), "{domain}: {error}");
     }
+    assert!(taken(&asked).is_empty(), "{:?}", taken(&asked));
 }
 
 #[test]
@@ -682,6 +693,11 @@ pub(crate) async fn stand_in_dns(reply: fn(&str, u16) -> Reply) -> (SocketAddr, 
 /// A question and "no records" to the others, and the questions it was
 /// asked (`TYPE name`).
 pub(crate) async fn stand_in_doh(a: Option<[u8; 4]>) -> (String, Asked) {
+    stand_in_doh_saying(0, a).await
+}
+
+/// [`stand_in_doh`] with `status` as the answers' Status: 2 is SERVFAIL.
+pub(crate) async fn stand_in_doh_saying(status: u8, a: Option<[u8; 4]>) -> (String, Asked) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -709,11 +725,11 @@ pub(crate) async fn stand_in_doh(a: Option<[u8; 4]>) -> (String, Asked) {
                 .push(format!("{} {}", field("type"), field("name")));
             let body = match a.filter(|_| field("type") == "A") {
                 Some(ip) => format!(
-                    r#"{{"Status":0,"Answer":[{{"name":"{}","type":1,"TTL":60,"data":"{}"}}]}}"#,
+                    r#"{{"Status":{status},"Answer":[{{"name":"{}","type":1,"TTL":60,"data":"{}"}}]}}"#,
                     field("name"),
                     std::net::Ipv4Addr::from(ip)
                 ),
-                None => r#"{"Status":0,"Answer":[]}"#.to_owned(),
+                None => format!(r#"{{"Status":{status},"Answer":[]}}"#),
             };
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -739,19 +755,50 @@ pub(crate) fn taken(asked: &Asked) -> Vec<String> {
     asked.lock().unwrap().clone()
 }
 
+/// Interfaces by name, as `if_nametoindex` would find them.
+fn stand_in_zone(zone: &str) -> Option<u32> {
+    match zone {
+        "eth0" => Some(2),
+        "wlan0" | "en0" => Some(6),
+        "utun3" => Some(18),
+        other => other.parse().ok().filter(|index| *index != 0),
+    }
+}
+
 #[test]
 fn resolv_conf_names_the_servers_and_nothing_stands_in_for_none() {
     let text = "# comment\nsearch corp.example.org\nnameserver 192.0.2.53\n\
                 nameserver 192.0.2.53\nnameserverx 198.51.100.1\n\
-                nameserver fe80::53%eth0\n  nameserver 2001:db8::53 # trailing\n";
-    let servers: Vec<String> = parse_resolv_conf(text)
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+                nameserver fe80::53%eth0\n  nameserver 2001:db8::53 # trailing\n\
+                nameserver fe80::54%7\nnameserver fe80::55%nosuch0\nnameserver fe80::56\n";
+    let servers = parse_resolv_conf_with(text, &stand_in_zone);
+    let shown: Vec<String> = servers.iter().map(ToString::to_string).collect();
+    // A link-local server keeps its interface, named or numbered; one on
+    // an interface this machine does not have, or on none, is left out.
     assert_eq!(
-        servers,
-        ["192.0.2.53:53", "[fe80::53]:53", "[2001:db8::53]:53"]
+        shown,
+        [
+            "192.0.2.53:53",
+            "[fe80::53%2]:53",
+            "[2001:db8::53]:53",
+            "[fe80::54%7]:53"
+        ]
     );
+    let SocketAddr::V6(link) = servers[1] else {
+        panic!("{servers:?}")
+    };
+    assert_eq!(link.scope_id(), 2);
+    // The system's own interfaces: the loopback one exists everywhere.
+    let lo = if cfg!(target_os = "linux") {
+        "lo"
+    } else {
+        "lo0"
+    };
+    let real = parse_resolv_conf(&format!(
+        "nameserver fe80::1%{lo}\nnameserver fe80::2%nosuch0\n"
+    ));
+    assert_eq!(real.len(), 1, "{real:?}");
+    assert!(matches!(real[0], SocketAddr::V6(v6) if v6.scope_id() != 0));
     // No file, or one without servers: no public resolver takes their place.
     assert!(parse_resolv_conf("").is_empty());
     assert!(parse_resolv_conf("search example.org\n").is_empty());
@@ -811,15 +858,28 @@ async fn doh_is_asked_only_when_the_system_resolver_gives_no_answer() {
     let (doh, doh_asked) = stand_in_doh(None).await;
     let resolver = stand_in_resolver(vec![server], &doh);
     // A final answer, records or none, is not asked of anyone else.
-    assert!(resolver.resolve("gone.example.org", 1).await.is_empty());
-    assert!(resolver.resolve("www.example.org", 16).await.is_empty());
+    assert_eq!(
+        resolver.resolve("gone.example.org", 1).await,
+        Lookup::NoRecords
+    );
+    assert_eq!(
+        resolver.resolve("www.example.org", 16).await,
+        Lookup::NoRecords
+    );
     assert!(taken(&doh_asked).is_empty());
-    // No answer: a public name goes over DNS-over-HTTPS, a private one not.
-    assert!(resolver.resolve("broken.example.org", 15).await.is_empty());
-    assert!(resolver.resolve("refused.example.org", 15).await.is_empty());
+    // No answer: a public name goes over DNS-over-HTTPS (which says there
+    // is none), a private one not.
+    assert_eq!(
+        resolver.resolve("broken.example.org", 15).await,
+        Lookup::NoRecords
+    );
+    assert_eq!(
+        resolver.resolve("refused.example.org", 15).await,
+        Lookup::NoRecords
+    );
     let private_ptr = reverse_dns_name("10.0.0.5".parse().unwrap());
-    assert!(resolver.resolve(&private_ptr, 12).await.is_empty());
-    assert!(resolver.resolve("dc01.corp.local", 1).await.is_empty());
+    assert_eq!(resolver.resolve(&private_ptr, 12).await, Lookup::Failed);
+    assert_eq!(resolver.resolve("dc01.corp.local", 1).await, Lookup::Failed);
     assert_eq!(
         taken(&doh_asked),
         ["MX broken.example.org", "MX refused.example.org"]
@@ -838,7 +898,7 @@ async fn without_a_system_resolver_only_public_names_go_out_and_only_over_doh() 
         ("_dmarc.dc01.corp.local".to_owned(), 16),
         ("www.example.org".to_owned(), 16),
     ] {
-        assert!(resolver.resolve(&name, rrtype).await.is_empty());
+        assert!(resolver.resolve(&name, rrtype).await.records().is_empty());
     }
     assert_eq!(taken(&doh_asked), ["TXT www.example.org"]);
 }
@@ -846,8 +906,12 @@ async fn without_a_system_resolver_only_public_names_go_out_and_only_over_doh() 
 #[tokio::test]
 async fn an_internal_target_is_never_asked_over_doh() {
     // The system resolver answers nothing (SERVFAIL), which would send a
-    // public name over DNS-over-HTTPS.
-    let (server, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
+    // public name over DNS-over-HTTPS; it knows the target's own name.
+    let (server, asked) = stand_in_dns(|name, _| match name {
+        "dc01.corp.example.org" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::ServFail,
+    })
+    .await;
     let (doh, doh_asked) = stand_in_doh(None).await;
     let target = Target::parse("dc01.corp.example.org").unwrap();
     // The dns stage: the system resolved the name to a private address.
@@ -855,6 +919,7 @@ async fn an_internal_target_is_never_asked_over_doh() {
         &target,
         stand_in_resolver(vec![server], &doh),
         (vec!["10.0.0.5".to_owned()], Vec::new()),
+        false,
     )
     .await;
     assert_eq!(ips, ["10.0.0.5"]);
@@ -863,13 +928,21 @@ async fn an_internal_target_is_never_asked_over_doh() {
     // The mail-dns stage for that target.
     assert!(is_internal_target("dc01.corp.example.org", &ips).await);
     assert!(is_internal_target("dc01.corp.local", &[]).await);
-    let mail_dns = |internal| {
+    assert_eq!(
+        internal_target_addresses("dc01.corp.example.org", &ips).await,
+        Some(ips.clone())
+    );
+    assert_eq!(
+        internal_target_addresses("printer.corp.local", &["10.0.0.9".to_owned()]).await,
+        Some(vec!["10.0.0.9".to_owned()])
+    );
+    let mail_dns = |internal: bool| {
         crate::maildns::run_on(
             stand_in_resolver(vec![server], &doh),
             "dc01.corp.example.org",
             "10.0.0.5",
             &[],
-            internal,
+            internal.then_some(ips.as_slice()),
         )
     };
     mail_dns(true).await.unwrap();
@@ -894,6 +967,7 @@ async fn an_internal_target_is_never_asked_over_doh() {
         &public,
         stand_in_resolver(vec![server], &doh),
         (Vec::new(), Vec::new()),
+        false,
     )
     .await;
     assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
@@ -910,6 +984,7 @@ async fn an_address_only_doh_gives_is_reported_and_never_the_target_s() {
         &target,
         stand_in_resolver(vec![server], &doh),
         (Vec::new(), Vec::new()),
+        false,
     )
     .await;
     assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
@@ -943,6 +1018,7 @@ async fn the_dns_stage_takes_the_addresses_the_system_resolves() {
         &target,
         stand_in_resolver(vec![server], &doh),
         (vec!["192.0.2.10".to_owned()], Vec::new()),
+        false,
     )
     .await;
     assert_eq!(ips, ["192.0.2.10"]);
@@ -955,10 +1031,542 @@ async fn the_dns_stage_takes_the_addresses_the_system_resolves() {
         .collect();
     assert_eq!(resolved, ["192.0.2.10"]);
     assert!(!format!("{observations:?}").contains("198.51.100.66"));
-    assert!(!taken(&asked).contains(&"1 www.example.org".to_owned()));
+    // DNS is asked for the name's address once, only to learn whether it
+    // knows the name (its "no such record" counts then).
+    let a_asked = taken(&asked)
+        .iter()
+        .filter(|q| *q == "1 www.example.org")
+        .count();
+    assert_eq!(a_asked, 1, "{:?}", taken(&asked));
     // The system's own resolution reads /etc/hosts and its like.
     let (v4, _) = system_addresses("localhost").await;
     assert!(v4.contains(&"127.0.0.1".to_owned()), "{v4:?}");
+}
+
+/// A resolver that sends each name where `routes` say, with `doh` for
+/// DNS-over-HTTPS.
+fn stand_in_routed(routes: DnsRoutes, doh: &str) -> Resolver {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    Resolver::with_routes(client, routes, vec![doh.to_owned()])
+}
+
+fn route_to(domain: &str, servers: Option<Vec<SocketAddr>>) -> DomainRoute {
+    DomainRoute {
+        domain: domain.to_owned(),
+        exact: false,
+        network: None,
+        servers,
+        order: 0,
+    }
+}
+
+fn routed(routes: &DnsRoutes, name: &str) -> (Vec<String>, bool) {
+    let route = routes.route(name);
+    let servers = route.servers.iter().map(ToString::to_string).collect();
+    (servers, route.matched)
+}
+
+/// `scutil --dns` on a Mac with a split-tunnel VPN (two domains), a
+/// tailnet, a reverse zone on another port and the multicast DNS domains.
+const SCUTIL_DNS: &str = "\
+DNS configuration
+
+resolver #1
+  search domain[0] : home.example.net
+  nameserver[0] : 192.0.2.1
+  nameserver[1] : fe80::1%en0
+  nameserver[2] : fe80::2
+  if_index : 6 (en0)
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : local
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300000
+
+resolver #3
+  domain   : 254.169.in-addr.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300200
+
+resolver #4
+  domain   : corp.example.com
+  search domain[0] : corp.example.com
+  nameserver[0] : 198.51.100.53
+  nameserver[1] : 198.51.100.54
+  if_index : 18 (utun3)
+  flags    : Supplemental, Request A records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+  order    : 102400
+
+resolver #5
+  domain   : eu.corp.example.com
+  nameserver[0] : 203.0.113.53
+  if_index : 18 (utun3)
+  flags    : Supplemental, Request A records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+  order    : 102401
+
+resolver #6
+  domain   : tail0123.example.net.
+  nameserver[0] : 203.0.113.100
+  if_index : 23 (utun4)
+  flags    : Supplemental, Request A records, Request AAAA records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+  order    : 102402
+
+resolver #7
+  domain   : 10.in-addr.arpa
+  nameserver[0] : 198.51.100.53
+  port     : 5353
+  flags    : Supplemental, Request A records
+  order    : 102403
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  search domain[0] : home.example.net
+  nameserver[0] : 192.0.2.1
+  if_index : 6 (en0)
+  flags    : Scoped, Request A records, Request AAAA records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : scoped.example.org
+  nameserver[0] : 198.51.100.99
+  if_index : 18 (utun3)
+  flags    : Scoped, Request A records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+";
+
+#[test]
+fn macos_resolvers_are_read_from_scutil_and_chosen_by_domain() {
+    let routes = parse_scutil_dns(SCUTIL_DNS, &stand_in_zone);
+    // The default resolver; a link-local server keeps its interface, from
+    // its zone or the resolver's if_index.
+    let default: Vec<String> = routes.default.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        default,
+        ["192.0.2.1:53", "[fe80::1%6]:53", "[fe80::2%6]:53"]
+    );
+    let vpn = vec!["198.51.100.53:53".to_owned(), "198.51.100.54:53".to_owned()];
+    assert_eq!(
+        routed(&routes, "intranet.corp.example.com"),
+        (vpn.clone(), true)
+    );
+    assert_eq!(routed(&routes, "Corp.Example.com."), (vpn.clone(), true));
+    assert_eq!(
+        routed(&routes, "_ldap._tcp.dc._msdcs.corp.example.com"),
+        (vpn, true)
+    );
+    // The longest domain wins.
+    assert_eq!(
+        routed(&routes, "db.eu.corp.example.com"),
+        (vec!["203.0.113.53:53".to_owned()], true)
+    );
+    assert_eq!(
+        routed(&routes, "host.tail0123.example.net"),
+        (vec!["203.0.113.100:53".to_owned()], true)
+    );
+    assert_eq!(
+        routed(&routes, "5.0.0.10.in-addr.arpa"),
+        (vec!["198.51.100.53:5353".to_owned()], true)
+    );
+    // Multicast DNS: no unicast server at all.
+    assert_eq!(routed(&routes, "printer.local"), (Vec::new(), true));
+    // Everything else, and a name that only ends the same way, goes to the
+    // default; so do the names of resolvers for scoped questions.
+    for name in [
+        "www.example.org",
+        "notcorp.example.com",
+        "a.scoped.example.org",
+    ] {
+        assert_eq!(routed(&routes, name), (default.clone(), false), "{name}");
+    }
+    assert_eq!(routes.domains.len(), 6, "{routes:?}");
+    // Nothing to go by: no default and no routes.
+    assert_eq!(parse_scutil_dns("", &stand_in_zone), DnsRoutes::default());
+}
+
+#[test]
+fn macos_resolver_files_name_a_domain_and_its_servers() {
+    let route = parse_resolver_file(
+        "corp.example.com",
+        "# VPN\nnameserver 198.51.100.53\nnameserver fe80::53%utun3\nport 5353\nsearch_order 1\n",
+        &stand_in_zone,
+    )
+    .unwrap();
+    assert_eq!(route.domain, "corp.example.com");
+    assert_eq!(route.order, 1);
+    let servers: Vec<String> = route
+        .servers
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(servers, ["198.51.100.53:5353", "[fe80::53%18]:5353"]);
+    let named = parse_resolver_file(
+        "lab",
+        "domain lab.example.org\nnameserver 192.0.2.9\n",
+        &stand_in_zone,
+    )
+    .unwrap();
+    assert_eq!(named.domain, "lab.example.org");
+    assert!(parse_resolver_file("empty.example.org", "# none\n", &stand_in_zone).is_none());
+    assert!(parse_resolver_file("bad name", "nameserver 192.0.2.9\n", &stand_in_zone).is_none());
+}
+
+#[test]
+fn windows_nrpt_rules_route_by_the_most_specific_namespace() {
+    let rule = |names: &[&str], servers: &str, options: u32| NrptRule {
+        names: names.iter().map(|n| (*n).to_owned()).collect(),
+        servers: servers.to_owned(),
+        options,
+    };
+    let local = vec![
+        rule(
+            &[".corp.example.com"],
+            "198.51.100.53; 198.51.100.54",
+            NRPT_OVERRIDE_DNS,
+        ),
+        // DNSSEC only: it says nothing about where questions go.
+        rule(&["build.corp.example.com"], "", 0x2),
+        rule(&["10.0.0.0/8"], "198.51.100.53", NRPT_OVERRIDE_DNS),
+        rule(&[".lab.example.org"], "203.0.113.53", 0),
+    ];
+    let routes = DnsRoutes {
+        default: vec!["192.0.2.1:53".parse().unwrap()],
+        domains: nrpt_routes(&local, &stand_in_zone),
+    };
+    let default = vec!["192.0.2.1:53".to_owned()];
+    let vpn = vec!["198.51.100.53:53".to_owned(), "198.51.100.54:53".to_owned()];
+    assert_eq!(
+        routed(&routes, "intranet.corp.example.com"),
+        (vpn.clone(), true)
+    );
+    assert_eq!(routed(&routes, "corp.example.com"), (vpn.clone(), true));
+    assert_eq!(
+        routed(&routes, "build.corp.example.com"),
+        (default.clone(), false)
+    );
+    assert_eq!(
+        routed(&routes, "x.build.corp.example.com"),
+        (vpn.clone(), true)
+    );
+    assert_eq!(
+        routed(&routes, "5.0.0.10.in-addr.arpa"),
+        (vec!["198.51.100.53:53".to_owned()], true)
+    );
+    for name in [
+        "5.0.0.11.in-addr.arpa",
+        "www.lab.example.org",
+        "www.example.org",
+    ] {
+        assert_eq!(routed(&routes, name), (default.clone(), false), "{name}");
+    }
+    // A rule for every name (a full-tunnel VPN) yields to the specific ones.
+    let mut all = local.clone();
+    all.push(rule(&["."], "192.0.2.53", NRPT_OVERRIDE_DNS));
+    let routes = DnsRoutes {
+        default: vec!["192.0.2.1:53".parse().unwrap()],
+        domains: nrpt_routes(&all, &stand_in_zone),
+    };
+    assert_eq!(
+        routed(&routes, "www.example.org"),
+        (vec!["192.0.2.53:53".to_owned()], true)
+    );
+    assert_eq!(routed(&routes, "intranet.corp.example.com"), (vpn, true));
+    // Group Policy's rules replace the local ones when there are any.
+    let policy = vec![rule(&[".example.org"], "192.0.2.7", NRPT_OVERRIDE_DNS)];
+    assert_eq!(effective_nrpt(policy.clone(), local.clone()), policy);
+    assert_eq!(effective_nrpt(Vec::new(), local.clone()), local);
+}
+
+#[tokio::test]
+async fn split_dns_names_go_to_their_own_servers_and_a_default_none_is_not_final() {
+    // The VPN's server knows the internal domain; the default one (the
+    // Wi-Fi's) knows nothing of it.
+    let (vpn, vpn_asked) = stand_in_dns(|name, _| match name {
+        "intranet.corp.example.com" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let (wifi, wifi_asked) = stand_in_dns(|_, _| Reply::NxDomain).await;
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let routes = DnsRoutes {
+        default: vec![wifi],
+        domains: vec![
+            route_to("corp.example.com", Some(vec![vpn])),
+            route_to("local", Some(Vec::new())),
+        ],
+    };
+    let mut resolver = stand_in_routed(routes, &doh);
+    resolver.keep_private("intranet.corp.example.com", &["10.0.0.5".to_owned()]);
+    // The domain's names: its own server, whose "none" is final.
+    assert_eq!(
+        resolver
+            .resolve("_dmarc.intranet.corp.example.com", 16)
+            .await,
+        Lookup::NoRecords
+    );
+    assert_eq!(
+        resolver.resolve("intranet.corp.example.com", 1).await,
+        Lookup::Found(vec!["10.0.0.5".to_owned()])
+    );
+    // A name outside it goes to the default server, which does not know
+    // the target: its "none" proves nothing.
+    assert_eq!(
+        resolver.resolve("_dmarc.example.com", 16).await,
+        Lookup::Unconfirmed
+    );
+    // A multicast DNS name: no unicast server is asked.
+    assert_eq!(resolver.resolve("printer.local", 1).await, Lookup::Failed);
+    // The default server never heard the internal names; DoH heard nothing.
+    assert_eq!(taken(&wifi_asked), ["16 _dmarc.example.com"]);
+    assert!(
+        taken(&vpn_asked)
+            .iter()
+            .all(|q| q.ends_with(".corp.example.com")),
+        "{:?}",
+        taken(&vpn_asked)
+    );
+    assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+}
+
+#[tokio::test]
+async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_it() {
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    // A domain controller as the only DNS server: it knows the target.
+    let (dc, _) = stand_in_dns(|name, _| match name {
+        "dc01.corp.example.org" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let mut resolver = stand_in_resolver(vec![dc], &doh);
+    resolver.keep_private("dc01.corp.example.org", &["10.0.0.5".to_owned()]);
+    assert_eq!(
+        resolver.resolve("_dmarc.dc01.corp.example.org", 16).await,
+        Lookup::NoRecords
+    );
+    // A target the hosts file names: the DNS server knows nothing of it.
+    let (other, asked) = stand_in_dns(|_, _| Reply::NxDomain).await;
+    let mut resolver = stand_in_resolver(vec![other], &doh);
+    resolver.keep_private(
+        "target.example.org",
+        &["10.0.0.9".to_owned(), "fd00::9".to_owned()],
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            resolver.resolve("_dmarc.target.example.org", 16).await,
+            Lookup::Unconfirmed
+        );
+    }
+    // Asked about the target once, A then AAAA.
+    let about: Vec<String> = taken(&asked)
+        .into_iter()
+        .filter(|q| q.ends_with(" target.example.org"))
+        .collect();
+    assert_eq!(about, ["1 target.example.org", "28 target.example.org"]);
+    // A server that answers every name (NXDOMAIN rewritten, a captive
+    // portal, a wildcard parent zone) does not know the target either: it
+    // gives another address than the hosts file.
+    let (hijack, asked) = stand_in_dns(|_, qtype| match qtype {
+        1 => Reply::Address([198, 51, 100, 7]),
+        28 => Reply::NoData,
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let mut resolver = stand_in_resolver(vec![hijack], &doh);
+    resolver.keep_private("intranet.example.org", &["10.0.0.5".to_owned()]);
+    assert_eq!(
+        resolver.resolve("_dmarc.intranet.example.org", 16).await,
+        Lookup::Unconfirmed
+    );
+    // Only A: the system has no IPv6 address for it.
+    assert_eq!(
+        taken(&asked),
+        ["16 _dmarc.intranet.example.org", "1 intranet.example.org"]
+    );
+    // The dns stage for that target claims no missing record.
+    let (observations, _, summary) = run_dns_with(
+        &Target::parse("intranet.example.org").unwrap(),
+        stand_in_resolver(vec![hijack], &doh),
+        (vec!["10.0.0.5".to_owned()], Vec::new()),
+        false,
+    )
+    .await;
+    assert!(!format!("{observations:?}").contains("no AAAA record"));
+    assert!(
+        summary.ends_with("; this machine's DNS server does not know the name"),
+        "{summary}"
+    );
+    // The same server for a target whose address it does give.
+    let mut resolver = stand_in_resolver(vec![hijack], &doh);
+    resolver.keep_private("intranet.example.org", &["198.51.100.7".to_owned()]);
+    assert_eq!(
+        resolver.resolve("_dmarc.intranet.example.org", 16).await,
+        Lookup::NoRecords
+    );
+    // With no address from the system, nothing proves the server knows it.
+    let (dc, dc_asked) = stand_in_dns(|name, _| match name {
+        "dc01.corp.example.org" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let mut resolver = stand_in_resolver(vec![dc], &doh);
+    resolver.keep_private("dc01.corp.example.org", &[]);
+    assert_eq!(
+        resolver.resolve("_dmarc.dc01.corp.example.org", 16).await,
+        Lookup::Unconfirmed
+    );
+    assert_eq!(taken(&dc_asked), ["16 _dmarc.dc01.corp.example.org"]);
+    // For a public target, the system's "none" is final.
+    let public = stand_in_resolver(vec![other], &doh);
+    assert_eq!(
+        public.resolve("_dmarc.www.example.org", 16).await,
+        Lookup::NoRecords
+    );
+    assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+}
+
+#[tokio::test]
+async fn up_to_three_servers_are_asked_as_the_system_does() {
+    let (first, _) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (second, _) = stand_in_dns(|_, _| Reply::Refused).await;
+    let (third, third_asked) = stand_in_dns(|_, _| Reply::Address([192, 0, 2, 7])).await;
+    let (fourth, fourth_asked) = stand_in_dns(|_, _| Reply::Address([192, 0, 2, 8])).await;
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let resolver = stand_in_resolver(vec![first, second, third, fourth], &doh);
+    assert_eq!(
+        resolver.resolve("www.example.org", 1).await,
+        Lookup::Found(vec!["192.0.2.7".to_owned()])
+    );
+    assert_eq!(taken(&third_asked), ["1 www.example.org"]);
+    assert!(taken(&fourth_asked).is_empty());
+    assert!(taken(&doh_asked).is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
+    // Every DNS server fails (a domain with broken DNSSEC), and so does
+    // DNS-over-HTTPS.
+    let (failing, _) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (doh, doh_asked) = stand_in_doh_saying(2, None).await;
+    let target = Target::parse("www.example.org").unwrap();
+    let (observations, _, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![failing], &doh),
+        (Vec::new(), Vec::new()),
+        false,
+    )
+    .await;
+    assert!(taken(&doh_asked).contains(&"AAAA www.example.org".to_owned()));
+    let text = format!("{observations:?}");
+    assert!(!text.contains("no AAAA record"), "{text}");
+    assert!(
+        observations
+            .iter()
+            .any(|o| matches!(o, Observation::HostMeta { ipv6_dns: None, .. })),
+        "{text}"
+    );
+    assert!(summary.ends_with("; some DNS lookups failed"), "{summary}");
+    // When DNS says there is none, that is said.
+    let (nodata, _) = stand_in_dns(|_, _| Reply::NoData).await;
+    let (observations, _, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![nodata], &doh),
+        (Vec::new(), Vec::new()),
+        false,
+    )
+    .await;
+    assert!(format!("{observations:?}").contains("no AAAA record published"));
+    assert!(!summary.contains("failed"), "{summary}");
+    // An internal target: only a server that knows it may say "none".
+    let internal = (vec!["192.0.2.10".to_owned()], Vec::new());
+    let (observations, _, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![nodata], &doh),
+        internal.clone(),
+        false,
+    )
+    .await;
+    assert!(!format!("{observations:?}").contains("no AAAA record"));
+    assert!(
+        summary.ends_with("; this machine's DNS server does not know the name"),
+        "{summary}"
+    );
+    let (knows, _) = stand_in_dns(|name, _| match name {
+        "www.example.org" => Reply::Address([192, 0, 2, 10]),
+        _ => Reply::NoData,
+    })
+    .await;
+    let (observations, _, _) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![knows], &doh),
+        internal,
+        false,
+    )
+    .await;
+    assert!(format!("{observations:?}").contains("no AAAA record published"));
+    // An address whose PTR lookup failed has not "no PTR record".
+    let address = Target::parse("192.0.2.10").unwrap();
+    let ptr = |server| {
+        run_dns_with(
+            &address,
+            stand_in_resolver(vec![server], &doh),
+            (Vec::new(), Vec::new()),
+            false,
+        )
+    };
+    assert_eq!(ptr(failing).await.2, "PTR lookup failed");
+    assert_eq!(ptr(nodata).await.2, "no PTR record");
+}
+
+#[tokio::test]
+async fn mail_dns_ends_without_a_grade_when_no_lookup_answers() {
+    // The audit's run: every question gets SERVFAIL, DoH too.
+    let (failing, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (doh, _) = stand_in_doh_saying(2, None).await;
+    let (observations, summary) = crate::maildns::run_on(
+        stand_in_resolver(vec![failing], &doh),
+        "pub.example.org",
+        "192.0.2.10",
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(observations.is_empty(), "{observations:?}");
+    assert_eq!(summary, "DNS lookups failed");
+    // It stopped after the first questions.
+    assert_eq!(taken(&asked).len(), 3, "{:?}", taken(&asked));
+    // An internal target this machine's DNS server does not know.
+    let (other, _) = stand_in_dns(|_, _| Reply::NxDomain).await;
+    let (observations, summary) = crate::maildns::run_on(
+        stand_in_resolver(vec![other], &doh),
+        "intranet.example.org",
+        "10.0.0.5",
+        &[],
+        Some(&["10.0.0.5".to_owned()]),
+    )
+    .await
+    .unwrap();
+    assert!(observations.is_empty(), "{observations:?}");
+    assert_eq!(
+        summary,
+        "DNS lookups failed: this machine's DNS server does not know intranet.example.org"
+    );
 }
 
 #[cfg(windows)]
@@ -1069,4 +1677,454 @@ async fn a_probes_program_ends_when_the_session_closes() {
     late.args(["-c", "sleep 300"]);
     configure_osint_command(&mut late);
     assert!(tools.spawn(&mut late).is_err());
+}
+
+/// A shell script in `dir` named `name` that runs `body`.
+#[cfg(unix)]
+fn stand_in(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The process id a stand-in wrote to `file`.
+#[cfg(unix)]
+fn pid_in(file: &std::path::Path) -> libc::pid_t {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no pid in {file:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A TLS audit says whether every handshake answered. Only then do the
+/// versions and weak ciphers it found replace those listed: a check that
+/// could not connect, or did not finish, keeps what was found before.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tls_audit_replaces_what_was_listed_only_when_every_check_answered() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `openssl s_client`: the default handshake (TLS 1.3, a weak cipher
+    // before), TLS 1.2 and 1.3 taken, TLS 1.1 refused, TLS 1.0 as `tls1`.
+    let openssl = |name: &str, tls1: &str| {
+        stand_in(
+            tmp.path(),
+            name,
+            &format!(
+                "case \"$*\" in\n\
+                 *-tls1_2*|*-tls1_3*) printf 'CONNECTED(00000003)\\nNew, TLSv1.2, Cipher is ECDHE-RSA-AES128-GCM-SHA256\\n' ;;\n\
+                 *-tls1_1*) printf 'CONNECTED(00000003)\\nNew, (NONE), Cipher is (NONE)\\n' ;;\n\
+                 *-tls1*) {tls1} ;;\n\
+                 *) printf 'CONNECTED(00000003)\\n    Protocol  : TLSv1.3\\n    Cipher    : TLS_AES_256_GCM_SHA384\\n' ;;\n\
+                 esac"
+            ),
+        )
+    };
+    let refused = openssl(
+        "refused",
+        "printf 'CONNECTED(00000003)\\nNew, (NONE), Cipher is (NONE)\\n'",
+    );
+    // A check that could not connect (a rate limit, a dropped packet).
+    let silent = openssl("silent", "exit 1");
+    let tools = Tracker::new();
+    let audit = |openssl: std::path::PathBuf| {
+        let tools = &tools;
+        async move {
+            let (observations, _) = super::tls::run_tls_audit_with(
+                tools,
+                Some(openssl),
+                "192.0.2.40",
+                Some("www.example.com"),
+                443,
+            )
+            .await
+            .unwrap();
+            observations
+        }
+    };
+    let http = |observations: &[Observation]| {
+        observations
+            .iter()
+            .find_map(|observation| match observation {
+                Observation::WebMeta { http, .. } => Some((**http).clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let earlier = || Observation::WebMeta {
+        address: "192.0.2.40".into(),
+        port: 443,
+        http: Box::new(HttpInfo {
+            scheme: "https".into(),
+            tls_versions: vec!["TLSv1.0".into(), "TLSv1.2".into(), "TLSv1.3".into()],
+            tls_weak_ciphers: vec!["DES-CBC3-SHA".into()],
+            ..HttpInfo::default()
+        }),
+        record: EvidenceRecord::observed(Source::TlsCert, Confidence::High, "x"),
+    };
+    let listed = |graph: &crate::graph::Graph| {
+        let http = graph.hosts["192.0.2.40"].ports["443/tcp"]
+            .http
+            .clone()
+            .unwrap();
+        (http.tls_versions, http.tls_weak_ciphers)
+    };
+
+    // TLS 1.0 and 3DES were turned off: every check answered.
+    let found = audit(refused).await;
+    assert!(http(&found).tls_complete);
+    assert_eq!(http(&found).tls_versions, ["TLSv1.3", "TLSv1.2"]);
+    let mut graph = crate::graph::Graph::default();
+    graph.apply(earlier());
+    graph.apply_all(found);
+    assert_eq!(
+        listed(&graph),
+        (vec!["TLSv1.3".to_owned(), "TLSv1.2".to_owned()], vec![])
+    );
+
+    // The TLS 1.0 check did not answer: nothing is taken off the list.
+    let found = audit(silent).await;
+    assert!(!http(&found).tls_complete);
+    assert_eq!(http(&found).tls_versions, ["TLSv1.3", "TLSv1.2"]);
+    let mut graph = crate::graph::Graph::default();
+    graph.apply(earlier());
+    graph.apply_all(found);
+    assert_eq!(
+        listed(&graph),
+        (
+            vec![
+                "TLSv1.0".to_owned(),
+                "TLSv1.2".to_owned(),
+                "TLSv1.3".to_owned()
+            ],
+            vec!["DES-CBC3-SHA".to_owned()]
+        )
+    );
+    assert_eq!(tools.running(), 0);
+}
+
+/// A program still printing at its deadline: what it printed is kept, but
+/// for the line it had not finished, and it ends with all it started.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_program_cut_off_at_its_deadline_keeps_what_it_printed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = tmp.path().join("pid");
+    let script = stand_in(
+        tmp.path(),
+        "slow",
+        &format!(
+            "printf ' 1  198.51.100.1  0.5 ms\\n 2  198.51.100.2  3.1 ms\\n 3  198.51.1'\n\
+             sleep 300 &\necho $! > '{}'\nwait",
+            pid.display()
+        ),
+    );
+    let tools = Tracker::new();
+    let mut command = tokio::process::Command::new(&script);
+    configure_osint_command(&mut command);
+    let (child, group) = tools.spawn(&mut command).unwrap();
+    let started = std::time::Instant::now();
+    let printed = read_bounded(child, group, 4096, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(printed.timed_out);
+    assert_eq!(
+        printed.text,
+        " 1  198.51.100.1  0.5 ms\n 2  198.51.100.2  3.1 ms\n"
+    );
+    crate::procs::tests::wait_gone(pid_in(&pid));
+    assert_eq!(tools.running(), 0);
+
+    // Past the size cap: whole lines only, and not "timed out".
+    let mut command = tokio::process::Command::new(&script);
+    configure_osint_command(&mut command);
+    let (child, group) = tools.spawn(&mut command).unwrap();
+    let printed = read_bounded(child, group, 30, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(!printed.timed_out);
+    assert_eq!(printed.text, " 1  198.51.100.1  0.5 ms\n");
+
+    // A program that ends: all it printed.
+    let quick = stand_in(tmp.path(), "quick", "printf 'one\\ntwo'");
+    let mut command = tokio::process::Command::new(&quick);
+    configure_osint_command(&mut command);
+    let (child, group) = tools.spawn(&mut command).unwrap();
+    assert_eq!(
+        wait_bounded_stdout(child, group, 4096, Duration::from_secs(10)).await,
+        Some("one\ntwo".to_owned())
+    );
+}
+
+/// The traceroute of the audit: four hops at once, then a silent route
+/// until the tool is stopped. The four hops are the route; no other tool
+/// starts once the time is up.
+#[cfg(unix)]
+#[tokio::test]
+async fn trace_keeps_the_hops_a_stalled_tool_printed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = tmp.path().join("pid");
+    let stalled = stand_in(
+        tmp.path(),
+        "traceroute",
+        &format!(
+            "echo \"traceroute to $9 ($9), 15 hops max, 60 byte packets\"\n\
+             echo ' 1  198.51.100.1  0.512 ms'\necho ' 2  198.51.100.2  3.120 ms'\n\
+             echo ' 3  198.51.100.3  9.870 ms'\necho ' 4  198.51.100.4  12.400 ms'\n\
+             echo ' 5  *'\nsleep 300 &\necho $! > '{}'\nwait",
+            pid.display()
+        ),
+    );
+    let started_file = tmp.path().join("second-started");
+    let second = stand_in(
+        tmp.path(),
+        "tracepath",
+        &format!("touch '{}'", started_file.display()),
+    );
+    let target: IpAddr = "203.0.113.9".parse().unwrap();
+    let commands = trace_commands(&target.to_string());
+    let commands = vec![
+        (stalled, commands[0].1.clone()),
+        (second, commands[1].1.clone()),
+    ];
+    let tools = Tracker::new();
+    let started = std::time::Instant::now();
+    let (observations, summary) = trace_with(
+        &tools,
+        target,
+        Some("192.0.2.1"),
+        &commands,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(summary, "4 intermediate hops");
+    let hops = [
+        "198.51.100.1",
+        "198.51.100.2",
+        "198.51.100.3",
+        "198.51.100.4",
+    ];
+    let text = format!("{observations:?}");
+    match &observations[0] {
+        Observation::HostMeta {
+            address, hops: got, ..
+        } => {
+            assert_eq!(address, "203.0.113.9");
+            assert_eq!(got, &hops);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The target did not answer: no hop, and no time, is made up for it.
+    assert!(
+        text.contains("route path (4 hops, target did not answer"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Target Host") && !text.contains("Hop 6"),
+        "{text}"
+    );
+    crate::procs::tests::wait_gone(pid_in(&pid));
+    assert!(
+        !started_file.exists(),
+        "a second tool ran after the time was up"
+    );
+    assert_eq!(tools.running(), 0);
+}
+
+/// A route the tool gave no hop of is not recorded: not the gateway, not
+/// the target, not a time.
+#[cfg(unix)]
+#[tokio::test]
+async fn trace_without_hops_records_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target: IpAddr = "203.0.113.9".parse().unwrap();
+    let args = trace_commands(&target.to_string())[0].1.clone();
+    let tools = Tracker::new();
+    for (name, body) in [
+        ("silent", "exit 0"),
+        ("filtered", "echo 'traceroute to 203.0.113.9'\necho ' 1  * * *'\necho ' 2  * * *'\necho ' 3  * * *'"),
+        ("unreachable", "echo 'connect: Network is unreachable'\nexit 2"),
+    ] {
+        let program = stand_in(tmp.path(), name, body);
+        let (observations, summary) = trace_with(
+            &tools,
+            target,
+            Some("192.0.2.1"),
+            &[(program, args.clone())],
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(observations.is_empty(), "{name}: {observations:?}");
+        assert_eq!(summary, "traceroute gave no hops", "{name}");
+    }
+    // None installed.
+    let error = trace_with(&tools, target, None, &[], Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("not installed"), "{error:#}");
+}
+
+/// What the tool gave, and nothing else: the target's own time when it
+/// answered, the local router only when it was a hop.
+#[cfg(unix)]
+#[tokio::test]
+async fn trace_records_only_the_hops_the_tool_gave() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target: IpAddr = "203.0.113.9".parse().unwrap();
+    let args = trace_commands(&target.to_string())[0].1.clone();
+    let program = stand_in(
+        tmp.path(),
+        "traceroute",
+        "echo ' 1  198.51.100.1  0.5 ms'\necho ' 2  *'\necho ' 3  203.0.113.9  14.2 ms'",
+    );
+    let tools = Tracker::new();
+    let (observations, summary) = trace_with(
+        &tools,
+        target,
+        Some("192.0.2.1"),
+        &[(program, args)],
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary, "1 intermediate hops");
+    let Observation::Fact { claim, record, .. } = &observations[1] else {
+        panic!("{observations:?}");
+    };
+    assert_eq!(
+        claim,
+        "route path (3 hops (14.2 ms)): 198.51.100.1 -> 203.0.113.9"
+    );
+    assert!(
+        !record.evidence.contains("192.0.2.1"),
+        "{}",
+        record.evidence
+    );
+    assert!(!record.evidence.contains("1.5 ms"), "{}", record.evidence);
+    assert_eq!(
+        record.evidence.matches("Hop ").count(),
+        3,
+        "{}",
+        record.evidence
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_tools_fit_in_the_stage_s_time() {
+    let commands = trace_commands("203.0.113.9");
+    let line = |at: usize| format!("{} {}", commands[at].0, commands[at].1.join(" "));
+    assert_eq!(line(0), "traceroute -n -q 1 -w 1 -m 15 203.0.113.9");
+    assert_eq!(line(1), "tracepath -n -m 15 203.0.113.9");
+    // One 1 s probe a hop; three 1 s tries a hop.
+    assert!(TRACE_TIMEOUT >= Duration::from_secs(15 * 3));
+}
+
+#[cfg(windows)]
+#[test]
+fn tracert_fits_in_the_stage_s_time() {
+    let commands = trace_commands("203.0.113.9");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, "tracert");
+    assert_eq!(
+        commands[0].1,
+        ["-d", "-h", "15", "-w", "500", "203.0.113.9"]
+    );
+    // Three probes of 0.5 s for each of 15 silent hops.
+    assert!(TRACE_TIMEOUT >= Duration::from_millis(15 * 3 * 500));
+}
+
+#[test]
+fn reserved_ipv4_ranges_are_not_public() {
+    for reserved in ["0.1.2.3", "240.0.0.7", "250.1.2.3", "255.255.255.254"] {
+        assert!(is_non_public_ip(reserved.parse().unwrap()), "{reserved}");
+    }
+    // Both IPv6 documentation prefixes: 2001:db8::/32 and 3fff::/20.
+    for documentation in ["2001:db8::7", "3fff::7", "3fff:fff:ffff::1"] {
+        assert!(
+            is_non_public_ip(documentation.parse().unwrap()),
+            "{documentation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_name_with_any_internal_address_is_internal() {
+    // Whatever address comes first.
+    for known in [
+        &["240.0.0.7", "fd00::5"][..],
+        &["fd00::5", "240.0.0.7"],
+        &["2001:db8::7", "10.0.0.5"],
+    ] {
+        let known: Vec<String> = known.iter().map(|ip| (*ip).to_owned()).collect();
+        assert!(
+            is_internal_target("mixed.example.org", &known).await,
+            "{known:?}"
+        );
+    }
+}
+
+/// The address a name's facts go on is the one nmap scans: its first IPv4
+/// address, or with `-6` its first IPv6 one, whatever the text order.
+#[tokio::test]
+async fn the_dns_stage_records_on_the_address_the_scan_goes_to() {
+    let ips = |list: &[&str]| list.iter().map(|ip| (*ip).to_owned()).collect::<Vec<_>>();
+    let dual = ips(&["203.0.113.7", "203.0.113.70", "2001:db8::7", "2001:db8::70"]);
+    assert_eq!(
+        primary_address(&dual, false).as_deref(),
+        Some("203.0.113.7")
+    );
+    assert_eq!(primary_address(&dual, true).as_deref(), Some("2001:db8::7"));
+    let v6_only = ips(&["2001:db8::7"]);
+    assert_eq!(
+        primary_address(&v6_only, false).as_deref(),
+        Some("2001:db8::7")
+    );
+    let v4_only = ips(&["203.0.113.7"]);
+    assert_eq!(
+        primary_address(&v4_only, true).as_deref(),
+        Some("203.0.113.7")
+    );
+    assert_eq!(primary_address(&[], false), None);
+
+    let (server, _) = stand_in_dns(|name, _| match name {
+        "dual.example.org" => Reply::Address([203, 0, 113, 7]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let (doh, _) = stand_in_doh(None).await;
+    let target = Target::parse("dual.example.org").unwrap();
+    for (ipv6, bound) in [(false, "203.0.113.7"), (true, "2001:db8::7")] {
+        let (observations, found, _) = run_dns_with(
+            &target,
+            stand_in_resolver(vec![server], &doh),
+            (ips(&["203.0.113.7"]), ips(&["2001:db8::7"])),
+            ipv6,
+        )
+        .await;
+        // In the system's order.
+        assert_eq!(found, ["203.0.113.7", "2001:db8::7"]);
+        let named: Vec<&str> = observations
+            .iter()
+            .filter_map(|o| match o {
+                Observation::Hostname {
+                    address, hostname, ..
+                } if hostname == "dual.example.org" => Some(address.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [bound], "-6: {ipv6}");
+    }
 }

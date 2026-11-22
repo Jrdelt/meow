@@ -170,6 +170,10 @@ pub struct HttpInfo {
     pub tls_versions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tls_weak_ciphers: Vec<String>,
+    /// Set by a TLS audit whose checks all answered: its versions and weak
+    /// ciphers are all the port offers now. Not kept.
+    #[serde(skip)]
+    pub tls_complete: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub robots_disallow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +252,45 @@ fn merge_list(mine: &mut Vec<String>, theirs: Vec<String>, max: usize) -> bool {
         }
     }
     mine.len() != before
+}
+
+/// `jQuery 1.12.4 (older than ...)` as `("jquery", Some("1.12.4"))`: the
+/// words before the version, and the version.
+fn tech_name(entry: &str) -> (String, Option<&str>) {
+    let mut name = Vec::new();
+    for word in entry.split_whitespace() {
+        if word.starts_with(|c: char| c.is_ascii_digit()) {
+            return (name.join(" ").to_ascii_lowercase(), Some(word));
+        }
+        name.push(word);
+    }
+    (name.join(" ").to_ascii_lowercase(), None)
+}
+
+/// The software stack with what a later page shows: another version of a
+/// library replaces the one listed, so an update is not reported as still
+/// outdated. A name without a version does not replace one with it.
+fn merge_tech(mine: &mut Vec<String>, theirs: Vec<String>) {
+    for item in theirs {
+        let (name, version) = tech_name(&item);
+        let known = mine.iter().position(|entry| {
+            let (other, other_version) = tech_name(entry);
+            !name.is_empty() && other == name && (version.is_some() || other_version.is_none())
+        });
+        match known {
+            Some(at) => mine[at] = item,
+            None if mine.len() < 24 && !mine.contains(&item) => {
+                // "nginx" when "nginx 1.18.0" is there already says nothing new.
+                let vaguer = version.is_none()
+                    && !name.is_empty()
+                    && mine.iter().any(|entry| tech_name(entry).0 == name);
+                if !vaguer {
+                    mine.push(item);
+                }
+            }
+            None => {}
+        }
+    }
 }
 
 impl HttpInfo {
@@ -330,8 +373,15 @@ impl HttpInfo {
         self.js_secrets.truncate(32);
     }
 
-    pub fn absorb(&mut self, mut other: HttpInfo) -> bool {
+    pub fn absorb(&mut self, other: HttpInfo) -> bool {
+        self.absorb_from(other, false)
+    }
+
+    /// [`Self::absorb`]; `page` when `other` is the headers stage's reading
+    /// of the page, whose software stack is all the page shows now.
+    fn absorb_from(&mut self, mut other: HttpInfo, page: bool) -> bool {
         other.sanitize();
+        let tls_complete = std::mem::take(&mut other.tls_complete);
         let before = self.clone();
         if self.scheme.is_empty() || other.scheme == "https" {
             self.scheme = other.scheme;
@@ -364,22 +414,29 @@ impl HttpInfo {
         if !other.missing_headers.is_empty() {
             self.missing_headers = other.missing_headers;
         }
-        for v in other.tls_versions {
-            if !self.tls_versions.contains(&v) && self.tls_versions.len() < 8 {
-                self.tls_versions.push(v);
-            }
-        }
-        for c in other.tls_weak_ciphers {
-            if !self.tls_weak_ciphers.contains(&c) && self.tls_weak_ciphers.len() < 32 {
-                self.tls_weak_ciphers.push(c);
-            }
+        if tls_complete && !other.tls_versions.is_empty() {
+            // A TLS audit whose checks all answered found all the port
+            // offers: what it no longer finds was turned off.
+            self.tls_versions = other.tls_versions;
+            self.tls_weak_ciphers = other.tls_weak_ciphers;
+        } else {
+            // A check that did not answer says nothing: what was found
+            // before stays.
+            merge_list(&mut self.tls_versions, other.tls_versions, 8);
+            merge_list(&mut self.tls_weak_ciphers, other.tls_weak_ciphers, 32);
         }
         for r in other.robots_disallow {
             if !self.robots_disallow.contains(&r) && self.robots_disallow.len() < 32 {
                 self.robots_disallow.push(r);
             }
         }
-        merge_list(&mut self.tech, other.tech, 24);
+        if page && !other.tech.is_empty() {
+            // The page as the headers stage read it now: its whole stack.
+            // A library taken off the page is no longer listed.
+            self.tech = other.tech;
+        } else {
+            merge_tech(&mut self.tech, other.tech);
+        }
         // The latest page's cookies and header grade replace the earlier ones.
         if !other.cookies.is_empty() {
             self.cookies = other.cookies;
@@ -466,9 +523,11 @@ pub struct DnsSecurity {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DnsCheck {
-    /// `SPF`, `DMARC`, `DKIM`, `CAA`, `DNSSEC`, `Mail`.
+    /// `SPF`, `DMARC`, `DKIM`, `CAA`, `DNSSEC`, `Mail`, `Directory`,
+    /// `Wildcard`.
     pub name: String,
-    /// `ok`, `warn`, `bad` or `info`.
+    /// `ok`, `warn`, `bad`, `info`, or `unknown` when its lookups got no
+    /// answer (it could not be checked).
     pub status: String,
     pub value: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -484,7 +543,8 @@ pub struct DnsService {
 }
 
 /// A name from the certificate logs, looked up: `resolves`, `wildcard`
-/// (only the wildcard answers, so it may not exist) or `gone`.
+/// (only the wildcard answers, so it may not exist), `gone`, or `unknown`
+/// when its lookups got no answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubdomainCheck {
     pub name: String,
@@ -496,7 +556,7 @@ pub struct SubdomainCheck {
 impl DnsSecurity {
     pub fn sanitize(&mut self) {
         let status = |s: &str| match s {
-            "ok" | "warn" | "bad" | "info" => s.to_owned(),
+            "ok" | "warn" | "bad" | "info" | "unknown" => s.to_owned(),
             _ => "info".to_owned(),
         };
         self.domain = clean(&self.domain);
@@ -524,9 +584,10 @@ impl DnsSecurity {
             .collect();
         for sub in &mut self.subdomains {
             sub.name = clean(&sub.name);
+            // Anything else claims nothing about the name.
             sub.status = match sub.status.as_str() {
-                "resolves" | "wildcard" | "gone" => sub.status.clone(),
-                _ => "gone".to_owned(),
+                "resolves" | "wildcard" | "gone" | "unknown" => sub.status.clone(),
+                _ => "unknown".to_owned(),
             };
             sub.addresses = std::mem::take(&mut sub.addresses)
                 .into_iter()
@@ -663,6 +724,8 @@ impl Port {
         .iter()
         .any(|field| field.is_some());
         if names_it && other.identified >= self.identified {
+            let product_before = self.product.clone();
+            let version_before = self.version.clone();
             for (mine, theirs) in [
                 (&mut self.service, other.service),
                 (&mut self.product, other.product),
@@ -675,12 +738,44 @@ impl Port {
                 }
             }
             self.identified = other.identified;
-        }
-        for cpe in other.cpes {
-            if self.cpes.len() >= MAX_CPES_PER_PORT {
-                break;
+            if !other.cpes.is_empty() {
+                // The CPEs name what runs there now: those of an earlier
+                // version or product would still be looked up.
+                let cpes: BTreeSet<String> =
+                    other.cpes.into_iter().take(MAX_CPES_PER_PORT).collect();
+                if self.cpes != cpes {
+                    self.cpes = cpes;
+                    changed = true;
+                }
+            } else if self.product != product_before || self.version != version_before {
+                let product_changed = !same_product(&self.product, &product_before);
+                let before = self.cpes.len();
+                self.cpes.retain(|cpe| {
+                    cpe_fits(
+                        cpe,
+                        product_changed,
+                        self.product.as_deref(),
+                        self.version.as_deref(),
+                    )
+                });
+                changed |= self.cpes.len() != before;
             }
-            changed |= self.cpes.insert(cpe);
+        } else {
+            // A less sure source does not name the port anew, and its CPE
+            // of another version (an older scan) does not either.
+            for cpe in other.cpes {
+                if self.cpes.len() >= MAX_CPES_PER_PORT {
+                    break;
+                }
+                if cpe_fits(
+                    &cpe,
+                    false,
+                    self.product.as_deref(),
+                    self.version.as_deref(),
+                ) {
+                    changed |= self.cpes.insert(cpe);
+                }
+            }
         }
         for san in other.tls_sans {
             if self.tls_sans.len() >= MAX_TLS_SANS_PER_PORT {
@@ -709,6 +804,54 @@ impl Port {
         }
         changed
     }
+}
+
+/// Letters and digits only, in lower case: `Apache Tomcat` is `apachetomcat`.
+fn squashed(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn same_product(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => squashed(a) == squashed(b),
+        (a, b) => a == b,
+    }
+}
+
+/// Whether a port's CPE still names what a source that gave no CPEs says
+/// runs there (`product`, `version`): an application of another product
+/// or another version does not. What the system runs on stays.
+fn cpe_fits(
+    cpe: &str,
+    product_changed: bool,
+    product: Option<&str>,
+    version: Option<&str>,
+) -> bool {
+    let Some(parts) = crate::cpe::parts(cpe) else {
+        return true;
+    };
+    if parts.part != 'a' {
+        return true;
+    }
+    if product_changed
+        && !product.is_some_and(|product| squashed(product).contains(&squashed(&parts.product)))
+    {
+        return false;
+    }
+    let (Some(named), Some(version)) = (parts.version, version) else {
+        return true;
+    };
+    let cleaned = crate::cpe::clean_version(&named);
+    version
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            token.eq_ignore_ascii_case(&named)
+                || crate::cpe::clean_version(token).eq_ignore_ascii_case(&cleaned)
+        })
 }
 
 fn merge_paths(into: &mut PathNode, from: PathNode, budget: &mut usize) {
@@ -1404,9 +1547,13 @@ fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
         });
     }
     fact.record.sanitize_fields();
-    let duplicate = facts
-        .iter()
-        .any(|f| f.claim == fact.claim && f.record.source == fact.record.source);
+    // A diff note names only the file and its line counts: another change
+    // to the same file, of the same size, is told apart by its lines.
+    let duplicate = facts.iter().any(|f| {
+        f.claim == fact.claim
+            && f.record.source == fact.record.source
+            && (fact.record.source != Source::GitDiff || f.record.evidence == fact.record.evidence)
+    });
     if duplicate || facts.len() >= MAX_FACTS || fact.claim.is_empty() {
         return false;
     }
@@ -2570,7 +2717,7 @@ impl Graph {
                 address,
                 port,
                 http,
-                record: _,
+                record,
             } => {
                 let Some(entry) = self.port_entry(&address, port, "tcp") else {
                     return false;
@@ -2582,11 +2729,13 @@ impl Graph {
                 }
                 match &mut entry.http {
                     Some(existing) => {
-                        changed |= existing.absorb(*http);
+                        let page = record.source == Source::HttpHeader;
+                        changed |= existing.absorb_from(*http, page);
                     }
                     None => {
                         let mut h = *http;
                         h.sanitize();
+                        h.tls_complete = false;
                         entry.http = Some(h);
                         changed = true;
                     }
@@ -2656,6 +2805,20 @@ impl Graph {
             Some(existing) => {
                 let before = existing.clone();
                 let before_weight = advisory_weight(&before);
+                // The port it was found on is closed now, or a lookup's
+                // match runs other software there now (updated): it is
+                // named by the port and query it is found by today.
+                let looked_up = matches!(existing.record.source, Source::NvdApi | Source::OsvApi);
+                let gone = existing.port.as_ref().is_some_and(|key| {
+                    !host.ports.get(key).is_some_and(|port| {
+                        port.is_open()
+                            && (!looked_up || crate::cve::port_asks(port, &existing.matched))
+                    })
+                });
+                if gone && advisory.port.is_some() {
+                    existing.port = advisory.port;
+                    existing.matched = advisory.matched;
+                }
                 existing.kev |= advisory.kev;
                 if existing.title.is_empty() {
                     existing.title = advisory.title;
@@ -2692,8 +2855,14 @@ impl Graph {
 
     /// Removes database matches that a complete new lookup no longer
     /// returns: the software was updated, or the match was a wrong one.
-    /// CVEs from anywhere else (a note, an import) stay.
-    pub fn drop_stale_advisories(&mut self, address: &str, current: &BTreeSet<String>) -> usize {
+    /// CVEs from anywhere else (a note, an import) stay, and so do those
+    /// `asked_less` says the lookup did not ask about.
+    pub fn drop_stale_advisories(
+        &mut self,
+        address: &str,
+        current: &BTreeSet<String>,
+        asked_less: impl Fn(&Advisory) -> bool,
+    ) -> usize {
         let Some(host) = self.host_mut(address) else {
             return 0;
         };
@@ -2701,7 +2870,8 @@ impl Graph {
         let mut freed = 0usize;
         host.advisories.retain(|advisory| {
             let keep = current.contains(&advisory.id)
-                || !matches!(advisory.record.source, Source::NvdApi | Source::OsvApi);
+                || !matches!(advisory.record.source, Source::NvdApi | Source::OsvApi)
+                || asked_less(advisory);
             if !keep {
                 freed += advisory_weight(advisory);
             }
@@ -4118,7 +4288,7 @@ mod tests {
         let mut graph = Graph::default();
         // Unknown-host operations never materialize phantom empty hosts.
         assert_eq!(
-            graph.drop_stale_advisories("198.51.100.99", &BTreeSet::new()),
+            graph.drop_stale_advisories("198.51.100.99", &BTreeSet::new(), |_| false),
             0
         );
         assert!(graph.hosts.is_empty());
@@ -4256,5 +4426,285 @@ mod tests {
         ));
         assert!(graph.tally.weight < 1024 * 1024);
         assert!(!graph.is_full());
+    }
+
+    fn named(
+        number: u16,
+        product: &str,
+        version: &str,
+        cpes: &[&str],
+        confidence: Confidence,
+    ) -> Observation {
+        Observation::Port {
+            address: "192.0.2.60".into(),
+            port: number,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: Some(product.into()),
+            version: Some(version.into()),
+            extra_info: None,
+            cpes: cpes.iter().map(|c| c.to_string()).collect(),
+            record: EvidenceRecord::observed(Source::NmapXml, confidence, "x"),
+        }
+    }
+
+    fn cpes_of(graph: &Graph, number: u16) -> Vec<&str> {
+        graph.hosts["192.0.2.60"].ports[&format!("{number}/tcp")]
+            .cpes
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn an_update_replaces_the_cpes_of_what_ran_before() {
+        let old = "cpe:2.3:a:igor_sysoev:nginx:1.18.0:*:*:*:*:*:*:*";
+        let new = "cpe:2.3:a:igor_sysoev:nginx:1.25.3:*:*:*:*:*:*:*";
+        let kernel = "cpe:2.3:o:linux:linux_kernel:*:*:*:*:*:*:*:*";
+        let mut graph = Graph::default();
+        graph.apply(named(
+            80,
+            "nginx",
+            "1.18.0",
+            &[old, kernel],
+            Confidence::High,
+        ));
+        // The session's own scan after the update names the new release.
+        assert!(graph.apply(named(80, "nginx", "1.25.3", &[new], Confidence::High)));
+        assert_eq!(cpes_of(&graph, 80), [new]);
+        // A less sure source (an older scan imported) names nothing anew
+        // and brings back no CPE of another version.
+        graph.apply(named(80, "nginx", "1.18.0", &[old], Confidence::Medium));
+        assert_eq!(
+            graph.hosts["192.0.2.60"].ports["80/tcp"].version.as_deref(),
+            Some("1.25.3")
+        );
+        assert_eq!(cpes_of(&graph, 80), [new]);
+        graph.apply(named(
+            80,
+            "nginx",
+            "1.25.3",
+            &[new, kernel],
+            Confidence::Medium,
+        ));
+        assert_eq!(cpes_of(&graph, 80), [new, kernel]);
+
+        // A source as sure that gives no CPEs: those of another version
+        // or product go, what the system runs on stays.
+        graph.apply(named(
+            8080,
+            "nginx",
+            "1.18.0",
+            &[old, kernel],
+            Confidence::Medium,
+        ));
+        graph.apply(named(
+            8080,
+            "nginx",
+            "1.18.0 (Ubuntu)",
+            &[],
+            Confidence::Medium,
+        ));
+        assert_eq!(cpes_of(&graph, 8080), [old, kernel], "the same version");
+        graph.apply(named(8080, "nginx", "1.25.3", &[], Confidence::Medium));
+        assert_eq!(cpes_of(&graph, 8080), [kernel]);
+        let jetty = "cpe:2.3:a:eclipse:jetty:9.4.31:*:*:*:*:*:*:*";
+        let tomcat = "cpe:2.3:a:apache:tomcat:*:*:*:*:*:*:*:*";
+        graph.apply(named(
+            8443,
+            "Jetty",
+            "9.4.31",
+            &[jetty, tomcat, kernel],
+            Confidence::Medium,
+        ));
+        graph.apply(named(
+            8443,
+            "Apache Tomcat",
+            "9.4.31",
+            &[],
+            Confidence::Medium,
+        ));
+        assert_eq!(cpes_of(&graph, 8443), [tomcat, kernel]);
+    }
+
+    #[test]
+    fn a_retest_shows_what_tls_and_the_page_offer_now() {
+        let mut graph = Graph::default();
+        let web = |http: HttpInfo, source: Source| Observation::WebMeta {
+            address: "192.0.2.80".into(),
+            port: 443,
+            http: Box::new(HttpInfo {
+                scheme: "https".into(),
+                ..http
+            }),
+            record: rec(source),
+        };
+        let words = |list: &[&str]| list.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // A TLS audit: `complete` when every handshake answered.
+        let tls = |versions: &[&str], weak: &[&str], complete: bool| {
+            web(
+                HttpInfo {
+                    tls_versions: words(versions),
+                    tls_weak_ciphers: words(weak),
+                    tls_complete: complete,
+                    ..HttpInfo::default()
+                },
+                Source::TlsCert,
+            )
+        };
+        // The headers stage's reading of the page.
+        let page = |tech: &[&str]| {
+            web(
+                HttpInfo {
+                    tech: words(tech),
+                    header_grade: Some("C".into()),
+                    ..HttpInfo::default()
+                },
+                Source::HttpHeader,
+            )
+        };
+        let http = |graph: &Graph| {
+            graph.hosts["192.0.2.80"].ports["443/tcp"]
+                .http
+                .clone()
+                .unwrap()
+        };
+        graph.apply(tls(&["TLSv1.0", "TLSv1.2"], &["DES-CBC3-SHA"], true));
+        assert!(!http(&graph).tls_complete, "not kept");
+        graph.apply(page(&[
+            "nginx 1.18.0",
+            "jQuery 1.12.4 (older than 3.5.0: XSS)",
+            "Drupal",
+        ]));
+        // After hardening: TLS 1.0 and 3DES are off, jQuery is updated.
+        assert!(graph.apply(tls(&["TLSv1.2", "TLSv1.3"], &[], true)));
+        assert!(graph.apply(page(&["nginx", "jQuery 3.7.1", "PHP 8.2.1"])));
+        let now = http(&graph);
+        assert_eq!(now.tls_versions, ["TLSv1.2", "TLSv1.3"]);
+        assert!(now.tls_weak_ciphers.is_empty());
+        assert!(!now.tls_complete);
+        assert_eq!(now.tech, ["nginx", "jQuery 3.7.1", "PHP 8.2.1"]);
+        // A library taken off the page is no longer listed.
+        graph.apply(page(&["nginx", "PHP 8.2.1"]));
+        assert_eq!(http(&graph).tech, ["nginx", "PHP 8.2.1"]);
+        // A page read that named nothing says nothing about the stack.
+        graph.apply(page(&[]));
+        assert_eq!(http(&graph).tech, ["nginx", "PHP 8.2.1"]);
+        // Another source's stack is added to it: a newer version of a
+        // library replaces the one listed, a vaguer name adds nothing.
+        graph.apply(web(
+            HttpInfo {
+                tech: words(&["PHP 8.3.0", "nginx", "Varnish"]),
+                ..HttpInfo::default()
+            },
+            Source::Favicon,
+        ));
+        assert_eq!(http(&graph).tech, ["nginx", "PHP 8.3.0", "Varnish"]);
+
+        // An audit whose version checks did not all answer (a slow or
+        // rate-limited server): what it found is added, nothing removed.
+        graph.apply(tls(&["TLSv1.0", "TLSv1.2", "TLSv1.3"], &["RC4-MD5"], true));
+        assert!(!graph.apply(tls(&["TLSv1.3"], &[], false)));
+        assert_eq!(http(&graph).tls_versions, ["TLSv1.0", "TLSv1.2", "TLSv1.3"]);
+        assert_eq!(http(&graph).tls_weak_ciphers, ["RC4-MD5"]);
+        graph.apply(tls(&["TLSv1.1"], &["DES-CBC3-SHA"], false));
+        assert_eq!(
+            http(&graph).tls_versions,
+            ["TLSv1.0", "TLSv1.2", "TLSv1.3", "TLSv1.1"]
+        );
+        assert_eq!(http(&graph).tls_weak_ciphers, ["RC4-MD5", "DES-CBC3-SHA"]);
+        // A weak cipher seen without a version check is added too.
+        graph.apply(tls(&[], &["NULL-MD5"], true));
+        assert_eq!(
+            http(&graph).tls_weak_ciphers,
+            ["RC4-MD5", "DES-CBC3-SHA", "NULL-MD5"]
+        );
+    }
+
+    #[test]
+    fn another_change_to_the_same_file_is_a_note_of_its_own() {
+        let mut graph = Graph::default();
+        let diff = |from: &str, to: &str| {
+            crate::parsers::diff::parse(&format!(
+                "--- a/app.conf\n+++ b/app.conf\n@@ -1 +1 @@\n-{from}\n+{to}\n"
+            ))
+        };
+        assert_eq!(graph.apply_all(diff("debug = true", "debug = false")), 1);
+        assert_eq!(
+            graph.apply_all(diff("allow_guest = true", "allow_guest = false")),
+            1
+        );
+        assert_eq!(
+            graph.apply_all(diff("debug = true", "debug = false")),
+            0,
+            "the same change"
+        );
+        let blocks: Vec<&str> = graph
+            .notes
+            .iter()
+            .map(|n| n.record.evidence.as_str())
+            .collect();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[1].contains("+allow_guest = false"), "{blocks:?}");
+    }
+
+    #[test]
+    fn a_cve_found_again_on_another_port_names_it_when_its_own_is_gone() {
+        let mut graph = Graph::default();
+        graph.apply(named(80, "nginx", "1.18.0", &[], Confidence::High));
+        let found_on = |port: &str| Advisory {
+            id: "CVE-2021-23017".into(),
+            title: "t".into(),
+            severity: None,
+            cvss: None,
+            kev: false,
+            matched: "keywordSearch=nginx 1.18.0".into(),
+            port: Some(port.into()),
+            references: vec![],
+            fixed_in: None,
+            last_affected: None,
+            record: rec(Source::NvdApi),
+        };
+        assert!(graph.add_advisory("192.0.2.60", found_on("443/tcp")));
+        assert!(graph.add_advisory("192.0.2.60", found_on("80/tcp")));
+        assert_eq!(
+            graph.hosts["192.0.2.60"].advisories[0].port.as_deref(),
+            Some("80/tcp")
+        );
+        // Found on an open port that still runs what found it, it stays
+        // where it was found.
+        graph.apply(named(443, "nginx", "1.18.0", &[], Confidence::High));
+        assert!(!graph.add_advisory("192.0.2.60", found_on("443/tcp")));
+        assert_eq!(
+            graph.hosts["192.0.2.60"].advisories[0].port.as_deref(),
+            Some("80/tcp")
+        );
+        // The nginx on 80 is updated: found again from 443/tcp, it is
+        // named by that port and the query that found it there.
+        graph.apply(named(80, "nginx", "1.25.3", &[], Confidence::High));
+        let by_cpe = Advisory {
+            matched: "cpeName=cpe:2.3:a:f5:nginx:1.18.0:*:*:*:*:*:*:*".into(),
+            ..found_on("443/tcp")
+        };
+        graph.apply(named(
+            443,
+            "nginx",
+            "1.18.0",
+            &["cpe:2.3:a:f5:nginx:1.18.0:*:*:*:*:*:*:*"],
+            Confidence::High,
+        ));
+        assert!(graph.add_advisory("192.0.2.60", by_cpe));
+        let stored = &graph.hosts["192.0.2.60"].advisories[0];
+        assert_eq!(stored.port.as_deref(), Some("443/tcp"));
+        assert!(stored.matched.starts_with("cpeName="), "{}", stored.matched);
+        // A match that no lookup made (graph.json, by hand) is moved only
+        // when its port is closed.
+        let mut imported = found_on("443/tcp");
+        imported.id = "CVE-2021-3618".into();
+        imported.record = rec(Source::ManualNote);
+        assert!(graph.add_advisory("192.0.2.60", imported.clone()));
+        imported.port = Some("80/tcp".into());
+        assert!(!graph.add_advisory("192.0.2.60", imported));
     }
 }

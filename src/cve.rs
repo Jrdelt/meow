@@ -777,50 +777,83 @@ pub fn plan(host: &Host) -> Vec<Lookup> {
 
 /// [`plan`] in two parts: the lookups for the open ports `own` accepts and
 /// the operator's notes, then those for the host's other open ports, within
-/// the same limit.
+/// the same limit. Each question is asked once, for the first port that
+/// has it. The software on every open port comes before any guess from a
+/// script's file name, so a page that links many scripts cannot push the
+/// host's services out of the limit.
 pub fn plan_split(host: &Host, own: impl Fn(&Port) -> bool) -> (Vec<Lookup>, Vec<Lookup>) {
-    let mut out: Vec<Lookup> = Vec::new();
-    for port in host.open_ports().filter(|port| own(port)) {
-        plan_port(port, &mut out);
+    let (mine, others): (Vec<&Port>, Vec<&Port>) = host.open_ports().partition(|port| own(port));
+    let found = |ports: &[&Port]| -> (Vec<Lookup>, Vec<Lookup>) {
+        let mut software = Vec::new();
+        let mut guesses = Vec::new();
+        for port in ports {
+            let (named, guessed) = port_lookups(port);
+            software.extend(named);
+            guesses.extend(guessed);
+        }
+        (software, guesses)
+    };
+    let (my_software, my_guesses) = found(&mine);
+    let (other_software, other_guesses) = found(&others);
+    let mut asked = BTreeSet::new();
+    let mut first = Vec::new();
+    let mut rest = Vec::new();
+    for (lookup, is_mine) in my_software
+        .into_iter()
+        .chain(note_lookups(host))
+        .map(|lookup| (lookup, true))
+        .chain(other_software.into_iter().map(|lookup| (lookup, false)))
+        .chain(my_guesses.into_iter().map(|lookup| (lookup, true)))
+        .chain(other_guesses.into_iter().map(|lookup| (lookup, false)))
+    {
+        if asked.len() >= MAX_LOOKUPS_PER_HOST {
+            break;
+        }
+        if asked.insert(lookup.question()) {
+            let list = if is_mine { &mut first } else { &mut rest };
+            list.push(lookup);
+        }
     }
-    // Package URLs the operator wrote into notes.
+    (first, rest)
+}
+
+/// Package URLs the operator wrote into notes.
+fn note_lookups(host: &Host) -> Vec<Lookup> {
+    let mut out = Vec::new();
     for fact in &host.facts {
         if fact.record.source != Source::ManualNote {
             continue;
         }
         for found in PURL.find_iter(&fact.claim) {
-            push_lookup(
-                &mut out,
-                Lookup::Package {
-                    package: Package {
-                        purl: Some(found.as_str().to_owned()),
-                        name: String::new(),
-                        ecosystem: String::new(),
-                        version: String::new(),
-                        declared: true,
-                    },
-                    port: None,
+            out.push(Lookup::Package {
+                package: Package {
+                    purl: Some(found.as_str().to_owned()),
+                    name: String::new(),
+                    ecosystem: String::new(),
+                    version: String::new(),
+                    declared: true,
                 },
-            );
+                port: None,
+            });
         }
     }
-    let first = out.len();
-    for port in host.open_ports().filter(|port| !own(port)) {
-        plan_port(port, &mut out);
-    }
-    let rest = out.split_off(first);
-    (out, rest)
+    out
 }
 
-fn push_lookup(out: &mut Vec<Lookup>, lookup: Lookup) {
-    if out.len() < MAX_LOOKUPS_PER_HOST && !out.contains(&lookup) {
-        out.push(lookup);
-    }
+/// Library versions guessed from one port's script file names, at most.
+const MAX_GUESSES_PER_PORT: usize = 8;
+
+/// The lookups one open port justifies: its software (CPE and keyword),
+/// and the libraries named by script files that answered
+/// (`jquery-1.12.4.min.js`), at most [`MAX_GUESSES_PER_PORT`] of those.
+fn port_lookups(port: &Port) -> (Vec<Lookup>, Vec<Lookup>) {
+    (software_lookups(port), script_guesses(port))
 }
 
-/// The lookups one open port justifies.
-fn plan_port(port: &Port, out: &mut Vec<Lookup>) {
+/// The CPE and keyword lookups for the software one port runs.
+fn software_lookups(port: &Port) -> Vec<Lookup> {
     let key = port.key();
+    let mut software = Vec::new();
     let mut keyworded = false;
     for name in &port.cpes {
         let Some(parts) = cpe::parts(name) else {
@@ -836,23 +869,17 @@ fn plan_port(port: &Port, out: &mut Vec<Lookup>) {
             .then(|| cpe::with_version(name, &version))
             .flatten()
             .unwrap_or_else(|| name.clone());
-        push_lookup(
-            out,
-            Lookup::Cpe {
-                cpe,
-                port: key.clone(),
-            },
-        );
+        software.push(Lookup::Cpe {
+            cpe,
+            port: key.clone(),
+        });
         let product = parts.product.replace('_', " ");
         if is_safe_keyword_token(&product, true) && is_safe_keyword_token(&version, false) {
-            push_lookup(
-                out,
-                Lookup::Keyword {
-                    product,
-                    version,
-                    port: key.clone(),
-                },
-            );
+            software.push(Lookup::Keyword {
+                product,
+                version,
+                port: key.clone(),
+            });
             if parts.part == 'a' {
                 keyworded = true;
             }
@@ -863,39 +890,64 @@ fn plan_port(port: &Port, out: &mut Vec<Lookup>) {
             (&port.product, port.version.as_deref().and_then(first_token))
         {
             if is_safe_keyword_token(product, true) && is_safe_keyword_token(&version, false) {
-                push_lookup(
-                    out,
-                    Lookup::Keyword {
-                        product: product.clone(),
-                        version,
-                        port: key.clone(),
-                    },
-                );
+                software.push(Lookup::Keyword {
+                    product: product.clone(),
+                    version,
+                    port: key.clone(),
+                });
             }
         }
     }
-    for (path, _) in port.paths.walk() {
+    software
+}
+
+/// Whether a port's lookups ask what found an advisory (its `matched`):
+/// not when the port runs other software now.
+pub(crate) fn port_asks(port: &Port, matched: &str) -> bool {
+    let lookups = if matched.starts_with("cpeName=") || matched.starts_with("keywordSearch=") {
+        software_lookups(port)
+    } else {
+        script_guesses(port)
+    };
+    lookups.iter().any(|lookup| lookup.matched() == matched)
+}
+
+/// The libraries named by one port's script files that answered.
+fn script_guesses(port: &Port) -> Vec<Lookup> {
+    let key = port.key();
+    let mut guesses: Vec<Lookup> = Vec::new();
+    for (path, node) in port.paths.walk() {
+        if guesses.len() >= MAX_GUESSES_PER_PORT {
+            break;
+        }
+        // A file the server did not serve (404, 500) says nothing about
+        // what the site runs; one only linked or printed is not counted.
+        if !node.status.is_some_and(|status| status < 400) {
+            continue;
+        }
         let file = path.rsplit('/').next().unwrap_or("");
         let Some(found) = JS_LIBRARY.captures(file) else {
             continue;
         };
         let name = found[1].to_ascii_lowercase().replace('.', "-");
-        if KNOWN_JS.contains(&name.as_str()) {
-            push_lookup(
-                out,
-                Lookup::Package {
-                    package: Package {
-                        purl: None,
-                        name,
-                        ecosystem: "npm".to_owned(),
-                        version: found[2].to_owned(),
-                        declared: false,
-                    },
-                    port: Some(key.clone()),
-                },
-            );
+        if !KNOWN_JS.contains(&name.as_str()) {
+            continue;
+        }
+        let guess = Lookup::Package {
+            package: Package {
+                purl: None,
+                name,
+                ecosystem: "npm".to_owned(),
+                version: found[2].to_owned(),
+                declared: false,
+            },
+            port: Some(key.clone()),
+        };
+        if !guesses.contains(&guess) {
+            guesses.push(guess);
         }
     }
+    guesses
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +963,12 @@ pub struct Grounding {
     /// True when pagination caps, detail caps, or detail fetch errors left
     /// the lookup incomplete so stale advisories should not be pruned.
     pub partial: bool,
+    /// What the host's lookups would ask that this run did not (the
+    /// per-host limit, or the session's limit for text), as an advisory's
+    /// `matched` names it, and the ports it is for: earlier matches from
+    /// those are kept.
+    pub unasked: BTreeSet<String>,
+    pub unasked_ports: BTreeSet<String>,
     /// One line per lookup that failed.
     pub errors: Vec<String>,
 }
@@ -1454,6 +1512,21 @@ impl CveClient {
         if lookups.is_empty() {
             return grounding;
         }
+        let asked: BTreeSet<String> = lookups.iter().map(Lookup::question).collect();
+        for port in host.open_ports() {
+            let (software, guesses) = port_lookups(port);
+            for lookup in software.iter().chain(&guesses) {
+                if !asked.contains(&lookup.question()) {
+                    grounding.unasked.insert(lookup.matched());
+                    grounding.unasked_ports.insert(port.key());
+                }
+            }
+        }
+        for lookup in note_lookups(host) {
+            if !asked.contains(&lookup.question()) {
+                grounding.unasked.insert(lookup.matched());
+            }
+        }
         let kev = match self.kev().await {
             Ok(ids) => ids,
             Err(error) => {
@@ -1482,7 +1555,7 @@ impl CveClient {
                         continue;
                     };
                     (
-                        format!("cpeName={cpe}"),
+                        lookup.matched(),
                         parts.product,
                         parts.version.unwrap_or_default(),
                         port,
@@ -1492,12 +1565,7 @@ impl CveClient {
                     product,
                     version,
                     port,
-                } => (
-                    format!("keywordSearch={product} {version}"),
-                    product.clone(),
-                    version.clone(),
-                    port,
-                ),
+                } => (lookup.matched(), product.clone(), version.clone(), port),
             };
             if nvd_stopped {
                 grounding.partial = true;
@@ -1670,16 +1738,28 @@ impl Lookup {
             Lookup::Package { package, .. } => format!("package {}", package.label()),
         }
     }
+
+    /// The query as an advisory found by it names it (`matched`):
+    /// `cpeName=cpe:2.3:...`, `keywordSearch=nginx 1.18.0`, `jquery@1.12.4 (npm)`.
+    fn matched(&self) -> String {
+        match self {
+            Lookup::Cpe { cpe, .. } => format!("cpeName={cpe}"),
+            Lookup::Keyword {
+                product, version, ..
+            } => format!("keywordSearch={product} {version}"),
+            Lookup::Package { package, .. } => package.label(),
+        }
+    }
 }
 
 /// Who asked for a host's CVE lookups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Asked {
-    /// The operator: looked up first, as many as needed.
+    /// The operator: looked up first, up to the per-host limit.
     Operator,
     /// A recon task, for the open ports its own scans reported (`22/tcp`):
-    /// those first, as many as needed. The host's other ports are known
-    /// from text, and are looked up as text is.
+    /// those first, within the same limit. The host's other ports are
+    /// known from text, and are looked up as text is.
     Recon(BTreeSet<String>),
     /// Terminal text or an imported file, which anyone can write: looked up
     /// after the rest, and only so many new questions per session.
@@ -1819,7 +1899,7 @@ pub struct Merged {
 
 /// Merges one host's grounding into the graph. After a lookup that reached
 /// every source without truncation, earlier matches it did not return are
-/// removed.
+/// removed: not those of a port or a query it left out.
 pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Grounding) -> Merged {
     let mut merged = Merged::default();
     let known: BTreeSet<String> = graph
@@ -1838,7 +1918,13 @@ pub fn merge(graph: &mut crate::graph::Graph, address: &str, grounding: &Groundi
     }
     if grounding.lookups > 0 && grounding.errors.is_empty() && !grounding.partial {
         let current: BTreeSet<String> = grounding.advisories.iter().map(|a| a.id.clone()).collect();
-        merged.dropped = graph.drop_stale_advisories(address, &current);
+        merged.dropped = graph.drop_stale_advisories(address, &current, |advisory| {
+            grounding.unasked.contains(&advisory.matched)
+                || advisory
+                    .port
+                    .as_ref()
+                    .is_some_and(|port| grounding.unasked_ports.contains(port))
+        });
     }
     merged
 }
@@ -1943,8 +2029,13 @@ pub fn cmp_urgency(a: &Advisory, b: &Advisory) -> Ordering {
 
 /// Why the version of a service on this host may say little: its
 /// distribution backports security fixes without changing the version.
+/// `port_key` is one port or several (`80/tcp, 443/tcp`).
 pub fn backport_note_for(host: &Host, port_key: Option<&str>) -> Option<&'static str> {
-    if let Some(p) = port_key.and_then(|key| host.ports.get(key)) {
+    let ports = port_key
+        .into_iter()
+        .flat_map(|keys| keys.split(", "))
+        .filter_map(|key| host.ports.get(key));
+    for p in ports {
         for field in [
             p.version.as_deref(),
             p.extra_info.as_deref(),
@@ -1968,7 +2059,7 @@ pub fn backport_note_for(host: &Host, port_key: Option<&str>) -> Option<&'static
 pub struct CveGroup<'a> {
     /// `nginx 1.18.0`, `jquery@3.4.1 (npm)`
     pub software: String,
-    /// The port the software was seen on, if any.
+    /// The open ports the software runs on (`80/tcp, 443/tcp`), if any.
     pub port: Option<String>,
     /// Most urgent first.
     pub cves: Vec<&'a Advisory>,
@@ -2026,19 +2117,34 @@ impl CveGroup<'_> {
     }
 }
 
-/// The name and version of the software a CVE was found from.
-fn software_of(host: &Host, advisory: &Advisory) -> String {
-    let seen = advisory
-        .port
-        .as_ref()
+/// `nginx 1.18.0`: the product and version a port was seen running.
+fn port_software(port: &Port) -> Option<String> {
+    let product = port.product.as_deref()?;
+    Some(match port.version.as_deref() {
+        Some(version) => format!("{product} {version}"),
+        None => product.to_owned(),
+    })
+}
+
+/// The name and version of the software a CVE was found from: that of
+/// the port it was found on, or, when that port asks it no more (its
+/// software was updated) and others still do, of the first of those.
+fn software_of(
+    host: &Host,
+    advisory: &Advisory,
+    asking: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let askers = asking
+        .get(&advisory.matched)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let port = match &advisory.port {
+        Some(own) if !askers.is_empty() && !askers.contains(own) => askers.first(),
+        own => own.as_ref(),
+    };
+    let seen = port
         .and_then(|key| host.ports.get(key))
-        .and_then(|port| {
-            let product = port.product.as_deref()?;
-            Some(match port.version.as_deref() {
-                Some(version) => format!("{product} {version}"),
-                None => product.to_owned(),
-            })
-        });
+        .and_then(port_software);
     if let Some(cpe) = advisory.matched.strip_prefix("cpeName=") {
         seen.or_else(|| {
             let parts = cpe::parts(cpe)?;
@@ -2052,20 +2158,71 @@ fn software_of(host: &Host, advisory: &Advisory) -> String {
     }
 }
 
+/// `53/udp` before `80/tcp` before `443/tcp`: by number, then protocol.
+fn port_order(key: &str) -> (u32, String) {
+    let number = key.split('/').next().and_then(|n| n.parse::<u32>().ok());
+    (number.unwrap_or(u32::MAX), key.to_owned())
+}
+
+/// Every open port the software of a CVE runs on: those that ask what it
+/// was found by, and those that run the same product and version
+/// (`80/tcp, 443/tcp`). The port it was found on when no open port runs
+/// it; none for a CVE found from a note.
+fn ports_of(
+    host: &Host,
+    advisory: &Advisory,
+    software: &str,
+    asking: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let found_on = advisory.port.as_ref()?;
+    let mut ports: Vec<String> = asking.get(&advisory.matched).cloned().unwrap_or_default();
+    ports.extend(
+        host.open_ports()
+            .filter(|port| port_software(port).as_deref() == Some(software))
+            .map(Port::key),
+    );
+    if ports.is_empty() {
+        return Some(found_on.clone());
+    }
+    ports.sort_by_key(|key| port_order(key));
+    ports.dedup();
+    Some(ports.join(", "))
+}
+
 /// A host's CVEs grouped by the software and version they were found
 /// from, the most urgent group first and the most urgent CVE first in each.
 pub fn by_software(host: &Host) -> Vec<CveGroup<'_>> {
+    // What each open port asks, by the `matched` of what it finds. Its
+    // script files are walked only when a CVE was found from one.
+    let guessed = host
+        .advisories
+        .iter()
+        .any(|a| a.record.source == Source::OsvApi && a.port.is_some());
+    let mut asking: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    if !host.advisories.is_empty() {
+        for port in host.open_ports() {
+            let mut lookups = software_lookups(port);
+            if guessed {
+                lookups.extend(script_guesses(port));
+            }
+            for lookup in lookups {
+                asking.entry(lookup.matched()).or_default().push(port.key());
+            }
+        }
+    }
     let mut groups: Vec<CveGroup> = Vec::new();
     for advisory in &host.advisories {
-        let software = software_of(host, advisory);
+        let software = software_of(host, advisory, &asking);
+        let port = ports_of(host, advisory, &software, &asking);
         match groups
             .iter_mut()
-            .find(|g| g.software == software && g.port == advisory.port)
+            .find(|g| g.software == software && g.port == port)
         {
             Some(group) => group.cves.push(advisory),
             None => groups.push(CveGroup {
                 software,
-                port: advisory.port.clone(),
+                port,
                 cves: vec![advisory],
             }),
         }
@@ -2084,7 +2241,8 @@ pub fn by_software(host: &Host) -> Vec<CveGroup<'_>> {
 /// Groups a host's CVEs by the software they were found from: one update
 /// usually answers all of them. In the order of [`by_software`], with the
 /// same software on several ports as one update: `nginx 1.18.0` on 80/tcp
-/// and 443/tcp is one program to update, to the release that fixes all.
+/// and 443/tcp is one program to update, to the release that fixes all,
+/// and both ports are named.
 pub fn fix_plan(host: &Host) -> Vec<FixItem> {
     let mut merged: Vec<CveGroup> = Vec::new();
     for group in by_software(host) {
@@ -2103,10 +2261,7 @@ pub fn fix_plan(host: &Host) -> Vec<FixItem> {
     for group in &mut merged {
         if let Some(ports) = &group.port {
             let mut list: Vec<&str> = ports.split(", ").collect();
-            list.sort_by_key(|port| {
-                let number = port.split('/').next().and_then(|n| n.parse::<u32>().ok());
-                (number.unwrap_or(u32::MAX), port.to_string())
-            });
+            list.sort_by_key(|port| port_order(port));
             list.dedup();
             group.port = Some(list.join(", "));
         }
@@ -2118,7 +2273,12 @@ pub fn fix_plan(host: &Host) -> Vec<FixItem> {
             let close = group
                 .port
                 .as_ref()
-                .map(|port| format!(", or close {port} if the service is not needed"))
+                .map(|port| {
+                    format!(
+                        ", or close {} if the service is not needed",
+                        port_words(port)
+                    )
+                })
                 .unwrap_or_default();
             FixItem {
                 action: format!("Update {} to {target}{close}.", group.software),
@@ -2130,6 +2290,15 @@ pub fn fix_plan(host: &Host) -> Vec<FixItem> {
             }
         })
         .collect()
+}
+
+/// `80/tcp, 443/tcp` as `80/tcp and 443/tcp`; `22/tcp, 80/tcp, 443/tcp`
+/// as `22/tcp, 80/tcp and 443/tcp`.
+pub fn port_words(ports: &str) -> String {
+    match ports.rsplit_once(", ") {
+        Some((first, last)) => format!("{first} and {last}"),
+        None => ports.to_owned(),
+    }
 }
 
 /// Grounds every host that has something to look up and merges the results
@@ -2410,9 +2579,10 @@ mod tests {
             [
                 "cpe cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:* @80/tcp",
                 "kw nginx 1.18.0 @80/tcp",
-                "pkg jquery@3.4.1 (npm) @Some(\"80/tcp\")",
                 "kw Jetty 9.4.31.v20200723 @8080/tcp",
                 "pkg pkg:npm/lodash@4.17.20 @None",
+                // Guesses from file names come after the software of every port.
+                "pkg jquery@3.4.1 (npm) @Some(\"80/tcp\")",
             ]
         );
     }
@@ -2597,8 +2767,8 @@ mod tests {
                 "CVE-2026-2222",
                 "CVE-2026-3333",
                 "CVE-2019-9999",
-                "GHSA-jquery-1",
                 "GHSA-lodash-1",
+                "GHSA-jquery-1",
                 "GHSA-jquery-2",
             ],
             "cpeName results are trusted as matched by NVD; keyword results add nothing new here"
@@ -2831,6 +3001,9 @@ mod tests {
     #[test]
     fn one_program_on_two_ports_is_one_update_to_the_release_that_fixes_all() {
         let mut host = sample_host();
+        let mut https = host.ports["80/tcp"].clone();
+        https.number = 443;
+        host.ports.insert(https.key(), https);
         host.advisories = vec![
             Advisory {
                 port: Some("443/tcp".into()),
@@ -2847,8 +3020,8 @@ mod tests {
         assert_eq!((plan[0].advisories, plan[0].kev), (3, 1));
         assert_eq!(
             plan[0].action,
-            "Update nginx 1.18.0 to 1.25.3 or later, or close 80/tcp, 443/tcp if the service \
-             is not needed."
+            "Update nginx 1.18.0 to 1.25.3 or later, or close 80/tcp and 443/tcp if the \
+             service is not needed."
         );
     }
 
@@ -3193,13 +3366,18 @@ mod tests {
             )
             .route(
                 "/osv/v1/querybatch",
-                axum::routing::post(|| async {
-                    Json(json!({
-                        "results": [
-                            { "vulns": [{ "id": "GHSA-jq-fixed" }] },
-                            { "vulns": [] }
-                        ]
-                    }))
+                axum::routing::post(|Json(body): Json<Value>| async move {
+                    // The jQuery file guessed on port 80 has the vulnerability.
+                    let results: Vec<Value> = body["queries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|query| match query["package"]["name"].as_str() {
+                            Some("jquery") => json!({ "vulns": [{ "id": "GHSA-jq-fixed" }] }),
+                            _ => json!({ "vulns": [] }),
+                        })
+                        .collect();
+                    Json(json!({ "results": results }))
                 }),
             )
             .route(
@@ -3415,5 +3593,259 @@ mod tests {
         }
         assert!(!queue.push("one-more.example", Asked::Operator));
         assert_eq!(queue.waiting.len(), 2 * MAX_WAITING);
+    }
+
+    /// NVD on 127.0.0.1: a CVE for each CPE asked about whose version is
+    /// `vulnerable` (`CVE-2026-<port>` for `cpe:/a:v<port>:p<port>:..`),
+    /// and the questions it was asked.
+    async fn per_cpe_nvd(vulnerable: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/nvd",
+                get(
+                    move |State(asked): State<Arc<Mutex<Vec<String>>>>,
+                          Query(query): Query<HashMap<String, String>>| async move {
+                        let question = query
+                            .get("cpeName")
+                            .or(query.get("keywordSearch"))
+                            .cloned()
+                            .unwrap_or_default();
+                        asked.lock().unwrap().push(question);
+                        let Some(name) = query.get("cpeName") else {
+                            return Json(json!({ "totalResults": 0, "vulnerabilities": [] }));
+                        };
+                        let parts = cpe::parts(name).unwrap();
+                        if parts.version.as_deref() != Some(vulnerable) {
+                            return Json(json!({ "totalResults": 0, "vulnerabilities": [] }));
+                        }
+                        let number: String =
+                            parts.product.chars().filter(char::is_ascii_digit).collect();
+                        let product = format!(
+                            "cpe:2.3:a:{}:{}:*:*:*:*:*:*:*:*",
+                            parts.vendor, parts.product
+                        );
+                        Json(json!({ "totalResults": 1, "vulnerabilities": [ { "cve": {
+                            "id": format!("CVE-2026-{number:0>5}"), "vulnStatus": "Analyzed",
+                            "descriptions": [ { "lang": "en", "value": "x" } ],
+                            "configurations": [ { "nodes": [ { "cpeMatch": [
+                                { "vulnerable": true, "criteria": product,
+                                  "versionEndExcluding": "9.0" } ] } ] } ] } } ] }))
+                    },
+                ),
+            )
+            .route(
+                "/kev",
+                get(|| async { Json(json!({ "vulnerabilities": [] })) }),
+            )
+            .route(
+                "/osv/v1/querybatch",
+                post(|Json(body): Json<Value>| async move {
+                    let n = body["queries"].as_array().map_or(0, Vec::len);
+                    Json(json!({ "results": vec![json!({}); n] }))
+                }),
+            )
+            .with_state(Arc::clone(&asked));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, asked)
+    }
+
+    fn versioned_port(graph: &mut Graph, address: &str, number: u16, version: &str) {
+        graph.apply(Observation::Port {
+            address: address.into(),
+            port: number,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("x".into()),
+            product: Some(format!("p{number}")),
+            version: Some(version.into()),
+            extra_info: None,
+            cpes: vec![format!("cpe:/a:v{number}:p{number}:{version}")],
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+    }
+
+    #[tokio::test]
+    async fn what_the_limit_left_out_keeps_its_earlier_matches() {
+        let (base, _) = per_cpe_nvd("1.0").await;
+        let client = client(&base, None).with_nvd_pace(Duration::from_millis(1));
+        let address = "192.0.2.50";
+        let mut graph = Graph::default();
+        for number in 9001..=9010 {
+            versioned_port(&mut graph, address, number, "1.0");
+        }
+        let first = client.ground(&graph.hosts[address].clone()).await;
+        assert_eq!(merge(&mut graph, address, &first).added, 10);
+        // Thirty more services, whose ports sort first: two questions each
+        // fill the limit before 9003/tcp is reached.
+        for number in 1001..=1030 {
+            versioned_port(&mut graph, address, number, "1.0");
+        }
+        let host = graph.hosts[address].clone();
+        let second = client.ground(&host).await;
+        assert_eq!(second.lookups, MAX_LOOKUPS_PER_HOST);
+        assert!(!second.partial && second.errors.is_empty());
+        assert!(second.unasked_ports.contains("9010/tcp"));
+        assert!(!second.unasked_ports.contains("9001/tcp"));
+        let merged = merge(&mut graph, address, &second);
+        assert_eq!((merged.added, merged.dropped), (30, 0));
+        assert_eq!(graph.hosts[address].advisories.len(), 40);
+
+        // A port that was asked about and no longer matches loses its CVE.
+        versioned_port(&mut graph, address, 9001, "9.1");
+        let third = client.ground(&graph.hosts[address].clone()).await;
+        let merged = merge(&mut graph, address, &third);
+        assert_eq!(merged.dropped, 1);
+        assert!(!graph.hosts[address]
+            .advisories
+            .iter()
+            .any(|a| a.port.as_deref() == Some("9001/tcp")));
+    }
+
+    #[test]
+    fn script_names_come_after_every_service_and_only_files_that_answered() {
+        let address = "192.0.2.70";
+        let mut graph = Graph::default();
+        graph.apply_all(
+            crate::parsers::nmap::parse(
+                r#"<nmaprun><host><status state="up"/><address addr="192.0.2.70" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.18.0" method="probed" conf="10"><cpe>cpe:/a:igor_sysoev:nginx:1.18.0</cpe></service></port>
+<port protocol="tcp" portid="8080"><state state="open"/><service name="http" product="Jetty" version="9.4.31.v20200723" method="probed" conf="10"><cpe>cpe:/a:eclipse:jetty:9.4.31.v20200723</cpe></service></port>
+</ports></host></nmaprun>"#,
+                true,
+            )
+            .unwrap(),
+        );
+        let crawl = |graph: &mut Graph, status: u16| {
+            for n in 1..=64 {
+                let line = format!(
+                    r#"{{"request":{{"method":"GET","endpoint":"http://192.0.2.70/js/jquery-1.{status}.{n}.min.js"}},"response":{{"status_code":{status}}}}}"#
+                );
+                graph.apply_all(crate::parsers::jsonl::parse_line(&line).unwrap());
+            }
+        };
+        let jetty = |lookups: &[Lookup]| lookups.iter().any(|l| l.question().contains("jetty"));
+        let guesses = |lookups: &[Lookup]| {
+            lookups
+                .iter()
+                .filter(|l| matches!(l, Lookup::Package { .. }))
+                .count()
+        };
+        // Files the server did not have say nothing about the site.
+        crawl(&mut graph, 404);
+        let lookups = plan(&graph.hosts[address]);
+        assert!(jetty(&lookups));
+        assert_eq!(guesses(&lookups), 0);
+        // Files it served: a few guesses, after every service.
+        crawl(&mut graph, 200);
+        let host = graph.hosts[address].clone();
+        let lookups = plan(&host);
+        assert!(jetty(&lookups));
+        assert_eq!(guesses(&lookups), MAX_GUESSES_PER_PORT);
+        assert!(matches!(lookups[4], Lookup::Package { .. }), "{lookups:?}");
+        let (own, rest) = plan_split(&host, |port| port.key() == "80/tcp");
+        assert!(jetty(&rest));
+        assert_eq!(own.len() + rest.len(), 4 + MAX_GUESSES_PER_PORT);
+    }
+
+    #[tokio::test]
+    async fn the_same_software_on_two_ports_is_asked_once_and_names_both() {
+        let (base, asked) = per_cpe_nvd("1.0").await;
+        let client = client(&base, None).with_nvd_pace(Duration::from_millis(1));
+        let address = "192.0.2.90";
+        let mut graph = Graph::default();
+        for number in [80, 443] {
+            graph.apply(Observation::Port {
+                address: address.into(),
+                port: number,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("http".into()),
+                product: Some("p7".into()),
+                version: Some("1.0".into()),
+                extra_info: None,
+                cpes: vec!["cpe:/a:v7:p7:1.0".into()],
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        let grounding = client.ground(&graph.hosts[address].clone()).await;
+        assert_eq!(grounding.lookups, 2);
+        assert_eq!(asked.lock().unwrap().len(), 2, "one question each");
+        merge(&mut graph, address, &grounding);
+        let host = &graph.hosts[address];
+        let groups = by_software(host);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].port.as_deref(), Some("80/tcp, 443/tcp"));
+        let plan = fix_plan(host);
+        assert_eq!(plan[0].port.as_deref(), Some("80/tcp, 443/tcp"));
+        assert_eq!(
+            plan[0].action,
+            "Update p7 1.0 to 9.0 or later, or close 80/tcp and 443/tcp if the service is not \
+             needed."
+        );
+        assert_eq!(
+            port_words("22/tcp, 80/tcp, 443/tcp"),
+            "22/tcp, 80/tcp and 443/tcp"
+        );
+        assert_eq!(port_words("80/tcp"), "80/tcp");
+    }
+
+    #[tokio::test]
+    async fn a_cve_follows_the_port_that_still_runs_the_old_version() {
+        let (base, _) = per_cpe_nvd("1.0").await;
+        let client = client(&base, None).with_nvd_pace(Duration::from_millis(1));
+        let address = "192.0.2.91";
+        let mut graph = Graph::default();
+        let runs = |graph: &mut Graph, number: u16, version: &str| {
+            graph.apply(Observation::Port {
+                address: address.into(),
+                port: number,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("http".into()),
+                product: Some("p7".into()),
+                version: Some(version.into()),
+                extra_info: None,
+                cpes: vec![format!("cpe:/a:v7:p7:{version}")],
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        };
+        runs(&mut graph, 80, "1.0");
+        runs(&mut graph, 443, "1.0");
+        let first = client.ground(&graph.hosts[address].clone()).await;
+        merge(&mut graph, address, &first);
+        let stored = |graph: &Graph| {
+            let advisory = &graph.hosts[address].advisories[0];
+            (advisory.port.clone(), advisory.matched.clone())
+        };
+        assert_eq!(stored(&graph).0.as_deref(), Some("443/tcp"));
+        let fix = |graph: &Graph| fix_plan(&graph.hosts[address])[0].action.clone();
+        let only_80 =
+            "Update p7 1.0 to 9.0 or later, or close 80/tcp if the service is not needed.";
+
+        // The p7 on 443 is updated, the one on 80 is not: the CVE is the
+        // old version's, on the port that still runs it, at once.
+        runs(&mut graph, 443, "2.0");
+        assert_eq!(fix(&graph), only_80);
+        let groups = by_software(&graph.hosts[address]);
+        assert_eq!(
+            groups[0].heading(),
+            "p7 1.0 \u{b7} 80/tcp \u{b7} fixed in 9.0"
+        );
+        // And after the next lookup, which finds it from 80/tcp.
+        let second = client.ground(&graph.hosts[address].clone()).await;
+        assert_eq!(merge(&mut graph, address, &second).dropped, 0);
+        let (port, matched) = stored(&graph);
+        assert_eq!(port.as_deref(), Some("80/tcp"));
+        assert!(matched.ends_with(":p7:1.0"), "{matched}");
+        assert_eq!(fix(&graph), only_80);
+
+        // Both updated: the next lookup removes it.
+        runs(&mut graph, 80, "2.0");
+        let third = client.ground(&graph.hosts[address].clone()).await;
+        assert_eq!(merge(&mut graph, address, &third).dropped, 1);
+        assert!(graph.hosts[address].advisories.is_empty());
     }
 }

@@ -83,26 +83,67 @@ fn configure_osint_command(cmd: &mut tokio::process::Command) {
         .kill_on_drop(true);
 }
 
+/// What a program printed, and whether its time ran out before it ended.
+struct Printed {
+    text: String,
+    timed_out: bool,
+}
+
 /// Reads what a program started with [`Tracker::spawn`] prints, up to
-/// `max_bytes` and for at most `timeout`. The program and everything it
+/// `max_bytes` and for at most `timeout`. What it printed by then is kept,
+/// without a last line it had not finished. The program and everything it
 /// started end with this call, however it ends: `group` is dropped here.
-async fn wait_bounded_stdout(
+async fn read_bounded(
     mut child: tokio::process::Child,
     group: Group,
     max_bytes: usize,
     timeout: Duration,
-) -> Option<String> {
-    let _group = group;
+) -> Option<Printed> {
     let mut stdout = child.stdout.take()?;
-    let fut = async move {
-        let mut buf = Vec::with_capacity(max_bytes.min(8192));
-        let mut limited = (&mut stdout).take(max_bytes as u64);
-        let _ = limited.read_to_end(&mut buf).await;
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        String::from_utf8_lossy(&buf).into_owned()
-    };
-    tokio::time::timeout(timeout, fut).await.ok()
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = Vec::with_capacity(max_bytes.min(8192));
+    let mut chunk = [0u8; 4096];
+    let mut timed_out = false;
+    let mut ended = false;
+    while buf.len() < max_bytes {
+        let room = (max_bytes - buf.len()).min(chunk.len());
+        match tokio::time::timeout_at(deadline, stdout.read(&mut chunk[..room])).await {
+            Ok(Ok(0) | Err(_)) => {
+                ended = true;
+                break;
+            }
+            Ok(Ok(read)) => buf.extend_from_slice(&chunk[..read]),
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+    group.kill();
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    drop(group);
+    if !ended {
+        // Cut off mid-line: that line may be wrong.
+        let whole = buf.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1);
+        buf.truncate(whole);
+    }
+    Some(Printed {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        timed_out,
+    })
+}
+
+/// [`read_bounded`]'s text.
+async fn wait_bounded_stdout(
+    child: tokio::process::Child,
+    group: Group,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Option<String> {
+    read_bounded(child, group, max_bytes, timeout)
+        .await
+        .map(|printed| printed.text)
 }
 
 async fn read_bytes_bounded(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
@@ -178,7 +219,7 @@ pub fn is_allowed_resolved_ip_for_name(domain: &str, ip: IpAddr) -> bool {
 }
 
 /// True when `ip` is loopback, private (RFC 1918 / RFC 4193), link-local,
-/// multicast, CGNAT, benchmarking, or documentation space that external
+/// multicast, CGNAT, benchmarking, reserved, or documentation space that external
 /// internet registries (Team Cymru / RDAP) do not index as public routable
 /// autonomous systems.
 pub fn is_non_public_ip(ip: IpAddr) -> bool {
@@ -192,6 +233,8 @@ pub fn is_non_public_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_multicast()
                 || v4.is_documentation()
+                || octets[0] == 0 // 0.0.0.0/8 "this network"
+                || octets[0] >= 240 // 240.0.0.0/4 reserved
                 || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64) // 100.64.0.0/10 CGNAT
                 || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)) // 198.18.0.0/15
         }
@@ -203,6 +246,7 @@ pub fn is_non_public_ip(ip: IpAddr) -> bool {
                 || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
                 || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 doc
+                || (segs[0] == 0x3fff && (segs[1] & 0xf000) == 0) // 3fff::/20 doc (RFC 9637)
         }
     }
 }
