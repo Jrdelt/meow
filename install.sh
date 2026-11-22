@@ -10,8 +10,8 @@
 #   ./install.sh --no-tools    leave out the scanners and the wordlist
 #   ./install.sh --no-geo      leave out the location database (the map's
 #                              round map then shows only your own place)
-#   ./install.sh --tools-only  only the scanners and the wordlist (what
-#                              `meow recon` and `meow tools` run)
+#   ./install.sh --tools-only  only the scanners, the wordlist and the
+#                              location database (with --no-geo, without it)
 #
 # Nothing is installed that is already present, so it is safe to run again.
 

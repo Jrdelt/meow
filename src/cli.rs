@@ -41,7 +41,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List every saved workspace and whether its session is running
+    /// List saved sessions and whether each is running
     #[command(visible_aliases = ["ls", "status"])]
     List,
     /// Set up the default mode, local AI, cloud AI and lookups
@@ -71,7 +71,7 @@ pub enum Command {
         /// Claude API: models asked when one declines ("": API chooses)
         #[arg(long, value_name = "A,B")]
         fallback_models: Option<String>,
-        /// URL of another OpenAI-style cloud AI service
+        /// URL of another cloud AI service (OpenAI-style, or a Claude API gateway with --provider claude)
         #[arg(long, value_name = "URL")]
         cloud_url: Option<String>,
         /// Cloud AI triage model

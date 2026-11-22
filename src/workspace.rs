@@ -83,11 +83,11 @@ const WINDOWS_RESERVED: &[&str] = &[
 const CONFIG_TEMPLATE: &str = r#"# meow global configuration. Applies to every workspace.
 
 # Discovery mode for newly created workspaces: "light", "mild" or "aggressive".
-# "light" is passive only and sends no packets.
+# "light" is passive only and sends no packets to hosts.
 default_mode = "light"
 
-# Shell to launch inside a session. Leave commented out to use the platform
-# default (zsh on macOS, bash on Linux, PowerShell on Windows).
+# Shell to launch inside a session. Leave commented out to use $SHELL
+# (zsh on macOS, bash on Linux without it; PowerShell on Windows).
 # shell = "/bin/zsh"
 
 [location]

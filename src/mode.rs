@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Passive only: zero outbound packets (default)
+    /// Passive only: no packets to hosts (default)
     #[default]
     Light,
     /// Rate-limited active discovery

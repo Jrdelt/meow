@@ -1500,7 +1500,7 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
             if running_mode(state, &task_row) == Mode::Light {
                 update(stage, "interrupted", LIGHT_DETAIL)?;
                 state.notice(format!(
-                    "recon {} paused: light mode sends no packets",
+                    "recon {} paused: light mode sends no packets to hosts",
                     task_row.target
                 ));
                 return Ok(());

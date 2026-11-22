@@ -940,7 +940,7 @@ impl State {
                 let mode = self.mode();
                 if mode == Mode::Light {
                     bail!(
-                        "light mode sends no packets, so recon is refused; \
+                        "light mode sends no packets to hosts, so recon is refused; \
                          run `meow mode mild` (or aggressive) first"
                     );
                 }
@@ -974,7 +974,7 @@ impl State {
             Command::CheckHost { address } => {
                 if self.mode() == Mode::Light {
                     bail!(
-                        "light mode sends no packets, so the host is not checked; \
+                        "light mode sends no packets to hosts, so the host is not checked; \
                          run `meow mode mild` (or aggressive) first"
                     );
                 }
