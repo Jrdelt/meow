@@ -86,9 +86,26 @@ const RELOAD_PAGE: &str = "<!doctype html>\n<html lang=\"en\"><head><meta charse
 <body style=\"background:#0b0c0e;color:#e7e9ec;font:14px monospace;padding:24px\">\
 <p id=\"why\">Opening the map\u{2026}</p></body></html>\n";
 
+/// What a reload gets when the token the tab kept is no longer the
+/// session's (it ended, or another one runs on the port now): no secret in
+/// it, and its script makes the tab forget that token.
+const STALE_PAGE: &str = "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>meow map</title><script src=\"/reload.js\" data-stale=\"1\"></script></head>\
+<body style=\"background:#0b0c0e;color:#e7e9ec;font:14px monospace;padding:24px\">\
+<p id=\"why\">This map link has no session any more: run `meow map` in the session again.</p>\
+</body></html>\n";
+
 const RELOAD_SCRIPT: &str = "(function () {\n\
+  var script = document.currentScript;\n\
+  var stale = !!(script && script.hasAttribute('data-stale'));\n\
   var token = '';\n\
-  try { token = sessionStorage.getItem('meow-map-token') || ''; } catch (_) {}\n\
+  try {\n\
+    if (stale) { sessionStorage.removeItem('meow-map-token'); }\n\
+    else { token = sessionStorage.getItem('meow-map-token') || ''; }\n\
+  } catch (_) {}\n\
+  if (stale && window.history && typeof window.history.replaceState === 'function') {\n\
+    window.history.replaceState(null, '', '/');\n\
+  }\n\
   if (/^[0-9a-f]{64}$/.test(token)) {\n\
     location.replace('/?token=' + token);\n\
     return;\n\
@@ -101,6 +118,10 @@ const RELOAD_SCRIPT: &str = "(function () {\n\
 
 pub fn reload_page() -> Response {
     with_type("text/html; charset=utf-8", RELOAD_PAGE.to_owned())
+}
+
+pub fn stale_page() -> Response {
+    with_static("text/html; charset=utf-8", STALE_PAGE)
 }
 
 pub fn reload_script() -> Response {

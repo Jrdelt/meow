@@ -306,6 +306,9 @@ pub struct State {
     /// Bumped when only the progress changed: WebSocket clients then get
     /// that alone, not the whole state again.
     progress_revision: watch::Sender<u64>,
+    /// Bumped when only the AI reply grew: WebSocket clients then get the
+    /// reply alone, not the whole state again.
+    ai_revision: watch::Sender<u64>,
     /// Every program recon starts, so that none outlives the session.
     tools: Tracker,
     cve: Option<CveClient>,
@@ -847,9 +850,20 @@ impl State {
                 Ok(json!({ "mode": mode, "resumed": resumed }))
             }
             Command::Note { address, text } => {
-                let text = text.trim().to_owned();
+                // U+FEFF too, as JavaScript's trim() does: the page counts so.
+                let text = text
+                    .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+                    .to_owned();
                 if text.is_empty() {
                     bail!("the note is empty");
+                }
+                // Refused whole, never cut: the page and the HUD keep it.
+                if text.len() > crate::evidence::EVIDENCE_MAX {
+                    bail!(
+                        "the note is too long: {} bytes, {} at most",
+                        text.len(),
+                        crate::evidence::EVIDENCE_MAX
+                    );
                 }
                 let record =
                     EvidenceRecord::observed(Source::ManualNote, Confidence::Medium, &text);
@@ -1075,7 +1089,8 @@ impl State {
         let mut on_text = move |piece: &str| {
             if !piece.is_empty() {
                 lock(&streamer.ai_status).text.push_str(piece);
-                streamer.touch();
+                // Only the reply is sent again, not the whole state.
+                streamer.ai_revision.send_modify(|rev| *rev += 1);
             }
         };
         let result = self
@@ -1283,6 +1298,20 @@ async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     };
     if !constant_time_eq(&presented, &state.token) {
+        // A reload of a map tab that kept the token of a session that has
+        // since ended: a page without secrets that says so and makes the
+        // tab forget that token.
+        if request.method() == axum::http::Method::GET
+            && request.uri().path() == "/"
+            && fetch_says(headers, "sec-fetch-mode", "navigate")
+        {
+            let mut response = webui::stale_page();
+            *response.status_mut() = StatusCode::UNAUTHORIZED;
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            return response;
+        }
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     }
     match tokio::time::timeout(REQUEST_BODY_TIMEOUT, next.run(request)).await {
@@ -1367,6 +1396,7 @@ async fn serve_socket(
 ) {
     let mut revision = state.revision.subscribe();
     let mut progress = state.progress_revision.subscribe();
+    let mut reply = state.ai_revision.subscribe();
     let send_state = |state: &Shared| {
         Message::Text(
             json!({ "type": "state", "key": state.page_key, "state": state.snapshot() })
@@ -1378,8 +1408,11 @@ async fn serve_socket(
         return;
     }
     let mut pending_push = false;
+    let mut pending_reply = false;
     let throttle = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(throttle);
+    let reply_throttle = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(reply_throttle);
     loop {
         tokio::select! {
             changed = revision.changed(), if !pending_push => {
@@ -1394,9 +1427,32 @@ async fn serve_socket(
             () = &mut throttle, if pending_push => {
                 pending_push = false;
                 let _ = revision.borrow_and_update();
-                // The state says how far the stages are, too.
+                // The state says how far the stages are, and the AI reply
+                // so far, too.
                 let _ = progress.borrow_and_update();
+                let _ = reply.borrow_and_update();
+                pending_reply = false;
                 if socket.send(send_state(&state)).await.is_err() {
+                    break;
+                }
+            }
+            // Only the AI reply grew (it streams in): the reply alone is
+            // sent, at most as often as the state.
+            changed = reply.changed(), if !pending_reply => {
+                if changed.is_err() {
+                    break;
+                }
+                pending_reply = true;
+                reply_throttle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + WS_MIN_INTERVAL);
+            }
+            () = &mut reply_throttle, if pending_reply => {
+                pending_reply = false;
+                let _ = reply.borrow_and_update();
+                let status = lock(&state.ai_status).clone();
+                let message = json!({ "type": "ai", "key": state.page_key, "ai": status });
+                if socket.send(Message::Text(message.to_string().into())).await.is_err() {
                     break;
                 }
             }
@@ -2186,6 +2242,7 @@ impl Coordinator {
             progress: Mutex::new(std::collections::HashMap::new()),
             progress_wake: tokio::sync::Notify::new(),
             progress_revision: watch::channel(0u64).0,
+            ai_revision: watch::channel(0u64).0,
             tools: Tracker::new(),
             cve,
             vault: Mutex::new(vault),
