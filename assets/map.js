@@ -1366,8 +1366,8 @@
     var scan = progress.percent ? (progress.note ? apart(progress.note) + ' ' : '') + progress.percent : apart(progress.note);
     return [progress.items, scan].filter(Boolean).join(' \u00b7 ');
   }
-  // A recon ends with its session: the stage that was running is stopped
-  // for good, and the stages after it are left out with these words.
+  // A recon ends with its session: the stage that had started is stopped
+  // for good, and the ones that never started are left out with these words.
   var CLOSED_DETAIL = 'stopped: the session was closed', NOT_RUN_DETAIL = 'not run: the session was closed';
   function notRun(stage) {
     return stage.status === 'skipped' && /^not run: /.test(stage.detail);
@@ -1604,17 +1604,18 @@
   }
   // The session has gone (its terminal was closed) or cannot be reached.
   // Its recons ended with it, so they are shown as the next session will
-  // find them: the running stage stopped, the ones after it left out, in
-  // the words the session itself stores. Nothing ticks until it is back.
+  // find them: the stage that had started (running, or stopped by light
+  // mode) stopped, the ones that never started left out, in the words the
+  // session itself stores. Nothing ticks until it is back.
   function reconStill() {
     var tasks = state && Array.isArray(state.tasks) ? state.tasks : [], stopped = false;
     tasks.forEach(function (task) {
       (task && Array.isArray(task.stages) ? task.stages : []).forEach(function (stage) {
         if (!stage || typeof stage !== 'object') { return; }
-        if (stage.status === 'running') {
+        if (stage.status === 'running' || (live(stage) && stage.started_utc)) {
           stage.status = 'interrupted';
           stage.detail = CLOSED_DETAIL;
-        } else if (stage.status === 'pending' || (stage.status === 'interrupted' && stage.detail !== CLOSED_DETAIL)) {
+        } else if (live(stage)) {
           stage.status = 'skipped';
           stage.detail = NOT_RUN_DETAIL;
         } else {

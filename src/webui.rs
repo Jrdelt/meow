@@ -617,4 +617,114 @@ process.exit(failed ? 1 : 0);
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    /// Runs the map's `reconStill` under Node on the recons a session sent
+    /// last and prints them as it leaves them.
+    const STILL_CHECK: &str = r#"'use strict';
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function grab(from, to) {
+  const start = src.indexOf(from), end = src.indexOf(to, start);
+  if (start < 0 || end < start) { throw new Error('not found: ' + from); }
+  return src.slice(start, end);
+}
+const code = grab('  var CLOSED_DETAIL = ', '  function reconRank(') +
+  grab('  function reconStill() {', '  function paintRow(');
+const state = { tasks: JSON.parse(fs.readFileSync(process.argv[3], 'utf8')) };
+const byId = () => ({ classList: { add() {} } });
+new Function('state', 'byId', 'renderRecon', 'reconTick',
+  code + '\nreconStill();')(state, byId, () => {}, () => {});
+console.log(JSON.stringify(state.tasks));
+"#;
+
+    /// When the session goes, an open map shows its recons in the words the
+    /// session stores for them, as the HUD does for a session that is gone:
+    /// a stage that had started (running, or stopped by light mode) is cut
+    /// short, and only one that never started is "not run".
+    #[test]
+    fn the_map_ends_a_gone_sessions_recons_as_the_hud_does() {
+        use crate::queue::{show_ended, TaskRow, CLOSED_DETAIL, LIGHT_DETAIL, NOT_RUN_CLOSED};
+        let (start, end) = ("2026-11-21T21:46:40Z", "2026-11-21T21:46:45Z");
+        let tasks = serde_json::json!([
+            { "id": 1, "target": "192.0.2.1", "mode": "mild", "extra_flags": [],
+              "created_utc": start, "stages": [
+                { "stage": "trace", "status": "skipped",
+                  "detail": "turned off in config.toml (recon.skip)" },
+                { "stage": "ports", "status": "interrupted", "detail": LIGHT_DETAIL,
+                  "started_utc": start, "finished_utc": end },
+                { "stage": "udp", "status": "interrupted", "detail": LIGHT_DETAIL },
+                { "stage": "services", "status": "pending", "detail": "",
+                  "started_utc": start, "finished_utc": end },
+                { "stage": "headers", "status": "pending", "detail": "" } ] },
+            { "id": 2, "target": "198.51.100.7", "mode": "mild", "extra_flags": [],
+              "created_utc": start, "stages": [
+                { "stage": "dns", "status": "done", "detail": "2 records",
+                  "started_utc": start, "finished_utc": end },
+                { "stage": "ports", "status": "running", "detail": "", "started_utc": start,
+                  "progress": { "percent": 42, "note": "SYN Stealth Scan" } },
+                { "stage": "services", "status": "pending", "detail": "" } ] }
+        ]);
+        let mut hud: Vec<TaskRow> = serde_json::from_value(tasks.clone()).unwrap();
+        show_ended(&mut hud);
+        let words = |stages: &serde_json::Value| -> Vec<(String, String, String)> {
+            stages
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|stage| {
+                    let field = |name: &str| stage[name].as_str().unwrap_or("").to_owned();
+                    (field("stage"), field("status"), field("detail"))
+                })
+                .collect()
+        };
+        let hud = serde_json::to_value(&hud).unwrap();
+        let light = &words(&hud[0]["stages"]);
+        assert_eq!(
+            light[1],
+            ("ports".into(), "interrupted".into(), CLOSED_DETAIL.into())
+        );
+        assert_eq!(
+            light[2],
+            ("udp".into(), "skipped".into(), NOT_RUN_CLOSED.into())
+        );
+        assert_eq!(light[3].2, CLOSED_DETAIL);
+        assert_eq!(light[4].2, NOT_RUN_CLOSED);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (check, script, sent) = (
+            dir.path().join("check.js"),
+            dir.path().join("map.js"),
+            dir.path().join("tasks.json"),
+        );
+        std::fs::write(&check, STILL_CHECK).unwrap();
+        std::fs::write(&script, SCRIPT).unwrap();
+        std::fs::write(&sent, tasks.to_string()).unwrap();
+        let Ok(output) = std::process::Command::new("node")
+            .args([&check, &script, &sent])
+            .output()
+        else {
+            eprintln!("Node is not installed: the map's end of a session was not checked");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let map: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for task in 0..2 {
+            assert_eq!(words(&map[task]["stages"]), words(&hud[task]["stages"]));
+            // The times a stage ran are kept, and nothing is still counting.
+            for (shown, stored) in map[task]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(hud[task]["stages"].as_array().unwrap())
+            {
+                assert_eq!(shown["started_utc"], stored["started_utc"]);
+                assert_eq!(shown["finished_utc"], stored["finished_utc"]);
+                assert!(shown.get("progress").is_none());
+            }
+        }
+    }
 }
