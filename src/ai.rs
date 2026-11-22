@@ -1085,7 +1085,7 @@ impl std::error::Error for BudgetReached {}
 /// makes (a model asked after another declined, a resumed research turn)
 /// is checked against it first, and counted. With the day-wide record of
 /// all the user's sessions, each call is also set aside there first.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Allowance {
     calls_left: u32,
     usd_left: f64,
@@ -1096,13 +1096,27 @@ pub struct Allowance {
 
 /// A request's part of the day-wide record ([`crate::usage`]): what it
 /// has set aside or spent there, and on which day.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Shared {
     ledger: crate::usage::Ledger,
     max_usd: f64,
     max_calls: u32,
     day: String,
     held: f64,
+    /// What the request is known to cost should it end before it is
+    /// settled (the session closed during a call): what it cost before
+    /// that call, and that call's input. Set aside in place of the most.
+    floor: f64,
+    settled: bool,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if !self.settled {
+            // Kept set aside as it is if the record cannot be written.
+            let _ = self.hold(self.floor, 0.0, false);
+        }
+    }
 }
 
 impl Shared {
@@ -1156,6 +1170,8 @@ impl Allowance {
                 max_calls: budget.max_calls,
                 day: String::new(),
                 held: 0.0,
+                floor: 0.0,
+                settled: true,
             }),
             ..Self::new(budget)
         }
@@ -1172,8 +1188,11 @@ impl Allowance {
     }
 
     /// Before an API call: `spent` is what this request has cost so far,
-    /// `most` the most the call can cost where that is known (0 where not).
-    pub fn take_call(&mut self, spent: f64, most: f64) -> Result<()> {
+    /// `most` the most the call can cost where that is known (0 where not),
+    /// `least` what it costs once sent (its input; 0 where not known). If
+    /// the request ends before [`Allowance::settle`] (the session closed),
+    /// `spent + least` takes the place of what was set aside.
+    pub fn take_call(&mut self, spent: f64, most: f64, least: f64) -> Result<()> {
         // Written so that a NaN anywhere refuses.
         let fits = spent + most <= self.usd_left;
         if self.calls >= self.calls_left || !fits {
@@ -1186,6 +1205,8 @@ impl Allowance {
         }
         if let Some(shared) = &mut self.shared {
             shared.hold(spent, most, true)?;
+            shared.floor = spent + least.clamp(0.0, most.max(0.0));
+            shared.settled = false;
         }
         self.calls += 1;
         Ok(())
@@ -1197,9 +1218,17 @@ impl Allowance {
     pub fn settle(&mut self, cost: f64) -> Result<()> {
         match &mut self.shared {
             Some(shared) if self.calls > 0 && cost.is_finite() && cost >= 0.0 => {
-                shared.hold(cost, 0.0, false)
+                // Tried again when the request ends if it fails now.
+                shared.floor = cost;
+                shared.hold(cost, 0.0, false)?;
+                shared.settled = true;
+                Ok(())
             }
-            _ => Ok(()),
+            Some(shared) => {
+                shared.settled = true;
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 }
@@ -2693,7 +2722,7 @@ impl AiEngine {
                         "parameters": { "max_uses": 2, "max_results": 5, "search_context_size": "low" },
                     }]);
                 }
-                match allowance.take_call(0.0, 0.0) {
+                match allowance.take_call(0.0, 0.0, 0.0) {
                     Ok(()) => self
                         .chat(
                             &settings.cloud_url,
@@ -3797,7 +3826,7 @@ mod tests {
                     // The reply talks about the masked host, split so that a
                     // placeholder straddles two stream events.
                     sse(
-                        &["## 1. Risk\nPatch <<HO", "ST_01>> (", "<<DOM_01>>", ") now.\n## 2. Fix\nUpgrade nginx.\n## 3. Rule\nalert"],
+                        &["## 1. Risk\nPatch <<HO", "ST_01>> now.\nIts name: ", "<<DOM_01>>", ".\n## 2. Fix\nUpgrade nginx.\n## 3. Rule\nalert"],
                         Some(json!({ "prompt_tokens": 800, "completion_tokens": 120, "cost": 0.0042,
                                      "server_tool_use": { "web_search_requests": if body.get("tools").is_some() { 2 } else { 0 } } })),
                     )
@@ -3903,7 +3932,7 @@ mod tests {
         assert!(
             outcome
                 .text
-                .contains("Patch 10.10.10.5 (portal.corp-acme.com) now."),
+                .contains("Patch 10.10.10.5 now.\nIts name: portal.corp-acme.com."),
             "{}",
             outcome.text
         );
@@ -5688,8 +5717,45 @@ mod tests {
             },
             crate::usage::Ledger::at(dir.path().join("missing").join(crate::usage::FILE)),
         );
-        assert!(allowance.take_call(0.0, 0.1).is_err());
+        assert!(allowance.take_call(0.0, 0.1, 0.01).is_err());
         assert_eq!(allowance.calls, 0);
+    }
+
+    /// Audit 4 review: a request that ends before it is settled (the
+    /// session closed during a call) leaves its input, not the most its
+    /// call could cost, in the day's record.
+    #[test]
+    fn a_request_cut_off_keeps_its_input_not_the_most_it_could_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = crate::usage::Ledger::at(dir.path().join(crate::usage::FILE));
+        let budget = Budget {
+            max_usd: 1.0,
+            max_calls: 20,
+            ..Budget::default()
+        };
+        let mut allowance = Allowance::shared(&budget, ledger.clone());
+        allowance.take_call(0.0, 0.54, 0.04).unwrap();
+        assert!((ledger.today().unwrap().usd - 0.54).abs() < 1e-9);
+        drop(allowance);
+        let day = ledger.today().unwrap();
+        assert!((day.usd - 0.04).abs() < 1e-9, "{day:?}");
+        assert_eq!(day.calls, 1);
+        // A second call after a first that cost 0.10: that, and its input.
+        let mut allowance = Allowance::shared(&budget, ledger.clone());
+        allowance.take_call(0.0, 0.3, 0.02).unwrap();
+        allowance.take_call(0.1, 0.3, 0.02).unwrap();
+        drop(allowance);
+        let day = ledger.today().unwrap();
+        assert!((day.usd - 0.16).abs() < 1e-9, "{day:?}");
+        assert_eq!(day.calls, 3);
+        // Settled, it keeps what it cost; with no call, nothing changes.
+        let mut allowance = Allowance::shared(&budget, ledger.clone());
+        allowance.take_call(0.0, 0.3, 0.02).unwrap();
+        allowance.settle(0.25).unwrap();
+        drop(allowance);
+        assert!((ledger.today().unwrap().usd - 0.41).abs() < 1e-9);
+        drop(Allowance::shared(&budget, ledger.clone()));
+        assert!((ledger.today().unwrap().usd - 0.41).abs() < 1e-9);
     }
 
     /// Audit 4: a model whose one call could cost more than the whole cap
@@ -5891,11 +5957,13 @@ mod tests {
             token("portal.corp-acme.com"),
             token("collect.attacker.example"),
         );
-        // The certificate's name and the address, each a word of its
-        // own, are prose; joined into one link they are not (audit 4).
+        // The certificate's name and the address are filled in each on a
+        // line of its own, never together, however the line reads (audit 4).
         let reply = format!(
             "Open https://{own}/admin and https://{name}/.\n\
              Patch {own} ({name}) now.\n\
+             Patch {own} now.\n\
+             Renew the certificate of {name}.\n\
              Then https://{name}/?h={own}\n\
              See [status](https://{other}/?h={own})\n"
         );
@@ -5905,7 +5973,9 @@ mod tests {
             shown,
             format!(
                 "Open https://{own}/admin and https://{name}/.\n\
-                 Patch 10.10.10.5 (portal.corp-acme.com) now.\n\
+                 Patch {own} ({name}) now.\n\
+                 Patch 10.10.10.5 now.\n\
+                 Renew the certificate of portal.corp-acme.com.\n\
                  Then https://{name}/?h={own}\n\
                  See [status](https://{other}/?h={own})\n{}{}",
                 crate::vault::KEPT_NOTE,

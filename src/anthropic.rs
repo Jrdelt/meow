@@ -122,6 +122,12 @@ fn most_usd(model: &str, bytes: usize, research: bool) -> f64 {
     cost_usd(model, input, u64::from(MAX_TOKENS), searches)
 }
 
+/// What sending a request of `bytes` costs on `model` before any reply:
+/// its input, counted as [`most_usd`] counts it.
+fn input_usd(model: &str, bytes: usize) -> f64 {
+    cost_usd(model, (bytes as u64).div_ceil(3), 0, 0)
+}
+
 /// The request body for one question. Thinking is adaptive (asked for by
 /// name, because the 4.x models run without it otherwise); how hard the
 /// model works is set with the effort level. `own_chain` is true when meow
@@ -381,7 +387,12 @@ async fn triage(
     let messages = json!([{ "role": "user", "content": user }]);
     let body = body(model, false, own_chain, system, &messages);
     let request = request(http, base, key, &body)?;
-    allowance.take_call(spent, most_usd(model, body.to_string().len(), false))?;
+    let bytes = body.to_string().len();
+    allowance.take_call(
+        spent,
+        most_usd(model, bytes, false),
+        input_usd(model, bytes),
+    )?;
     let mut response = send(request, base).await?;
     if let Some(len) = response.content_length() {
         if len > crate::ai::MAX_ANSWER_BYTES as u64 {
@@ -498,7 +509,12 @@ async fn research(
         let request = request(http, base, key, &body)?.timeout(RESEARCH_TIMEOUT);
         // A resumed turn is a request of its own, billed again.
         let so_far = spent + counts.usage(model).cost_usd;
-        allowance.take_call(so_far, most_usd(model, body.to_string().len(), true))?;
+        let bytes = body.to_string().len();
+        allowance.take_call(
+            so_far,
+            most_usd(model, bytes, true),
+            input_usd(model, bytes),
+        )?;
         let mut response = send(request, base).await?;
         let body = crate::ai::read_bounded(&mut response, crate::ai::MAX_ANSWER_BYTES).await?;
         let reply: Value =

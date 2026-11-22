@@ -2685,21 +2685,7 @@
         send({ cmd: 'ai', tier: tier[0], address: host.address });
       });
     });
-    var budget = state.budget || {};
-    if (budget.has_key) {
-      ai.appendChild(hint(row('Cloud AI today', '$' + (budget.spent_usd || 0).toFixed(2) + ' of $' +
-        (budget.max_usd || 0).toFixed(2) + ' \u00b7 ' + (budget.calls || 0) + '/' + (budget.max_calls || 0) +
-        ' calls \u00b7 masked first'),
-        'Spent today, and the daily cap. Past it, Cloud AI answers with the local AI.'));
-    } else {
-      // No key, or the file with it cannot be read: the local AI answers.
-      var why = el('span', null, budget.setup_unreadable ? 'ai.toml unreadable (' : 'no key (');
-      why.appendChild(el('code', null, 'meow setup'));
-      why.appendChild(document.createTextNode(') \u00b7 local AI answers instead'));
-      ai.appendChild(hint(row('Cloud AI', why), budget.setup_unreadable
-        ? '~/.meow/ai.toml cannot be read. Research is off until it is fixed.'
-        : 'Research is off until a key is added. A key added applies to this session at once.'));
-    }
+    ai.appendChild(cloudAiLine(state.budget || {}));
 
     // Notes: the ones saved for this host, then a box for the next.
     var note = card('Notes');
@@ -3023,6 +3009,29 @@
   // its findings are the tabs under the map. With nothing selected, the
   // card is the report.
   var lastDetailId = null;
+  // The Ask AI card's line on the cloud: today's spend and the cap, or why
+  // the local AI answers instead.
+  function cloudAiLine(budget) {
+    if (budget.has_key && budget.usage_unreadable) {
+      // What all sessions spent today is unknown: no cloud call is made.
+      return hint(row('Cloud AI', 'off \u00b7 ai-usage unreadable \u00b7 local AI answers instead'),
+        '~/.meow/ai-usage cannot be read. Research is off until it is fixed.');
+    }
+    if (budget.has_key) {
+      return hint(row('Cloud AI today', '$' + (budget.spent_usd || 0).toFixed(2) + ' of $' +
+        (budget.max_usd || 0).toFixed(2) + ' \u00b7 ' + (budget.calls || 0) + '/' + (budget.max_calls || 0) +
+        ' calls \u00b7 masked first'),
+        'Spent today by all sessions, and the daily cap. Past it, Cloud AI answers with the local AI.');
+    }
+    // No key, or the file with it cannot be read: the local AI answers.
+    var why = el('span', null, budget.setup_unreadable ? 'ai.toml unreadable (' : 'no key (');
+    why.appendChild(el('code', null, 'meow setup'));
+    why.appendChild(document.createTextNode(') \u00b7 local AI answers instead'));
+    return hint(row('Cloud AI', why), budget.setup_unreadable
+      ? '~/.meow/ai.toml cannot be read. Research is off until it is fixed.'
+      : 'Research is off until a key is added. A key added applies to this session at once.');
+  }
+
   function renderDetail() {
     var detail = byId('detail');
     var panels = byId('host-panels');
