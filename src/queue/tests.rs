@@ -17,6 +17,7 @@ fn the_udp_scan_names_its_services_and_explains_open_ones() {
     let command = udp_command(
         &settings,
         &["203.0.113.5".to_owned()],
+        &[],
         false,
         Path::new("/tmp/out.xml"),
     );
@@ -32,6 +33,7 @@ fn the_udp_scan_names_its_services_and_explains_open_ones() {
     assert!(udp_command(
         &settings,
         &["2001:db8::5".to_owned()],
+        &[],
         true,
         Path::new("o.xml")
     )
@@ -1044,6 +1046,7 @@ fn only_meow_asks_nmap_for_progress_reports() {
     assert!(asks(&udp_command(
         &settings,
         &["192.0.2.5".into()],
+        &[],
         false,
         out
     )));
@@ -1720,48 +1723,280 @@ fn ids_in_script_endpoints_are_kept_and_never_listed_to_rotate() {
     }
 }
 
-#[test]
-fn trace_goes_to_the_address_the_port_inventory_scanned() {
-    use crate::coordinator::Coordinator;
-    use crate::workspace::{Config, MeowHome, Workspace};
-
+/// A coordinator in `mode` whose queue runs nothing on its own, with
+/// `config`. The folder goes with it.
+fn quiet_coordinator(
+    mode: Mode,
+    config: crate::workspace::Config,
+) -> (tempfile::TempDir, crate::coordinator::Coordinator) {
+    use crate::workspace::{MeowHome, Workspace};
     let tmp = tempfile::tempdir().unwrap();
     let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
-    // Light: the queue runs nothing on its own.
-    let (workspace, _) =
+    let (mut workspace, _) =
         Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
-    let mut config = Config::default();
+    workspace.set_mode(mode).unwrap();
+    let coordinator = crate::coordinator::Coordinator::start(workspace, config).unwrap();
+    (tmp, coordinator)
+}
+
+fn no_cve_config() -> crate::workspace::Config {
+    let mut config = crate::workspace::Config::default();
     config.cve.enabled = false;
-    let coordinator = Coordinator::start(workspace, config).unwrap();
-    let state = coordinator.state();
-    let name = "www.example.org";
-    let target = Target::parse(name).unwrap();
-    let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
-    // DNS published one address; the scanner resolved the name (with the
-    // user's /etc/hosts) to another and scanned that.
-    let dns = Found {
-        ips: vec!["198.51.100.66".into()],
+    config
+}
+
+fn strings_of(list: &[&str]) -> Vec<String> {
+    list.iter().map(|item| (*item).to_owned()).collect()
+}
+
+/// What the dns stage saves for a dual-stack name: the system's order, and
+/// the address the scan goes to.
+fn dual_stack(ipv6: bool) -> Found {
+    let ips = strings_of(&["203.0.113.7", "2001:db8::7"]);
+    Found {
+        primary: crate::osint::primary_address(&ips, ipv6),
+        ips,
         ..Found::default()
-    };
-    dns.save(&state.db_lock(), id, Stage::Dns).unwrap();
+    }
+}
+
+#[test]
+fn the_dns_stage_s_addresses_keep_their_order() {
+    let target = Target::parse("dual.example.org").unwrap();
+    let found = Found {
+        ips: strings_of(&["203.0.113.9", "198.51.100.20", "2001:db8::7", "203.0.113.9"]),
+        primary: Some("203.0.113.9".to_owned()),
+        ..Found::default()
+    }
+    .checked(&target);
+    // Not as text: "198..." and "2001:..." would come first.
+    assert_eq!(found.ips, ["203.0.113.9", "198.51.100.20", "2001:db8::7"]);
+    assert_eq!(found.primary.as_deref(), Some("203.0.113.9"));
+    // Only one of its own addresses.
+    let planted = Found {
+        primary: Some("192.0.2.99".to_owned()),
+        ..found.clone()
+    }
+    .checked(&target);
+    assert_eq!(planted.primary, None);
+    // And read back as saved.
+    let db = Db::open_in_memory().unwrap();
+    let id = enqueue(&db, "dual.example.org", Mode::Mild, &[]).unwrap();
+    found.save(&db, id, Stage::Dns).unwrap();
+    assert_eq!(Found::load(&db, id, Stage::Dns, &target), found);
+}
+
+#[test]
+fn trace_goes_to_the_address_the_port_inventory_scanned() {
+    // It runs after the port inventory.
+    let at = |stage: Stage| STAGES.iter().position(|s| *s == stage).unwrap();
+    assert!(at(Stage::Ports) < at(Stage::Trace));
+
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, no_cve_config());
+    let state = coordinator.state();
+    let name = "dual.example.org";
+    let target = Target::parse(name).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let first = || {
+    let first = |id: i64| {
         runtime
             .block_on(resolve_target_ips(&state, id, &target))
             .first()
             .map(ToString::to_string)
     };
-    assert_eq!(first().as_deref(), Some("198.51.100.66"));
+    // Before the scan: the address nmap scans, IPv4 unless `-6`, whatever
+    // the text order of the addresses.
+    for (ipv6, expected) in [(false, "203.0.113.7"), (true, "2001:db8::7")] {
+        let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+        dual_stack(ipv6)
+            .save(&state.db_lock(), id, Stage::Dns)
+            .unwrap();
+        assert_eq!(first(id).as_deref(), Some(expected), "-6: {ipv6}");
+    }
+    // DNS published one address; the scanner resolved the name (with the
+    // user's /etc/hosts) to another and scanned that.
+    let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+    dual_stack(false)
+        .save(&state.db_lock(), id, Stage::Dns)
+        .unwrap();
     let ports = Found {
         up: 1,
         hosts: BTreeMap::from([("192.0.2.10".to_owned(), vec![80])]),
         ..Found::default()
     };
     ports.save(&state.db_lock(), id, Stage::Ports).unwrap();
-    assert_eq!(first().as_deref(), Some("192.0.2.10"));
+    assert_eq!(first(id).as_deref(), Some("192.0.2.10"));
+    coordinator.shutdown();
+}
+
+/// Mail-dns records on the address the scan went to, which has the name:
+/// not on another of its addresses that sorts first as text.
+#[test]
+fn mail_dns_records_on_the_scanned_address_of_a_dual_stack_name() {
+    use crate::osint::tests::{stand_in_dns, stand_in_doh, stand_in_resolver, Reply};
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, no_cve_config());
+    let state = coordinator.state();
+    let name = "dual.example.org";
+    let target = Target::parse(name).unwrap();
+    let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+    dual_stack(false)
+        .save(&state.db_lock(), id, Stage::Dns)
+        .unwrap();
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (server, _) = stand_in_dns(|name, _| match name {
+            "dual.example.org" => Reply::Address([203, 0, 113, 7]),
+            _ => Reply::NxDomain,
+        })
+        .await;
+        let (doh, _) = stand_in_doh(None).await;
+        let cx = stages::Ctx::new(&state, &task, &target, Stage::MailDns).unwrap();
+        let end = stages::mail_dns_with(&cx, stand_in_resolver(vec![server], &doh))
+            .await
+            .unwrap();
+        assert!(matches!(end, StageEnd::Done(_)));
+    });
+    let graph = state.graph();
+    let graded: Vec<&str> = graph
+        .hosts
+        .values()
+        .filter(|h| h.dns_security.is_some())
+        .map(|h| h.address.as_str())
+        .collect();
+    assert_eq!(graded, ["203.0.113.7"]);
+    assert!(!graph.hosts.contains_key("2001:db8::7"));
+    drop(graph);
+    coordinator.shutdown();
+}
+
+/// crt.sh is not asked about a name with any address that is not public,
+/// whichever comes first. 3fff::/20 (RFC 9637) is a public address here.
+#[test]
+fn subdomains_keeps_a_name_with_any_internal_address_off_crt_sh() {
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, no_cve_config());
+    let state = coordinator.state();
+    let name = "mixed.example.org";
+    let target = Target::parse(name).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for ips in [&["3fff::7", "fd00::5"][..], &["3fff::7", "240.0.0.7"]] {
+        let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+        let ips = strings_of(ips);
+        Found {
+            primary: crate::osint::primary_address(&ips, false),
+            ips: ips.clone(),
+            ..Found::default()
+        }
+        .save(&state.db_lock(), id, Stage::Dns)
+        .unwrap();
+        let task = task(&state.db_lock(), id).unwrap().unwrap();
+        let cx = stages::Ctx::new(&state, &task, &target, Stage::Subdomains).unwrap();
+        let said = match runtime.block_on(stages::subdomains(&cx)).unwrap() {
+            StageEnd::Skipped(why) => why,
+            StageEnd::Done(what) => format!("done: {what}"),
+            StageEnd::ModeChanged => "mode changed".to_owned(),
+        };
+        assert!(said.contains("not sent to crt.sh"), "{ips:?}: {said}");
+    }
+    coordinator.shutdown();
+}
+
+/// The UDP scan takes the operator's up check and address family, and a
+/// scan that found no host up says so, not "0 UDP services".
+#[cfg(unix)]
+#[test]
+fn the_udp_scan_takes_the_up_check_flags_and_says_when_no_host_was_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let nmap = dir.path().join("nmap");
+    std::fs::write(
+        &nmap,
+        format!(
+            "#!/bin/sh
+echo \"$*\" >> '{}'
+out=''; prev=''; pn=0
+\
+             for a in \"$@\"; do [ \"$prev\" = '-oX' ] && out=\"$a\"; [ \"$a\" = '-Pn' ] && pn=1; prev=\"$a\"; done
+\
+             if [ $pn = 1 ]; then cat > \"$out\" <<'XML'
+\
+             <nmaprun><host><status state=\"up\"/><address addr=\"203.0.113.9\" addrtype=\"ipv4\"/><ports>\
+             <port protocol=\"udp\" portid=\"161\"><state state=\"open\"/><service name=\"snmp\"/></port>\
+             </ports></host><runstats><hosts up=\"1\" down=\"0\" total=\"1\"/></runstats></nmaprun>
+XML
+\
+             else cat > \"$out\" <<'XML'
+\
+             <nmaprun><runstats><hosts up=\"0\" down=\"1\" total=\"1\"/></runstats></nmaprun>
+XML
+fi
+",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nmap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = no_cve_config();
+    config.recon.nmap = nmap.to_string_lossy().into_owned();
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Aggressive, config);
+    let state = coordinator.state();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let udp = |target: &str, flags: &[&str]| {
+        let parsed = Target::parse(target).unwrap();
+        let id = enqueue(
+            &state.db_lock(),
+            target,
+            Mode::Aggressive,
+            &strings_of(flags),
+        )
+        .unwrap();
+        let task = task(&state.db_lock(), id).unwrap().unwrap();
+        let mut cx = stages::Ctx::new(&state, &task, &parsed, Stage::Udp).unwrap();
+        // As root.
+        cx.privileged = true;
+        let end = runtime.block_on(stages::udp(&cx)).unwrap();
+        let args = std::fs::read_to_string(&calls)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned();
+        (end, args)
+    };
+    let (end, args) = udp("203.0.113.9", &[]);
+    assert!(!args.contains("-Pn"), "{args}");
+    let StageEnd::Skipped(why) = end else {
+        panic!("not skipped");
+    };
+    assert!(why.starts_with("nothing answered nmap's up check"), "{why}");
+    assert!(why.contains("`-- -Pn`"), "{why}");
+
+    let (end, args) = udp("203.0.113.9", &["-Pn"]);
+    assert!(args.contains(" -Pn "), "{args}");
+    let StageEnd::Done(what) = end else {
+        panic!("not done");
+    };
+    assert!(what.starts_with("1 UDP services answered"), "{what}");
+
+    // A name scanned at its IPv6 address, as the TCP scans do.
+    let (_, args) = udp("dual.example.org", &["-6", "-n"]);
+    assert_eq!(args.matches(" -6 ").count(), 1, "{args}");
+    assert!(
+        args.contains(" -n ") && args.ends_with("-- dual.example.org"),
+        "{args}"
+    );
     coordinator.shutdown();
 }
 

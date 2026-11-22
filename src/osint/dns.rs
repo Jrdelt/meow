@@ -1049,23 +1049,43 @@ fn any_non_public(addresses: &[String]) -> bool {
         .any(is_non_public_ip)
 }
 
-/// Runs the passive `dns` stage for `target`.
+/// The address of a name the port scan goes to, of `addresses` the system
+/// resolved it to (in the system's order): nmap scans the first IPv4
+/// address, or with `-6` (`ipv6`) the first IPv6 one. The other family's
+/// first when there is none of that one.
+pub fn primary_address(addresses: &[String], ipv6: bool) -> Option<String> {
+    let of_family = |v6: bool| {
+        addresses
+            .iter()
+            .find(|ip| ip.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6() == v6))
+    };
+    of_family(ipv6).or_else(|| of_family(!ipv6)).cloned()
+}
+
+/// Runs the passive `dns` stage for `target`, whose port scan goes to IPv6
+/// addresses when `ipv6` (`-6`).
 /// Returns `(observations, resolved_ips, summary_text)`.
-pub async fn run_dns(target: &Target) -> Result<(Vec<Observation>, Vec<String>, String)> {
+pub async fn run_dns(
+    target: &Target,
+    ipv6: bool,
+) -> Result<(Vec<Observation>, Vec<String>, String)> {
     let resolver = Resolver::system(build_http_client(Duration::from_secs(6))?);
     let system = match target {
         Target::Host(HostAddr::Name(name)) => system_addresses(name).await,
         _ => (Vec::new(), Vec::new()),
     };
-    Ok(run_dns_with(target, resolver, system).await)
+    Ok(run_dns_with(target, resolver, system, ipv6).await)
 }
 
 /// The `dns` stage with `resolver` for the records, and `system`, the IPv4
-/// and IPv6 addresses the system resolved a name target to.
+/// and IPv6 addresses the system resolved a name target to. What it finds
+/// about the name is recorded on the address the port scan goes to (see
+/// [`primary_address`]).
 pub(super) async fn run_dns_with(
     target: &Target,
     mut resolver: Resolver,
     system: (Vec<String>, Vec<String>),
+    ipv6: bool,
 ) -> (Vec<Observation>, Vec<String>, String) {
     let mut observations = Vec::new();
     let mut resolved_ips = Vec::new();
@@ -1192,10 +1212,8 @@ pub(super) async fn run_dns_with(
                 }
             }
 
-            let primary_address = resolved_ips
-                .first()
-                .cloned()
-                .unwrap_or_else(|| domain.clone());
+            let primary_address =
+                primary_address(&resolved_ips, ipv6).unwrap_or_else(|| domain.clone());
 
             if primary_address != *domain {
                 observations.push(Observation::Hostname {

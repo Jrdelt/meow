@@ -49,7 +49,9 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
             "network range {net} does not have a single DNS target"
         )));
     }
-    let (observations, ips, summary) = match crate::osint::run_dns(target).await {
+    // The family the port scan takes for a name: IPv6 with `-6`.
+    let ipv6 = split_recon_flags(&task.extra_flags).ipv6();
+    let (observations, ips, summary) = match crate::osint::run_dns(target, ipv6).await {
         Ok(res) => res,
         Err(err) => return Ok(StageEnd::Skipped(format!("DNS lookup unavailable: {err}"))),
     };
@@ -65,6 +67,7 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
         }
     }
     let found = Found {
+        primary: crate::osint::primary_address(&ips, ipv6),
         ips,
         cnames,
         ..Found::default()
@@ -122,13 +125,12 @@ pub(crate) async fn subdomains(cx: &Ctx<'_>) -> Result<StageEnd> {
         ));
     };
     let dns_found = Found::load(&state.db_lock(), task.id, Stage::Dns, target);
-    let primary_address = dns_found
-        .ips
-        .first()
-        .cloned()
-        .unwrap_or_else(|| domain.clone());
-    let (observations, summary) = match crate::osint::run_subdomains(domain, &primary_address).await
-    {
+    let primary_address = dns_found.primary.unwrap_or_else(|| domain.clone());
+    // Decided as for mail-dns: any address of the name that is not public,
+    // or a name only a local network knows.
+    let internal = crate::osint::is_internal_target(domain, &dns_found.ips).await;
+    let ran = crate::osint::run_subdomains(domain, &primary_address, internal).await;
+    let (observations, summary) = match ran {
         Ok(res) => res,
         Err(err) => {
             return Ok(StageEnd::Skipped(format!(
@@ -165,11 +167,7 @@ pub(crate) async fn mail_dns_with(
         ));
     };
     let dns_found = Found::load(&state.db_lock(), task.id, Stage::Dns, target);
-    let primary_address = dns_found
-        .ips
-        .first()
-        .cloned()
-        .unwrap_or_else(|| domain.clone());
+    let primary_address = dns_found.primary.clone().unwrap_or_else(|| domain.clone());
     // The names the certificate logs gave, to see which really resolve.
     let ct_names: Vec<String> = state
         .graph()
@@ -238,10 +236,15 @@ pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {
     let task = cx.task;
     let target = cx.target;
     let same_mode = || cx.same_mode();
-    let Some(resolved_ip) = resolve_target_ips(state, task.id, target)
-        .await
-        .into_iter()
-        .next()
+    // The address the port scan went to, which comes first; for a name it
+    // did not reach, the one it would scan (IPv4 unless `-6`).
+    let ips = resolve_target_ips(state, task.id, target).await;
+    let ipv6 = split_recon_flags(&task.extra_flags).ipv6();
+    let Some(resolved_ip) = ips
+        .iter()
+        .find(|ip| ip.is_ipv6() == ipv6)
+        .or(ips.first())
+        .copied()
     else {
         return Ok(StageEnd::Skipped(
             "no target IP resolved for traceroute".to_owned(),
@@ -279,10 +282,9 @@ pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {
         Some(Ok(res)) => res,
         Some(Err(err)) => return Ok(StageEnd::Skipped(format!("traceroute unavailable: {err}"))),
     };
+    // No hop: the summary says so.
     if observations.is_empty() {
-        return Ok(StageEnd::Skipped(
-            "no intermediate traceroute hops observed".to_owned(),
-        ));
+        return Ok(StageEnd::Skipped(summary));
     }
     let (changed, _) = record(state, observations, None);
     Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))

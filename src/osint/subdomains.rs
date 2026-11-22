@@ -68,18 +68,19 @@ pub fn parse_crtsh_json(json_text: &str, root: &str, limit: usize) -> Result<Vec
 }
 
 /// Queries `https://crt.sh/?q=%25.<root_domain>&output=json` passively.
+/// `internal`: the target is internal (see [`is_internal_target`]), and
+/// nothing about it is sent. What is found is recorded on
+/// `primary_address`.
 pub async fn run_subdomains(
     domain: &str,
     primary_address: &str,
+    internal: bool,
 ) -> Result<(Vec<Observation>, String)> {
     let Some(root) = root_domain(domain) else {
         bail!("'{domain}' has no registrable root domain");
     };
     // A public log knows only public names; an internal one is not sent.
-    let internal_address = primary_address
-        .parse::<IpAddr>()
-        .is_ok_and(is_non_public_ip);
-    if !may_ask_public_services(&root) || internal_address {
+    if internal || !may_ask_public_services(&root) {
         bail!("'{domain}' is an internal name; it is not sent to crt.sh");
     }
     let client = build_http_client(Duration::from_secs(10))?;

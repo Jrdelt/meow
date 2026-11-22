@@ -85,11 +85,14 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
             "no host in the range answered the TCP scan".to_owned(),
         ));
     }
+    // The operator's up check (`-Pn`) and address family (`-6`), as for
+    // the TCP scans.
+    let flags = split_recon_flags(&task.extra_flags);
     let ipv6 = match target {
-        Target::Host(host) => host.ip().is_some_and(|ip| ip.is_ipv6()),
+        Target::Host(host) => host.ip().map_or(flags.ipv6(), |ip| ip.is_ipv6()),
         Target::Network(network) => network.is_ipv6(),
     };
-    let command = udp_command(&settings, &targets, ipv6, &out(".xml"));
+    let command = udp_command(&settings, &targets, &flags.shared, ipv6, &out(".xml"));
     let outcome = cx
         .run_tool(&command, OutputKind::NmapXml, |seen| seen)
         .await;
@@ -104,8 +107,13 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
         remove_regular_file(&command.output);
         bail!(describe_failure(&command.program, &outcome, limits));
     }
-    let (_, mut observations) = read_scan_with_up(&command.output)?;
+    let (answered, mut observations) = read_scan_with_up(&command.output)?;
     Found::of(&observations, target).save(&state.db_lock(), task.id, cx.stage)?;
+    if answered == Some(0) {
+        // No port was scanned: not "no UDP service".
+        let hint = discovery_hint(&task.extra_flags);
+        return Ok(StageEnd::Skipped(hint.trim_start_matches("; ").to_owned()));
+    }
     let (mut open, mut maybe) = (0usize, 0usize);
     let mut notes = Vec::new();
     for observation in &observations {

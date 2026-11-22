@@ -4103,7 +4103,8 @@ mod tests {
             state.touch();
             let (ended, _) = next(patient).await.unwrap();
             assert_eq!(ended["type"], "state");
-            let ports = &ended["state"]["tasks"][0]["stages"][6];
+            let at = queue::STAGES.iter().position(|s| *s == Stage::Ports);
+            let ports = &ended["state"]["tasks"][0]["stages"][at.unwrap()];
             assert_eq!(
                 (&ports["stage"], &ports["status"]),
                 (&json!("ports"), &json!("done"))

@@ -36,7 +36,12 @@ async fn crt_sh_is_not_asked_about_an_internal_name() {
         ("db.acme.corp", "10.0.0.5"),
         ("portal.client.com", "10.0.0.7"),
     ] {
-        let error = format!("{:#}", run_subdomains(domain, address).await.unwrap_err());
+        // How the stage decides.
+        let internal = is_internal_target(domain, &[address.to_owned()]).await;
+        let error = format!(
+            "{:#}",
+            run_subdomains(domain, address, internal).await.unwrap_err()
+        );
         assert!(error.contains("not sent to crt.sh"), "{domain}: {error}");
     }
 }
@@ -908,6 +913,7 @@ async fn an_internal_target_is_never_asked_over_doh() {
         &target,
         stand_in_resolver(vec![server], &doh),
         (vec!["10.0.0.5".to_owned()], Vec::new()),
+        false,
     )
     .await;
     assert_eq!(ips, ["10.0.0.5"]);
@@ -955,6 +961,7 @@ async fn an_internal_target_is_never_asked_over_doh() {
         &public,
         stand_in_resolver(vec![server], &doh),
         (Vec::new(), Vec::new()),
+        false,
     )
     .await;
     assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
@@ -971,6 +978,7 @@ async fn an_address_only_doh_gives_is_reported_and_never_the_target_s() {
         &target,
         stand_in_resolver(vec![server], &doh),
         (Vec::new(), Vec::new()),
+        false,
     )
     .await;
     assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
@@ -1004,6 +1012,7 @@ async fn the_dns_stage_takes_the_addresses_the_system_resolves() {
         &target,
         stand_in_resolver(vec![server], &doh),
         (vec!["192.0.2.10".to_owned()], Vec::new()),
+        false,
     )
     .await;
     assert_eq!(ips, ["192.0.2.10"]);
@@ -1388,6 +1397,7 @@ async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_i
         &Target::parse("intranet.example.org").unwrap(),
         stand_in_resolver(vec![hijack], &doh),
         (vec!["10.0.0.5".to_owned()], Vec::new()),
+        false,
     )
     .await;
     assert!(!format!("{observations:?}").contains("no AAAA record"));
@@ -1452,6 +1462,7 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
         &target,
         stand_in_resolver(vec![failing], &doh),
         (Vec::new(), Vec::new()),
+        false,
     )
     .await;
     assert!(taken(&doh_asked).contains(&"AAAA www.example.org".to_owned()));
@@ -1470,6 +1481,7 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
         &target,
         stand_in_resolver(vec![nodata], &doh),
         (Vec::new(), Vec::new()),
+        false,
     )
     .await;
     assert!(format!("{observations:?}").contains("no AAAA record published"));
@@ -1480,6 +1492,7 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
         &target,
         stand_in_resolver(vec![nodata], &doh),
         internal.clone(),
+        false,
     )
     .await;
     assert!(!format!("{observations:?}").contains("no AAAA record"));
@@ -1492,8 +1505,13 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
         _ => Reply::NoData,
     })
     .await;
-    let (observations, _, _) =
-        run_dns_with(&target, stand_in_resolver(vec![knows], &doh), internal).await;
+    let (observations, _, _) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![knows], &doh),
+        internal,
+        false,
+    )
+    .await;
     assert!(format!("{observations:?}").contains("no AAAA record published"));
     // An address whose PTR lookup failed has not "no PTR record".
     let address = Target::parse("192.0.2.10").unwrap();
@@ -1502,6 +1520,7 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
             &address,
             stand_in_resolver(vec![server], &doh),
             (Vec::new(), Vec::new()),
+            false,
         )
     };
     assert_eq!(ptr(failing).await.2, "PTR lookup failed");
@@ -1652,4 +1671,341 @@ async fn a_probes_program_ends_when_the_session_closes() {
     late.args(["-c", "sleep 300"]);
     configure_osint_command(&mut late);
     assert!(tools.spawn(&mut late).is_err());
+}
+
+/// A shell script in `dir` named `name` that runs `body`.
+#[cfg(unix)]
+fn stand_in(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The process id a stand-in wrote to `file`.
+#[cfg(unix)]
+fn pid_in(file: &std::path::Path) -> libc::pid_t {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no pid in {file:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A program still printing at its deadline: what it printed is kept, but
+/// for the line it had not finished, and it ends with all it started.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_program_cut_off_at_its_deadline_keeps_what_it_printed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = tmp.path().join("pid");
+    let script = stand_in(
+        tmp.path(),
+        "slow",
+        &format!(
+            "printf ' 1  198.51.100.1  0.5 ms\\n 2  198.51.100.2  3.1 ms\\n 3  198.51.1'\n\
+             sleep 300 &\necho $! > '{}'\nwait",
+            pid.display()
+        ),
+    );
+    let tools = Tracker::new();
+    let mut command = tokio::process::Command::new(&script);
+    configure_osint_command(&mut command);
+    let (child, group) = tools.spawn(&mut command).unwrap();
+    let started = std::time::Instant::now();
+    let printed = read_bounded(child, group, 4096, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(printed.timed_out);
+    assert_eq!(
+        printed.text,
+        " 1  198.51.100.1  0.5 ms\n 2  198.51.100.2  3.1 ms\n"
+    );
+    crate::procs::tests::wait_gone(pid_in(&pid));
+    assert_eq!(tools.running(), 0);
+
+    // Past the size cap: whole lines only, and not "timed out".
+    let mut command = tokio::process::Command::new(&script);
+    configure_osint_command(&mut command);
+    let (child, group) = tools.spawn(&mut command).unwrap();
+    let printed = read_bounded(child, group, 30, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(!printed.timed_out);
+    assert_eq!(printed.text, " 1  198.51.100.1  0.5 ms\n");
+
+    // A program that ends: all it printed.
+    let quick = stand_in(tmp.path(), "quick", "printf 'one\\ntwo'");
+    let mut command = tokio::process::Command::new(&quick);
+    configure_osint_command(&mut command);
+    let (child, group) = tools.spawn(&mut command).unwrap();
+    assert_eq!(
+        wait_bounded_stdout(child, group, 4096, Duration::from_secs(10)).await,
+        Some("one\ntwo".to_owned())
+    );
+}
+
+/// The traceroute of the audit: four hops at once, then a silent route
+/// until the tool is stopped. The four hops are the route; no other tool
+/// starts once the time is up.
+#[cfg(unix)]
+#[tokio::test]
+async fn trace_keeps_the_hops_a_stalled_tool_printed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = tmp.path().join("pid");
+    let stalled = stand_in(
+        tmp.path(),
+        "traceroute",
+        &format!(
+            "echo \"traceroute to $9 ($9), 15 hops max, 60 byte packets\"\n\
+             echo ' 1  198.51.100.1  0.512 ms'\necho ' 2  198.51.100.2  3.120 ms'\n\
+             echo ' 3  198.51.100.3  9.870 ms'\necho ' 4  198.51.100.4  12.400 ms'\n\
+             echo ' 5  *'\nsleep 300 &\necho $! > '{}'\nwait",
+            pid.display()
+        ),
+    );
+    let started_file = tmp.path().join("second-started");
+    let second = stand_in(
+        tmp.path(),
+        "tracepath",
+        &format!("touch '{}'", started_file.display()),
+    );
+    let target: IpAddr = "203.0.113.9".parse().unwrap();
+    let commands = trace_commands(&target.to_string());
+    let commands = vec![
+        (stalled, commands[0].1.clone()),
+        (second, commands[1].1.clone()),
+    ];
+    let tools = Tracker::new();
+    let started = std::time::Instant::now();
+    let (observations, summary) = trace_with(
+        &tools,
+        target,
+        Some("192.0.2.1"),
+        &commands,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(summary, "4 intermediate hops");
+    let hops = [
+        "198.51.100.1",
+        "198.51.100.2",
+        "198.51.100.3",
+        "198.51.100.4",
+    ];
+    let text = format!("{observations:?}");
+    match &observations[0] {
+        Observation::HostMeta {
+            address, hops: got, ..
+        } => {
+            assert_eq!(address, "203.0.113.9");
+            assert_eq!(got, &hops);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The target did not answer: no hop, and no time, is made up for it.
+    assert!(
+        text.contains("route path (4 hops, target did not answer"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Target Host") && !text.contains("Hop 6"),
+        "{text}"
+    );
+    crate::procs::tests::wait_gone(pid_in(&pid));
+    assert!(
+        !started_file.exists(),
+        "a second tool ran after the time was up"
+    );
+    assert_eq!(tools.running(), 0);
+}
+
+/// A route the tool gave no hop of is not recorded: not the gateway, not
+/// the target, not a time.
+#[cfg(unix)]
+#[tokio::test]
+async fn trace_without_hops_records_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target: IpAddr = "203.0.113.9".parse().unwrap();
+    let args = trace_commands(&target.to_string())[0].1.clone();
+    let tools = Tracker::new();
+    for (name, body) in [
+        ("silent", "exit 0"),
+        ("filtered", "echo 'traceroute to 203.0.113.9'\necho ' 1  * * *'\necho ' 2  * * *'\necho ' 3  * * *'"),
+        ("unreachable", "echo 'connect: Network is unreachable'\nexit 2"),
+    ] {
+        let program = stand_in(tmp.path(), name, body);
+        let (observations, summary) = trace_with(
+            &tools,
+            target,
+            Some("192.0.2.1"),
+            &[(program, args.clone())],
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(observations.is_empty(), "{name}: {observations:?}");
+        assert_eq!(summary, "traceroute gave no hops", "{name}");
+    }
+    // None installed.
+    let error = trace_with(&tools, target, None, &[], Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("not installed"), "{error:#}");
+}
+
+/// What the tool gave, and nothing else: the target's own time when it
+/// answered, the local router only when it was a hop.
+#[cfg(unix)]
+#[tokio::test]
+async fn trace_records_only_the_hops_the_tool_gave() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target: IpAddr = "203.0.113.9".parse().unwrap();
+    let args = trace_commands(&target.to_string())[0].1.clone();
+    let program = stand_in(
+        tmp.path(),
+        "traceroute",
+        "echo ' 1  198.51.100.1  0.5 ms'\necho ' 2  *'\necho ' 3  203.0.113.9  14.2 ms'",
+    );
+    let tools = Tracker::new();
+    let (observations, summary) = trace_with(
+        &tools,
+        target,
+        Some("192.0.2.1"),
+        &[(program, args)],
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary, "1 intermediate hops");
+    let Observation::Fact { claim, record, .. } = &observations[1] else {
+        panic!("{observations:?}");
+    };
+    assert_eq!(
+        claim,
+        "route path (3 hops (14.2 ms)): 198.51.100.1 -> 203.0.113.9"
+    );
+    assert!(
+        !record.evidence.contains("192.0.2.1"),
+        "{}",
+        record.evidence
+    );
+    assert!(!record.evidence.contains("1.5 ms"), "{}", record.evidence);
+    assert_eq!(
+        record.evidence.matches("Hop ").count(),
+        3,
+        "{}",
+        record.evidence
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_tools_fit_in_the_stage_s_time() {
+    let commands = trace_commands("203.0.113.9");
+    let line = |at: usize| format!("{} {}", commands[at].0, commands[at].1.join(" "));
+    assert_eq!(line(0), "traceroute -n -q 1 -w 1 -m 15 203.0.113.9");
+    assert_eq!(line(1), "tracepath -n -m 15 203.0.113.9");
+    // One 1 s probe a hop; three 1 s tries a hop.
+    assert!(TRACE_TIMEOUT >= Duration::from_secs(15 * 3));
+}
+
+#[cfg(windows)]
+#[test]
+fn tracert_fits_in_the_stage_s_time() {
+    let commands = trace_commands("203.0.113.9");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, "tracert");
+    assert_eq!(
+        commands[0].1,
+        ["-d", "-h", "15", "-w", "500", "203.0.113.9"]
+    );
+    // Three probes of 0.5 s for each of 15 silent hops.
+    assert!(TRACE_TIMEOUT >= Duration::from_millis(15 * 3 * 500));
+}
+
+#[test]
+fn reserved_ipv4_ranges_are_not_public() {
+    for reserved in ["0.1.2.3", "240.0.0.7", "250.1.2.3", "255.255.255.254"] {
+        assert!(is_non_public_ip(reserved.parse().unwrap()), "{reserved}");
+    }
+}
+
+#[tokio::test]
+async fn a_name_with_any_internal_address_is_internal() {
+    // Whatever address comes first.
+    for known in [
+        &["240.0.0.7", "fd00::5"][..],
+        &["fd00::5", "240.0.0.7"],
+        &["2001:db8::7", "10.0.0.5"],
+    ] {
+        let known: Vec<String> = known.iter().map(|ip| (*ip).to_owned()).collect();
+        assert!(
+            is_internal_target("mixed.example.org", &known).await,
+            "{known:?}"
+        );
+    }
+}
+
+/// The address a name's facts go on is the one nmap scans: its first IPv4
+/// address, or with `-6` its first IPv6 one, whatever the text order.
+#[tokio::test]
+async fn the_dns_stage_records_on_the_address_the_scan_goes_to() {
+    let ips = |list: &[&str]| list.iter().map(|ip| (*ip).to_owned()).collect::<Vec<_>>();
+    let dual = ips(&["203.0.113.7", "203.0.113.70", "2001:db8::7", "2001:db8::70"]);
+    assert_eq!(
+        primary_address(&dual, false).as_deref(),
+        Some("203.0.113.7")
+    );
+    assert_eq!(primary_address(&dual, true).as_deref(), Some("2001:db8::7"));
+    let v6_only = ips(&["2001:db8::7"]);
+    assert_eq!(
+        primary_address(&v6_only, false).as_deref(),
+        Some("2001:db8::7")
+    );
+    let v4_only = ips(&["203.0.113.7"]);
+    assert_eq!(
+        primary_address(&v4_only, true).as_deref(),
+        Some("203.0.113.7")
+    );
+    assert_eq!(primary_address(&[], false), None);
+
+    let (server, _) = stand_in_dns(|name, _| match name {
+        "dual.example.org" => Reply::Address([203, 0, 113, 7]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let (doh, _) = stand_in_doh(None).await;
+    let target = Target::parse("dual.example.org").unwrap();
+    for (ipv6, bound) in [(false, "203.0.113.7"), (true, "2001:db8::7")] {
+        let (observations, found, _) = run_dns_with(
+            &target,
+            stand_in_resolver(vec![server], &doh),
+            (ips(&["203.0.113.7"]), ips(&["2001:db8::7"])),
+            ipv6,
+        )
+        .await;
+        // In the system's order.
+        assert_eq!(found, ["203.0.113.7", "2001:db8::7"]);
+        let named: Vec<&str> = observations
+            .iter()
+            .filter_map(|o| match o {
+                Observation::Hostname {
+                    address, hostname, ..
+                } if hostname == "dual.example.org" => Some(address.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [bound], "-6: {ipv6}");
+    }
 }

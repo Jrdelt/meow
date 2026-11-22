@@ -2967,7 +2967,7 @@ mod tests {
             .map(|(id, target, statuses)| (*id, target.as_str(), *statuses))
             .collect();
         let mut message = runs_message(&runs);
-        message["state"]["tasks"][5]["stages"][5]["detail"] = json!("12 hops");
+        message["state"]["tasks"][5]["stages"][5]["detail"] = json!("2 open ports");
         message["state"]["tasks"][5]["stages"][6]["progress"] =
             json!({ "percent": 11, "eta_s": 36, "note": "SYN Stealth Scan" });
         let model = shown(&message);
@@ -2978,8 +2978,8 @@ mod tests {
             rows[..9],
             [
                 "192.0.2.31  -----█>·········· 6/17",
-                "  ports 0:42 · SYN Stealth Scan 11% (36s left)",
-                "    trace: 12 hops",
+                "  trace 0:42 · SYN Stealth Scan 11% (36s left)",
+                "    ports: 2 open ports",
                 "192.0.2.32  ················· 0/17  waiting",
                 "192.0.2.33  ················· 0/17  waiting",
                 "192.0.2.34  ················· 0/17  waiting",
@@ -3001,8 +3001,8 @@ mod tests {
             rows,
             [
                 "192.0.2.31  -----█>·········· 6/17",
-                "  ports 0:42 · SYN Stealth Scan 11% (36s left)",
-                "    trace: 12 hops",
+                "  trace 0:42 · SYN Stealth Scan 11% (36s left)",
+                "    ports: 2 open ports",
                 "192.0.2.32  ················· 0/17  waiting",
                 "192.0.2.33  ················· 0/17  waiting",
                 "+4 more",
@@ -3015,8 +3015,8 @@ mod tests {
             rows,
             [
                 "192.0.2.31  -----█>·········· 6/17",
-                "  ports 0:42 · SYN Stealth Scan 11%",
-                "    trace: 12 hops",
+                "  trace 0:42 · SYN Stealth Scan 11%",
+                "    ports: 2 open ports",
                 "192.0.2.32  ················· 0/17",
                 "  waiting",
                 "+5 more",
@@ -3031,7 +3031,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "192.0.2.31  -----█>·········· 6/17  ports 0:42",
+                "192.0.2.31  -----█>·········· 6/17  trace 0:42",
                 "192.0.2.32  -················ 1/17  dns waiting",
                 "192.0.2.33  ················· 0/17  waiting",
                 "192.0.2.34  ················· 0/17  waiting",
@@ -3044,7 +3044,7 @@ mod tests {
             rows,
             [
                 "192.0.2.31  -----█>·········· 6/17",
-                "  ports 0:42",
+                "  trace 0:42",
                 "192.0.2.32  -················ 1/17",
                 "  dns waiting",
                 "+4 waiting",
@@ -3069,7 +3069,7 @@ mod tests {
             json!({ "started_utc": "2026-11-12T10:00:00Z", "progress": { "done": 3 , "note": "3 results so far" } }),
         );
         let mut model = shown(&message);
-        assert!(screen(&model, 160, 40).contains("ports 0:42 · 3 results so far"));
+        assert!(screen(&model, 160, 40).contains("trace 0:42 · 3 results so far"));
         model.age = Duration::from_secs(3);
         let tick = |running: serde_json::Value| {
             json!({ "type": "progress", "key": "k", "now_utc": "2026-11-12T10:00:50Z",
@@ -3077,11 +3077,11 @@ mod tests {
             .to_string()
         };
         model.apply_message(&tick(json!([
-            { "task": 7, "stage": "ports",
+            { "task": 7, "stage": "trace",
               "progress": { "percent": 40, "eta_s": 30, "note": "SYN Stealth Scan" } },
             // Not a running stage of a task that is shown: ignored.
             { "task": 7, "stage": "lan", "progress": { "percent": 99 } },
-            { "task": 8, "stage": "ports", "progress": { "percent": 98 } },
+            { "task": 8, "stage": "trace", "progress": { "percent": 98 } },
             { "task": 7, "stage": "no-such-stage", "progress": { "percent": 97 } },
             "junk",
         ])));
@@ -3093,7 +3093,7 @@ mod tests {
         );
         let text = screen(&model, 160, 40);
         assert!(
-            text.contains("ports 0:50 · SYN Stealth Scan 40% (30s left)"),
+            text.contains("trace 0:50 · SYN Stealth Scan 40% (30s left)"),
             "{text}"
         );
         assert!(!text.contains("99%") && !text.contains("98%") && !text.contains("97%"));
@@ -3102,11 +3102,11 @@ mod tests {
         // A stage the message no longer names says nothing any more.
         model.apply_message(&tick(json!([])));
         let text = screen(&model, 160, 40);
-        assert!(text.contains(" 6/17  ports 0:50  "), "{text}");
+        assert!(text.contains(" 6/17  trace 0:50  "), "{text}");
         // What is not a list changes nothing but the clock; no state yet,
         // nothing at all.
         model.apply_message(&tick(json!("all of them")));
-        assert!(screen(&model, 160, 40).contains(" 6/17  ports 0:50  "));
+        assert!(screen(&model, 160, 40).contains(" 6/17  trace 0:50  "));
         let mut empty = Model::new(true);
         empty.apply_message(&tick(json!([])));
         assert!(empty.snapshot.is_none());
@@ -3177,7 +3177,7 @@ mod tests {
         let wide = screen(&model, 200, 40);
         assert!(
             wide.contains(
-                "192.0.2.5  ██-█x█>·········· 6/17  ports 0:42 · SYN Stealth Scan 12% (56s left)"
+                "192.0.2.5  ██-█x█>·········· 6/17  trace 0:42 · SYN Stealth Scan 12% (56s left)"
             ),
             "{wide}"
         );
@@ -3185,7 +3185,7 @@ mod tests {
         let wide = screen(&model, 160, 40);
         for expected in [
             "│192.0.2.5  ██-█x█>·········· 6/17 ",
-            "│  ports 0:42 · SYN Stealth Scan 12% (56s left) ",
+            "│  trace 0:42 · SYN Stealth Scan 12% (56s left) ",
         ] {
             assert!(wide.contains(expected), "missing {expected:?} in:\n{wide}");
         }
@@ -3193,7 +3193,7 @@ mod tests {
         let narrow = screen(&model, 80, 24);
         for expected in [
             "│192.0.2.5  ██-█x█>·········· 6/17 ",
-            "│  ports 0:42 · SYN Stealth Scan 12% ",
+            "│  trace 0:42 · SYN Stealth Scan 12% ",
         ] {
             assert!(
                 narrow.contains(expected),
@@ -3206,7 +3206,7 @@ mod tests {
         model.age = Duration::from_millis(300);
         let ahead = screen(&model, 160, 40);
         assert!(
-            ahead.contains("ports 0:43 · SYN Stealth Scan 12% (56s left)"),
+            ahead.contains("trace 0:43 · SYN Stealth Scan 12% (56s left)"),
             "{ahead}"
         );
         model.lead = Duration::ZERO;
@@ -3214,40 +3214,40 @@ mod tests {
         model.age = Duration::from_secs(5);
         let later = screen(&model, 160, 40);
         assert!(
-            later.contains("ports 0:47 · SYN Stealth Scan 12% (51s left)"),
+            later.contains("trace 0:47 · SYN Stealth Scan 12% (51s left)"),
             "{later}"
         );
         model.age = Duration::from_secs(3600);
         let late = screen(&model, 160, 40);
         assert!(
-            late.contains("6/17  ports 1:00:42 · SYN Stealth Scan 12%  "),
+            late.contains("6/17  trace 1:00:42 · SYN Stealth Scan 12%  "),
             "{late}"
         );
         assert!(!late.contains("left)"), "{late}");
 
         // Items instead of a percent, both, or only what the tool says.
         for (progress, expected) in [
-            (json!({ "done": 3, "total": 9 }), "ports 3/9 0:42  "),
+            (json!({ "done": 3, "total": 9 }), "trace 3/9 0:42  "),
             (
                 json!({ "done": 1, "total": 4, "percent": 100, "eta_s": 7200 }),
-                "ports 1/4 0:42 · 100% (2h00m left)",
+                "trace 1/4 0:42 · 100% (2h00m left)",
             ),
             // The scan a percent is of is named with it.
             (
                 json!({ "done": 1, "total": 4, "percent": 37, "eta_s": 44, "note": "Service scan" }),
-                "ports 1/4 0:42 · Service scan 37% (44s left)",
+                "trace 1/4 0:42 · Service scan 37% (44s left)",
             ),
             // A count of items says what it counts: no words with it.
             (
                 json!({ "done": 3, "total": 9, "note": "hosts" }),
-                "ports 3/9 0:42  ",
+                "trace 3/9 0:42  ",
             ),
             (
                 json!({ "done": 412, "note": "412 results so far" }),
-                "ports 0:42 · 412 results so far  ",
+                "trace 0:42 · 412 results so far  ",
             ),
-            (json!({ "eta_s": 90 }), "ports 0:42 (2m left)"),
-            (json!({}), "ports 0:42  "),
+            (json!({ "eta_s": 90 }), "trace 0:42 (2m left)"),
+            (json!({}), "trace 0:42  "),
         ] {
             let message = recon_message(
                 &SEVENTEEN,
@@ -3263,11 +3263,11 @@ mod tests {
             json!({ "started_utc": "2026-11-12T10:00:00Z\u{1b}[2J" }),
         ] {
             let text = screen(&shown(&recon_message(&SEVENTEEN, running)), 160, 40);
-            assert!(text.contains(" 6/17  ports  "), "{text}");
+            assert!(text.contains(" 6/17  trace  "), "{text}");
         }
         // A start after the session's own clock counts as now.
         let ahead = recon_message(&SEVENTEEN, json!({ "started_utc": "2026-11-12T10:05:00Z" }));
-        assert!(screen(&shown(&ahead), 160, 40).contains(" 6/17  ports 0:00  "));
+        assert!(screen(&shown(&ahead), 160, 40).contains(" 6/17  trace 0:00  "));
     }
 
     #[test]
@@ -3278,7 +3278,7 @@ mod tests {
                 "progress": { "percent": 75, "eta_s": 50 } }),
         );
         let mut model = shown(&message);
-        assert!(screen(&model, 160, 40).contains("ports 0:42 · 75% (50s left)"));
+        assert!(screen(&model, 160, 40).contains("trace 0:42 · 75% (50s left)"));
         model.age = Duration::from_secs(9);
 
         model.session_ended();
@@ -3286,7 +3286,7 @@ mod tests {
         let text = screen(&model, 160, 40);
         for expected in [
             " =^..^= acme · mild · session ended · ",
-            "192.0.2.5  ██-█x█!---------- 6/17  ports stopped",
+            "192.0.2.5  ██-█x█!---------- 6/17  trace stopped",
             "    session ended",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -3370,7 +3370,7 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let text = screen(&model, 160, 40);
         assert!(
-            text.contains("192.0.2.5  ██-█x█!·········· 6/17  ports stopped"),
+            text.contains("192.0.2.5  ██-█x█!·········· 6/17  trace stopped"),
             "{text}"
         );
         let row = text
@@ -3451,7 +3451,7 @@ mod tests {
             (2, "turned off in config.toml (recon.skip)"),
             (3, "4 open ports"),
             (4, "no route"),
-            (5, "12 hops"),
+            (5, "2 open ports"),
         ];
         for (index, detail) in details {
             message["state"]["tasks"][0]["stages"][index]["detail"] = json!(detail);
@@ -3463,7 +3463,7 @@ mod tests {
         // result.
         let text = screen(&shown(&message), 160, 40);
         assert!(text.contains("  mail-dns failed: no route"), "{text}");
-        assert!(!text.contains("trace: 12 hops"), "{text}");
+        assert!(!text.contains("ports: 2 open ports"), "{text}");
         set(&mut message, 4, "detail", "");
         let text = screen(&shown(&message), 160, 40);
         assert!(text.contains("  mail-dns failed  "), "{text}");
@@ -3476,20 +3476,20 @@ mod tests {
         set(&mut message, 3, "status", "done");
         set(&mut message, 4, "status", "done");
         let text = screen(&shown(&message), 160, 40);
-        assert!(text.contains("  trace: 12 hops"), "{text}");
+        assert!(text.contains("  ports: 2 open ports"), "{text}");
         // A stage left out after the last result does not take its place.
         set(&mut message, 5, "status", "skipped");
         set(&mut message, 5, "detail", "turned off");
         let text = screen(&shown(&message), 160, 40);
         assert!(text.contains("  subdomains: 4 open ports"), "{text}");
-        assert!(!text.contains("trace: turned off"), "{text}");
+        assert!(!text.contains("ports: turned off"), "{text}");
         // Where every stage with something to say was left out, the last
         // of them says why.
         for index in [0, 3] {
             set(&mut message, index, "detail", "");
         }
         let text = screen(&shown(&message), 160, 40);
-        assert!(text.contains("  trace: turned off"), "{text}");
+        assert!(text.contains("  ports: turned off"), "{text}");
     }
 
     #[test]
@@ -3528,14 +3528,14 @@ mod tests {
         };
         assert_eq!(
             plain(task_lines(&run(task, 0), &clock, 21)),
-            ["192.0.2.5  6/17", "  ports 0:42 · 12%"]
+            ["192.0.2.5  6/17", "  trace 0:42 · 12%"]
         );
         assert_eq!(
             plain(task_lines(&run(task, 2), &clock, 38)),
             [
                 "192.0.2.5 (+2 earlier)",
                 "  ██-█x█>·········· 6/17",
-                "  ports 0:42 · 12% (56s left)"
+                "  trace 0:42 · 12% (56s left)"
             ]
         );
         // No room at all: the time, whole.
@@ -3557,21 +3557,21 @@ mod tests {
             plain(task_lines(&run(wordy_task, 0), &clock, 38)),
             [
                 "192.0.2.5  ██-█x█>·········· 6/17",
-                "  ports 0:42 · site 1 of 3, 3 results…"
+                "  trace 0:42 · site 1 of 3, 3 results…"
             ]
         );
         let last = |width: usize| plain(task_lines(&run(wordy_task, 0), &clock, width)).pop();
         assert_eq!(
             last(44).as_deref(),
-            Some("  ports 0:42 · site 1 of 3, 3 results so far")
+            Some("  trace 0:42 · site 1 of 3, 3 results so far")
         );
-        assert_eq!(last(19).as_deref(), Some("  ports 0:42 · sit…"));
+        assert_eq!(last(19).as_deref(), Some("  trace 0:42 · sit…"));
         // No room for even a few letters: the name and the clock.
         assert_eq!(
             plain(task_lines(&run(wordy_task, 0), &clock, 16)),
-            ["192.0.2.5  6/17", "  ports 0:42"]
+            ["192.0.2.5  6/17", "  trace 0:42"]
         );
-        assert_eq!(last(12).as_deref(), Some("  ports 0:42"));
+        assert_eq!(last(12).as_deref(), Some("  trace 0:42"));
         assert_eq!(last(11).as_deref(), Some("  0:42"));
         assert_eq!(fit("résultats so far", 9), "résultat…");
         assert_eq!(fit("so far", 6), "so far");
@@ -3583,15 +3583,15 @@ mod tests {
         let last = |width: usize| plain(task_lines(&run(both_task, 0), &clock, width)).pop();
         assert_eq!(
             last(55).as_deref(),
-            Some("  ports 0:42 · site 1 of 3, 3 results so far (10m left)")
+            Some("  trace 0:42 · site 1 of 3, 3 results so far (10m left)")
         );
         assert_eq!(
             last(54).as_deref(),
-            Some("  ports 0:42 · site 1 of 3, 3 results so far")
+            Some("  trace 0:42 · site 1 of 3, 3 results so far")
         );
         assert_eq!(
             last(40).as_deref(),
-            Some("  ports 0:42 · site 1 of 3, 3 results s…")
+            Some("  trace 0:42 · site 1 of 3, 3 results s…")
         );
 
         // A long-running stage with every figure, in panels from 40
@@ -3626,13 +3626,13 @@ mod tests {
                 last(51)
             ],
             [
-                "  ports 1:02:03",
-                "  ports 1:02:03 · 42%",
-                "  ports 1:02:03 · Ser… 42%",
-                "  ports 1:02:03 · Service… 42%",
-                "  ports 1:02:03 · Service scan 42%",
-                "  ports 1/4 1:02:03 · Service scan 42%",
-                "  ports 1/4 1:02:03 · Service scan 42% (1h05m left)",
+                "  trace 1:02:03",
+                "  trace 1:02:03 · 42%",
+                "  trace 1:02:03 · Ser… 42%",
+                "  trace 1:02:03 · Service… 42%",
+                "  trace 1:02:03 · Service scan 42%",
+                "  trace 1/4 1:02:03 · Service scan 42%",
+                "  trace 1/4 1:02:03 · Service scan 42% (1h05m left)",
             ]
         );
 
@@ -3647,8 +3647,8 @@ mod tests {
         );
         let text = screen(&shown(&hostile), 160, 40);
         assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text}");
-        assert!(text.contains("ports 0:42 · [2Jresults so far"), "{text}");
-        assert!(text.contains("  ports: note]52;c;x"), "{text}");
+        assert!(text.contains("trace 0:42 · [2Jresults so far"), "{text}");
+        assert!(text.contains("  trace: note]52;c;x"), "{text}");
 
         assert_eq!(clock_time(Duration::from_secs(59)), "0:59");
         assert_eq!(clock_time(Duration::from_secs(3723)), "1:02:03");

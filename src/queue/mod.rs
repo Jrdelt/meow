@@ -1,7 +1,7 @@
 //! The background recon queue.
 //!
 //! `meow recon <target>` queues one task of 17 sequential stages (`lan`, `dns`,
-//! `asn`, `subdomains`, `mail-dns`, `trace`, `ports`, `udp`, `services`, `headers`,
+//! `asn`, `subdomains`, `mail-dns`, `ports`, `trace`, `udp`, `services`, `headers`,
 //! `waf-cdn`, `tls-audit`, `ssh-audit`, `cves`, `crawl`, `js`, `dirs`) that run strictly one at
 //! a time. External tools (`nmap`, `katana`, `feroxbuster`, `traceroute`,
 //! `openssl`) run with `stdin` closed, under a wall-clock timeout and an output
@@ -65,8 +65,9 @@ pub const STAGES: [Stage; 17] = [
     Stage::Asn,
     Stage::Subdomains,
     Stage::MailDns,
-    Stage::Trace,
     Stage::Ports,
+    // After the port inventory: the route to the address it scanned.
+    Stage::Trace,
     Stage::Udp,
     Stage::Services,
     Stage::Headers,
@@ -916,9 +917,14 @@ pub struct Found {
     /// Open UDP ports: (address, port).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub udp: Vec<(String, u16)>,
-    /// Resolved IP addresses from the `dns` stage.
+    /// Resolved IP addresses from the `dns` stage, in the system's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ips: Vec<String>,
+    /// Of `ips`, the one the port scan goes to (see
+    /// [`crate::osint::primary_address`]): where the stages record what
+    /// they find about the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
     /// CNAME targets from the `dns` stage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cnames: Vec<String>,
@@ -1074,10 +1080,15 @@ impl Found {
         self.udp.sort_unstable();
         self.udp.dedup();
         self.udp.truncate(MAX_FOUND);
-        self.ips.retain(|ip| Self::belongs(ip, target));
-        self.ips.sort_unstable();
-        self.ips.dedup();
-        self.ips.truncate(MAX_FOUND);
+        // In the order found: the first of a family is the one scanned.
+        let mut ips: Vec<String> = Vec::new();
+        for ip in std::mem::take(&mut self.ips) {
+            if Self::belongs(&ip, target) && !ips.contains(&ip) && ips.len() < MAX_FOUND {
+                ips.push(ip);
+            }
+        }
+        self.ips = ips;
+        self.primary = self.primary.take().filter(|ip| self.ips.contains(ip));
         self.cnames.retain(|c| HostAddr::parse(c).is_some());
         self.cnames.sort_unstable();
         self.cnames.dedup();
@@ -1294,8 +1305,13 @@ async fn resolve_target_ips(state: &State, task_id: i64, target: &Target) -> Vec
         }
         _ => Vec::new(),
     };
+    // Then the address the scan goes to, then the name's other addresses.
     let dns_found = Found::load(&state.db_lock(), task_id, Stage::Dns, target);
-    for ip_str in scanned.iter().chain(&dns_found.ips) {
+    for ip_str in scanned
+        .iter()
+        .chain(&dns_found.primary)
+        .chain(&dns_found.ips)
+    {
         if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
             if !ips.contains(&ip) {
                 ips.push(ip);
@@ -1529,13 +1545,15 @@ async fn run_task(state: &Arc<State>, id: i64) -> Result<()> {
                     stage.as_str()
                 ));
                 if stage == Stage::Ports {
-                    // Nothing to build on: the later stages cannot run.
+                    // Nothing to build on: the later stages cannot run,
+                    // but for the route, which needs no inventory.
                     if let Some(pos) = STAGES.iter().position(|s| *s == Stage::Ports) {
                         for later in &STAGES[pos + 1..] {
-                            update(*later, "skipped", "the port inventory failed")?;
+                            if *later != Stage::Trace {
+                                update(*later, "skipped", "the port inventory failed")?;
+                            }
                         }
                     }
-                    return Ok(());
                 }
             }
         }
