@@ -13,6 +13,10 @@ build = "build.rs"
 name = "meow"
 path = "src/main.rs"
 
+# A workspace of its own: cargo takes no Cargo.toml, Cargo.lock or [patch]
+# from a folder above the checkout.
+[workspace]
+
 # Crates are added in the step that first uses them.
 [dependencies]
 anyhow = "1"

@@ -3,7 +3,8 @@
 .SYNOPSIS
     Checks the downloads in install.ps1 on Windows: HTTPS only, size limits
     that hold, and no partial file left behind when a download fails. Also
-    its check of who may change the Cargo settings above it (Test-OwnPath).
+    its check of who may change the Cargo settings above it (Test-OwnPath,
+    Get-CargoSettingProblem).
 
 .DESCRIPTION
     The installer is never run. Only the functions and constants these checks
@@ -197,7 +198,7 @@ try {
 
     # The installer's own functions. Its Invoke-SafeDownload is loaded as
     # Invoke-InstallerDownload; the stand-in above takes its name.
-    foreach ($Name in @('Test-IsReparsePoint', 'Get-GeoFile', 'Test-OwnPath')) {
+    foreach ($Name in @('Test-IsReparsePoint', 'Get-GeoFile', 'Test-OwnPath', 'Get-CargoSettingProblem')) {
         . ([ScriptBlock]::Create((Get-InstallerFunction $Name).Extent.Text))
     }
     $Download = Get-InstallerFunction 'Invoke-SafeDownload'
@@ -308,6 +309,48 @@ try {
         Fail 'Test-OwnPath counts a file it cannot read as its own'
     } else {
         Pass 'Test-OwnPath does not count a file it cannot read as its own'
+    }
+
+    # A .cargo the user keeps on another disk through a junction of their
+    # own is taken while what it leads to is theirs alone; any other link,
+    # and one that leads nowhere, is not.
+    $UserDir = New-CheckFolder 'profile'
+    $CargoHome = New-CheckFolder 'cargo-home'
+    New-Item -ItemType Junction -Path (Join-Path $UserDir '.cargo') -Target $CargoHome | Out-Null
+    $Problem = Get-CargoSettingProblem $UserDir '.cargo'
+    if ($null -eq $Problem) {
+        Pass 'a .cargo junction to a folder of the user''s own is taken'
+    } else {
+        Fail "a .cargo junction to a folder of the user's own is refused: $Problem"
+    }
+    if ($null -eq (Get-CargoSettingProblem $UserDir 'rust-toolchain.toml')) {
+        Pass 'nothing is wrong with settings that are not there'
+    } else {
+        Fail 'settings that are not there are refused'
+    }
+    $Acl = Get-Acl -LiteralPath $CargoHome
+    $Acl.AddAccessRule($Rule)
+    Set-Acl -LiteralPath $CargoHome -AclObject $Acl
+    $Problem = Get-CargoSettingProblem $UserDir '.cargo'
+    if (($null -ne $Problem) -and ($Problem -match '^leads to ')) {
+        Pass "a .cargo junction to a folder every account may change is refused: $Problem"
+    } else {
+        Fail "a .cargo junction to a folder every account may change is not refused: $Problem"
+    }
+    New-Item -ItemType Junction -Path (Join-Path $UserDir 'rust-toolchain') -Target $CargoHome | Out-Null
+    if ((Get-CargoSettingProblem $UserDir 'rust-toolchain') -eq 'is a link') {
+        Pass 'a rust-toolchain link is refused'
+    } else {
+        Fail 'a rust-toolchain link is not refused'
+    }
+    $Gone = New-CheckFolder 'gone'
+    $Dangling = New-CheckFolder 'dangling'
+    New-Item -ItemType Junction -Path (Join-Path $Dangling '.cargo') -Target $Gone | Out-Null
+    [System.IO.Directory]::Delete($Gone)
+    if ((Get-CargoSettingProblem $Dangling '.cargo') -eq 'is a link that leads nowhere') {
+        Pass 'a .cargo junction that leads nowhere is refused'
+    } else {
+        Fail 'a .cargo junction that leads nowhere is not refused'
     }
 
     # Only HTTPS is fetched; nothing is requested or written for another scheme.

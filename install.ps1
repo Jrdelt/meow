@@ -104,6 +104,46 @@ function Test-OwnPath([string]$Path) {
     }
 }
 
+# What is wrong with the Cargo or rustup settings $Name in $Dir, or $null
+# (also when there is nothing there). A .cargo folder may be a link (a
+# junction, say) to keep it on another disk: one in a folder only this
+# user can change, to a folder of the user's own.
+function Get-CargoSettingProblem([string]$Dir, [string]$Name) {
+    $Path = [System.IO.Path]::Combine($Dir, $Name)
+    try {
+        # Read from the item itself: a link, even one that leads nowhere.
+        $Attributes = [System.IO.File]::GetAttributes($Path)
+    } catch {
+        return $null
+    }
+    if (-not [bool]($Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        if (Test-OwnPath $Path) {
+            return $null
+        }
+        return 'can be changed by another account'
+    }
+    if (($Name -ne '.cargo') -or -not (Test-OwnPath $Dir)) {
+        return 'is a link'
+    }
+    $Target = $null
+    try {
+        $Target = @((Get-Item -LiteralPath $Path -Force).Target)[0]
+    } catch {
+        $Target = $null
+    }
+    if ($Target -and -not [System.IO.Path]::IsPathRooted($Target)) {
+        $Target = [System.IO.Path]::Combine($Dir, $Target)
+    }
+    if ((-not $Target) -or -not (Test-Path -LiteralPath $Target)) {
+        return 'is a link that leads nowhere'
+    }
+    # Get-Acl may read the link or what it leads to: both must pass.
+    if ((Test-OwnPath $Path) -and (Test-OwnPath $Target)) {
+        return $null
+    }
+    return "leads to $Target, which another account can change"
+}
+
 # Cargo and rustup take settings, which can name programs to run, from
 # .cargo\config.toml and rust-toolchain.toml here and in every folder above,
 # and any account may make a folder in C:\. Stop if another account owns or
@@ -112,10 +152,9 @@ function Assert-OwnCargoSettings {
     $Dir = (Get-Location).ProviderPath
     while ($Dir) {
         foreach ($Name in @('.cargo', '.cargo\config', '.cargo\config.toml', 'rust-toolchain', 'rust-toolchain.toml')) {
-            $Candidate = [System.IO.Path]::Combine($Dir, $Name)
-            if ((Test-Path -LiteralPath $Candidate) -and
-                ((Test-IsReparsePoint $Candidate) -or -not (Test-OwnPath $Candidate))) {
-                Die "$Candidate can be changed by another account, and cargo would obey it. Have it removed, then run this again."
+            $Problem = Get-CargoSettingProblem $Dir $Name
+            if ($Problem) {
+                Die "$([System.IO.Path]::Combine($Dir, $Name)) $Problem, and cargo would use it."
             }
         }
         $Dir = [System.IO.Path]::GetDirectoryName($Dir)

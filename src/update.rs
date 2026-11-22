@@ -165,7 +165,8 @@ fn not_own(path: &Path, meta: &std::fs::Metadata) -> Option<&'static str> {
 const USE_OWN_CHECKOUT: &str = "Update from a meow folder of your own \
      (clone it again and run ./install.sh there), or pass --source <folder>";
 #[cfg(windows)]
-const USE_OWN_CHECKOUT: &str = "Clone meow into your own user folder and update from there";
+const USE_OWN_CHECKOUT: &str =
+    "Clone meow into your user folder and run .\\install.ps1 there, or pass --source <folder>";
 
 /// git, and then the folder's installer, are run in `dir`: it must be this
 /// user's own. A folder (or any file git tracks in it, or what git keeps
@@ -333,43 +334,115 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
     // the user's own private `~/.cargo/config.toml`, but refuse any parent
     // override file owned or writable by another account, and a `.cargo`
     // folder another account could put one in. On Windows any account may
-    // make `C:\.cargo`.
+    // make `C:\.cargo`. A checkout whose manifest is no workspace of its
+    // own would also take a `Cargo.toml` (its `[patch]`) and `Cargo.lock`
+    // from above.
     #[cfg(any(unix, windows))]
-    for ancestor in dir.ancestors().skip(1) {
-        for rel in std::iter::once(".cargo").chain(OVERRIDES) {
-            let candidate = ancestor.join(rel);
-            let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
-                continue;
-            };
-            if untrusted_override(&candidate, &meta) {
-                bail!(
-                    "refusing to build {safe_dir}: untrusted parent override {}",
-                    sanitize(&candidate.display().to_string(), 400)
-                );
+    {
+        let manifests: &[&str] = if is_own_workspace(dir) {
+            &[]
+        } else {
+            &["Cargo.toml", "Cargo.lock"]
+        };
+        for ancestor in dir.ancestors().skip(1) {
+            for &rel in [".cargo"].iter().chain(&OVERRIDES).chain(manifests) {
+                let candidate = ancestor.join(rel);
+                let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+                    continue;
+                };
+                if let Some(problem) = untrusted_override(&candidate, &meta, rel == ".cargo") {
+                    bail!(
+                        "refusing to build {safe_dir}: {} {problem}, and cargo would use it",
+                        sanitize(&candidate.display().to_string(), 400)
+                    );
+                }
             }
         }
     }
     Ok(())
 }
 
-/// Whether cargo or rustup must not take settings from `path`, above the
-/// checkout: a link, or what an account other than this user or root
-/// owns or can change.
+/// Whether the checkout's `Cargo.toml` makes it a workspace of its own,
+/// so cargo looks for no manifest above it.
+#[cfg(any(unix, windows))]
+fn is_own_workspace(dir: &Path) -> bool {
+    read_manifest_bounded(&dir.join("Cargo.toml"))
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .is_some_and(|manifest| manifest.contains_key("workspace"))
+}
+
+/// Why cargo or rustup must not take settings from `path`, above the
+/// checkout, if they must not: a link, or what an account other than
+/// this user (or root, SYSTEM, Administrators) owns or can change. A
+/// `.cargo` folder (`cargo_dir`) may be a link the user keeps on another
+/// disk: one of the user's own, to a folder that passes.
+#[cfg(any(unix, windows))]
+fn untrusted_override(path: &Path, meta: &std::fs::Metadata, cargo_dir: bool) -> Option<String> {
+    if !(cargo_dir && meta.file_type().is_symlink()) {
+        return override_problem(path, meta).map(str::to_owned);
+    }
+    if let Some(problem) = link_problem(path, meta) {
+        return Some(problem.to_owned());
+    }
+    let Some((target, target_meta)) = std::fs::canonicalize(path).ok().and_then(|target| {
+        let meta = std::fs::symlink_metadata(&target).ok()?;
+        Some((target, meta))
+    }) else {
+        return Some("is a link that leads nowhere".to_owned());
+    };
+    let problem = override_problem(&target, &target_meta)?;
+    Some(format!(
+        "leads to {}, which {problem}",
+        sanitize(&git_path(&target).display().to_string(), 400)
+    ))
+}
+
+/// What keeps `path` from being a place cargo may take settings from: a
+/// link, another account's (root's is fine), or one others can change.
 #[cfg(unix)]
-fn untrusted_override(path: &Path, meta: &std::fs::Metadata) -> bool {
+fn override_problem(path: &Path, meta: &std::fs::Metadata) -> Option<&'static str> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: this call has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    meta.file_type().is_symlink()
-        || (meta.uid() != me && meta.uid() != 0)
-        || crate::perms::others_can_change(path, meta)
+    if meta.file_type().is_symlink() {
+        Some("is a symbolic link")
+    } else if meta.uid() != me && meta.uid() != 0 {
+        Some("belongs to another user")
+    } else if crate::perms::others_can_change(path, meta) {
+        Some("can be changed by other users")
+    } else {
+        None
+    }
 }
 
-/// [`untrusted_override`] on Windows: SYSTEM, Administrators and
+/// [`override_problem`] on Windows: SYSTEM, Administrators and
 /// TrustedInstaller count as the user ([`not_own`]).
 #[cfg(windows)]
-fn untrusted_override(path: &Path, meta: &std::fs::Metadata) -> bool {
-    not_own(path, meta).is_some()
+fn override_problem(path: &Path, meta: &std::fs::Metadata) -> Option<&'static str> {
+    not_own(path, meta)
+}
+
+/// What keeps the link `path` itself from being the user's own. Nobody
+/// can change where a link points on Unix, only replace the link.
+#[cfg(unix)]
+fn link_problem(_path: &Path, meta: &std::fs::Metadata) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: this call has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    (meta.uid() != me && meta.uid() != 0).then_some("is a link that belongs to another user")
+}
+
+/// [`link_problem`] on Windows, read from the link's own owner and access
+/// list: whoever may change a link (a junction too) may point it elsewhere.
+#[cfg(windows)]
+fn link_problem(path: &Path, _meta: &std::fs::Metadata) -> Option<&'static str> {
+    use crate::perms::Foreign;
+    match crate::perms::foreign(path) {
+        Ok(None) => None,
+        Ok(Some(Foreign::Owner)) => Some("is a link that belongs to another account"),
+        Ok(Some(Foreign::Writable)) => Some("is a link other accounts can change"),
+        Err(_) => Some("is a link that cannot be checked"),
+    }
 }
 
 #[cfg(unix)]
@@ -2792,11 +2865,126 @@ mod tests {
         for (path, mode, back) in [(&config, 0o666, 0o644), (&cargo, 0o777, 0o755)] {
             set_mode(path, mode);
             let err = audit_untracked_build_overrides(&clone).unwrap_err();
-            let expected = format!("untrusted parent override {}", path.display());
+            let expected = format!("{} can be changed by other users", path.display());
             assert!(format!("{err:#}").contains(&expected), "{err:#}");
             set_mode(path, back);
         }
         audit_untracked_build_overrides(&clone).unwrap();
+    }
+
+    /// Review (SUP-V2): a `~/.cargo` the user keeps on another disk
+    /// through a link of their own stopped every update. Such a link is
+    /// taken when what it leads to passes; the settings in it, a link
+    /// another user owns, and a link that leads nowhere are still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_folder_the_user_links_elsewhere_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("home").join("meow");
+        std::fs::create_dir_all(&clone).unwrap();
+        let target = tmp.path().join("disk").join("cargo-home");
+        std::fs::create_dir_all(&target).unwrap();
+        let config = target.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(&target, 0o755);
+        set_mode(&config, 0o644);
+        let link = tmp.path().join("home").join(".cargo");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        audit_untracked_build_overrides(&clone).unwrap();
+        let refused = |expected: &str| {
+            let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
+            assert!(said.contains(expected), "{said}");
+        };
+        // What the link leads to, and the settings in it.
+        set_mode(&target, 0o777);
+        let real = std::fs::canonicalize(&target).unwrap();
+        refused(&format!(
+            "{} leads to {}, which can be changed by other users",
+            link.display(),
+            real.display()
+        ));
+        set_mode(&target, 0o755);
+        set_mode(&config, 0o666);
+        refused(&format!(
+            "{} can be changed by other users",
+            link.join("config.toml").display()
+        ));
+        set_mode(&config, 0o644);
+        audit_untracked_build_overrides(&clone).unwrap();
+        // Only the `.cargo` folder may be a link.
+        let elsewhere = tmp.path().join("disk").join("config.toml");
+        std::fs::write(&elsewhere, "").unwrap();
+        std::fs::remove_file(&config).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
+        refused(&format!(
+            "{} is a symbolic link",
+            link.join("config.toml").display()
+        ));
+        std::fs::remove_file(&config).unwrap();
+        audit_untracked_build_overrides(&clone).unwrap();
+        // A link another user owns (root may make one here).
+        // SAFETY: this call has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a plain system call on a valid C string.
+            assert_eq!(unsafe { libc::lchown(path.as_ptr(), 4242, 4242) }, 0);
+            refused(&format!(
+                "{} is a link that belongs to another user",
+                link.display()
+            ));
+        }
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &link).unwrap();
+        refused(&format!("{} is a link that leads nowhere", link.display()));
+    }
+
+    /// Review (SUP-V2): cargo took the workspace, its `[patch]` and its
+    /// `Cargo.lock` from a `Cargo.toml` above a checkout whose manifest
+    /// has no `[workspace]`. meow's own manifest has one; for one without,
+    /// a manifest above that another user can change is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_above_counts_only_for_a_checkout_without_its_own_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(is_own_workspace(Path::new(env!("CARGO_MANIFEST_DIR"))));
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("shared").join("meow");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::write(clone.join("Cargo.toml"), "[package]\nname = \"meow\"\n").unwrap();
+        assert!(!is_own_workspace(&clone));
+        for name in ["Cargo.toml", "Cargo.lock"] {
+            let above = tmp.path().join("shared").join(name);
+            std::fs::write(&above, "[workspace]\nmembers = [\"meow\"]\n").unwrap();
+            std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o644)).unwrap();
+            audit_untracked_build_overrides(&clone).unwrap();
+            std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o666)).unwrap();
+            let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
+            let expected = format!("{} can be changed by other users", above.display());
+            assert!(said.contains(&expected), "{said}");
+            std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let above = tmp.path().join("shared").join("Cargo.toml");
+        std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::fs::write(
+            clone.join("Cargo.toml"),
+            "[package]\nname = \"meow\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        assert!(is_own_workspace(&clone));
+        audit_untracked_build_overrides(&clone).unwrap();
+    }
+
+    /// meow's manifest is a workspace of its own, so cargo takes no
+    /// `Cargo.toml`, `Cargo.lock` or `[patch]` from a folder above.
+    #[test]
+    fn meows_manifest_is_a_workspace_of_its_own() {
+        let manifest: toml::Table = toml::from_str(include_str!("../Cargo.toml")).unwrap();
+        assert!(manifest.contains_key("workspace"));
     }
 
     /// Runs icacls (`System32`) on `path` with `args`.
@@ -2857,7 +3045,7 @@ mod tests {
             let expected = format!("{} can be changed by other accounts", path.display());
             assert!(said.contains(&expected), "{said}");
             assert!(
-                said.contains("Clone meow into your own user folder"),
+                said.contains("Clone meow into your user folder and run .\\install.ps1 there"),
                 "{said}"
             );
         };
@@ -2894,10 +3082,44 @@ mod tests {
         for path in [&config, &cargo] {
             icacls(path, &["/grant", "*S-1-5-11:(M)"]);
             let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
-            let expected = format!("untrusted parent override {}", path.display());
+            let expected = format!("{} can be changed by other accounts", path.display());
             assert!(said.contains(&expected), "{said}");
             icacls(path, &["/remove:g", "*S-1-5-11"]);
         }
+        audit_untracked_build_overrides(&clone).unwrap();
+    }
+
+    /// Review (SUP-V2): a `.cargo` the user keeps on another disk through
+    /// a junction of their own (`mklink /J`) stopped every update. It is
+    /// taken while what it leads to is the user's alone.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_cargo_folder_the_user_links_elsewhere_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("home").join("meow");
+        std::fs::create_dir_all(&clone).unwrap();
+        let target = tmp.path().join("disk").join("cargo-home");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("config.toml"), "").unwrap();
+        let link = tmp.path().join("home").join(".cargo");
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let status = Command::new(Path::new(&root).join("System32").join("cmd.exe"))
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J");
+        audit_untracked_build_overrides(&clone).unwrap();
+        icacls(&target, &["/grant", "*S-1-5-11:(M)"]);
+        let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
+        assert!(
+            said.contains(&format!("{} leads to ", link.display())),
+            "{said}"
+        );
+        assert!(said.contains("can be changed by other accounts"), "{said}");
+        icacls(&target, &["/remove:g", "*S-1-5-11"]);
         audit_untracked_build_overrides(&clone).unwrap();
     }
 
