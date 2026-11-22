@@ -41,8 +41,8 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// Once the shell has exited, how long the tap and the resize watcher get
 /// to finish before they are left behind.
 const THREAD_GRACE: Duration = Duration::from_secs(1);
-/// After `SIGTERM` or `SIGHUP`, how long the shell gets to end on the
-/// hang-up it is sent before it is killed.
+/// After a signal that ends the session, how long the shell gets to end on
+/// the hang-up it is sent before it is killed.
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
@@ -511,7 +511,9 @@ fn join_within<T>(thread: JoinHandle<T>, limit: Duration) -> Option<T> {
 // ---------------------------------------------------------------------------
 
 /// Background watcher that keeps the PTY the same size as the real terminal
-/// and, on Unix, turns `SIGTERM` / `SIGHUP` into an orderly shutdown.
+/// and turns what ends meow from outside into an orderly shutdown: on Unix
+/// `SIGTERM`, `SIGHUP`, `SIGINT` and `SIGQUIT`; on Windows a closed console
+/// window, a logoff or a shutdown (see `close`).
 struct Watcher {
     #[cfg(unix)]
     handle: signal_hook::iterator::Handle,
@@ -530,17 +532,25 @@ impl Watcher {
         shell: Option<u32>,
         over: Arc<AtomicBool>,
     ) -> Result<Self> {
-        use signal_hook::consts::{SIGHUP, SIGTERM, SIGWINCH};
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGWINCH};
         use signal_hook::iterator::Signals;
 
-        let mut signals =
-            Signals::new([SIGWINCH, SIGTERM, SIGHUP]).context("cannot install signal handlers")?;
+        // `SIGINT` and `SIGQUIT` come from `kill`, or from Ctrl-C and
+        // Ctrl-\ where the terminal is not in raw mode (output to a pipe).
+        // In raw mode those keys are bytes for the shell.
+        let mut signals = Signals::new([SIGWINCH, SIGTERM, SIGHUP, SIGINT, SIGQUIT])
+            .context("cannot install signal handlers")?;
         let handle = signals.handle();
         let thread = spawn_pty(move || {
             let mut shell = shell.and_then(|pid| libc::pid_t::try_from(pid).ok());
             for signal in signals.forever() {
                 if signal == SIGWINCH {
                     sync_size(&master);
+                    continue;
+                }
+                // Waited for: the session is ending already, and the
+                // shell's ID may be another's.
+                if over.load(Ordering::SeqCst) {
                     continue;
                 }
                 // Ending the shell ends the session through the normal
@@ -571,10 +581,14 @@ impl Watcher {
     #[cfg(not(unix))]
     fn start(
         master: SharedMaster,
-        _killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
         _shell: Option<u32>,
         _over: Arc<AtomicBool>,
     ) -> Result<Self> {
+        #[cfg(windows)]
+        close::watch(killer);
+        #[cfg(not(windows))]
+        drop(killer);
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = spawn_pty(move || {
@@ -601,12 +615,193 @@ impl Drop for Watcher {
         self.handle.close();
         #[cfg(not(unix))]
         self.stop.store(true, Ordering::Relaxed);
+        #[cfg(windows)]
+        close::shell_over();
         if let Some(thread) = self.thread.take() {
             let _ = join_within(thread, THREAD_GRACE);
         }
-        // signal-hook's handler stays installed, so SIGTERM and SIGHUP are
-        // ignored from here on. That is wanted: the coordinator's cleanup,
-        // which stops running scans, is bounded and must not be cut short.
+        // signal-hook's handler stays installed, so SIGTERM, SIGHUP, SIGINT
+        // and SIGQUIT are ignored from here on (and on Windows the console
+        // handler waits). That is wanted: the coordinator's cleanup, which
+        // stops running scans, is bounded and must not be cut short.
+    }
+}
+
+/// meow has done all it does as a session ends. On Windows a console
+/// window that is being closed waits for this, up to 4.5 s.
+pub fn cleaned_up() {
+    #[cfg(windows)]
+    close::cleaned_up();
+}
+
+/// Closing the console window, logging off or shutting down ends the
+/// session as `SIGHUP` does on Unix: the shell is ended and meow's own
+/// cleanup runs. Windows ends the process once the handler returns, or
+/// about 5 s after the event, so the handler waits for the cleanup.
+/// Ctrl-C and Ctrl-Break keep what Windows does with them.
+#[cfg(windows)]
+mod close {
+    use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{FALSE, TRUE};
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    type Killer = Box<dyn portable_pty::ChildKiller + Send + Sync>;
+
+    /// The longest the handler waits for the cleanup: less than the about
+    /// 5 s Windows gives it.
+    pub const WAIT: Duration = Duration::from_millis(4500);
+
+    /// The shell of the session, while it runs.
+    static SHELL: Mutex<Option<Killer>> = Mutex::new(None);
+    /// Whether meow has cleaned up after the session.
+    static DONE: Mutex<bool> = Mutex::new(false);
+    static DONE_SAID: Condvar = Condvar::new();
+    static INSTALL: Once = Once::new();
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether console `event` ends the session.
+    pub fn ends_session(event: u32) -> bool {
+        matches!(
+            event,
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+        )
+    }
+
+    /// The session's shell runs: the handler is installed (once; it stays,
+    /// as signal handlers do on Unix) and ends it on a close.
+    pub fn watch(shell: Killer) {
+        *lock(&DONE) = false;
+        *lock(&SHELL) = Some(shell);
+        INSTALL.call_once(|| {
+            // SAFETY: `handler` is a function that lives as long as the
+            // process.
+            unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) };
+        });
+    }
+
+    /// The shell has ended: nothing is left to end on a close.
+    pub fn shell_over() {
+        lock(&SHELL).take();
+    }
+
+    pub fn cleaned_up() {
+        *lock(&DONE) = true;
+        DONE_SAID.notify_all();
+    }
+
+    /// Called by Windows on a thread of its own. Returning FALSE passes the
+    /// event on to the next handler: for Ctrl-C and Ctrl-Break, Windows'
+    /// own, which ends the process.
+    unsafe extern "system" fn handler(event: u32) -> BOOL {
+        if !ends_session(event) {
+            return FALSE;
+        }
+        end_and_wait(WAIT);
+        TRUE
+    }
+
+    /// Ends the shell, if it still runs, and waits up to `limit` for the
+    /// cleanup. Returns whether it was done in time.
+    pub fn end_and_wait(limit: Duration) -> bool {
+        if let Some(mut shell) = lock(&SHELL).take() {
+            let _ = shell.kill();
+        }
+        let deadline = Instant::now() + limit;
+        let mut done = lock(&DONE);
+        while !*done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            done = DONE_SAID
+                .wait_timeout(done, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+        /// A shell that counts how often it was ended.
+        #[derive(Debug, Clone)]
+        struct Shell(Arc<AtomicUsize>);
+
+        impl portable_pty::ChildKiller for Shell {
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(self.clone())
+            }
+        }
+
+        /// The only test of this module's state, which is the process's.
+        #[test]
+        fn closing_the_console_ends_the_shell_and_waits_for_the_cleanup() {
+            for event in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+                assert!(ends_session(event), "{event}");
+            }
+            for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT, 3, 4, 7] {
+                assert!(!ends_session(event), "{event}");
+            }
+
+            let ended = Arc::new(AtomicUsize::new(0));
+            watch(Box::new(Shell(Arc::clone(&ended))));
+            // Ctrl-C and Ctrl-Break are passed on, and end nothing.
+            // SAFETY: the handler is a plain function.
+            unsafe {
+                assert_eq!(handler(CTRL_C_EVENT), FALSE);
+                assert_eq!(handler(CTRL_BREAK_EVENT), FALSE);
+            }
+            assert_eq!(ended.load(Ordering::SeqCst), 0);
+
+            // A cleanup that never comes is waited for no longer than said.
+            let started = Instant::now();
+            assert!(!end_and_wait(Duration::from_millis(100)));
+            assert!(started.elapsed() >= Duration::from_millis(100));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(ended.load(Ordering::SeqCst), 1);
+
+            // The window closes as the session runs: the shell is ended,
+            // and the handler returns once meow has cleaned up.
+            watch(Box::new(Shell(Arc::clone(&ended))));
+            let cleanup = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                cleaned_up();
+            });
+            let started = Instant::now();
+            // SAFETY: as above.
+            assert_eq!(unsafe { handler(CTRL_CLOSE_EVENT) }, TRUE);
+            assert!(started.elapsed() >= Duration::from_millis(200));
+            assert!(started.elapsed() < WAIT);
+            assert_eq!(ended.load(Ordering::SeqCst), 2);
+            cleanup.join().unwrap();
+
+            // Once the shell is over, a close ends nothing more and, the
+            // cleanup done, returns at once.
+            watch(Box::new(Shell(Arc::clone(&ended))));
+            shell_over();
+            cleaned_up();
+            // SAFETY: as above.
+            assert_eq!(unsafe { handler(CTRL_SHUTDOWN_EVENT) }, TRUE);
+            assert_eq!(ended.load(Ordering::SeqCst), 2);
+        }
     }
 }
 

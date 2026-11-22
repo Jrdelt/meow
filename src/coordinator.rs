@@ -3769,15 +3769,20 @@ mod tests {
         use queue::Stage;
         for mode in [Mode::Mild, Mode::Aggressive] {
             let tmp = tempfile::tempdir().unwrap();
-            let mut ids = (0, 0, 0);
+            let mut ids = (0, 0, 0, 0);
             let (held, coordinator) = session_over(&tmp, mode, |db| {
-                // Waiting whole; cut while a stage ran; stopped by light mode.
+                // Waiting whole; cut while a stage ran; stopped by light mode
+                // before and after its stage started.
                 ids.0 = queue::enqueue(db, "192.0.2.5", mode, &[]).unwrap();
                 ids.1 = queue::enqueue(db, "192.0.2.6", mode, &[]).unwrap();
                 queue::set_stage(db, ids.1, Stage::Lan, "done", "3 neighbours").unwrap();
                 queue::set_stage(db, ids.1, Stage::Dns, "running", "").unwrap();
                 ids.2 = queue::enqueue(db, "192.0.2.7", mode, &[]).unwrap();
                 queue::set_stage(db, ids.2, Stage::Lan, "interrupted", queue::LIGHT_DETAIL)
+                    .unwrap();
+                ids.3 = queue::enqueue(db, "192.0.2.8", mode, &[]).unwrap();
+                queue::set_stage(db, ids.3, Stage::Lan, "running", "").unwrap();
+                queue::set_stage(db, ids.3, Stage::Lan, "interrupted", queue::LIGHT_DETAIL)
                     .unwrap();
             });
             let state = coordinator.state();
@@ -3791,7 +3796,7 @@ mod tests {
                     .collect()
             };
             let not_run = ("skipped".to_owned(), queue::NOT_RUN_ENDED.to_owned());
-            let found = [rows(ids.0), rows(ids.1), rows(ids.2)];
+            let found = [rows(ids.0), rows(ids.1), rows(ids.2), rows(ids.3)];
             assert!(found[0].iter().all(|row| *row == not_run), "{found:?}");
             assert_eq!(
                 found[1][..2],
@@ -3802,7 +3807,12 @@ mod tests {
             );
             assert!(found[1][2..].iter().all(|row| *row == not_run));
             assert!(found[2].iter().all(|row| *row == not_run), "{found:?}");
-            for id in [ids.0, ids.1, ids.2] {
+            assert_eq!(
+                found[3][0],
+                ("interrupted".to_owned(), queue::CLOSED_DETAIL.to_owned())
+            );
+            assert!(found[3][1..].iter().all(|row| *row == not_run));
+            for id in [ids.0, ids.1, ids.2, ids.3] {
                 assert!(!state.owns_recon(id));
             }
 
@@ -3810,12 +3820,15 @@ mod tests {
             let (left, more) = coordinator.left_recons();
             assert_eq!(
                 left.iter().map(|task| task.id).collect::<Vec<_>>(),
-                [ids.0, ids.1, ids.2]
+                [ids.0, ids.1, ids.2, ids.3]
             );
             assert_eq!(more, 0);
             assert!(left[1]
                 .left_line(true)
                 .starts_with("Recon 192.0.2.6 cut short at dns \u{b7} "));
+            assert!(left[3]
+                .left_line(true)
+                .starts_with("Recon 192.0.2.8 cut short at lan \u{b7} "));
 
             // Nothing runs, whatever the mode is set to, and not even a
             // row that is put back to waiting behind the session's back.
@@ -3838,6 +3851,7 @@ mod tests {
             assert!(rows(ids.0).iter().all(|row| row.0 == "pending"));
             assert_eq!(rows(ids.1), found[1]);
             assert_eq!(rows(ids.2), found[2]);
+            assert_eq!(rows(ids.3), found[3]);
             assert!(
                 !lock(&state.notices)
                     .iter()

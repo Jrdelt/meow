@@ -843,6 +843,8 @@ fn start_session(
     // The database closes with its last handle; then the files are recorded.
     drop(state);
     drop(files);
+    // A console window that is being closed may end the process now.
+    pty::cleaned_up();
     // The window may be gone by now (it was closed): then nobody is told,
     // and that is no error.
     if !skipped.is_empty() {

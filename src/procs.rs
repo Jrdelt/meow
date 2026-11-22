@@ -943,6 +943,18 @@ mod identity {
         (start > 0).then_some(start)
     }
 
+    /// Field 3 of `/proc/<pid>/stat`, the state, says the process has
+    /// ended and waits for its parent to collect it (`Z`, a zombie) or is
+    /// being collected (`X`; `x` before Linux 3.14).
+    #[cfg(any(target_os = "linux", target_os = "android", test))]
+    pub fn ended_in_stat(stat: &[u8]) -> bool {
+        stat.iter()
+            .rposition(|byte| *byte == b')')
+            .and_then(|name_end| stat.get(name_end + 1..))
+            .and_then(|rest| rest.iter().find(|byte| **byte != b' '))
+            .is_some_and(|state| matches!(state, b'Z' | b'X' | b'x'))
+    }
+
     /// The real user id in `/proc/<pid>/status` (`Uid:` and four numbers).
     #[cfg(any(target_os = "linux", target_os = "android", test))]
     pub fn uid_in_status(status: &str) -> Option<libc::uid_t> {
@@ -957,7 +969,7 @@ mod identity {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     mod system {
-        use super::{start_in_stat, uid_in_status, Seen};
+        use super::{ended_in_stat, start_in_stat, uid_in_status, Seen};
         use std::io::Read;
 
         fn read(path: &str) -> Option<Vec<u8>> {
@@ -970,11 +982,13 @@ mod identity {
             Some(text)
         }
 
-        pub fn seen(pid: libc::pid_t) -> Option<Seen> {
-            let start = start_in_stat(&read(&format!("/proc/{pid}/stat"))?)?;
+        /// The process, and whether it has ended (see [`super::ended`]).
+        pub fn look(pid: libc::pid_t) -> Option<(Seen, bool)> {
+            let stat = read(&format!("/proc/{pid}/stat"))?;
+            let start = start_in_stat(&stat)?;
             let status = read(&format!("/proc/{pid}/status"))?;
             let uid = uid_in_status(&String::from_utf8_lossy(&status))?;
-            Some(Seen { start, uid })
+            Some((Seen { start, uid }, ended_in_stat(&stat)))
         }
 
         /// When the calling process started, or 0. Only async-signal-safe
@@ -1041,13 +1055,14 @@ mod identity {
                 .saturating_add(info.pbi_start_tvusec)
         }
 
-        pub fn seen(pid: libc::pid_t) -> Option<Seen> {
+        /// The process, and whether it has ended (see [`super::ended`]).
+        pub fn look(pid: libc::pid_t) -> Option<(Seen, bool)> {
             let info = info(pid)?;
-            Some(Seen {
+            let seen = Seen {
                 start: start(&info),
                 uid: info.pbi_ruid,
-            })
-            .filter(|seen| seen.start > 0)
+            };
+            (seen.start > 0).then_some((seen, info.pbi_status == libc::SZOMB))
         }
 
         /// When the calling process started, or 0. One system call: for
@@ -1069,7 +1084,7 @@ mod identity {
     mod system {
         use super::Seen;
 
-        pub fn seen(_pid: libc::pid_t) -> Option<Seen> {
+        pub fn look(_pid: libc::pid_t) -> Option<(Seen, bool)> {
             None
         }
 
@@ -1082,7 +1097,20 @@ mod identity {
         }
     }
 
-    pub use system::{boot, own_start, seen};
+    pub use system::{boot, own_start};
+
+    /// A process that runs. One that has ended and waits for its parent to
+    /// collect it (a zombie: the tool of a session that was killed, until
+    /// the system takes it in) does not.
+    pub fn seen(pid: libc::pid_t) -> Option<Seen> {
+        system::look(pid).and_then(|(seen, ended)| (!ended).then_some(seen))
+    }
+
+    /// What a process that has ended was, while its parent has not
+    /// collected it yet.
+    pub fn ended(pid: libc::pid_t) -> Option<Seen> {
+        system::look(pid).and_then(|(seen, ended)| ended.then_some(seen))
+    }
 }
 
 /// The record of running tools: one file per tool in `~/.meow/run`, named
@@ -1323,28 +1351,40 @@ mod record {
         Some(text)
     }
 
-    /// Whether the group `record` names is the tool it was written for,
-    /// still running.
+    /// Whether the group `record` names is still the tool it was written
+    /// for, and whether its leader runs.
     ///
     /// A record is only a hint, and is believed as far as the system
-    /// confirms it: the group is killed only if its leader is a running
-    /// process of this user that started at the very moment the record
-    /// says, and is not meow itself. A process id that has been given to
-    /// another program since does not pass, and neither does a record
-    /// someone made up: whoever can write one that passes can read that
-    /// process's start time and write into this user's private folder, and
-    /// so can already kill the process without meow.
-    fn still_runs(record: &Entry, own: &[libc::pid_t]) -> bool {
+    /// confirms it: the group is killed only if its leader is a process of
+    /// this user that started at the very moment the record says, and is
+    /// not meow itself. A process id that has been given to another program
+    /// since does not pass, and neither does a record someone made up:
+    /// whoever can write one that passes can read that process's start time
+    /// and write into this user's private folder, and so can already kill
+    /// the process without meow.
+    ///
+    /// A leader that has ended but was not collected yet (a zombie) is the
+    /// tool too, as its process id is not given to another until then: the
+    /// tool itself no longer runs, but what it started in its group may.
+    fn still_runs(record: &Entry, own: &[libc::pid_t]) -> Option<Leader> {
         if own.contains(&record.group) {
-            return false;
+            return None;
         }
-        let Some(seen) = identity::seen(record.group) else {
-            return false;
+        let (seen, leader) = match identity::seen(record.group) {
+            Some(seen) => (seen, Leader::Runs),
+            None => (identity::ended(record.group)?, Leader::Ended),
         };
         // SAFETY: plain system calls.
         let (user, leads) =
             unsafe { (libc::getuid(), libc::getpgid(record.group) == record.group) };
-        leads && seen.start == record.start && seen.uid == user
+        (leads && seen.start == record.start && seen.uid == user).then_some(leader)
+    }
+
+    /// What [`still_runs`] found of a tool's group leader.
+    #[derive(PartialEq, Eq)]
+    enum Leader {
+        Runs,
+        Ended,
     }
 
     pub fn sweep(dir: &Path) -> Vec<String> {
@@ -1391,13 +1431,17 @@ mod record {
                 {
                     continue;
                 }
-                if still_runs(&record, &own) {
+                if let Some(leader) = still_runs(&record, &own) {
                     // SAFETY: a plain system call on a group that
                     // `still_runs` found to be a tool's.
                     unsafe {
                         libc::killpg(record.group, libc::SIGKILL);
                     }
-                    stopped.push(record.name);
+                    // A tool that had ended (the guard stopped it, say)
+                    // was not left running: nothing is said of it.
+                    if leader == Leader::Runs {
+                        stopped.push(record.name);
+                    }
                 }
             }
             // Acted on, out of date or not a record: gone either way.
@@ -1801,6 +1845,99 @@ pub(crate) mod tests {
         // SAFETY: a plain system call.
         assert_eq!(seen.uid, unsafe { libc::getuid() });
         assert!(identity::seen(libc::pid_t::MAX).is_none());
+    }
+
+    #[test]
+    fn a_process_that_has_ended_is_not_running() {
+        let stat = |state: &str| {
+            format!(
+                "4242 (a) Z b) {state} 1 4242 4242 0 -1 4194304 139 0 0 0 0 0 0 0 20 0 1 0 \
+                 7654321 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0\n"
+            )
+        };
+        for state in ["Z", "X", "x"] {
+            assert!(identity::ended_in_stat(stat(state).as_bytes()), "{state}");
+        }
+        // Running, asleep, stopped; a `Z` in the name is no state.
+        for state in ["R", "S", "D", "T", "t", "I"] {
+            assert!(!identity::ended_in_stat(stat(state).as_bytes()), "{state}");
+        }
+        assert!(!identity::ended_in_stat(b"4242 (Z"));
+        assert!(!identity::ended_in_stat(b""));
+    }
+
+    /// A child that has exited and that nobody has collected yet (a
+    /// zombie) is no running process, though the system still knows it:
+    /// a sweep does not say it stopped a tool that had already ended.
+    #[test]
+    fn a_sweep_says_nothing_of_a_tool_that_had_ended() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let Some(_) = identity::seen(std::process::id() as libc::pid_t) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        crate::workspace::create_private_dir(&run).unwrap();
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead = gone.id() as libc::pid_t;
+        gone.wait().unwrap();
+        let boot = identity::boot();
+        let pids = dir.path().join("pids");
+        // A tool that ends when told to (its input closes), and one that
+        // leaves a program of its own running in its group as it ends.
+        let tool = |leaves: bool| {
+            let script = if leaves {
+                format!("sleep 300 & echo $! > '{}'; read x", pids.display())
+            } else {
+                "read x".to_owned()
+            };
+            let child = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .stdin(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id() as libc::pid_t;
+            let start = identity::seen(pid).unwrap().start;
+            let line = format!("meow-run 1 {boot} {dead} 5 {pid} {start} nmap\n");
+            std::fs::write(run.join(format!("{dead}.{}", u8::from(leaves))), line).unwrap();
+            (child, pid, start)
+        };
+
+        let (mut ended, ended_pid, ended_start) = tool(false);
+        ended.stdin.take().unwrap().write_all(b"\n").unwrap();
+        wait_gone(ended_pid);
+        // Not collected: the system still knows it, as one that ended.
+        assert!(identity::seen(ended_pid).is_none());
+        #[cfg(target_os = "linux")]
+        assert_eq!(identity::ended(ended_pid).unwrap().start, ended_start);
+        let _ = ended_start;
+        assert_eq!(sweep(&run), Vec::<String>::new(), "it was not running");
+        assert_eq!(std::fs::read_dir(&run).unwrap().count(), 0);
+        assert!(ended.wait().unwrap().success());
+
+        // What a tool that ended left running in its group is stopped all
+        // the same, and nothing is said.
+        #[cfg(target_os = "linux")]
+        {
+            let (mut left, left_pid, _) = tool(true);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let sleep = loop {
+                let found = std::fs::read_to_string(&pids).unwrap_or_default();
+                if let Ok(pid) = found.trim().parse::<libc::pid_t>() {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "the tool did not start");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            left.stdin.take().unwrap().write_all(b"\n").unwrap();
+            wait_gone(left_pid);
+            assert!(alive(sleep));
+            assert_eq!(sweep(&run), Vec::<String>::new());
+            wait_gone(sleep);
+            assert!(left.wait().unwrap().success());
+        }
     }
 
     #[test]

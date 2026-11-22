@@ -761,13 +761,13 @@ fn what_a_killed_meow_left_is_ended_by_the_next_start() {
             _ => assert_eq!(was, is),
         }
     }
-    // The stage light mode had stopped is left out too, with the times it
-    // ran from and to.
+    // The stage light mode had stopped after it had started is cut short
+    // too, with the times it ran from and to; the ones after it never ran.
     let after_paused = task(&db, paused).unwrap().unwrap();
     let lan = stage_of(&after_paused, Stage::Lan);
     assert_eq!(
         (lan.status.as_str(), lan.detail.as_str()),
-        ("skipped", NOT_RUN_ENDED)
+        ("interrupted", CLOSED_DETAIL)
     );
     assert_eq!(
         (&lan.started_utc, &lan.finished_utc),
@@ -776,7 +776,7 @@ fn what_a_killed_meow_left_is_ended_by_the_next_start() {
             &stage_of(&paused_before, Stage::Lan).finished_utc
         )
     );
-    assert!(after_paused.stages.iter().all(StageRow::not_run));
+    assert!(after_paused.stages[1..].iter().all(StageRow::not_run));
     assert!(unfinished(&db).unwrap().is_empty());
     assert_eq!(end_session(&db, SessionEnd::Lost).unwrap(), 0);
 
@@ -792,6 +792,76 @@ fn what_a_killed_meow_left_is_ended_by_the_next_start() {
         [id, paused, later]
     );
     assert_eq!(more, 0);
+}
+
+/// A stage that light mode stopped after it had started ran and may have
+/// sent packets: the end of the session cuts it short, as it does a running
+/// one, and the next start says so. Only a stage that never started is
+/// "not run".
+#[test]
+fn a_stage_light_mode_stopped_after_it_started_is_cut_short_not_dropped() {
+    for end in [SessionEnd::Closed, SessionEnd::Lost] {
+        let db = Db::open_in_memory().unwrap();
+        let ran = enqueue(&db, "192.0.2.5", Mode::Mild, &[]).unwrap();
+        set_stage(&db, ran, Stage::Lan, "done", "3 neighbours").unwrap();
+        set_stage(&db, ran, Stage::Ports, "running", "").unwrap();
+        set_stage(&db, ran, Stage::Ports, "interrupted", LIGHT_DETAIL).unwrap();
+        // Light mode was on before its first stage could start.
+        let waited = enqueue(&db, "192.0.2.6", Mode::Mild, &[]).unwrap();
+        set_stage(&db, waited, Stage::Lan, "interrupted", LIGHT_DETAIL).unwrap();
+        let before = task(&db, ran).unwrap().unwrap();
+        let mut shown = tasks(&db, 5).unwrap();
+        show_ended(&mut shown);
+
+        assert_eq!(end_session(&db, end).unwrap(), 2);
+        let after = task(&db, ran).unwrap().unwrap();
+        let ports = stage_of(&after, Stage::Ports);
+        assert_eq!(
+            (ports.status.as_str(), ports.detail.as_str()),
+            ("interrupted", CLOSED_DETAIL),
+            "{end:?}"
+        );
+        let was = stage_of(&before, Stage::Ports);
+        assert!(is_time(&was.started_utc) && is_time(&was.finished_utc));
+        assert_eq!(
+            (&ports.started_utc, &ports.finished_utc),
+            (&was.started_utc, &was.finished_utc),
+            "the times it ran from and to"
+        );
+        assert!(!ports.live() && !ports.not_run());
+        let ports_at = STAGES.iter().position(|s| *s == Stage::Ports).unwrap();
+        assert!(after.stages[ports_at + 1..].iter().all(StageRow::not_run));
+        assert_eq!(stage_of(&after, Stage::Lan), stage_of(&before, Stage::Lan));
+        let never = task(&db, waited).unwrap().unwrap();
+        assert!(never.stages.iter().all(StageRow::not_run), "{never:?}");
+        assert_eq!(stage_of(&never, Stage::Lan).started_utc, None);
+
+        // A view of the session that is gone says the same.
+        for (shown, stored) in shown.iter().rev().zip([&after, &never]) {
+            for (shown, stored) in shown.stages.iter().zip(&stored.stages) {
+                assert_eq!(
+                    (&shown.status, shown.not_run()),
+                    (&stored.status, stored.not_run()),
+                    "{:?}",
+                    shown.stage
+                );
+            }
+        }
+
+        // The next start names where it was cut.
+        let (left, _) = take_left(&db).unwrap();
+        let lines: Vec<String> = left.iter().map(|task| task.left_line(true)).collect();
+        assert_eq!(
+            lines,
+            [
+                "Recon 192.0.2.5 cut short at ports \u{b7} `meow recon 192.0.2.5`",
+                "Recon 192.0.2.6 not run \u{b7} `meow recon 192.0.2.6`",
+            ]
+        );
+        // Said again, it changes nothing.
+        assert_eq!(end_session(&db, end).unwrap(), 0);
+        assert_eq!(task(&db, ran).unwrap().unwrap(), after);
+    }
 }
 
 /// A recon that meow 0.2.3 kept for its resume question: the first start
@@ -910,12 +980,22 @@ fn a_view_of_a_session_that_is_gone_shows_its_recons_as_ended() {
     set_stage(&db, id, Stage::Dns, "running", "").unwrap();
     let paused = enqueue(&db, "192.0.2.6", Mode::Mild, &[]).unwrap();
     set_stage(&db, paused, Stage::Lan, "interrupted", LIGHT_DETAIL).unwrap();
+    // One that light mode stopped after it had started.
+    let ran = enqueue(&db, "192.0.2.8", Mode::Mild, &[]).unwrap();
+    set_stage(&db, ran, Stage::Lan, "running", "").unwrap();
+    set_stage(&db, ran, Stage::Lan, "interrupted", LIGHT_DETAIL).unwrap();
 
     let mut shown = tasks(&db, 5).unwrap();
-    shown[1].stages[1].progress = Some(Progress::items(1, 2));
+    shown[2].stages[1].progress = Some(Progress::items(1, 2));
     show_ended(&mut shown);
     assert_eq!(statuses_of(&db, id)[..3], ["done", "running", "pending"]);
     assert_eq!(statuses_of(&db, paused)[..2], ["interrupted", "pending"]);
+    let lan = stage_of(&shown[0], Stage::Lan);
+    assert_eq!(
+        (lan.status.as_str(), lan.detail.as_str()),
+        ("interrupted", CLOSED_DETAIL)
+    );
+    assert!(stage_of(&shown[1], Stage::Lan).not_run());
 
     end_session(&db, SessionEnd::Closed).unwrap();
     let ended = tasks(&db, 5).unwrap();

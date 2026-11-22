@@ -450,15 +450,17 @@ impl StageRow {
     }
 }
 
-/// Shows `tasks` as the end of their session leaves them: the running
-/// stage stopped, the ones that had not started left out. For a view of a
-/// session that is gone; nothing is stored.
+/// Shows `tasks` as the end of their session leaves them: the stage that
+/// had started stopped, the ones that had not started left out. For a view
+/// of a session that is gone; nothing is stored.
 pub fn show_ended(tasks: &mut [TaskRow]) {
     for stage in tasks.iter_mut().flat_map(|task| &mut task.stages) {
         // A stage meow 0.2.3 had stopped and kept for a resume is one this
         // version stopped, as `end_session` stores it.
         let stopped_before = stage.status == "interrupted" && stage.detail == CLOSED_DETAIL_BEFORE;
-        if stage.status == "running" || stopped_before {
+        // So is one that light mode stopped after it had started.
+        let started = stage.live() && stage.started_utc.is_some();
+        if stage.status == "running" || stopped_before || started {
             stage.status = "interrupted".to_owned();
             stage.detail = CLOSED_DETAIL.to_owned();
         } else if stage.live() {
@@ -764,11 +766,11 @@ impl Left {
     }
 }
 
-/// A session is over, and so are its recons: the stage that was running was
-/// stopped with it, and every stage that had not started is left out.
-/// Finished stages keep their status and results. Nothing is kept waiting
-/// for a later session. Returns how many recons this cut short; said again,
-/// it changes nothing.
+/// A session is over, and so are its recons: the stage that was running,
+/// or that light mode stopped after it had started, was stopped with it,
+/// and every stage that had not started is left out. Finished stages keep
+/// their status and results. Nothing is kept waiting for a later session.
+/// Returns how many recons this cut short; said again, it changes nothing.
 pub fn end_session(db: &Db, end: SessionEnd) -> Result<usize> {
     let now = now_rfc3339();
     let (not_run, stopped_at) = match end {
@@ -795,7 +797,17 @@ pub fn end_session(db: &Db, end: SessionEnd) -> Result<usize> {
         "UPDATE task_stages SET detail = ?1 WHERE status = 'interrupted' AND detail = ?2",
         params![CLOSED_DETAIL, CLOSED_DETAIL_BEFORE],
     )?;
-    // A stage that light mode had stopped keeps the times it ran from and to.
+    // A stage that light mode stopped after it had started ran: it is cut
+    // short, with the times it ran from and to.
+    tx.execute(
+        &format!(
+            "UPDATE task_stages SET status = 'interrupted', detail = ?1,
+                    finished_utc = COALESCE(finished_utc, ?2)
+             WHERE status <> 'running' AND started_utc IS NOT NULL AND {LIVE_STAGE}"
+        ),
+        params![CLOSED_DETAIL, stopped_at],
+    )?;
+    // The rest never started.
     tx.execute(
         &format!(
             "UPDATE task_stages SET status = 'skipped', detail = ?1,
