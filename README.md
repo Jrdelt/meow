@@ -44,7 +44,7 @@ On Windows, run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in the 
 
 `meow update` upgrades meow itself; `--check` only shows what is new.
 
-- **Release download:** gets the newest release, checks its SHA-256 and replaces meow, nothing else. Never a pre-release.
+- **Release download:** gets the newest release, checks its SHA-256 and replaces meow, nothing else. No pre-release unless meow is one.
 - **Homebrew:** `brew update`, then `brew upgrade meow` (`--fetch-HEAD` for `--HEAD`). This also upgrades outdated `nmap`, `katana` and `feroxbuster`.
 - **`install.sh`:** pulls into the folder meow was built from and runs `install.sh --yes`. It rebuilds meow, adds missing data files, and adds only the missing tools it can install without sudo.
 - **`install.ps1`:** pulls, then asks you to close meow and run `install.ps1 -Yes`.
@@ -99,7 +99,7 @@ meow report    # REPORT.md in the session folder; not masked
 | Command | What it does |
 | :--- | :--- |
 | `meow` | Setup on a new machine; else list your sessions |
-| `meow <name>` | Open or make a session; a new one asks where to save it (`./meow/<name>/` by default) |
+| `meow <name>` | Open or make a session (`./meow/<name>/` by default) |
 | `meow <name> --local` / `--home` | Use `./meow/<name>/` here, or `~/.meow/workspaces/<name>/`, without asking |
 | `meow list` (`ls`, `status`) | Your sessions, where they are, which are running |
 | `meow delete <name>` (`rm`) | Delete a session (`--local`: the one here; `-y`: do not ask) |
@@ -130,7 +130,7 @@ On macOS and Linux, meow refuses a folder that another user owns or can write to
 | Message | Meaning |
 | :--- | :--- |
 | `Files changed outside meow: shell history and last folder not used` | Files were replaced between sessions (a pull, a checkout, an archive), or by a `git pull` during one. The last folder is where the shell starts |
-| `git tracks session files (...)` | Run `git rm -r --cached meow` as it says. Until then, every session ends as above |
+| `git tracks session files (...)` | Run `git rm -r --cached meow` as it says. Until then, a session whose history or state git tracks ends as above |
 | `meow did not end cleanly last time` | After `kill -9`, a crash, power loss, or a `meow add` or `meow report` cut short. The history stays unless files were replaced |
 | `Session moved from <old path>` | A moved folder keeps its session and history if the old folder is gone and the files are unchanged |
 
@@ -187,7 +187,7 @@ Every mode watches the shell; switch with `meow mode light`, `mild` or `aggressi
 
 - `js` reads only the site's own scripts (15 in mild, 40 in aggressive). A key it finds goes straight into the Privacy Vault: you see only a placeholder like `<<SEC_03>>`, and the report lists it to rotate. Endpoints keep parameter names, never values.
 - Cookie values are never stored. `dirs` skips sites behind a WAF or CDN in mild mode.
-- Rescans replace old findings. A port's new software replaces the old, whose CVEs go at the next full lookup. TLS findings are replaced only when every handshake answered. A new `headers` result replaces the site's software list, so an updated jQuery no longer shows as outdated.
+- A port's new software replaces the old, whose CVEs go at the next full lookup. TLS findings are replaced only when every handshake answered. A new `headers` result replaces the site's software list, so an updated jQuery no longer shows as outdated.
 
 ## Live Map, HUD and Report
 
@@ -232,7 +232,7 @@ meow setup --show           # the AI setup, never the key
 meow setup --check          # test the local AI server and the cloud AI key
 meow setup --provider openrouter --api-key-stdin   # or claude; the key stays out of shell history
 meow setup --local-url http://localhost:11434/v1 --local-model qwen2.5-coder:14b
-meow setup --forget-key     # or --cloud-off: local AI only
+meow setup --forget-key     # removes the key; --cloud-off: local AI only
 ```
 
 `--cloud-url`, `--cloud-model`, `--research-model` and `--fallback-models` set the matching `[ai]` keys.
