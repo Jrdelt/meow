@@ -371,6 +371,19 @@ impl Model {
                     self.age = Duration::ZERO;
                 }
             }
+            // The AI reply so far, and nothing else: sent while it streams
+            // in, in place of the whole state.
+            Some("ai") => {
+                let Some(snapshot) = &mut self.snapshot else {
+                    return;
+                };
+                if let Ok(mut ai) = serde_json::from_value::<AiStatus>(message["ai"].clone()) {
+                    if let Some(address) = &mut ai.address {
+                        *address = sanitize(address, 120);
+                    }
+                    snapshot.ai = ai;
+                }
+            }
             Some("result") => {
                 self.status = match message.get("ok").and_then(Value::as_bool) {
                     Some(true) => self.sent.take().unwrap_or_else(|| "Done".to_owned()),
@@ -3826,6 +3839,14 @@ mod tests {
         assert!(text.contains("│1. Evidence-Backed Risk "), "{text}");
         assert!(!text.contains("##"), "{text}");
         assert!(text.contains("Upgrade nginx[2J on 10.10.10.5"), "{text}");
+        // ... and then through messages of the reply alone.
+        let mut reply = state["state"]["ai"].clone();
+        reply["text"] =
+            json!("## 1. Evidence-Backed Risk\nUpgrade nginx on 10.10.10.5\nThen restart it.");
+        model.apply_message(&json!({ "type": "ai", "key": "k", "ai": reply }).to_string());
+        let text = screen(&model, 160, 46);
+        assert!(text.contains("│Then restart it."), "{text}");
+        assert!(text.contains("┌Cloud AI · 10.10.10.5 · running─"), "{text}");
 
         state["state"]["ai"]["running"] = json!(false);
         state["state"]["ai"]["error"] =

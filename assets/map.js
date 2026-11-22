@@ -33,12 +33,21 @@
     return object && hasOwn.call(object, key) ? object[key] : undefined;
   }
   var noteDrafts = table();
+  // Notes sent and not yet answered, by host address.
+  var notesSaving = table();
+  // The most a note may hold: the session's limit (EVIDENCE_MAX), in bytes.
+  var NOTE_MAX = 2000;
+  var encoder = new TextEncoder();
+  function utf8Length(text) {
+    return encoder.encode(text).length;
+  }
   var socket = null;
   var state = null;
   var selected = null;
   var drawn = '';
   var pendingAiScroll = false;
   var lastAiKey = '';
+  var lastAiBody = '';
 
   // The map is drawn top-down, like a home-network diagram: the Internet
   // cloud at the top, your router (or access point) under it, and every
@@ -52,6 +61,9 @@
   var STEP = 250, SUB_STEP = 215;           // in the row; below you
   var YOU_Y = -360, GW_Y = -190, EGRESS_Y = -20, CLOUD_Y = 155, TARGET_Y = 365;
   var BAR_Y = 110, ROW_Y = 215;
+  // The most devices drawn in the row under the router, and in the group
+  // without a route: the rest are counted (the Hosts card lists them all).
+  var LAN_ROW = 24, NO_ROUTE_MAX = 12;
   var traceExpanded = false;
   // Room kept around the drawing, in screen pixels, and the zooms it is
   // shown at: never blown up past MAX_ZOOM, and never shrunk below
@@ -242,16 +254,36 @@
     flash.timer = setTimeout(function () { box.remove(); }, 6000);
   }
 
+  // The socket that proved it is this page's session: its first state
+  // carried the page's key. Nothing is sent to any other, and nothing it
+  // sends is shown.
+  var trusted = null;
+  // How long a socket may take to prove it (the session sends its state
+  // first thing, but a large one takes a while).
+  var KEY_WAIT = 10000;
+  // What each command sent on the trusted socket waits for: the session
+  // answers every command with one result, in the order sent.
+  var waiting = [];
+
   function connected() {
-    return !!socket && socket.readyState === WebSocket.OPEN;
+    return !!socket && socket === trusted && socket.readyState === WebSocket.OPEN;
   }
 
-  function send(command) {
+  // Sends a command; `done` gets its result (null when the socket closed
+  // first). Says so and returns false when there is no session to send to.
+  function send(command, done) {
     if (connected()) {
       socket.send(JSON.stringify(command));
-    } else {
-      flash('Not connected to the session.');
+      waiting.push(done || null);
+      return true;
     }
+    flash('Not connected to the session.');
+    return false;
+  }
+
+  function badge(text, kind) {
+    byId('conn').textContent = text;
+    byId('conn').className = 'badge ' + kind;
   }
 
   var reconnectDelay = 2000;
@@ -263,11 +295,15 @@
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     var ws = new WebSocket(proto + location.host + withToken('/ws'));
     socket = ws;
-    ws.onopen = function () {
-      if (socket !== ws) { return; }
-      byId('conn').textContent = 'live';
-      byId('conn').className = 'badge on';
-    };
+    waiting = [];
+    // No keyed state in time: whatever answered is not the session. It is
+    // let go of at once: one that never answers the close is not waited for.
+    var keyTimer = setTimeout(function () {
+      if (socket !== ws || trusted === ws) { return; }
+      if (ws.readyState === WebSocket.OPEN) { ended = true; }
+      ws.close();
+      closed();
+    }, KEY_WAIT);
     ws.onmessage = function (event) {
       if (socket !== ws) { return; }
       var message;
@@ -283,7 +319,14 @@
           // its port. Nothing it sends is shown.
           ended = true;
           ws.close();
+          closed();
           return;
+        }
+        if (!message.state || typeof message.state !== 'object') { return; }
+        if (trusted !== ws) {
+          trusted = ws;
+          clearTimeout(keyTimer);
+          badge('live', 'on');
         }
         reconnectDelay = 2000;
         state = message.state;
@@ -293,34 +336,64 @@
           askedWhere = true;
           send({ cmd: 'locate' });
         }
-      } else if (message.type === 'progress') {
+        return;
+      }
+      // Anything else only from the session, and only after its state.
+      if (trusted !== ws || !state) { return; }
+      if (message.type === 'progress') {
         // How far the running stages are, sent alone while a tool counts
         // its results: only the strip is drawn again, not the cards.
-        if (state && message.key === pageKey) { reconProgress(message); }
-      } else if (message.type === 'result' && !message.ok) {
-        flash(message.error || 'Command failed.');
+        if (message.key === pageKey) { reconProgress(message); }
+      } else if (message.type === 'ai') {
+        // The AI reply so far, sent alone while it streams in.
+        if (message.key === pageKey && message.ai && typeof message.ai === 'object') {
+          state.ai = message.ai;
+          renderDetail();
+          renderAiPanel();
+        }
+      } else if (message.type === 'result') {
+        var done = waiting.shift();
+        if (done) {
+          done(message);
+        } else if (!message.ok) {
+          flash(message.error || 'Command failed.');
+        }
       }
     };
-    ws.onclose = function () {
+    function closed() {
+      clearTimeout(keyTimer);
       if (socket !== ws) { return; }
-      byId('conn').textContent = ended ? 'session ended' : 'session closed';
-      byId('conn').className = 'badge off';
-      reconStill();
+      socket = null;
+      var left = waiting;
+      waiting = [];
+      left.forEach(function (done) { if (done) { done(null); } });
+      var dropped = trusted === ws && !ended;
+      trusted = null;
+      if (dropped) {
+        // It was live a moment ago: the recons are left as they were
+        // until a try to reconnect fails.
+        badge('reconnecting\u2026', 'warn');
+      } else {
+        badge(ended ? 'session ended' : 'session closed', 'off');
+        if (ended) { flash('The session ended.'); }
+        reconStill();
+      }
       if (!ended) {
         var wait = reconnectDelay;
         reconnectDelay = Math.min(30000, Math.round(reconnectDelay * 1.5));
         clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(connect, wait);
       }
-    };
+    }
+    ws.onclose = closed;
   }
 
   function renderHeader() {
     var sessionName = String(state.session || '');
     var mode = String(state.mode || 'light').replace(/[^a-z0-9_-]/gi, '');
-    byId('session').textContent = sessionName;
-    byId('avatar').textContent = sessionName.slice(0, 1).toUpperCase();
-    byId('mode').textContent = 'mode ' + mode;
+    setText(byId('session'), sessionName);
+    setText(byId('avatar'), sessionName.slice(0, 1).toUpperCase());
+    setText(byId('mode'), 'mode ' + mode);
     byId('mode').className = 'badge mode-' + mode;
     // One line of status, like a finished lookup: what there is, what to do.
     var hostsMap = (state.graph && state.graph.hosts) || {};
@@ -338,7 +411,7 @@
     // "5 hosts · 9 CVEs · 2 exploited": no CVE count while there are none.
     var parts = [hosts.length + (hosts.length === 1 ? ' host' : ' hosts')];
     if (total.total) { parts.push(cveWords(total)); }
-    byId('counts').textContent = parts.join(' · ');
+    setText(byId('counts'), parts.join(' · '));
     document.title = 'meow: ' + sessionName;
   }
 
@@ -515,12 +588,20 @@
       var lanPeers = gateways.slice(1).concat(linked(home, ['neighbour', 'direct']).filter(function (id) {
         return id !== hub && id !== 'local' && !placed[id];
       }).sort(bySeverity));
+      // The first ones only, as in every group: the Hosts card lists all.
+      var lanMore = Math.max(0, lanPeers.length - LAN_ROW);
+      lanPeers.slice(LAN_ROW).forEach(function (id) { placed[id] = true; });
+      lanPeers = lanPeers.slice(0, LAN_ROW);
       if (lanPeers.length) {
         var barY = GW_Y + 85;
         rowLeft = -lanPeers.length * STEP;
         lanPeers.forEach(function (id, i) {
           put(id, -(i + 1) * STEP, GW_Y + 150);
         });
+        if (lanMore) {
+          rowLeft -= STEP;
+          title('title:lan-more', '+' + lanMore + ' more in Hosts', rowLeft - 30, GW_Y + 140, '#6b7178');
+        }
         link(hub, anchor(0, barY), LINE.ethernet, tree);
         link(anchor(rowLeft, barY), anchor(0, barY), LINE.ethernet, tree);
         lanPeers.forEach(function (id) {
@@ -687,8 +768,12 @@
     }).sort(bySeverity);
     if (rest.length) {
       var y0 = Object.keys(pos).reduce(function (y, id) { return Math.max(y, pos[id].y); }, 0) + 230;
-      title('title:unknown', 'No route', rowLeft - 50, y0 - 62, '#6b7178');
-      rest.forEach(function (h, i) { put(h, rowLeft + (i % 6) * SUB_STEP, y0 + Math.floor(i / 6) * 170); });
+      var restMore = Math.max(0, rest.length - NO_ROUTE_MAX);
+      title('title:unknown', 'No route' + (restMore ? ' \u00b7 +' + restMore + ' more in Hosts' : ''),
+        rowLeft - 50, y0 - 62, '#6b7178');
+      rest.slice(0, NO_ROUTE_MAX).forEach(function (h, i) {
+        put(h, rowLeft + (i % 6) * SUB_STEP, y0 + Math.floor(i / 6) * 170);
+      });
     }
 
     asnBoxes.forEach(function (box) { elements.push(box); });
@@ -1450,7 +1535,8 @@
     var parts = [], of = count.done + ' of ' + total + ' done';
     var problem = entry.rank === 1 ? first.interrupted || first.failed : first.failed;
     if (now) {
-      parts.push((model.running + 1) + '/' + total);
+      // Stages over, as the HUD counts them.
+      parts.push(over + '/' + total);
       if (count.failed) { parts.push(count.failed + ' failed'); }
       // "ports 3%": the tool's own name for its scan is the hint's.
       var said = now.progress.percent || figure(now.progress);
@@ -1481,7 +1567,7 @@
       model.note = problem ? describeStage(problem) : '';
     }
     model.main = parts.join(' \u00b7 ');
-    model.spoken = now ? model.main.replace(/^(\d+)\/(\d+)/, 'stage $1 of $2') : model.main;
+    model.spoken = now ? model.main.replace(/^(\d+)\/(\d+)/, '$1 of $2 stages over') : model.main;
     // A run that is over keeps its bar and, where there is room, the
     // names: which stages ran and which were skipped stays readable.
     model.over = entry.rank === 2;
@@ -2119,11 +2205,16 @@
   // map says how to get hosts while there are none; the names that were
   // only mentioned stay listed either way.
   function renderHosts() {
-    var list = clear(byId('hosts'));
     var mentioned = state.topology.mentioned || [];
     var hosts = state.topology.nodes.filter(function (node) { return node.data.kind === 'host'; });
-    hosts.sort(function (a, b) { return sortKey(a.data) < sortKey(b.data) ? -1 : 1; });
     var selData = selectedNodeData();
+    var named = (state.graph && state.graph.hosts) || {};
+    if (unchanged('hosts', [selected, selData && selData.kind, mentioned, hosts.map(function (node) {
+      var known = own(named, node.data.address);
+      return [node.data, known ? known.hostnames || null : null];
+    })])) { return; }
+    var list = clear(byId('hosts'));
+    hosts.sort(function (a, b) { return sortKey(a.data) < sortKey(b.data) ? -1 : 1; });
     if (selData && selData.kind === 'host') { hosts = []; }
     byId('card-hosts').hidden = !hosts.length && !mentioned.length;
     var labels = [], domains = table();
@@ -2201,6 +2292,7 @@
     renderCves();
 
     var notices = (state.notices || []).slice(-25).reverse();
+    if (unchanged('notices', notices)) { return; }
     byId('card-notices').hidden = !notices.length;
     byId('notices-count').textContent = notices.length ? String(notices.length) : '';
     renderList(byId('notices'), notices, '', function (notice) {
@@ -2344,13 +2436,21 @@
   // CVEs. Under each host's address when no host is selected, the most
   // urgent host first; in the host's own tab when one is.
   function renderCves() {
-    var box = clear(byId('cves'));
     var selData = selectedNodeData();
     var only = selData && selData.address ? selData.address : null;
-    // In the host's tab, the tab is its title.
-    byId('cves-title').hidden = !!only;
     var hostsMap = (state.graph && state.graph.hosts) || {};
     var byHost = state.cves || {};
+    var local = state.graph && state.graph.local;
+    if (unchanged('cves', [only, Object.keys(hostsMap).length > 0, byHost, state.fixes || null,
+      state.cve_lookups, (local && local.interfaces) || null,
+      Object.keys(byHost).map(function (address) {
+        var host = own(hostsMap, address);
+        return host ? [address, host.hostnames || null, host.advisories || null] : null;
+      }),
+      only && own(hostsMap, only) ? hasVersions(own(hostsMap, only)) : null])) { return; }
+    var box = clear(byId('cves'));
+    // In the host's tab, the tab is its title.
+    byId('cves-title').hidden = !!only;
     var addresses = Object.keys(byHost).filter(function (address) {
       return (!only || address === only) && own(hostsMap, address);
     });
@@ -2418,6 +2518,19 @@
     if (seconds < 86400) { return Math.round(seconds / 3600) + ' h ago'; }
     return String(at).slice(0, 10);
   }
+  // "3 min ago" that keeps up with the clock: written again in place
+  // (below), so the cards need not be built again for it.
+  function ago(at, after, className) {
+    var node = el('span', className || null, sinceText(at) + (after || ''));
+    node.setAttribute('data-at', String(at || ''));
+    node.setAttribute('data-after', after || '');
+    return node;
+  }
+  setInterval(function () {
+    Array.prototype.forEach.call(document.querySelectorAll('span[data-at]'), function (node) {
+      setText(node, sinceText(node.getAttribute('data-at')) + node.getAttribute('data-after'));
+    });
+  }, 15000);
 
   // Whether the host is there: what the scans saw, and what "Check now"
   // found. "Check now" makes one connection to each of a few known open
@@ -2453,19 +2566,21 @@
     else { status = 'not checked'; kind = 'warn'; }
     box.appendChild(hint(row('Host', marked(status, kind)), why));
     if (seenUp) {
-      var seenRow = box.appendChild(row('Last seen', sinceText(seenUp)));
+      var seenRow = box.appendChild(row('Last seen', ago(seenUp)));
       seenRow.title = seenUp.slice(0, 19).replace('T', ' ') + ' UTC';
     }
     if (lastScan && (!seenUp || Date.parse(lastScan) - Date.parse(seenUp) > 5 * 60000)) {
-      box.appendChild(row('Last scan', marked(sinceText(lastScan) + ' \u00b7 not seen', 'warn')));
+      var scanned = el('span');
+      scanned.appendChild(ago(lastScan, ' \u00b7 not seen '));
+      scanned.appendChild(mark('warn'));
+      box.appendChild(row('Last scan', scanned));
     }
     if (check && check.status !== 'checking') {
       // "1 min ago · 443 open 12 ms, 80 open 15 ms"
       var answers = (check.ports || []).map(function (p) {
         return p.port + ' ' + p.state + (typeof p.ms === 'number' ? ' ' + p.ms.toFixed(0) + ' ms' : '');
       });
-      box.appendChild(row('Checked', [sinceText(check.at)].concat(answers.length ? [answers.join(', ')] : [])
-        .filter(Boolean).join(' · ')));
+      box.appendChild(row('Checked', ago(check.at, answers.length ? ' \u00b7 ' + answers.join(', ') : '')));
     }
     var light = state && state.mode === 'light';
     var actions = box.appendChild(el('div', 'actions'));
@@ -2497,6 +2612,12 @@
       });
     })(node);
     return count;
+  }
+
+  // An outdated protocol version, as tls-audit stores it ("TLSv1.0",
+  // "TLSv1", "SSLv3") or written out ("TLS 1.1").
+  function oldTls(version) {
+    return /^(?:SSL ?v?[23](?:\.0)?|TLS ?v?1(?:\.[01])?)$/i.test(String(version || '').trim());
   }
 
   // "https" for nmap's "ssl/http": one name for a service everywhere.
@@ -2593,11 +2714,11 @@
         }
       }
       if (http.tls_versions && http.tls_versions.length) {
-        var hasLegacy = http.tls_versions.some(function (v) { return v === 'TLS 1.0' || v === 'TLS 1.1'; });
+        var legacy = http.tls_versions.filter(oldTls);
         web.appendChild(hint(row('TLS', marked(http.tls_versions.map(function (v) {
-          return v.replace(/^TLS /, '');
-        }).join(', '), hasLegacy ? 'warn' : 'ok')), http.tls_versions.join(', ') +
-          (hasLegacy ? ': TLS 1.0 and 1.1 are outdated' : '')));
+          return String(v).replace(/^TLS ?v?(?=\d)/i, '').replace(/^1$/, '1.0');
+        }).join(', '), legacy.length ? 'warn' : 'ok')), http.tls_versions.join(', ') +
+          (legacy.length ? ': ' + legacy.join(', ') + ' outdated' : '')));
       }
       if (http.tls_weak_ciphers && http.tls_weak_ciphers.length) {
         web.appendChild(row('Weak ciphers', marked(http.tls_weak_ciphers.join(', '), 'warn')));
@@ -2699,7 +2820,7 @@
     (host.facts || []).filter(function (fact) { return fact && fact.source === 'manual_note'; })
       .slice(-20).forEach(function (fact) {
         var line = note.appendChild(el('div', 'fact'));
-        line.appendChild(el('span', 'dim', sinceText(fact.timestamp_utc) + ' '));
+        line.appendChild(ago(fact.timestamp_utc, ' ', 'dim'));
         line.appendChild(document.createTextNode(String(fact.claim || '')));
       });
     var box = note.appendChild(el('textarea'));
@@ -2708,23 +2829,51 @@
     if (hasOwn.call(noteDrafts, host.address)) {
       box.value = noteDrafts[host.address];
     }
+    var actions = note.appendChild(el('div', 'actions'));
+    var save = actions.appendChild(el('button', null, 'Save'));
+    save.type = 'button';
+    var counter = actions.appendChild(el('span', 'note-count'));
+    // The session keeps at most NOTE_MAX bytes, as the HUD does: a longer
+    // note cannot be saved, and stays in the box to be cut.
+    function fit() {
+      var used = utf8Length(box.value.trim()), saving = hasOwn.call(notesSaving, host.address);
+      counter.textContent = used + ' / ' + NOTE_MAX;
+      counter.className = 'note-count ' + (used > NOTE_MAX ? 'bad-text' : 'dim');
+      counter.title = 'Bytes in the note, of ' + NOTE_MAX;
+      save.textContent = saving ? 'Saving\u2026' : 'Save';
+      save.disabled = saving || used > NOTE_MAX;
+      save.title = used > NOTE_MAX ? 'Too long: ' + NOTE_MAX + ' bytes at most'
+        : 'Kept in this session and listed in the report';
+    }
     box.addEventListener('input', function () {
       if (box.value) {
         noteDrafts[host.address] = box.value;
       } else {
         delete noteDrafts[host.address];
       }
+      fit();
     });
-    var save = note.appendChild(el('div', 'actions')).appendChild(el('button', null, 'Save'));
-    save.type = 'button';
-    save.title = 'Kept in this session and listed in the report';
     save.addEventListener('click', function () {
-      if (box.value.trim()) {
-        send({ cmd: 'note', address: host.address, text: box.value });
-        box.value = '';
-        delete noteDrafts[host.address];
+      var text = box.value, address = host.address;
+      if (!text.trim() || hasOwn.call(notesSaving, address) || utf8Length(text.trim()) > NOTE_MAX) { return; }
+      // The note stays in the box until the session says it kept it.
+      var sent = send({ cmd: 'note', address: address, text: text }, function (reply) {
+        delete notesSaving[address];
+        if (reply && reply.ok) {
+          var shown = noteBox(address);
+          if (shown && shown.value === text) { shown.value = ''; }
+          if (own(noteDrafts, address) === text) { delete noteDrafts[address]; }
+        } else {
+          flash(reply ? reply.error || 'Command failed.' : 'Note not saved: the session closed.');
+        }
+        renderDetail(true);
+      });
+      if (sent) {
+        notesSaving[address] = text;
+        fit();
       }
     });
+    fit();
     return { status: statusCard(host), ports: ports, web: web.childNodes.length ? web : null,
       ai: ai, note: note };
   }
@@ -2737,7 +2886,7 @@
 
   // A to F: green, amber or red.
   function gradeKind(grade) {
-    return /^[AB]$/.test(grade) ? 'ok' : grade === 'C' ? 'warn' : /^[DF]$/.test(grade) ? 'bad' : 'info';
+    return /^[AB]$/.test(grade) ? 'ok' : grade === 'C' ? 'warn' : /^[D-F]$/.test(grade) ? 'bad' : 'info';
   }
 
   // DNS & Mail: the graded checks, the services the domain publishes, and
@@ -2825,14 +2974,12 @@
       cves.serious ? 'bad' : cves.total ? 'warn' : state.cve_lookups === false ? 'info' : 'ok')));
     if (made.web) {
       // One short phrase per kind of problem, with the ports it was seen on.
-      var oldTls = [], weak = [], missing = [], edges = [], oldLibs = [], keyCount = 0, worstGrade = '';
+      var legacyTls = [], weak = [], missing = [], edges = [], oldLibs = [], keyCount = 0, worstGrade = '';
       Object.keys(ports).forEach(function (key) {
         var http = (own(ports, key) || {}).http;
         if (!http) { return; }
         var where = key.replace(/\/tcp$/, '');
-        if ((http.tls_versions || []).some(function (v) { return v === 'TLS 1.0' || v === 'TLS 1.1'; })) {
-          oldTls.push(where);
-        }
+        if ((http.tls_versions || []).some(oldTls)) { legacyTls.push(where); }
         if ((http.tls_weak_ciphers || []).length) { weak.push(where); }
         if ((http.missing_headers || []).length) { missing.push(where); }
         if (http.waf && edges.indexOf(http.waf) < 0) { edges.push(http.waf); }
@@ -2846,7 +2993,7 @@
       if (keyCount) { flagged.push(keyCount + (keyCount === 1 ? ' exposed key' : ' exposed keys')); }
       if (worstGrade && worstGrade !== 'A') { flagged.push('headers ' + worstGrade); }
       if (oldLibs.length) { flagged.push('outdated ' + oldLibs.join(', ')); }
-      if (oldTls.length) { flagged.push('TLS 1.0/1.1 on ' + oldTls.join(', ')); }
+      if (legacyTls.length) { flagged.push('old TLS on ' + legacyTls.join(', ')); }
       if (weak.length) { flagged.push('weak ciphers on ' + weak.join(', ')); }
       if (missing.length && !worstGrade) { flagged.push('headers missing on ' + missing.join(', ')); }
       var said = flagged.concat(edges);
@@ -3015,6 +3162,40 @@
     print.addEventListener('click', function () { window.print(); });
   }
 
+  // The selected host's note box, while its card is shown.
+  function noteBox(address) {
+    return selected === 'host:' + address ? byId('host-panels').querySelector('textarea') : null;
+  }
+
+  // What the cards were last drawn from. A card is drawn again only when
+  // that changed: a push that changed nothing it shows (an AI reply
+  // streaming in, a stage moving on) keeps clicks, selection and focus.
+  var drawnFrom = table();
+  function unchanged(name, inputs) {
+    var key = JSON.stringify(inputs);
+    if (own(drawnFrom, name) === key) { return true; }
+    drawnFrom[name] = key;
+    return false;
+  }
+
+  // Which button (or link) of the cards has the keyboard focus, told by
+  // its card, its kind and its words, so that the one built in its place
+  // gets it back. The note box and the tabs keep theirs on their own.
+  function focusMark() {
+    var active = document.activeElement;
+    var holder = active && active.closest ? active.closest('#detail, #host-panels > .panel') : null;
+    if (!holder || active.tagName === 'TEXTAREA' || active.getAttribute('role') === 'tab') { return null; }
+    var alike = function (node) { return node.tagName === active.tagName && node.textContent === active.textContent; };
+    var same = Array.prototype.filter.call(holder.querySelectorAll(active.tagName), alike);
+    return { holder: holder.id, alike: alike, at: same.indexOf(active) };
+  }
+  function focusAgain(mark) {
+    var holder = mark && byId(mark.holder);
+    if (!holder) { return; }
+    var node = Array.prototype.filter.call(holder.querySelectorAll('*'), mark.alike)[mark.at];
+    if (node && typeof node.focus === 'function') { node.focus({ preventScroll: true }); }
+  }
+
   // The selected node: what it is, in the card beside the map; for a host
   // its findings are the tabs under the map. With nothing selected, the
   // card is the report.
@@ -3042,7 +3223,18 @@
       : 'Research is off until a key is added. A key added applies to this session at once.');
   }
 
-  function renderDetail() {
+  function renderDetail(force) {
+    var data = selectedNodeData();
+    var address = data && data.address;
+    var host = address && state.graph ? own(state.graph.hosts, address) || null : null;
+    var reply = state.ai || {};
+    var local = state.graph && state.graph.local;
+    var inputs = [selected, data, host,
+      address ? [own(state.checks || {}, address) || null, own(state.cves || {}, address) || null] : null,
+      state.cve_lookups, state.mode, state.budget || null,
+      [reply.address || null, !!reply.running, !!reply.text, !!reply.error], traceExpanded,
+      data && data.kind === 'interface' ? (local && local.interfaces) || null : null];
+    if (unchanged('detail', inputs) && !force) { return; }
     var detail = byId('detail');
     var panels = byId('host-panels');
     // Keep cursor/focus and per-host note draft across live refreshes.
@@ -3054,6 +3246,7 @@
     var selEnd = hadFocus ? draft.selectionEnd : null;
     var tabFocused = sameHost && document.activeElement &&
       document.activeElement.getAttribute && document.activeElement.getAttribute('role') === 'tab';
+    var focused = sameHost ? focusMark() : null;
     lastDetailId = selected;
     clear(detail);
     detail.title = '';
@@ -3061,14 +3254,12 @@
     clear(panels);
     clear(byId('host-tabs'));
     byId('card-host').hidden = true;
-    var data = selectedNodeData();
     var title = byId('detail-title');
     if (!data) {
       title.textContent = 'Report';
       reportButtons(detail, null);
       return;
     }
-    var host = data.address && state.graph ? own(state.graph.hosts, data.address) : null;
     if (host) {
       if (sameHost && draftText) {
         noteDrafts[host.address] = draftText;
@@ -3131,6 +3322,7 @@
           try { box.setSelectionRange(selStart, selEnd); } catch (_) {}
         }
       }
+      focusAgain(focused);
       return;
     }
     title.textContent = String(data.caption || data.label || data.id || 'Selected').split('\n')[0];
@@ -3202,6 +3394,7 @@
     }
     // Why it is drawn as it is: a hint, not a finding.
     if (!detail.title) { detail.title = drawnAs(data); }
+    focusAgain(focused);
   }
 
   // Where a hop's address is, in words: "Fremont, California, United States".
@@ -3702,7 +3895,7 @@
     var reply = state.ai || {};
     if (!reply.running && !reply.text && !reply.error) {
       panel.hidden = true;
-      lastAiKey = '';
+      lastAiKey = lastAiBody = '';
       return;
     }
     panel.hidden = false;
@@ -3710,6 +3903,8 @@
     // While another host is selected, the answer folds to its head line.
     var elsewhere = !!(selectedAddress() && reply.address && !onSameHost);
     panel.classList.toggle('folded', elsewhere);
+    // Its head and its body are drawn again apart: while the reply streams
+    // in only the body changes, and the buttons above it keep working.
     var aiKey = JSON.stringify([
       !!reply.running,
       reply.tier || '',
@@ -3717,7 +3912,7 @@
       reply.summary || '',
       reply.error || '',
       onSameHost,
-      reply.text || ''
+      !!reply.text
     ]);
     if (aiKey !== lastAiKey) {
       lastAiKey = aiKey;
@@ -3743,11 +3938,12 @@
       }
 
       if (reply.text) {
-        var rawCopy = String(reply.text);
         var copyBtn = badges.appendChild(el('button', null, 'Copy'));
         copyBtn.type = 'button';
         copyBtn.title = 'Copy the answer as Markdown';
         copyBtn.addEventListener('click', function () {
+          // The answer as it stands now: it may have grown since.
+          var rawCopy = String((state.ai && state.ai.text) || '');
           if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
             navigator.clipboard.writeText(rawCopy).then(function () {
               copyBtn.textContent = 'Copied';
@@ -3770,13 +3966,6 @@
       meta.hidden = !summary;
       meta.textContent = summary ? capital(summary) : '';
 
-      var body = clear(byId('ai-body'));
-      if (reply.text) {
-        renderTriage(body, String(reply.text));
-      } else if (reply.running) {
-        body.appendChild(el('p', 'dim', 'Waiting for the answer\u2026'));
-      }
-
       var errBox = byId('ai-error');
       if (reply.error) {
         errBox.hidden = false;
@@ -3784,6 +3973,16 @@
       } else {
         errBox.hidden = true;
         errBox.textContent = '';
+      }
+    }
+    var bodyKey = JSON.stringify([!!reply.running, reply.text || '']);
+    if (bodyKey !== lastAiBody) {
+      lastAiBody = bodyKey;
+      var body = clear(byId('ai-body'));
+      if (reply.text) {
+        renderTriage(body, String(reply.text));
+      } else if (reply.running) {
+        body.appendChild(el('p', 'dim', 'Waiting for the answer\u2026'));
       }
     }
 
@@ -3810,7 +4009,16 @@
       drawn = '';
       renderGraph();
     }
+    // Expanded on a narrow screen the cards are hidden: a device's card
+    // is shown by going back to the page, at the card.
+    var narrow = mapExpanded && id !== 'internet' && window.matchMedia &&
+      window.matchMedia('(max-width: 900px)').matches;
+    if (narrow) { expandMap(false); }
     select(id);
+    if (narrow) {
+      var shown = byId('card-host').hidden ? byId('detail').parentNode : byId('card-host');
+      shown.scrollIntoView({ block: 'start' });
+    }
   });
   // Dragging the empty background scrolls the row, like the scrollbar.
   var dragFrom = null;

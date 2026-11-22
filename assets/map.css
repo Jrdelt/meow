@@ -331,7 +331,9 @@ button:hover { border-color: var(--accent); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 textarea { width: 100%; min-height: 70px; background: #0d0f11; color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 8px; font: inherit; }
-#flash { position: fixed; left: 14px; bottom: 14px; background: var(--bad); color: #fff; padding: 8px 12px; border-radius: 6px; max-width: 60%; z-index: 10; }
+/* Above Expand's full-window map, too. */
+#flash { position: fixed; left: 14px; bottom: 14px; background: var(--bad); color: #fff; padding: 8px 12px; border-radius: 6px; max-width: 60%; z-index: 30; }
+.note-count { margin-left: auto; align-self: center; font-size: 12px; }
 pre.reply { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: 6px 0 0; }
 
 /* Full-width AI triage & research output below all cards. */
