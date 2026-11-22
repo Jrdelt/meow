@@ -315,8 +315,10 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
         "rust-toolchain.toml",
     ];
     let safe_dir = sanitize(&dir.display().to_string(), 400);
+    // `rel` as a path of this system (`.cargo\config.toml` on Windows).
+    let native = |base: &Path, rel: &str| rel.split('/').fold(base.to_path_buf(), |p, c| p.join(c));
     for rel in OVERRIDES {
-        let candidate = dir.join(rel);
+        let candidate = native(dir, rel);
         let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
             continue;
         };
@@ -346,7 +348,7 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
         };
         for ancestor in dir.ancestors().skip(1) {
             for &rel in [".cargo"].iter().chain(&OVERRIDES).chain(manifests) {
-                let candidate = ancestor.join(rel);
+                let candidate = native(ancestor, rel);
                 let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
                     continue;
                 };

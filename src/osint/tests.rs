@@ -788,17 +788,21 @@ fn resolv_conf_names_the_servers_and_nothing_stands_in_for_none() {
         panic!("{servers:?}")
     };
     assert_eq!(link.scope_id(), 2);
-    // The system's own interfaces: the loopback one exists everywhere.
-    let lo = if cfg!(target_os = "linux") {
-        "lo"
-    } else {
-        "lo0"
-    };
-    let real = parse_resolv_conf(&format!(
-        "nameserver fe80::1%{lo}\nnameserver fe80::2%nosuch0\n"
-    ));
-    assert_eq!(real.len(), 1, "{real:?}");
-    assert!(matches!(real[0], SocketAddr::V6(v6) if v6.scope_id() != 0));
+    // The system's own interfaces: the loopback one exists on every Unix.
+    // (Windows reads no resolv.conf: its servers come from the adapters.)
+    #[cfg(unix)]
+    {
+        let lo = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let real = parse_resolv_conf(&format!(
+            "nameserver fe80::1%{lo}\nnameserver fe80::2%nosuch0\n"
+        ));
+        assert_eq!(real.len(), 1, "{real:?}");
+        assert!(matches!(real[0], SocketAddr::V6(v6) if v6.scope_id() != 0));
+    }
     // No file, or one without servers: no public resolver takes their place.
     assert!(parse_resolv_conf("").is_empty());
     assert!(parse_resolv_conf("search example.org\n").is_empty());

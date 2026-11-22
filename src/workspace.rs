@@ -7400,7 +7400,13 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         let latin1 = fx
             .cwd
             .join(std::ffi::OsStr::from_bytes(b"Projekt-M\xfcller"));
-        fs::create_dir(&latin1).unwrap();
+        match fs::create_dir(&latin1) {
+            Ok(()) => {}
+            // APFS keeps every name as UTF-8 and refuses this one: no such
+            // folder can exist there, so there is nothing to check.
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(e) => panic!("{e}"),
+        }
         let reason = check_new_folder(&fx.home, &latin1, "acme").unwrap_err();
         assert_eq!(reason, "the path is not valid UTF-8");
         let said = format!(
