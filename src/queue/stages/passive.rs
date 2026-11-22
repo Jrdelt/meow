@@ -183,7 +183,7 @@ pub(crate) async fn mail_dns_with(
         .map(|host| host.address.clone())
         .collect();
     // An internal target's questions stay on this machine's resolvers.
-    let internal = crate::osint::is_internal_target(domain, &dns_found.ips).await;
+    let internal = crate::osint::internal_target_addresses(domain, &dns_found.ips).await;
     // How many questions it will ask depends on the answers: said as it goes.
     let asked = |answered: usize| {
         cx.report(Progress {
@@ -202,7 +202,7 @@ pub(crate) async fn mail_dns_with(
             domain,
             &primary_address,
             &ct_names,
-            internal,
+            internal.as_deref(),
             asked,
         ),
     )

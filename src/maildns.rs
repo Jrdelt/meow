@@ -496,14 +496,16 @@ fn first_unknown<'a>(lookups: &[&'a Lookup]) -> Option<&'a Lookup> {
 
 /// A to F: two points for each check that is fine, one for a warning or
 /// an unknown, none for a problem. A check that could not be done is left
-/// out.
+/// out, and there is no grade (`?`) unless SPF, DMARC and one more were
+/// done: whether mail can be forged decides it.
 pub fn overall_grade(checks: &[DnsCheck]) -> String {
     let graded: Vec<&DnsCheck> = checks
         .iter()
         .filter(|c| matches!(c.name.as_str(), "SPF" | "DMARC" | "DKIM" | "CAA" | "DNSSEC"))
         .filter(|c| c.status != NOT_CHECKED)
         .collect();
-    if graded.is_empty() {
+    let done = |name: &str| graded.iter().any(|c| c.name == name);
+    if !done("SPF") || !done("DMARC") || graded.len() < 3 {
         return "?".to_owned();
     }
     let points: usize = graded
@@ -614,14 +616,15 @@ fn fact(address: &str, claim: String, evidence: &str) -> Observation {
 
 /// Runs the stage for `domain`, whose records are kept on `primary_address`
 /// (the address it resolves to, or the name itself). `ct_names` are names
-/// the certificate logs gave for the same domain. For an `internal` target
-/// (see [`crate::osint::is_internal_target`]), no question leaves this
-/// machine's resolvers.
+/// the certificate logs gave for the same domain. `internal` holds the
+/// system's addresses for an internal target (see
+/// [`crate::osint::internal_target_addresses`]): then no question leaves
+/// this machine's resolvers.
 pub async fn run(
     domain: &str,
     primary_address: &str,
     ct_names: &[String],
-    internal: bool,
+    internal: Option<&[String]>,
 ) -> Result<(Vec<Observation>, String)> {
     let resolver = Resolver::system(build_http_client(Duration::from_secs(6))?);
     run_on(resolver, domain, primary_address, ct_names, internal).await
@@ -633,7 +636,7 @@ pub async fn run_on(
     domain: &str,
     primary_address: &str,
     ct_names: &[String],
-    internal: bool,
+    internal: Option<&[String]>,
 ) -> Result<(Vec<Observation>, String)> {
     run_on_counted(
         resolver,
@@ -654,11 +657,11 @@ pub async fn run_on_counted(
     domain: &str,
     primary_address: &str,
     ct_names: &[String],
-    internal: bool,
+    internal: Option<&[String]>,
     asked: impl Fn(usize),
 ) -> Result<(Vec<Observation>, String)> {
-    if internal {
-        resolver.keep_private(domain);
+    if let Some(addresses) = internal {
+        resolver.keep_private(domain, addresses);
     }
     let answered = std::sync::atomic::AtomicUsize::new(0);
     let (resolver, answered, asked) = (&resolver, &answered, &asked);
@@ -780,7 +783,8 @@ where
             Some(unknown) => not_checked("CAA", unknown),
             None => grade_caa(caa.records(), &caa_at),
         },
-        match first_unknown(&[&ds]) {
+        // Signed when DS records are found; else the DNSKEY answer decides.
+        match first_unknown(&[&ds, &dnskey]).filter(|_| ds.records().is_empty()) {
             Some(unknown) => not_checked("DNSSEC", unknown),
             None => grade_dnssec(ds.records(), dnskey.records(), &zone),
         },
@@ -1151,6 +1155,21 @@ mod tests {
         no_dmarc[1].status = "bad".to_owned();
         assert_eq!(overall_grade(&no_dmarc), "C");
         assert_eq!(overall_grade(&[check("Mail", "info", "", "")]), "?");
+        // A DMARC or SPF that could not be checked might be missing: no
+        // grade rather than an A.
+        for unchecked in [0, 1] {
+            let mut checks = all("ok");
+            checks[unchecked].status = NOT_CHECKED.to_owned();
+            assert_eq!(overall_grade(&checks), "?", "{checks:?}");
+        }
+        // SPF and DMARC alone are not enough either.
+        let mut few = all("ok");
+        for c in &mut few[2..] {
+            c.status = NOT_CHECKED.to_owned();
+        }
+        assert_eq!(overall_grade(&few), "?");
+        few[2].status = "ok".to_owned();
+        assert_eq!(overall_grade(&few), "A");
     }
 
     #[tokio::test]
@@ -1376,11 +1395,11 @@ mod tests {
                 "{name}"
             );
         }
-        // Graded on SPF and DKIM alone.
-        assert_eq!(info.grade, "A", "{summary}");
+        // Without DMARC, no grade: mail may be forgeable.
+        assert_eq!(info.grade, "?", "{summary}");
         assert_eq!(
             summary,
-            "grade A: SPF ok, DMARC not checked, DKIM ok, CAA not checked, DNSSEC not checked"
+            "grade ?: SPF ok, DMARC not checked, DKIM ok, CAA not checked, DNSSEC not checked"
         );
         // No claim about the name whose lookups failed.
         assert_eq!(info.subdomains[0].status, "unknown");

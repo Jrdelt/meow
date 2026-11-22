@@ -781,9 +781,10 @@ pub enum Lookup {
     /// DNS-over-HTTPS failed or was not allowed, or no server could be asked.
     Failed,
     /// "None" about an internal target's name from default servers that do
-    /// not know the target. The system resolves it some other way (a
-    /// split-DNS resolver not found, the hosts file, multicast DNS): the
-    /// answer proves nothing.
+    /// not resolve the target to the system's addresses for it. The system
+    /// resolves it some other way (a split-DNS resolver not found, the hosts
+    /// file, multicast DNS), or the servers answer made-up names: the answer
+    /// proves nothing.
     Unconfirmed,
 }
 
@@ -836,8 +837,9 @@ pub struct Resolver {
     doh: Vec<String>,
     /// Whether DNS-over-HTTPS may be used at all in this run.
     public: bool,
-    /// The internal target, once [`Resolver::keep_private`] named it.
-    target: Option<String>,
+    /// The internal target and the system's addresses for it, once
+    /// [`Resolver::keep_private`] named them.
+    target: Option<(String, Vec<IpAddr>)>,
     /// Whether the default servers know the target (see
     /// [`Lookup::Unconfirmed`]).
     target_known: tokio::sync::OnceCell<bool>,
@@ -887,10 +889,16 @@ impl Resolver {
     /// Keeps every later question on this machine's resolvers: `target` is
     /// internal, and so is every name asked about it. A "none" then counts
     /// only from servers chosen for the name's domain, or from default
-    /// servers that know `target`.
-    pub fn keep_private(&mut self, target: &str) {
+    /// servers that resolve `target` to one of `addresses`, the system's
+    /// addresses for it.
+    pub fn keep_private(&mut self, target: &str, addresses: &[String]) {
         self.public = false;
-        self.target = Some(target.trim_end_matches('.').to_ascii_lowercase());
+        let addresses = addresses
+            .iter()
+            .filter_map(|ip| ip.parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .collect();
+        self.target = Some((target.trim_end_matches('.').to_ascii_lowercase(), addresses));
     }
 
     /// The records of type `rrtype` for `qname`.
@@ -911,10 +919,13 @@ impl Resolver {
         query_doh(&self.client, &self.doh, qname, rrtype).await
     }
 
-    /// Whether the default servers resolve the internal target's own name,
-    /// asked once, and only when they are the ones the system asks about it.
+    /// Whether the default servers resolve the internal target's own name
+    /// to an address the system has for it, asked once, and only when they
+    /// are the ones the system asks about it. Any other answer (a server
+    /// that answers every name, a hosts-file entry it does not know) proves
+    /// nothing.
     async fn default_knows_target(&self, routes: &DnsRoutes) -> bool {
-        let Some(target) = &self.target else {
+        let Some((target, addresses)) = &self.target else {
             return false;
         };
         *self
@@ -924,9 +935,17 @@ impl Resolver {
                 if route.matched {
                     return false;
                 }
-                for qtype in [1, 28] {
+                for (qtype, wanted) in [(1, true), (28, false)] {
+                    // Only the families the system has an address of.
+                    if !addresses.iter().any(|ip| ip.is_ipv4() == wanted) {
+                        continue;
+                    }
                     let found = self.ask_system(route.servers, target, qtype).await;
-                    if found.is_some_and(|records| !records.is_empty()) {
+                    if found.unwrap_or_default().iter().any(|record| {
+                        record
+                            .parse::<IpAddr>()
+                            .is_ok_and(|ip| addresses.contains(&ip.to_canonical()))
+                    }) {
                         return true;
                     }
                 }
@@ -1005,6 +1024,22 @@ pub async fn is_internal_target(name: &str, known: &[String]) -> bool {
     }
     let (v4, v6) = system_addresses(name).await;
     any_non_public(&v4) || any_non_public(&v6)
+}
+
+/// For an internal target (see [`is_internal_target`]), the addresses the
+/// system resolves it to: `known`, or, with none known, those it resolves
+/// it to now. `None` for a public target.
+pub async fn internal_target_addresses(name: &str, known: &[String]) -> Option<Vec<String>> {
+    let mut addresses: Vec<String> = known
+        .iter()
+        .filter(|ip| ip.parse::<IpAddr>().is_ok())
+        .cloned()
+        .collect();
+    if addresses.is_empty() {
+        let (v4, v6) = system_addresses(name).await;
+        addresses = v4.into_iter().chain(v6).collect();
+    }
+    (!may_ask_public_services(name) || any_non_public(&addresses)).then_some(addresses)
 }
 
 fn any_non_public(addresses: &[String]) -> bool {
@@ -1088,7 +1123,15 @@ pub(super) async fn run_dns_with(
                 || any_non_public(&a_recs)
                 || any_non_public(&aaaa_recs)
             {
-                resolver.keep_private(domain);
+                // Only the system's addresses tell which DNS server knows
+                // the name.
+                let system: Vec<String> = a_recs
+                    .iter()
+                    .chain(&aaaa_recs)
+                    .filter(|_| from_system)
+                    .cloned()
+                    .collect();
+                resolver.keep_private(domain, &system);
             }
             // Whether the name publishes IPv6 when the system gave none
             // (Windows leaves it out on a machine without IPv6): reported,

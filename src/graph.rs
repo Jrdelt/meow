@@ -466,9 +466,11 @@ pub struct DnsSecurity {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DnsCheck {
-    /// `SPF`, `DMARC`, `DKIM`, `CAA`, `DNSSEC`, `Mail`.
+    /// `SPF`, `DMARC`, `DKIM`, `CAA`, `DNSSEC`, `Mail`, `Directory`,
+    /// `Wildcard`.
     pub name: String,
-    /// `ok`, `warn`, `bad` or `info`.
+    /// `ok`, `warn`, `bad`, `info`, or `unknown` when its lookups got no
+    /// answer (it could not be checked).
     pub status: String,
     pub value: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -484,7 +486,8 @@ pub struct DnsService {
 }
 
 /// A name from the certificate logs, looked up: `resolves`, `wildcard`
-/// (only the wildcard answers, so it may not exist) or `gone`.
+/// (only the wildcard answers, so it may not exist), `gone`, or `unknown`
+/// when its lookups got no answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubdomainCheck {
     pub name: String,
@@ -496,7 +499,7 @@ pub struct SubdomainCheck {
 impl DnsSecurity {
     pub fn sanitize(&mut self) {
         let status = |s: &str| match s {
-            "ok" | "warn" | "bad" | "info" => s.to_owned(),
+            "ok" | "warn" | "bad" | "info" | "unknown" => s.to_owned(),
             _ => "info".to_owned(),
         };
         self.domain = clean(&self.domain);
@@ -524,9 +527,10 @@ impl DnsSecurity {
             .collect();
         for sub in &mut self.subdomains {
             sub.name = clean(&sub.name);
+            // Anything else claims nothing about the name.
             sub.status = match sub.status.as_str() {
-                "resolves" | "wildcard" | "gone" => sub.status.clone(),
-                _ => "gone".to_owned(),
+                "resolves" | "wildcard" | "gone" | "unknown" => sub.status.clone(),
+                _ => "unknown".to_owned(),
             };
             sub.addresses = std::mem::take(&mut sub.addresses)
                 .into_iter()

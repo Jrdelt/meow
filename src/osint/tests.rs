@@ -916,13 +916,21 @@ async fn an_internal_target_is_never_asked_over_doh() {
     // The mail-dns stage for that target.
     assert!(is_internal_target("dc01.corp.example.org", &ips).await);
     assert!(is_internal_target("dc01.corp.local", &[]).await);
-    let mail_dns = |internal| {
+    assert_eq!(
+        internal_target_addresses("dc01.corp.example.org", &ips).await,
+        Some(ips.clone())
+    );
+    assert_eq!(
+        internal_target_addresses("printer.corp.local", &["10.0.0.9".to_owned()]).await,
+        Some(vec!["10.0.0.9".to_owned()])
+    );
+    let mail_dns = |internal: bool| {
         crate::maildns::run_on(
             stand_in_resolver(vec![server], &doh),
             "dc01.corp.example.org",
             "10.0.0.5",
             &[],
-            internal,
+            internal.then_some(ips.as_slice()),
         )
     };
     mail_dns(true).await.unwrap();
@@ -1289,7 +1297,7 @@ async fn split_dns_names_go_to_their_own_servers_and_a_default_none_is_not_final
         ],
     };
     let mut resolver = stand_in_routed(routes, &doh);
-    resolver.keep_private("intranet.corp.example.com");
+    resolver.keep_private("intranet.corp.example.com", &["10.0.0.5".to_owned()]);
     // The domain's names: its own server, whose "none" is final.
     assert_eq!(
         resolver
@@ -1331,7 +1339,7 @@ async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_i
     })
     .await;
     let mut resolver = stand_in_resolver(vec![dc], &doh);
-    resolver.keep_private("dc01.corp.example.org");
+    resolver.keep_private("dc01.corp.example.org", &["10.0.0.5".to_owned()]);
     assert_eq!(
         resolver.resolve("_dmarc.dc01.corp.example.org", 16).await,
         Lookup::NoRecords
@@ -1339,7 +1347,10 @@ async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_i
     // A target the hosts file names: the DNS server knows nothing of it.
     let (other, asked) = stand_in_dns(|_, _| Reply::NxDomain).await;
     let mut resolver = stand_in_resolver(vec![other], &doh);
-    resolver.keep_private("target.example.org");
+    resolver.keep_private(
+        "target.example.org",
+        &["10.0.0.9".to_owned(), "fd00::9".to_owned()],
+    );
     for _ in 0..3 {
         assert_eq!(
             resolver.resolve("_dmarc.target.example.org", 16).await,
@@ -1352,6 +1363,58 @@ async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_i
         .filter(|q| q.ends_with(" target.example.org"))
         .collect();
     assert_eq!(about, ["1 target.example.org", "28 target.example.org"]);
+    // A server that answers every name (NXDOMAIN rewritten, a captive
+    // portal, a wildcard parent zone) does not know the target either: it
+    // gives another address than the hosts file.
+    let (hijack, asked) = stand_in_dns(|_, qtype| match qtype {
+        1 => Reply::Address([198, 51, 100, 7]),
+        28 => Reply::NoData,
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let mut resolver = stand_in_resolver(vec![hijack], &doh);
+    resolver.keep_private("intranet.example.org", &["10.0.0.5".to_owned()]);
+    assert_eq!(
+        resolver.resolve("_dmarc.intranet.example.org", 16).await,
+        Lookup::Unconfirmed
+    );
+    // Only A: the system has no IPv6 address for it.
+    assert_eq!(
+        taken(&asked),
+        ["16 _dmarc.intranet.example.org", "1 intranet.example.org"]
+    );
+    // The dns stage for that target claims no missing record.
+    let (observations, _, summary) = run_dns_with(
+        &Target::parse("intranet.example.org").unwrap(),
+        stand_in_resolver(vec![hijack], &doh),
+        (vec!["10.0.0.5".to_owned()], Vec::new()),
+    )
+    .await;
+    assert!(!format!("{observations:?}").contains("no AAAA record"));
+    assert!(
+        summary.ends_with("; this machine's DNS server does not know the name"),
+        "{summary}"
+    );
+    // The same server for a target whose address it does give.
+    let mut resolver = stand_in_resolver(vec![hijack], &doh);
+    resolver.keep_private("intranet.example.org", &["198.51.100.7".to_owned()]);
+    assert_eq!(
+        resolver.resolve("_dmarc.intranet.example.org", 16).await,
+        Lookup::NoRecords
+    );
+    // With no address from the system, nothing proves the server knows it.
+    let (dc, dc_asked) = stand_in_dns(|name, _| match name {
+        "dc01.corp.example.org" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let mut resolver = stand_in_resolver(vec![dc], &doh);
+    resolver.keep_private("dc01.corp.example.org", &[]);
+    assert_eq!(
+        resolver.resolve("_dmarc.dc01.corp.example.org", 16).await,
+        Lookup::Unconfirmed
+    );
+    assert_eq!(taken(&dc_asked), ["16 _dmarc.dc01.corp.example.org"]);
     // For a public target, the system's "none" is final.
     let public = stand_in_resolver(vec![other], &doh);
     assert_eq!(
@@ -1455,7 +1518,7 @@ async fn mail_dns_ends_without_a_grade_when_no_lookup_answers() {
         "pub.example.org",
         "192.0.2.10",
         &[],
-        false,
+        None,
     )
     .await
     .unwrap();
@@ -1470,7 +1533,7 @@ async fn mail_dns_ends_without_a_grade_when_no_lookup_answers() {
         "intranet.example.org",
         "10.0.0.5",
         &[],
-        true,
+        Some(&["10.0.0.5".to_owned()]),
     )
     .await
     .unwrap();
