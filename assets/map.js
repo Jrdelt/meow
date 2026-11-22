@@ -2854,10 +2854,11 @@
       fit();
     });
     save.addEventListener('click', function () {
-      var text = box.value, address = host.address;
-      if (!text.trim() || hasOwn.call(notesSaving, address) || utf8Length(text.trim()) > NOTE_MAX) { return; }
-      // The note stays in the box until the session says it kept it.
-      var sent = send({ cmd: 'note', address: address, text: text }, function (reply) {
+      var text = box.value, address = host.address, kept = text.trim();
+      if (!kept || hasOwn.call(notesSaving, address) || utf8Length(kept) > NOTE_MAX) { return; }
+      // The note stays in the box until the session says it kept it. What
+      // is sent is what was counted (this trim() also drops U+FEFF).
+      var sent = send({ cmd: 'note', address: address, text: kept }, function (reply) {
         delete notesSaving[address];
         if (reply && reply.ok) {
           var shown = noteBox(address);

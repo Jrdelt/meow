@@ -825,7 +825,10 @@ impl State {
                 Ok(json!({ "mode": mode, "resumed": resumed }))
             }
             Command::Note { address, text } => {
-                let text = text.trim().to_owned();
+                // U+FEFF too, as JavaScript's trim() does: the page counts so.
+                let text = text
+                    .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+                    .to_owned();
                 if text.is_empty() {
                     bail!("the note is empty");
                 }
