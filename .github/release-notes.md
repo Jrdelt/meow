@@ -1,12 +1,20 @@
-### What's New in `meow` v0.2.5
+### What's New in `meow` v0.2.6
 
-- **Recon progress in the map and the HUD.** A bar shows each stage as done, running, waiting, skipped, failed or stopped, with the running stage's name, nmap's own percent and time left, and the time so far. A finished recon keeps its stage names, so you can see what ran.
-- **Closing the terminal ends the recon cleanly.** The running stage stops and every tool it started (nmap, katana, feroxbuster, traceroute) is killed; stages already done keep their results; stages that had not started are dropped. The next start says once where it stopped. A recon is never carried into a later session.
-- **No leftover scanners.** If meow is killed outright, a small watchdog stops its tools; if both die, the next start finds and stops them (only processes meow started, matched by their exact start time).
-- **Simpler screens.**
-  - Setup: one question per step, one short line per choice, details behind `?` (about 55% fewer words; fits 80x24).
-  - HUD: a numbers-first header (`acme · mild · 3 hosts · 4 CVEs · 1 exploited`), only known facts, only keys that work, `?` for the rest.
-  - Map: one "Findings" card per host, short labels on the drawing, no "unknown" rows (about 45% fewer words).
+- **Security (high): a cloned or unpacked git folder can no longer run its own programs.** meow's git check now reaches no remote, ignores the folder's `core.sshCommand` and credential helpers, and never asks for a password.
+- **Security: safer `meow update` from source.** It checks the clone before git reads it, refuses cargo settings above it that others can change, and builds in a private `~/.meow/build`.
+- **Security: AI replies keep placeholders in code and commands.** A one-word name from a host's certificate or banner is masked everywhere in that host's requests. Elsewhere, only where it stands as a host.
+- **Security: a `git pull` during a session is noticed.** The next start drops the shell history and last folder.
+- **Security: stricter folder checks,** with the reason in each refusal.
+- **Security: setup refuses a key meant for the other service.**
+- **New: `meow setup --cloud-off`** (entry `6` in `--plain`) turns cloud AI off and removes the key.
+- **One daily cloud cap for all sessions,** kept in `~/.meow/ai-usage`.
+- **Recon:** `trace` runs after `ports` and records only real hops. `-6` and `-Pn` reach every scan.
+- **DNS:** split DNS is followed on macOS and Windows. A failed lookup says `could not be checked`. `mail-dns` test names no longer say "meow".
+- **CVEs and report:** fix lines name every port, rescans drop old versions, and the report counts only hosts on the map.
+- **Map:** a connection badge and a 2000-byte note limit.
+- **Clean endings:** `kill -INT`, `Ctrl-C` with piped output and a closed Windows console end the session in order.
+- **Moved project folders** keep their session and history.
+- **Releases:** pre-releases are never marked Latest, nor installed by `meow update` unless meow is one. Nothing is published until the tests pass.
 
 ---
 
