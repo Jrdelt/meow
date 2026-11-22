@@ -1876,9 +1876,12 @@ fn mail_dns_records_on_the_scanned_address_of_a_dual_stack_name() {
 }
 
 /// crt.sh is not asked about a name with any address that is not public,
-/// whichever comes first. 3fff::/20 (RFC 9637) is a public address here.
+/// whichever comes first, nor when the address the name's facts go on is
+/// not known. The log asked is a stand-in on this machine, so nothing
+/// leaves it even if the check fails.
 #[test]
 fn subdomains_keeps_a_name_with_any_internal_address_off_crt_sh() {
+    use crate::osint::tests::{stand_in_doh, taken};
     let (_tmp, coordinator) = quiet_coordinator(Mode::Light, no_cve_config());
     let state = coordinator.state();
     let name = "mixed.example.org";
@@ -1887,25 +1890,45 @@ fn subdomains_keeps_a_name_with_any_internal_address_off_crt_sh() {
         .enable_all()
         .build()
         .unwrap();
-    for ips in [&["3fff::7", "fd00::5"][..], &["3fff::7", "240.0.0.7"]] {
+    let (crt_sh, asked) = runtime.block_on(stand_in_doh(None));
+    let cases: [(&[&str], Option<&str>); 4] = [
+        (&["203.0.113.7", "fd00::5"], Some("203.0.113.7")),
+        (&["2001:db8::7", "240.0.0.7"], Some("240.0.0.7")),
+        (&["3fff::7", "fd00::5"], Some("3fff::7")),
+        // Saved without the address it records on: the addresses decide.
+        (&["fd00::5"], None),
+    ];
+    for (ips, primary) in cases {
         let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
-        let ips = strings_of(ips);
         Found {
-            primary: crate::osint::primary_address(&ips, false),
-            ips: ips.clone(),
+            ips: strings_of(ips),
+            primary: primary.map(str::to_owned),
             ..Found::default()
         }
         .save(&state.db_lock(), id, Stage::Dns)
         .unwrap();
         let task = task(&state.db_lock(), id).unwrap().unwrap();
         let cx = stages::Ctx::new(&state, &task, &target, Stage::Subdomains).unwrap();
-        let said = match runtime.block_on(stages::subdomains(&cx)).unwrap() {
+        let said = match runtime
+            .block_on(stages::subdomains_with(&cx, &crt_sh))
+            .unwrap()
+        {
             StageEnd::Skipped(why) => why,
             StageEnd::Done(what) => format!("done: {what}"),
             StageEnd::ModeChanged => "mode changed".to_owned(),
         };
         assert!(said.contains("not sent to crt.sh"), "{ips:?}: {said}");
     }
+    assert!(taken(&asked).is_empty(), "{:?}", taken(&asked));
+    // The stand-in is where a public name's question would go.
+    let sent = runtime.block_on(crate::osint::run_subdomains_at(
+        &crt_sh,
+        "www.example.org",
+        "203.0.113.7",
+        false,
+    ));
+    assert!(sent.is_err(), "the stand-in gives no crt.sh list");
+    assert_eq!(taken(&asked).len(), 1);
     coordinator.shutdown();
 }
 
@@ -1995,6 +2018,271 @@ fi
     assert_eq!(args.matches(" -6 ").count(), 1, "{args}");
     assert!(
         args.contains(" -n ") && args.ends_with("-- dual.example.org"),
+        "{args}"
+    );
+    coordinator.shutdown();
+}
+
+/// A stand-in nmap in `dir` that adds its arguments to `dir/calls`. With
+/// `up`, it reports its target (the last argument) up with 22/tcp open, or
+/// 161/udp for `-sU`; otherwise no host up.
+#[cfg(unix)]
+fn stand_in_nmap(dir: &Path, up: bool) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let nmap = dir.join("nmap");
+    std::fs::write(
+        &nmap,
+        format!(
+            r#"#!/bin/sh
+echo "$*" >> '{calls}'
+out=''; prev=''; last=''
+for a in "$@"; do [ "$prev" = '-oX' ] && out="$a"; prev="$a"; last="$a"; done
+family=ipv4; case "$last" in *:*) family=ipv6;; esac
+proto=tcp; port=22; case " $* " in *" -sU "*) proto=udp; port=161;; esac
+if [ {up} = 1 ]; then cat > "$out" <<XML
+<nmaprun><host><status state="up"/><address addr="$last" addrtype="$family"/><ports><port protocol="$proto" portid="$port"><state state="open"/><service name="x"/></port></ports></host><runstats><hosts up="1" down="0" total="1"/></runstats></nmaprun>
+XML
+else cat > "$out" <<XML
+<nmaprun><runstats><hosts up="0" down="1" total="1"/></runstats></nmaprun>
+XML
+fi
+"#,
+            calls = dir.join("calls").display(),
+            up = u8::from(up),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nmap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    nmap.to_string_lossy().into_owned()
+}
+
+/// The arguments of the stand-in nmap's last run in `dir`, each after a
+/// space.
+#[cfg(unix)]
+fn last_nmap_call(dir: &Path) -> String {
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    format!(" {}", calls.lines().last().unwrap())
+}
+
+/// The port scan's flags are the preset's and then the operator's: their
+/// up check and address family hold for every scan.
+#[test]
+fn the_scan_flags_are_the_preset_s_and_the_operator_s() {
+    let mut config = no_cve_config();
+    config.recon.mild.nmap_ports = Some(strings_of(&[
+        "-sS",
+        "-T3",
+        "--top-ports",
+        "1000",
+        "-Pn",
+        "-6",
+    ]));
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, config);
+    let state = coordinator.state();
+    let target = Target::parse("dual.example.org").unwrap();
+    let flags = |extra: &[&str]| {
+        let id = enqueue(
+            &state.db_lock(),
+            "dual.example.org",
+            Mode::Mild,
+            &strings_of(extra),
+        )
+        .unwrap();
+        let task = task(&state.db_lock(), id).unwrap().unwrap();
+        stages::Ctx::new(&state, &task, &target, Stage::Ports)
+            .unwrap()
+            .scan_flags()
+    };
+    let preset = flags(&[]);
+    assert_eq!(preset.shared, ["-Pn", "-6"]);
+    assert!(preset.ipv6());
+    // The operator's word comes last.
+    assert!(!flags(&["-4"]).ipv6());
+    assert_eq!(flags(&["-n"]).shared, ["-Pn", "-6", "-n"]);
+    coordinator.shutdown();
+}
+
+/// A name is scanned and UDP-scanned at the address the dns stage recorded
+/// its facts on, not at whatever the scanner's own lookup gives next (a
+/// name with several addresses in changing order), and the route goes
+/// there too. With the preset's `-6`, at its IPv6 address.
+#[cfg(unix)]
+#[test]
+fn a_name_is_scanned_and_traced_at_the_address_its_facts_go_on() {
+    for preset_v6 in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = no_cve_config();
+        config.recon.nmap = stand_in_nmap(dir.path(), true);
+        if preset_v6 {
+            config.recon.aggressive.nmap_ports =
+                Some(strings_of(&["-sS", "-T4", "-p-", "-Pn", "-6"]));
+        }
+        let (_tmp, coordinator) = quiet_coordinator(Mode::Aggressive, config);
+        let state = coordinator.state();
+        let name = "rr.example.org";
+        let target = Target::parse(name).unwrap();
+        let id = enqueue(&state.db_lock(), name, Mode::Aggressive, &[]).unwrap();
+        let ips = strings_of(&["203.0.113.7", "203.0.113.8", "2001:db8::7"]);
+        Found {
+            primary: crate::osint::primary_address(&ips, preset_v6),
+            ips,
+            ..Found::default()
+        }
+        .save(&state.db_lock(), id, Stage::Dns)
+        .unwrap();
+        let task = task(&state.db_lock(), id).unwrap().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let expected = if preset_v6 {
+            "2001:db8::7"
+        } else {
+            "203.0.113.7"
+        };
+        for stage in [Stage::Ports, Stage::Udp] {
+            let mut cx = stages::Ctx::new(&state, &task, &target, stage).unwrap();
+            // As root.
+            cx.privileged = true;
+            let end = match stage {
+                Stage::Ports => runtime.block_on(stages::ports(&cx)),
+                _ => runtime.block_on(stages::udp(&cx)),
+            };
+            let said = match end.unwrap() {
+                StageEnd::Done(what) => what,
+                StageEnd::Skipped(why) => format!("skipped: {why}"),
+                StageEnd::ModeChanged => "mode changed".to_owned(),
+            };
+            assert!(
+                !said.starts_with("skipped") && said != "mode changed",
+                "{stage:?}: {said}"
+            );
+            let args = last_nmap_call(dir.path());
+            assert!(args.ends_with(&format!(" -- {expected}")), "{args}");
+            assert_eq!(
+                args.matches(" -6 ").count(),
+                usize::from(preset_v6),
+                "{args}"
+            );
+            assert_eq!(args.contains(" -Pn "), preset_v6, "{args}");
+        }
+        let scanned = Found::load(&state.db_lock(), id, Stage::Ports, &target);
+        assert_eq!(scanned.hosts.keys().collect::<Vec<_>>(), [expected]);
+        let cx = stages::Ctx::new(&state, &task, &target, Stage::Trace).unwrap();
+        let route = runtime.block_on(stages::route_target(&cx));
+        assert_eq!(route.map(|ip| ip.to_string()).as_deref(), Some(expected));
+        coordinator.shutdown();
+    }
+}
+
+/// The route goes to the address the port scan scanned, whatever family
+/// the flags name; with none scanned, to an address of the family the
+/// scan takes, the preset's `-6` included.
+#[test]
+fn the_route_goes_to_the_scanned_address_first() {
+    let mut config = no_cve_config();
+    config.recon.mild.nmap_ports = Some(strings_of(&["-sS", "-T3", "-6"]));
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, config);
+    let state = coordinator.state();
+    let name = "dual.example.org";
+    let target = Target::parse(name).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let route = |extra: &[&str], primary: Option<&str>, scanned: Option<&str>| {
+        let id = enqueue(&state.db_lock(), name, Mode::Mild, &strings_of(extra)).unwrap();
+        Found {
+            ips: strings_of(&["203.0.113.7", "2001:db8::7"]),
+            primary: primary.map(str::to_owned),
+            ..Found::default()
+        }
+        .save(&state.db_lock(), id, Stage::Dns)
+        .unwrap();
+        if let Some(address) = scanned {
+            Found {
+                up: 1,
+                hosts: BTreeMap::from([(address.to_owned(), vec![22])]),
+                ..Found::default()
+            }
+            .save(&state.db_lock(), id, Stage::Ports)
+            .unwrap();
+        }
+        let task = task(&state.db_lock(), id).unwrap().unwrap();
+        let cx = stages::Ctx::new(&state, &task, &target, Stage::Trace).unwrap();
+        runtime
+            .block_on(stages::route_target(&cx))
+            .map(|ip| ip.to_string())
+    };
+    // The scan went to the IPv6 address, with -6 from the preset.
+    let scanned = route(&[], Some("2001:db8::7"), Some("2001:db8::7"));
+    assert_eq!(scanned.as_deref(), Some("2001:db8::7"));
+    // Nothing scanned and no address saved for the facts: the family the
+    // scan takes.
+    assert_eq!(route(&[], None, None).as_deref(), Some("2001:db8::7"));
+    assert_eq!(route(&["-4"], None, None).as_deref(), Some("203.0.113.7"));
+    // What was scanned, whatever the flags say.
+    let scanned = route(&["-4"], Some("203.0.113.7"), Some("2001:db8::7"));
+    assert_eq!(scanned.as_deref(), Some("2001:db8::7"));
+    coordinator.shutdown();
+}
+
+/// `-Pn` kept in the preset reaches the UDP and service scans, and the
+/// hints when nothing answered do not tell the user to add it.
+#[cfg(unix)]
+#[test]
+fn a_preset_s_up_check_holds_for_every_scan_and_its_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = no_cve_config();
+    // Nothing answers, even without the up check.
+    config.recon.nmap = stand_in_nmap(dir.path(), false);
+    config.recon.aggressive.nmap_ports = Some(strings_of(&["-sS", "-T4", "-p-", "-O", "-Pn"]));
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Aggressive, config);
+    let state = coordinator.state();
+    let address = "203.0.113.9";
+    let target = Target::parse(address).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let id = enqueue(&state.db_lock(), address, Mode::Aggressive, &[]).unwrap();
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+    let run = |stage: Stage| {
+        let mut cx = stages::Ctx::new(&state, &task, &target, stage).unwrap();
+        cx.privileged = true;
+        let end = match stage {
+            Stage::Ports => runtime.block_on(stages::ports(&cx)),
+            Stage::Udp => runtime.block_on(stages::udp(&cx)),
+            _ => runtime.block_on(stages::services(&cx)),
+        };
+        (end.unwrap(), last_nmap_call(dir.path()))
+    };
+    let (end, args) = run(Stage::Ports);
+    assert!(args.contains(" -Pn "), "{args}");
+    let StageEnd::Done(what) = end else {
+        panic!("ports not done");
+    };
+    assert!(
+        what.ends_with("nothing answered, even scanning without the up check"),
+        "{what}"
+    );
+    let (end, args) = run(Stage::Udp);
+    assert!(args.contains(" -sU ") && args.contains(" -Pn "), "{args}");
+    let StageEnd::Skipped(why) = end else {
+        panic!("udp not skipped");
+    };
+    assert_eq!(why, "nothing answered, even scanning without the up check");
+    // The service scan of what an earlier port scan found.
+    Found {
+        up: 1,
+        hosts: BTreeMap::from([(address.to_owned(), vec![22])]),
+        ..Found::default()
+    }
+    .save(&state.db_lock(), id, Stage::Ports)
+    .unwrap();
+    let (_, args) = run(Stage::Services);
+    assert!(
+        args.contains(" -sV ") && args.contains(" -Pn ") && args.contains(" -p 22 "),
         "{args}"
     );
     coordinator.shutdown();

@@ -16,7 +16,7 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     let (command, notices) = ports_command(
         &settings,
         &preset,
-        target,
+        &cx.scan_target(),
         &split_recon_flags(&task.extra_flags).ports,
         privileged,
         &out(".xml"),
@@ -40,7 +40,7 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     found.save(&state.db_lock(), task.id, stage)?;
     let (changed, _) = record(state, observations, None);
     let silent = if answered == Some(0) {
-        discovery_hint(&task.extra_flags)
+        discovery_hint(&cx.scan_flags().shared)
     } else {
         String::new()
     };
@@ -70,9 +70,10 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
             "UDP scanning needs root (nmap -sU sends raw packets): start the session with sudo, or run `sudo nmap -sU -sV -p {UDP_PORTS} {target}` and `meow add` its XML"
         )));
     }
-    // A host as named; a network only where the TCP scan found hosts.
-    let targets: Vec<String> = match target {
-        Target::Host(_) => vec![target.to_string()],
+    // A host where the TCP scan went; a network only where it found hosts.
+    let scan_target = cx.scan_target();
+    let targets: Vec<String> = match &scan_target {
+        Target::Host(_) => vec![scan_target.to_string()],
         Target::Network(_) => Found::load(&state.db_lock(), task.id, Stage::Ports, target)
             .hosts
             .keys()
@@ -85,10 +86,10 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
             "no host in the range answered the TCP scan".to_owned(),
         ));
     }
-    // The operator's up check (`-Pn`) and address family (`-6`), as for
-    // the TCP scans.
-    let flags = split_recon_flags(&task.extra_flags);
-    let ipv6 = match target {
+    // The up check (`-Pn`) and address family (`-6`) the TCP scan ran
+    // with, the preset's and the operator's.
+    let flags = cx.scan_flags();
+    let ipv6 = match &scan_target {
         Target::Host(host) => host.ip().map_or(flags.ipv6(), |ip| ip.is_ipv6()),
         Target::Network(network) => network.is_ipv6(),
     };
@@ -111,7 +112,7 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
     Found::of(&observations, target).save(&state.db_lock(), task.id, cx.stage)?;
     if answered == Some(0) {
         // No port was scanned: not "no UDP service".
-        let hint = discovery_hint(&task.extra_flags);
+        let hint = discovery_hint(&flags.shared);
         return Ok(StageEnd::Skipped(hint.trim_start_matches("; ").to_owned()));
     }
     let (mut open, mut maybe) = (0usize, 0usize);
@@ -178,11 +179,17 @@ pub(crate) async fn services(cx: &Ctx<'_>) -> Result<StageEnd> {
     }
     let mut seen = Vec::new();
     let mut changed = 0;
+    // The operator's scripts and versions, and the up check and address
+    // family the port scan ran with.
+    let flags = ReconFlags {
+        shared: cx.scan_flags().shared,
+        ..split_recon_flags(&task.extra_flags)
+    };
     for (index, (address, ports)) in hosts.iter().enumerate() {
         let (command, notices) = services_command(
             &settings,
             &preset,
-            &split_recon_flags(&task.extra_flags),
+            &flags,
             address,
             ports,
             privileged,

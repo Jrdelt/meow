@@ -60,10 +60,14 @@ pub struct ReconFlags {
 }
 
 impl ReconFlags {
-    /// Whether nmap is asked for IPv6 (`-6`): a name is then scanned at its
-    /// first IPv6 address.
+    /// Whether nmap is asked for IPv6 (`-6`, unless a later `-4`): a name
+    /// is then scanned at its first IPv6 address.
     pub fn ipv6(&self) -> bool {
-        self.shared.iter().any(|flag| flag == "-6")
+        self.shared
+            .iter()
+            .rev()
+            .find(|flag| *flag == "-4" || *flag == "-6")
+            .is_some_and(|flag| flag == "-6")
     }
 }
 
@@ -669,8 +673,8 @@ pub fn udp_note(port: u16) -> Option<&'static str> {
 
 /// The UDP scan (aggressive mode, as root): the services in [`UDP_PORTS`]
 /// on `targets`, with a light version probe to tell open from no answer.
-/// `shared`: the operator's up-check, DNS and address-family flags, as for
-/// the other scans (see [`ReconFlags::shared`]).
+/// `shared`: the up-check, DNS and address-family flags the port scan ran
+/// with (see [`ReconFlags::shared`]).
 pub fn udp_command(
     settings: &ReconSettings,
     targets: &[String],

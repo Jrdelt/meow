@@ -246,6 +246,7 @@ pub fn is_non_public_ip(ip: IpAddr) -> bool {
                 || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
                 || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 doc
+                || (segs[0] == 0x3fff && (segs[1] & 0xf000) == 0) // 3fff::/20 doc (RFC 9637)
         }
     }
 }

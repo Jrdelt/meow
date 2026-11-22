@@ -32,6 +32,9 @@ fn internal_names_and_private_reverse_names_stay_off_public_services() {
 
 #[tokio::test]
 async fn crt_sh_is_not_asked_about_an_internal_name() {
+    // A stand-in for the log: nothing leaves this machine, whatever the
+    // check decides.
+    let (crt_sh, asked) = stand_in_doh(None).await;
     for (domain, address) in [
         ("db.acme.corp", "10.0.0.5"),
         ("portal.client.com", "10.0.0.7"),
@@ -40,10 +43,13 @@ async fn crt_sh_is_not_asked_about_an_internal_name() {
         let internal = is_internal_target(domain, &[address.to_owned()]).await;
         let error = format!(
             "{:#}",
-            run_subdomains(domain, address, internal).await.unwrap_err()
+            run_subdomains_at(&crt_sh, domain, address, internal)
+                .await
+                .unwrap_err()
         );
         assert!(error.contains("not sent to crt.sh"), "{domain}: {error}");
     }
+    assert!(taken(&asked).is_empty(), "{:?}", taken(&asked));
 }
 
 #[test]
@@ -1938,6 +1944,13 @@ fn tracert_fits_in_the_stage_s_time() {
 fn reserved_ipv4_ranges_are_not_public() {
     for reserved in ["0.1.2.3", "240.0.0.7", "250.1.2.3", "255.255.255.254"] {
         assert!(is_non_public_ip(reserved.parse().unwrap()), "{reserved}");
+    }
+    // Both IPv6 documentation prefixes: 2001:db8::/32 and 3fff::/20.
+    for documentation in ["2001:db8::7", "3fff::7", "3fff:fff:ffff::1"] {
+        assert!(
+            is_non_public_ip(documentation.parse().unwrap()),
+            "{documentation}"
+        );
     }
 }
 

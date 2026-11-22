@@ -713,6 +713,13 @@ impl Topology {
             .iter()
             .find(|f| f.record.source == crate::evidence::Source::Traceroute)
             .map(|f| f.record.evidence.as_str());
+        // The trace stage says so when the target itself gave no answer:
+        // then the route ends at the last hop that did.
+        let unanswered = host.facts.iter().any(|f| {
+            f.record.source == crate::evidence::Source::Traceroute
+                && f.claim.starts_with("route path")
+                && f.claim.contains("target did not answer")
+        });
 
         let mut hops = match trace_evidence {
             Some(ev) if !ev.is_empty() => crate::osint::parse_traceroute_detailed(
@@ -750,7 +757,7 @@ impl Topology {
             }
         }
 
-        if !hops.is_empty() && !hops.iter().any(|h| h.address == host.address) {
+        if !hops.is_empty() && !unanswered && !hops.iter().any(|h| h.address == host.address) {
             let next_hop = hops.last().map_or(1, |h| h.hop.saturating_add(1));
             hops.push(crate::osint::TraceHop {
                 hop: next_hop,
@@ -1026,8 +1033,18 @@ impl Topology {
                     }
                     let trace_hops = Self::host_trace_hops(graph, host, geo);
                     if !trace_hops.is_empty() {
-                        let hop_count = trace_hops.len();
-                        let rtt_ms = trace_hops.iter().rev().find_map(|h| h.rtt_ms);
+                        // As far as an answer came from: the target, or the
+                        // last hop when it did not answer. Its time is the
+                        // target's own, or none.
+                        let hop_count = trace_hops
+                            .iter()
+                            .rev()
+                            .find(|h| h.address != "* * *")
+                            .map_or(trace_hops.len(), |h| usize::from(h.hop));
+                        let rtt_ms = trace_hops
+                            .iter()
+                            .find(|h| h.address == host.address)
+                            .and_then(|h| h.rtt_ms);
                         let mut previous_rtt: Option<f64> = None;
                         let serialized_hops: Vec<Value> = trace_hops
                             .iter()
@@ -2122,5 +2139,81 @@ Hop 3: 45.33.32.156         (scanme.nmap.org)                 23.1 ms";
         assert_eq!(internet["data"]["hop_count"], 3);
         assert_eq!(internet["data"]["rtt_ms"], 23.1);
         assert_eq!(internet["data"]["trace_hops"].as_array().unwrap().len(), 3);
+    }
+
+    /// A route whose target did not answer ends at the last hop that did:
+    /// the map adds no target hop and gives no latency for the route.
+    #[test]
+    fn a_route_to_a_silent_target_ends_at_its_last_answer() {
+        use crate::osint::TraceHop;
+        let mut graph = lab();
+        let hop = |hop: u8, address: &str, rtt_ms: Option<f64>| TraceHop {
+            hop,
+            address: address.into(),
+            label: None,
+            rtt_ms,
+        };
+        // As the trace stage writes it: four hops, then silence to hop 15.
+        let lines: Vec<String> = [
+            hop(1, "198.51.100.1", Some(0.5)),
+            hop(2, "198.51.100.2", Some(3.1)),
+            hop(3, "198.51.100.3", Some(9.9)),
+            hop(4, "198.51.100.4", Some(12.4)),
+            hop(5, "* * *", None),
+        ]
+        .iter()
+        .map(TraceHop::formatted)
+        .collect();
+        let record =
+            EvidenceRecord::observed(Source::Traceroute, Confidence::Medium, &lines.join("\n"));
+        let target = "203.0.113.9";
+        graph.apply(Observation::HostMeta {
+            address: target.into(),
+            asn: None,
+            bgp_prefix: None,
+            country: None,
+            ipv6_dns: None,
+            waf_cdn: None,
+            hops: (1..=4).map(|n| format!("198.51.100.{n}")).collect(),
+            record: record.clone(),
+        });
+        graph.apply(Observation::Fact {
+            address: target.into(),
+            port: None,
+            protocol: "ip".into(),
+            claim: "route path (4 hops, target did not answer): 198.51.100.1 -> 198.51.100.2 \
+                    -> 198.51.100.3 -> 198.51.100.4"
+                .into(),
+            record,
+        });
+        let cyto = Topology::build(&graph).cytoscape(&graph);
+        let nodes = cyto["nodes"].as_array().unwrap();
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|n| n["data"]["id"] == id)
+                .unwrap_or_else(|| panic!("no {id}"))["data"]
+                .clone()
+        };
+        for data in [node("host:203.0.113.9"), node("internet")] {
+            assert_eq!(data["hop_count"], 4, "{data}");
+            assert!(data.get("rtt_ms").is_none(), "{data}");
+            let hops = data["trace_hops"].as_array().unwrap();
+            let addresses: Vec<&str> = hops
+                .iter()
+                .map(|h| h["address"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                addresses,
+                [
+                    "198.51.100.1",
+                    "198.51.100.2",
+                    "198.51.100.3",
+                    "198.51.100.4",
+                    "* * *"
+                ]
+            );
+            assert!(hops.iter().all(|h| h["is_target"] == false), "{hops:?}");
+        }
     }
 }

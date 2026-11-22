@@ -49,8 +49,9 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
             "network range {net} does not have a single DNS target"
         )));
     }
-    // The family the port scan takes for a name: IPv6 with `-6`.
-    let ipv6 = split_recon_flags(&task.extra_flags).ipv6();
+    // The family the port scan takes for a name: IPv6 with `-6`, the
+    // preset's or the operator's.
+    let ipv6 = cx.scan_flags().ipv6();
     let (observations, ips, summary) = match crate::osint::run_dns(target, ipv6).await {
         Ok(res) => res,
         Err(err) => return Ok(StageEnd::Skipped(format!("DNS lookup unavailable: {err}"))),
@@ -115,6 +116,11 @@ pub(crate) async fn asn(cx: &Ctx<'_>) -> Result<StageEnd> {
 }
 
 pub(crate) async fn subdomains(cx: &Ctx<'_>) -> Result<StageEnd> {
+    subdomains_with(cx, crate::osint::CRT_SH).await
+}
+
+/// The `subdomains` stage, with the certificate log at `crt_sh`.
+pub(crate) async fn subdomains_with(cx: &Ctx<'_>, crt_sh: &str) -> Result<StageEnd> {
     let state = cx.state;
     let task = cx.task;
     let target = cx.target;
@@ -129,7 +135,7 @@ pub(crate) async fn subdomains(cx: &Ctx<'_>) -> Result<StageEnd> {
     // Decided as for mail-dns: any address of the name that is not public,
     // or a name only a local network knows.
     let internal = crate::osint::is_internal_target(domain, &dns_found.ips).await;
-    let ran = crate::osint::run_subdomains(domain, &primary_address, internal).await;
+    let ran = crate::osint::run_subdomains_at(crt_sh, domain, &primary_address, internal).await;
     let (observations, summary) = match ran {
         Ok(res) => res,
         Err(err) => {
@@ -231,21 +237,31 @@ pub(crate) fn register_mail_dns(vault: &mut crate::vault::Vault, observations: &
     }
 }
 
-pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {
-    let state = cx.state;
-    let task = cx.task;
-    let target = cx.target;
-    let same_mode = || cx.same_mode();
-    // The address the port scan went to, which comes first; for a name it
-    // did not reach, the one it would scan (IPv4 unless `-6`).
+/// Where the `trace` stage goes: for a name, the address the port scan
+/// went to, which [`resolve_target_ips`] puts first. When it scanned
+/// nothing, the address it would scan: of the family it scans (IPv4
+/// unless `-6`).
+pub(crate) async fn route_target(cx: &Ctx<'_>) -> Option<std::net::IpAddr> {
+    let (state, task, target) = (cx.state, cx.task, cx.target);
     let ips = resolve_target_ips(state, task.id, target).await;
-    let ipv6 = split_recon_flags(&task.extra_flags).ipv6();
-    let Some(resolved_ip) = ips
-        .iter()
+    let scanned = matches!(target, Target::Host(HostAddr::Name(_)))
+        && !Found::load(&state.db_lock(), task.id, Stage::Ports, target)
+            .hosts
+            .is_empty();
+    if scanned {
+        return ips.first().copied();
+    }
+    let ipv6 = cx.scan_flags().ipv6();
+    ips.iter()
         .find(|ip| ip.is_ipv6() == ipv6)
         .or(ips.first())
         .copied()
-    else {
+}
+
+pub(crate) async fn trace(cx: &Ctx<'_>) -> Result<StageEnd> {
+    let state = cx.state;
+    let same_mode = || cx.same_mode();
+    let Some(resolved_ip) = route_target(cx).await else {
         return Ok(StageEnd::Skipped(
             "no target IP resolved for traceroute".to_owned(),
         ));
