@@ -62,6 +62,12 @@ const PROFILE_FILE: &str = "profile.toml";
 const AI_FILE: &str = "ai.toml";
 /// Exclusive session lock file inside a workspace.
 pub const LOCK_FILE: &str = "session.lock";
+/// Held by a helper command while it writes a session's files with no
+/// session running ([`Workspace::write_alone`]).
+pub const HELPER_LOCK_FILE: &str = "helper.lock";
+/// How long a session that starts, or a helper, waits for a helper that
+/// writes the session's files alone.
+const HELPER_WAIT: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5000 });
 /// Port and token of the running session; present only while one is open.
 pub const RUNTIME_FILE: &str = "runtime.json";
 const NAME_MAX: usize = 64;
@@ -1817,8 +1823,12 @@ pub fn local_location(home: &MeowHome, cwd: &Path, name: &str) -> Result<Locatio
         return Ok(here);
     }
     refuse_taken(home, &cwd, &name)?;
-    check_new_folder(home, &cwd, &name)
-        .map_err(|reason| anyhow!("Cannot save '{name}' in {}: {reason}", cwd.display()))?;
+    check_new_folder(home, &cwd, &name).map_err(|reason| {
+        anyhow!(
+            "Cannot save '{name}' in {}: {reason}. Run meow from a project folder, or use --home",
+            cwd.display()
+        )
+    })?;
     Ok(Location::Folder(cwd))
 }
 
@@ -2050,7 +2060,7 @@ fn folders_above(folder: &Path) -> Vec<PathBuf> {
 /// users can write to (through a shared group or an access list too)
 /// without the sticky bit `/tmp` has.
 #[cfg(unix)]
-fn unsafe_folder_above(folder: &Path) -> Option<&'static str> {
+fn unsafe_folder_above(folder: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let (me, _) = effective_ids();
     for path in folders_above(folder) {
@@ -2058,13 +2068,47 @@ fn unsafe_folder_above(folder: &Path) -> Option<&'static str> {
             continue;
         };
         if meta.uid() != 0 && meta.uid() != me {
-            return Some("a folder above it belongs to another user");
+            return Some("a folder above it belongs to another user".into());
         }
-        if meta.mode() & 0o1000 == 0 && crate::perms::others_can_change(&path, &meta) {
-            return Some("other users can change a folder above it");
+        if meta.mode() & 0o1000 == 0 {
+            if let Some(why) = crate::perms::why_others_can_change(&path, &meta) {
+                return Some(why.says("a folder above it"));
+            }
         }
     }
     None
+}
+
+/// Why another account could change `folder` itself, as its path names it
+/// and as it really is once links are resolved: it belongs to another
+/// user, or others can write to it. `None` for one that does not exist yet.
+#[cfg(unix)]
+fn unsafe_folder(folder: &Path) -> Option<String> {
+    let real = fs::canonicalize(folder).ok();
+    for path in std::iter::once(folder).chain(real.as_deref()) {
+        match fs::metadata(path) {
+            // A new session's folder may not be made yet.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Some(format!("cannot read it: {error}")),
+            Ok(meta) if verify_unix_owner_meta(&meta, path).is_err() => {
+                return Some("it belongs to another user".into())
+            }
+            Ok(meta) => {
+                if let Some(why) = crate::perms::why_others_can_change(path, &meta) {
+                    return Some(why.says("it"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Why meow cannot use a folder whose path is not text (UTF-8): the
+/// record of the user's sessions, and the shell start-up files, name it.
+fn not_text(path: &Path) -> Option<&'static str> {
+    path.to_str()
+        .is_none()
+        .then_some("the path is not valid UTF-8")
 }
 
 /// The folder that holds the session in `dir`: `<folder>` of
@@ -2091,24 +2135,16 @@ fn check_session_place(dir: &Path) -> Result<()> {
     };
     #[cfg(unix)]
     {
-        let reason = unsafe_folder_above(folder).map(str::to_owned).or_else(|| {
-            match fs::metadata(folder) {
-                // A new session's folder may not be made yet.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => Some(format!("cannot read it: {error}")),
-                Ok(meta) if verify_unix_owner_meta(&meta, folder).is_err() => {
-                    Some("it belongs to another user".to_owned())
-                }
-                Ok(meta) if crate::perms::others_can_change(folder, &meta) => {
-                    Some("other users can write to it".to_owned())
-                }
-                Ok(_) => None,
-            }
-        });
+        let reason = unsafe_folder_above(folder).or_else(|| unsafe_folder(folder));
         if let Some(reason) = reason {
+            // No permission of the user's own tells who may write there.
+            let fix = if reason.starts_with("meow cannot read") {
+                "Move that folder to a disk of this computer"
+            } else {
+                "Make that folder yours alone"
+            };
             bail!(
-                "Not using the session in {}: {reason}. Make that folder yours alone, \
-                 or delete {} yourself",
+                "Not using the session in {}: {reason}. {fix}, or delete {} yourself",
                 folder.display(),
                 dir.display()
             );
@@ -2152,6 +2188,9 @@ fn has_placeholder(path: &Path) -> bool {
 /// Why `folder` cannot hold a new session `name`, in a few words. A folder
 /// that does not exist yet passes the checks that need it to exist.
 pub fn check_new_folder(home: &MeowHome, folder: &Path, name: &str) -> Result<(), String> {
+    if let Some(reason) = not_text(folder) {
+        return Err(reason.into());
+    }
     if folder.to_string_lossy().chars().any(char::is_control) {
         return Err("the path has control characters".into());
     }
@@ -2182,20 +2221,16 @@ pub fn check_new_folder(home: &MeowHome, folder: &Path, name: &str) -> Result<()
     }
     #[cfg(unix)]
     if let Some(reason) = unsafe_folder_above(folder) {
-        return Err(reason.into());
+        return Err(reason);
     }
     match fs::metadata(folder) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot read it: {error}")),
         Ok(meta) if !meta.is_dir() => Err("that is a file, not a folder".into()),
-        Ok(_meta) => {
+        Ok(_) => {
             #[cfg(unix)]
-            if verify_unix_owner_meta(&_meta, folder).is_err() {
-                return Err("it belongs to another user".into());
-            }
-            #[cfg(unix)]
-            if crate::perms::others_can_change(folder, &_meta) {
-                return Err("other users can write to it".into());
+            if let Some(reason) = unsafe_folder(folder) {
+                return Err(reason);
             }
             check_sessions_dir(&sessions)?;
             if fs::symlink_metadata(sessions.join(name)).is_ok() {
@@ -2303,6 +2338,9 @@ impl Workspace {
     ) -> Result<(Self, bool)> {
         let name = checked_name(name)?;
         let dir = location.dir(home, &name)?;
+        if let Some(reason) = not_text(&dir) {
+            bail!("Not using {}: {reason}", dir.display());
+        }
         if has_placeholder(&dir) {
             bail!(
                 "{} has text like @NAME@ in its path, which meow cannot use",
@@ -2393,7 +2431,19 @@ impl Workspace {
     pub fn ensure_own(&self, home: &MeowHome, cwd: &Path) -> Result<()> {
         check_session_place(&self.dir)?;
         if self.is_foreign(home) {
-            let what = match commands_for(home, cwd, &self.dir, &self.name) {
+            let (open, delete) = commands_for(home, cwd, &self.dir, &self.name);
+            if let Some(old) = self.moved_from(home) {
+                let open = open.map_or_else(
+                    || "meow in that folder".to_owned(),
+                    |open| format!("`{open}`"),
+                );
+                bail!(
+                    "{} was moved from {}. Open it with {open} first",
+                    self.dir.display(),
+                    old.display()
+                );
+            }
+            let what = match (open, delete) {
                 (Some(open), Some(delete)) => format!(
                     "Review and accept it with `{open}` in a terminal, or remove it with `{delete}`"
                 ),
@@ -2404,12 +2454,27 @@ impl Workspace {
                 (None, None) => "Delete that folder if you do not want it".to_owned(),
             };
             bail!(
-                "{} was not made by you on this machine: it came with this folder. {what}",
+                "{} is a meow session from elsewhere: it came with this folder, \
+                 or the folder was moved or copied. {what}",
                 self.dir.display()
             );
         }
-        // While its session runs, the session itself checked them.
-        if !crate::lock::SessionLock::is_held(&self.lock_path()) && self.files_changed(home) {
+        // While its session runs, the session itself checked them; while a
+        // helper writes them alone, that helper did ([`Workspace::write_alone`]).
+        if !crate::lock::SessionLock::is_held(&self.lock_path())
+            && !crate::lock::HelperLock::is_held(&self.helper_lock_path())
+        {
+            self.ensure_files_as_left(home, cwd)?;
+        }
+        enforce_private_tree(&self.dir)
+            .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
+        Ok(())
+    }
+
+    /// Fails when files meow reads back from this session changed outside
+    /// meow ([`Workspace::files_changed`]): only opening it takes them in.
+    fn ensure_files_as_left(&self, home: &MeowHome, cwd: &Path) -> Result<()> {
+        if self.files_changed(home) {
             let open = commands_for(home, cwd, &self.dir, &self.name)
                 .0
                 .map_or_else(|| "it".to_owned(), |open| format!("it with `{open}`"));
@@ -2419,9 +2484,57 @@ impl Workspace {
                 self.dir.display()
             );
         }
-        enforce_private_tree(&self.dir)
-            .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
         Ok(())
+    }
+
+    /// For a helper command (`command`, as `meow add`) that writes this
+    /// session's files itself while no session runs: the helper lock, to be
+    /// held until the files are recorded ([`SessionFiles::for_helper`]), so
+    /// that no session starts meanwhile and no other such helper writes at
+    /// the same time. `None` while a session holds the session lock: the
+    /// command goes through that session. Waits a few seconds for another
+    /// helper, then fails with its name; fails too when the files changed
+    /// outside meow.
+    pub fn write_alone(
+        &self,
+        home: &MeowHome,
+        cwd: &Path,
+        command: &str,
+    ) -> Result<Option<crate::lock::HelperLock>> {
+        use crate::lock::{HelperLock, LockError, SessionLock};
+        let path = self.helper_lock_path();
+        let lock = match HelperLock::acquire(&path, command, HELPER_WAIT) {
+            Ok(lock) => lock,
+            Err(LockError::Held { .. }) => bail!(self.helper_busy()),
+            Err(LockError::Io(error)) => {
+                return Err(anyhow!(error).context(format!("cannot lock {}", path.display())))
+            }
+        };
+        if SessionLock::is_held(&self.lock_path()) {
+            return Ok(None);
+        }
+        self.ensure_files_as_left(home, cwd)?;
+        Ok(Some(lock))
+    }
+
+    /// For a session that starts: waits a few seconds for a helper that
+    /// writes its files alone ([`Workspace::write_alone`]), then fails with
+    /// its name. Call it holding the session lock.
+    pub fn wait_for_helpers(&self) -> Result<()> {
+        use crate::lock::{HelperLock, LockError};
+        let path = self.helper_lock_path();
+        match HelperLock::wait_free(&path, HELPER_WAIT) {
+            Ok(()) => Ok(()),
+            Err(LockError::Held { .. }) => bail!(self.helper_busy()),
+            Err(LockError::Io(error)) => {
+                Err(anyhow!(error).context(format!("cannot check {}", path.display())))
+            }
+        }
+    }
+
+    /// Who holds the helper lock, as said to the user.
+    fn helper_busy(&self) -> String {
+        helper_busy(&self.helper_lock_path(), &self.name)
     }
 
     /// Fails when another session of this user's already has this one's
@@ -2449,6 +2562,20 @@ impl Workspace {
     /// Refused when the user already has a session of that name.
     pub fn adopt(&mut self, home: &MeowHome, mode: Mode) -> Result<()> {
         self.check_name_free(home)?;
+        self.secure()?;
+        // A planted history could put a dangerous command one up-arrow away.
+        self.drop_carried_files();
+        let mark = new_mark()?;
+        self.profile.id = Some(mark.clone());
+        self.profile.mode = mode;
+        self.save_profile()?;
+        let in_sessions_dir = folder_session(&self.dir).is_some();
+        remember(home, &mark, in_sessions_dir.then_some(self.dir.as_path()))
+    }
+
+    /// Makes a session taken in from a folder private, as a new one is:
+    /// what [`Workspace::open_at`] leaves alone for one not yet accepted.
+    fn secure(&self) -> Result<()> {
         let in_sessions_dir = folder_session(&self.dir).is_some();
         if let (true, Some(sessions)) = (in_sessions_dir, self.dir.parent()) {
             secure_sessions_dir(sessions)?;
@@ -2463,14 +2590,7 @@ impl Workspace {
         create_private_subdir(&self.tmp_dir())?;
         create_private_subdir(&self.chats_dir())?;
         enforce_private_tree(&self.dir)
-            .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))?;
-        // A planted history could put a dangerous command one up-arrow away.
-        self.drop_carried_files();
-        let mark = new_mark()?;
-        self.profile.id = Some(mark.clone());
-        self.profile.mode = mode;
-        self.save_profile()?;
-        remember(home, &mark, in_sessions_dir.then_some(self.dir.as_path()))
+            .with_context(|| format!("cannot restrict permissions under {}", self.dir.display()))
     }
 
     /// Records that a session now owns this workspace: stores the name it was
@@ -2491,6 +2611,9 @@ impl Workspace {
     pub fn load(dir: &Path) -> Result<Self> {
         let dir = std::path::absolute(dir)
             .with_context(|| format!("cannot resolve {}", dir.display()))?;
+        if let Some(reason) = not_text(&dir) {
+            bail!("Not using {}: {reason}", dir.display());
+        }
         if let (Some(_), Some(sessions)) = (folder_session(&dir), dir.parent()) {
             // `./meow` is never a link either.
             refuse_symlink(sessions)?;
@@ -2541,6 +2664,10 @@ impl Workspace {
 
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join(LOCK_FILE)
+    }
+
+    pub fn helper_lock_path(&self) -> PathBuf {
+        self.dir.join(HELPER_LOCK_FILE)
     }
 
     pub fn replay_path(&self) -> PathBuf {
@@ -2799,10 +2926,27 @@ fn file_id(_path: &Path, meta: &fs::Metadata) -> io::Result<FileId> {
 /// The read-back files of a session as they are. `odd` is set by anything
 /// meow never leaves there (a link, a folder, a name it cannot record),
 /// and, in a stored one, when files were replaced during the session.
+/// `open`, in a stored one: written as a session started, and not yet
+/// replaced by the record of its end.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Snapshot {
     files: std::collections::BTreeMap<String, FileId>,
     odd: bool,
+    open: bool,
+}
+
+/// How a session's files are, against what meow last recorded of them
+/// ([`Workspace::files_seen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesSeen {
+    /// As meow left them, or never recorded (an older meow made it).
+    AsLeft,
+    /// The last session did not end as meow ends one (killed, a crash, the
+    /// power gone), so files it rewrites whole cannot be told from ones
+    /// put in their place; none it only changes in place was replaced.
+    Unclean,
+    /// Replaced, rewritten or added outside meow.
+    Changed,
 }
 
 impl Snapshot {
@@ -2874,11 +3018,45 @@ impl Snapshot {
                 .any(|(name, id)| end.files.get(name).is_some_and(|now| !id.same_file(now)))
     }
 
+    /// Whether `now` holds the files of this record moved to another place:
+    /// each of the same size and last write. Moved to another disk, they
+    /// are new files there, made at another time with other numbers.
+    fn moved_to(&self, now: &Snapshot) -> bool {
+        !self.odd
+            && !self.open
+            && !now.odd
+            && now.files.iter().all(|(name, id)| {
+                self.files
+                    .get(name)
+                    .is_some_and(|seen| seen.size == id.size && seen.written == id.written)
+            })
+    }
+
+    /// How `now` stands against this record. After a session that did not
+    /// end cleanly only a file put in place of one meow changes in place
+    /// tells: the others it rewrites whole itself.
+    fn seen(&self, now: &Snapshot) -> FilesSeen {
+        if !self.open {
+            if self.differs(now) {
+                FilesSeen::Changed
+            } else {
+                FilesSeen::AsLeft
+            }
+        } else if self.odd || self.replaced_by(now) {
+            FilesSeen::Changed
+        } else {
+            FilesSeen::Unclean
+        }
+    }
+
     fn to_text(&self) -> String {
-        let mut text = format!(
-            "{SEEN_HEADER}\n{}\n",
-            if self.odd { "changed" } else { "ok" }
-        );
+        let state = match (self.open, self.odd) {
+            (false, false) => "ok",
+            (false, true) => "changed",
+            (true, false) => "open",
+            (true, true) => "open changed",
+        };
+        let mut text = format!("{SEEN_HEADER}\n{state}\n");
         for (name, id) in &self.files {
             text.push_str(&format!(
                 "{} {} {} {} {name}\n",
@@ -2894,9 +3072,11 @@ impl Snapshot {
         if lines.next()? != SEEN_HEADER {
             return None;
         }
-        let odd = match lines.next()? {
-            "ok" => false,
-            "changed" => true,
+        let (open, odd) = match lines.next()? {
+            "ok" => (false, false),
+            "changed" => (false, true),
+            "open" => (true, false),
+            "open changed" => (true, true),
             _ => return None,
         };
         let mut files = std::collections::BTreeMap::new();
@@ -2912,7 +3092,7 @@ impl Snapshot {
             };
             files.insert(parts.next()?.to_owned(), id);
         }
-        Some(Self { files, odd })
+        Some(Self { files, odd, open })
     }
 }
 
@@ -2923,18 +3103,27 @@ fn seen_path(home: &MeowHome, mark: &str) -> PathBuf {
 /// How meow last left the files of the session `mark`. `None` when it
 /// never recorded them (a session made by an older meow).
 fn read_seen(home: &MeowHome, mark: &str) -> Option<Snapshot> {
-    let path = seen_path(home, mark);
-    match read_bounded(&path, SEEN_MAX) {
-        Ok(text) => Some(Snapshot::from_text(&text).unwrap_or(Snapshot {
+    match read_seen_text(home, mark) {
+        Ok(Some(text)) => Some(Snapshot::from_text(&text).unwrap_or(Snapshot {
             odd: true,
             ..Snapshot::default()
         })),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Ok(None) => None,
         // Something else in its place: nothing can be trusted.
-        Err(_) => Some(Snapshot {
+        Err(()) => Some(Snapshot {
             odd: true,
             ..Snapshot::default()
         }),
+    }
+}
+
+/// The record of the session `mark` as written: `Ok(None)` when there is
+/// none, `Err` when something else is in its place.
+fn read_seen_text(home: &MeowHome, mark: &str) -> Result<Option<String>, ()> {
+    match read_bounded(&seen_path(home, mark), SEEN_MAX) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
     }
 }
 
@@ -3384,11 +3573,53 @@ impl Workspace {
     /// Whether files meow reads back from this session were replaced,
     /// rewritten or added since meow last left it: by a `git pull` or `git
     /// checkout` in the folder that holds it, an unpacked archive, or by
-    /// hand. False for a session meow never left with this check.
+    /// hand. False for a session meow never left with this check. Asked
+    /// while no session runs in it: a session that runs records its files
+    /// as open ([`FilesSeen::Unclean`]).
     pub fn files_changed(&self, home: &MeowHome) -> bool {
+        self.files_seen(home) == FilesSeen::Changed
+    }
+
+    /// [`Workspace::files_changed`], and whether the last session ended
+    /// as meow ends one.
+    pub fn files_seen(&self, home: &MeowHome) -> FilesSeen {
         self.mark()
             .and_then(|mark| read_seen(home, mark))
-            .is_some_and(|seen| seen.differs(&Snapshot::of(&self.dir)))
+            .map_or(FilesSeen::AsLeft, |seen| {
+                seen.seen(&Snapshot::of(&self.dir))
+            })
+    }
+
+    /// The folder this session was moved from: the user's own record
+    /// places its mark in a folder that is gone, and its files are as meow
+    /// left them there, each of the same size and last write (moved to
+    /// another disk, they are new files there). `None` for anything else
+    /// (a copy, a folder that came with a clone, files changed since).
+    pub fn moved_from(&self, home: &MeowHome) -> Option<PathBuf> {
+        let mark = self.mark()?;
+        folder_session(&self.dir)?;
+        let old = read_record(home).into_iter().rev().find_map(|entry| {
+            let dir = entry.dir.filter(|_| entry.mark == mark)?;
+            matches!(fs::symlink_metadata(&dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                .then_some(dir)
+        })?;
+        read_seen(home, mark)?
+            .moved_to(&Snapshot::of(&self.dir))
+            .then_some(old)
+    }
+
+    /// Takes in the session [`Workspace::moved_from`] found: the record
+    /// places its mark here now, and what meow knew of its files holds for
+    /// them here. Its shell history and last folder stay.
+    pub fn take_moved(&self, home: &MeowHome) -> Result<()> {
+        self.check_name_free(home)?;
+        let mark = self
+            .mark()
+            .map(str::to_owned)
+            .context("the session has no mark")?;
+        self.secure()?;
+        remember(home, &mark, Some(&self.dir))?;
+        write_seen(home, &mark, &Snapshot::of(&self.dir))
     }
 
     /// Drops what a file put in the session could abuse: the shell
@@ -3401,16 +3632,17 @@ impl Workspace {
     }
 }
 
-/// Records, when dropped, how meow leaves the files of a session it used,
-/// in `~/.meow`, so that opening it next time tells whether something else
-/// changed them since ([`Workspace::files_changed`]).
+/// Records how meow leaves the files of a session it used, in `~/.meow`,
+/// so that opening it next time tells whether something else changed them
+/// since ([`Workspace::files_changed`]). A session records them as open
+/// when it starts, and as they are when it ends (when this is dropped): a
+/// record left open tells that it did not end cleanly.
 #[derive(Debug)]
 pub struct SessionFiles {
     home: MeowHome,
     dir: PathBuf,
     mark: Option<String>,
-    /// For a helper: nothing is recorded while a session holds the lock;
-    /// that session records its files when it ends.
+    /// For a helper: see [`SessionFiles::for_helper`].
     helper: bool,
     /// The files as the session found them, to tell whether one meow only
     /// changes in place was replaced while it ran.
@@ -3422,29 +3654,51 @@ pub struct SessionFiles {
     started: bool,
     /// See [`SessionFiles::changed_outside`].
     changed_outside: bool,
+    /// For a helper that writes the files alone: the helper lock
+    /// ([`Workspace::write_alone`]), let go once they are recorded.
+    alone: Option<crate::lock::HelperLock>,
+    /// For any other helper: the record as it was when it began.
+    seen_before: Result<Option<String>, ()>,
 }
 
 impl SessionFiles {
     /// For the session this process holds the lock of, taken before
-    /// anything of it is used. Drop it once the shell and the coordinator
-    /// have stopped and the database is closed. `doubtful`: see
-    /// [`SessionFiles::started`].
+    /// anything of it is used: the record says the session is open from
+    /// now on. Drop it once the shell and the coordinator have stopped and
+    /// the database is closed. `doubtful`: see [`SessionFiles::started`].
     pub fn for_session(home: &MeowHome, workspace: &Workspace, doubtful: bool) -> Self {
         let mut files = Self::new(home, workspace, false);
-        files.start = Some(Snapshot::of(&workspace.dir));
+        let start = Snapshot::of(&workspace.dir);
         files.doubtful = doubtful;
         files.started = false;
+        files.write_open(&Snapshot {
+            odd: doubtful,
+            ..start.clone()
+        });
+        files.start = Some(start);
         files
     }
 
-    /// For a helper command run on `workspace` without its session. Files
-    /// that had changed outside meow before it ran are left so: only
-    /// opening the session takes them in.
-    pub fn for_helper(home: &MeowHome, workspace: &Workspace) -> Self {
+    /// For a helper command run on `workspace` without its session. One
+    /// that wrote the files alone (`alone`, from [`Workspace::write_alone`])
+    /// records them when dropped, before it lets go of the helper lock.
+    /// Any other records them only if nobody else did since it began and
+    /// no session or helper writes them now. Files that had changed
+    /// outside meow before it ran are left so: only opening the session
+    /// takes them in. A record left open stays open.
+    pub fn for_helper(
+        home: &MeowHome,
+        workspace: &Workspace,
+        alone: Option<crate::lock::HelperLock>,
+    ) -> Self {
         let mut files = Self::new(home, workspace, true);
         if workspace.files_changed(home) {
             files.mark = None;
         }
+        if let Some(mark) = &files.mark {
+            files.seen_before = read_seen_text(home, mark);
+        }
+        files.alone = alone;
         files
     }
 
@@ -3458,15 +3712,40 @@ impl SessionFiles {
             doubtful: false,
             started: true,
             changed_outside: false,
+            alone: None,
+            seen_before: Ok(None),
         }
     }
 
     /// Says that the session has started: the user saw the warnings and
     /// answered about its queued scans, and its shell runs. Until then, a
     /// `doubtful` session that ends (a failed start, an error) is recorded
-    /// as changed outside meow, so the next open warns again.
+    /// as changed outside meow, so the next open warns again. The open
+    /// record now holds the files as they are.
     pub fn started(&mut self) {
         self.started = true;
+        let mut now = Snapshot::of(&self.dir);
+        now.odd = self.changed_outside
+            || self
+                .start
+                .as_ref()
+                .is_some_and(|start| start.replaced_by(&now));
+        self.write_open(&now);
+    }
+
+    /// Records `snapshot` as the files of a session that is open. Best
+    /// effort: without it, an end that is not clean looks like a change.
+    fn write_open(&self, snapshot: &Snapshot) {
+        let Some(mark) = &self.mark else {
+            return;
+        };
+        if self.dir.join(PROFILE_FILE).is_file() {
+            let open = Snapshot {
+                open: true,
+                ..snapshot.clone()
+            };
+            let _ = write_seen(&self.home, mark, &open);
+        }
     }
 
     /// Says that something outside meow may have put files in the session
@@ -3481,14 +3760,21 @@ impl SessionFiles {
         let Some(mark) = &self.mark else {
             return Ok(());
         };
-        if self.helper && crate::lock::SessionLock::is_held(&self.dir.join(LOCK_FILE)) {
-            return Ok(());
-        }
         if !self.dir.join(PROFILE_FILE).is_file() {
             return Ok(());
         }
         let mut now = Snapshot::of(&self.dir);
-        if self.changed_outside
+        if self.helper {
+            if self.alone.is_none()
+                && (crate::lock::SessionLock::is_held(&self.dir.join(LOCK_FILE))
+                    || crate::lock::HelperLock::is_held(&self.dir.join(HELPER_LOCK_FILE))
+                    || read_seen_text(&self.home, mark) != self.seen_before)
+            {
+                return Ok(());
+            }
+            // An end that was not clean stays known until a session ends.
+            now.open = read_seen(&self.home, mark).is_some_and(|seen| seen.open);
+        } else if self.changed_outside
             || (self.doubtful && !self.started)
             || self
                 .start
@@ -3504,6 +3790,8 @@ impl SessionFiles {
 impl Drop for SessionFiles {
     fn drop(&mut self) {
         let _ = self.record();
+        // The helper lock goes only now, with the files recorded.
+        drop(self.alone.take());
     }
 }
 
@@ -3782,9 +4070,10 @@ pub fn find_for_deletion(
     }
 }
 
-/// Fails while a session is open on the workspace. Checks `session.lock`
-/// read-only so `meow delete` never creates, follows, or truncates the lock
-/// file (even inside an unaccepted `./.meow` workspace).
+/// Fails while a session is open on the workspace, or a helper writes its
+/// files ([`Workspace::write_alone`]). Checks the locks read-only so `meow
+/// delete` never creates, follows, or truncates a lock file (even inside
+/// an unaccepted `./.meow` workspace).
 pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
     use crate::lock::{LockError, SessionLock};
     let lock = workspace.dir.join(LOCK_FILE);
@@ -3797,7 +4086,18 @@ pub fn ensure_closed(workspace: &WorkspaceSummary) -> Result<()> {
             workspace.name
         );
     }
+    let helper = workspace.dir.join(HELPER_LOCK_FILE);
+    if crate::lock::HelperLock::is_held(&helper) {
+        bail!(helper_busy(&helper, &workspace.name));
+    }
     Ok(())
+}
+
+/// That the helper holding the lock at `path` still writes session `name`.
+fn helper_busy(path: &Path, name: &str) -> String {
+    let who =
+        crate::lock::HelperLock::holder(path).unwrap_or_else(|| "another meow command".to_owned());
+    format!("{who} is still writing '{name}': try again when it ends")
 }
 
 /// Removes the workspace directory with everything in it: replay log,
@@ -5843,7 +6143,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         fs::create_dir(&inside).unwrap();
         chmod(&inside, 0o700);
         chmod(&open_to_all, 0o777);
-        let above = "other users can change a folder above it";
+        let above = "other users can write to a folder above it";
         assert_eq!(check(&inside), Err(above.into()));
         assert_eq!(check(&inside.join("new")), Err(above.into()));
         assert!(local_location(&fx.home, &inside, "acme").is_err());
@@ -5858,12 +6158,23 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert_eq!(check(&link), Ok(()));
         // A folder above that a group shared with others can write to.
         chmod(&open_to_all, 0o775);
+        let shared = "a group shared with other users can write to a folder above it";
         crate::perms::with_private_group(false, || {
-            assert_eq!(check(&inside), Err(above.into()));
-            assert_eq!(check(&link), Err(above.into()));
+            assert_eq!(check(&inside), Err(shared.into()));
+            assert_eq!(check(&link), Err(shared.into()));
         });
         crate::perms::with_private_group(true, || assert_eq!(check(&inside), Ok(())));
         chmod(&open_to_all, 0o755);
+        // A folder named through a link is checked as what it leads to.
+        let real = other_folder(&fx, "real");
+        chmod(&real, 0o775);
+        let named = fx.cwd.join("named");
+        std::os::unix::fs::symlink(&real, &named).unwrap();
+        crate::perms::with_private_group(false, || {
+            let shared = "a group shared with other users can write to it";
+            assert_eq!(check(&named), Err(shared.into()));
+        });
+        crate::perms::with_private_group(true, || assert_eq!(check(&named), Ok(())));
 
         // Another account's folder, or one below another account's: that
         // account could swap the session's files (root's too, with sudo).
@@ -5931,7 +6242,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         let above = proj.parent().unwrap().to_path_buf();
         let mode = mode_of(&above);
         chmod(&above, 0o777);
-        all_refused("other users can change a folder above it");
+        all_refused("other users can write to a folder above it");
         chmod(&above, mode);
         // Writable through an access list for another account.
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -5945,7 +6256,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             fs::create_dir(&inside).unwrap();
             assert_eq!(
                 check_new_folder(&fx.home, &inside, "beta"),
-                Err("other users can change a folder above it".into())
+                Err("other users can write to a folder above it".into())
             );
             // `chmod 755` takes write away from the access list's mask.
             chmod(&proj, 0o755);
@@ -6403,7 +6714,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             assert!(said.contains("changed outside meow"), "{what}: {said}");
             assert!(said.contains("`meow acme`"), "{what}: {said}");
             // What helpers write is not taken as meow's own meanwhile.
-            drop(SessionFiles::for_helper(&fx.home, &ws));
+            drop(SessionFiles::for_helper(&fx.home, &ws, None));
             assert!(ws.files_changed(&fx.home), "{what}");
             let _ = fs::remove_dir(ws.dir.join("graph.json"));
             record();
@@ -6419,7 +6730,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         let lock = crate::lock::SessionLock::acquire(&ws.lock_path()).unwrap();
         append(&ws.replay_path(), "ls\n");
         ws.ensure_own(&fx.home, &fx.cwd).unwrap();
-        drop(SessionFiles::for_helper(&fx.home, &ws));
+        drop(SessionFiles::for_helper(&fx.home, &ws, None));
         assert!(ws.files_changed(&fx.home));
         drop(SessionFiles::for_session(&fx.home, &ws, false));
         drop(lock);
@@ -6689,6 +7000,263 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         create_private_dir(&fx.home.root().join(SEEN_DIR)).unwrap();
         fs::write(seen_path(&fx.home, &mark), "something else\n").unwrap();
         assert!(ws.files_changed(&fx.home));
+    }
+
+    /// Puts `contents` in place of the file at `path` as a pull does: a new
+    /// file, made after the one it replaces.
+    fn put_in_place(path: &Path, contents: &str) {
+        std::thread::sleep(Duration::from_millis(30));
+        let new = path.with_extension("planted");
+        fs::write(&new, contents).unwrap();
+        fs::rename(&new, path).unwrap();
+    }
+
+    /// A session that ends without meow seeing it (killed, a crash, the
+    /// power gone) leaves its record open: what it rewrote whole itself
+    /// (its graph, the shell's history) is not taken for a change outside
+    /// meow, and the user's own history and last folder stay. A file it
+    /// only changes in place that was put in its place since still is.
+    #[test]
+    fn an_end_meow_did_not_see_keeps_the_users_own_files() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        fs::write(ws.history_path("bash"), "echo mine\n").unwrap();
+        fs::write(ws.last_cwd_path(), "/srv\n").unwrap();
+        fs::write(ws.state_db_path(), "db").unwrap();
+        fs::write(ws.replay_path(), "ls\n").unwrap();
+        write_private_atomic(&ws.graph_path(), b"{}").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::AsLeft);
+        let killed = || {
+            let mut files = SessionFiles::for_session(&fx.home, &ws, false);
+            files.started();
+            // What a session writes: its graph saved whole, the shell's
+            // history rewritten, the rest in place.
+            write_private_atomic(&ws.graph_path(), b"{\"hosts\":{}}").unwrap();
+            put_in_place(&ws.history_path("bash"), "echo mine\necho more\n");
+            fs::write(ws.last_cwd_path(), "/srv/x\n").unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(ws.replay_path())
+                .unwrap()
+                .write_all(b"id\n")
+                .unwrap();
+            // Killed: nothing is dropped.
+            std::mem::forget(files);
+        };
+        killed();
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::Unclean);
+        assert!(!ws.files_changed(&fx.home));
+        ws.ensure_own(&fx.home, &fx.cwd).unwrap();
+        // A helper that wrote alone records them, and the record stays open.
+        let alone = ws.write_alone(&fx.home, &fx.cwd, "meow add").unwrap();
+        assert!(alone.is_some());
+        let files = SessionFiles::for_helper(&fx.home, &ws, alone);
+        write_private_atomic(&ws.graph_path(), b"{\"hosts\":{\"a\":1}}").unwrap();
+        drop(files);
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::Unclean);
+        // A session that ends cleanly closes it.
+        let mut files = SessionFiles::for_session(&fx.home, &ws, false);
+        files.started();
+        drop(files);
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::AsLeft);
+        // Put in place of a file meow changes in place: changed outside.
+        for name in ["state.db", "replay.sh", "last_cwd"] {
+            killed();
+            put_in_place(&ws.dir.join(name), "planted");
+            assert_eq!(ws.files_seen(&fx.home), FilesSeen::Changed, "{name}");
+            assert!(ws.ensure_own(&fx.home, &fx.cwd).is_err(), "{name}");
+            drop(SessionFiles::for_session(&fx.home, &ws, true));
+            assert!(ws.files_changed(&fx.home), "a start that never got going");
+            let mut files = SessionFiles::for_session(&fx.home, &ws, true);
+            files.started();
+            drop(files);
+            assert_eq!(ws.files_seen(&fx.home), FilesSeen::AsLeft, "{name}");
+        }
+        // Killed before it started, after a warning: still changed.
+        put_in_place(&ws.state_db_path(), "planted again");
+        assert!(ws.files_changed(&fx.home));
+        std::mem::forget(SessionFiles::for_session(&fx.home, &ws, true));
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::Changed);
+        // The record says which it is.
+        let mut snapshot = Snapshot::of(&ws.dir);
+        for (open, odd) in [(true, false), (true, true), (false, false)] {
+            snapshot.open = open;
+            snapshot.odd = odd;
+            assert_eq!(
+                Snapshot::from_text(&snapshot.to_text()),
+                Some(snapshot.clone())
+            );
+        }
+        assert_eq!(Snapshot::from_text("meow session files 2\nopen ok\n"), None);
+    }
+
+    /// A helper that writes a session's files with no session running
+    /// (`meow add`) holds the helper lock until they are recorded: no
+    /// session starts meanwhile, another such helper waits its turn, and
+    /// none takes what it wrote for a change outside meow.
+    #[test]
+    fn a_helper_that_writes_alone_keeps_sessions_out_until_recorded() {
+        let fx = fixture();
+        let (ws, _) = open(&fx, "acme", true);
+        fs::write(ws.history_path("zsh"), ": 1:0;echo mine\n").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        let alone = ws.write_alone(&fx.home, &fx.cwd, "meow add").unwrap();
+        assert!(alone.is_some());
+        let files = SessionFiles::for_helper(&fx.home, &ws, alone);
+        write_private_atomic(&ws.graph_path(), b"{}").unwrap();
+        fs::write(ws.state_db_path(), "cached lookups").unwrap();
+        // A session that starts now waits, then names the helper.
+        let session = crate::lock::SessionLock::acquire(&ws.lock_path()).unwrap();
+        let said = format!("{:#}", ws.wait_for_helpers().unwrap_err());
+        assert_eq!(
+            said,
+            "meow add is still writing 'acme': try again when it ends"
+        );
+        drop(session);
+        // Another helper: may look, but not write, and records nothing.
+        ws.ensure_own(&fx.home, &fx.cwd).unwrap();
+        let said = format!(
+            "{:#}",
+            ws.write_alone(&fx.home, &fx.cwd, "meow mode").unwrap_err()
+        );
+        assert!(said.starts_with("meow add is still writing"), "{said}");
+        drop(SessionFiles::for_helper(&fx.home, &ws, None));
+        assert!(ws.files_changed(&fx.home));
+        let listed = find_for_deletion(&fx.home, &fx.cwd, Some("acme")).unwrap();
+        let said = format!("{:#}", ensure_closed(&listed).unwrap_err());
+        assert!(said.starts_with("meow add is still writing"), "{said}");
+        // Recorded as meow's own, then let go.
+        drop(files);
+        ensure_closed(&listed).unwrap();
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::AsLeft);
+        assert!(!crate::lock::HelperLock::is_held(&ws.helper_lock_path()));
+        ws.wait_for_helpers().unwrap();
+        // While a session holds the session lock, helpers go through it.
+        let session = crate::lock::SessionLock::acquire(&ws.lock_path()).unwrap();
+        assert!(ws
+            .write_alone(&fx.home, &fx.cwd, "meow add")
+            .unwrap()
+            .is_none());
+        drop(session);
+        // Files changed outside meow: nothing is written alone.
+        put_in_place(&ws.history_path("zsh"), ": 1:0;planted\n");
+        let said = format!(
+            "{:#}",
+            ws.write_alone(&fx.home, &fx.cwd, "meow add").unwrap_err()
+        );
+        assert!(said.contains("changed outside meow"), "{said}");
+        assert!(!crate::lock::HelperLock::is_held(&ws.helper_lock_path()));
+        // A helper that does not write alone records only if nobody else
+        // did since it began.
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        let looking = SessionFiles::for_helper(&fx.home, &ws, None);
+        fs::write(ws.state_db_path(), "the session's db").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &ws, false));
+        put_in_place(&ws.state_db_path(), "after the session");
+        drop(looking);
+        assert!(ws.files_changed(&fx.home));
+    }
+
+    /// The user's own session in a folder they moved or renamed is theirs
+    /// still, with its history, while its files are as meow left them; a
+    /// copy, or one whose files changed since, is asked about.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_folder_keeps_its_session() {
+        let fx = fixture();
+        let proj = other_folder(&fx, "proj");
+        let made = open_in(&fx, &proj, "acme");
+        fs::write(made.history_path("bash"), "echo mine\n").unwrap();
+        fs::write(made.state_db_path(), "db").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &made, false));
+        let mark = made.profile.id.clone().unwrap();
+        let moved = other_folder(&fx, "moved");
+        fs::remove_dir(&moved).unwrap();
+        fs::rename(&proj, &moved).unwrap();
+        let location = Location::Folder(moved.clone());
+        let (ws, created) = Workspace::open_at(&fx.home, &location, "acme", Mode::Light).unwrap();
+        assert!(!created);
+        assert!(ws.is_foreign(&fx.home));
+        assert_eq!(ws.moved_from(&fx.home), Some(made.dir.clone()));
+        let said = format!("{:#}", ws.ensure_own(&fx.home, &moved).unwrap_err());
+        assert!(said.contains("was moved from"), "{said}");
+        // To another disk: new files there, of the same size and last write.
+        let seen = read_seen(&fx.home, &mark).unwrap();
+        let mut elsewhere = seen.clone();
+        for id in elsewhere.files.values_mut() {
+            id.ino = id.ino.wrapping_add(7);
+            id.born = id.born.wrapping_add(1);
+        }
+        write_seen(&fx.home, &mark, &elsewhere).unwrap();
+        assert_eq!(ws.moved_from(&fx.home), Some(made.dir.clone()));
+        // Taken in: the record places it here, its files are as left.
+        ws.take_moved(&fx.home).unwrap();
+        assert!(!ws.is_foreign(&fx.home));
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::AsLeft);
+        assert_eq!(ws.profile.id.as_deref(), Some(mark.as_str()));
+        assert!(ws.history_path("bash").is_file());
+        ws.ensure_own(&fx.home, &moved).unwrap();
+        // A copy, while the folder it came from is there: asked about.
+        let copy = other_folder(&fx, "copy");
+        let copy_dir = sessions_dir(&copy).join("acme");
+        fs::create_dir_all(&copy_dir).unwrap();
+        for name in [PROFILE_FILE, "bash_history", "state.db"] {
+            fs::copy(ws.dir.join(name), copy_dir.join(name)).unwrap();
+        }
+        let copied = Workspace::load(&copy_dir).unwrap();
+        assert!(copied.is_foreign(&fx.home));
+        assert_eq!(copied.moved_from(&fx.home), None);
+        let said = format!("{:#}", copied.ensure_own(&fx.home, &copy).unwrap_err());
+        assert!(said.contains("a meow session from elsewhere"), "{said}");
+        assert!(said.contains("or the folder was moved or copied"), "{said}");
+        // Moved again, with a file changed since: asked about.
+        let again = other_folder(&fx, "again");
+        fs::remove_dir(&again).unwrap();
+        fs::rename(&moved, &again).unwrap();
+        let ws = Workspace::load(&sessions_dir(&again).join("acme")).unwrap();
+        assert!(ws.moved_from(&fx.home).is_some());
+        fs::write(ws.history_path("bash"), "echo planted\n").unwrap();
+        assert_eq!(ws.moved_from(&fx.home), None);
+    }
+
+    /// A folder whose path is not text cannot be named in the record or
+    /// in the shell's start-up files: no session is made or used there.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_whose_path_is_not_text_holds_no_session() {
+        use std::os::unix::ffi::OsStrExt;
+        let fx = fixture();
+        let latin1 = fx
+            .cwd
+            .join(std::ffi::OsStr::from_bytes(b"Projekt-M\xfcller"));
+        fs::create_dir(&latin1).unwrap();
+        let reason = check_new_folder(&fx.home, &latin1, "acme").unwrap_err();
+        assert_eq!(reason, "the path is not valid UTF-8");
+        let said = format!(
+            "{:#}",
+            local_location(&fx.home, &latin1, "acme").unwrap_err()
+        );
+        assert!(said.contains("not valid UTF-8"), "{said}");
+        assert!(said.contains("--home"), "{said}");
+        let location = Location::Folder(latin1.clone());
+        let said = format!(
+            "{:#}",
+            Workspace::open_at(&fx.home, &location, "acme", Mode::Light).unwrap_err()
+        );
+        assert!(said.contains("not valid UTF-8"), "{said}");
+        assert!(!latin1.join(SESSIONS_DIR).exists());
+        assert!(marks(&fx.home).is_empty());
+        // One an older meow made there is not used either.
+        let old = sessions_dir(&latin1).join("acme");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(
+            old.join(PROFILE_FILE),
+            "name = \"acme\"\nmode = \"light\"\n",
+        )
+        .unwrap();
+        assert!(Workspace::open_at(&fx.home, &location, "acme", Mode::Light).is_err());
+        assert!(Workspace::load(&old).is_err());
     }
 
     /// Git keeps out of `./meow`: it is listed in `.git/info/exclude`, and

@@ -284,8 +284,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let dir = resolve_helper_dir(&home, &cwd, target.local, target.session.as_deref(), &env)?;
     let mut workspace = Workspace::load(&dir)?;
     workspace.ensure_own(&home, &cwd)?;
+    // A command that may write the files meow reads back (the graph, the
+    // database) does so itself only while no session runs, and keeps
+    // sessions out until they are recorded.
+    let writes = match command {
+        Command::Add { .. } => Some("meow add"),
+        Command::Report { .. } => Some("meow report"),
+        _ => None,
+    };
+    let alone = match writes {
+        Some(command) => workspace.write_alone(&home, &cwd, command)?,
+        None => None,
+    };
+    let alone_here = alone.is_some();
     // What the command writes there is recorded as meow's own when it ends.
-    let _files = workspace::SessionFiles::for_helper(&home, &workspace);
+    let _files = workspace::SessionFiles::for_helper(&home, &workspace, alone);
     match command {
         Command::List
         | Command::Delete { .. }
@@ -319,7 +332,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 items: parsed.observations,
                 ground: !no_cve,
             };
-            let live = ipc::send(&workspace, &request)?;
+            let live = if alone_here {
+                None
+            } else {
+                Some(send_to_session(&workspace, &request, "add")?)
+            };
             let Request::Observations {
                 items: observations,
                 ..
@@ -485,6 +502,43 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// How long a helper waits for a session that holds the lock of its
+/// workspace to answer: one that is starting is not listening yet.
+const SESSION_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sends `request` to the session that holds the lock of `workspace`, for
+/// `meow <command>`. Never falls back to the files: the session writes them.
+fn send_to_session(
+    workspace: &Workspace,
+    request: &Request,
+    command: &str,
+) -> Result<serde_json::Value> {
+    let until = std::time::Instant::now() + SESSION_ANSWER_WAIT;
+    loop {
+        if let Some(answer) = ipc::send(workspace, request)? {
+            return Ok(answer);
+        }
+        let lock = workspace.lock_path();
+        if !SessionLock::is_held(&lock) {
+            bail!(
+                "session '{}' ended meanwhile; run `meow {command}` again",
+                workspace.name
+            );
+        }
+        if std::time::Instant::now() >= until {
+            let pid = SessionLock::holder_pid(&lock)
+                .map(|pid| format!(" (pid {pid})"))
+                .unwrap_or_default();
+            bail!(
+                "session '{}'{pid} is not responding; resume or exit it first, \
+                 then run `meow {command}` again",
+                workspace.name
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// Whether there is someone at a terminal to ask.
 fn can_ask() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -623,24 +677,48 @@ fn start_session(
     };
     let config = Config::load_or_create(home)?;
     let (mut workspace, created) = Workspace::open_at(home, &location, name, config.default_mode)?;
-    let foreign = workspace.is_foreign(home);
+    let mut foreign = workspace.is_foreign(home);
     if foreign {
-        accept_foreign_workspace(home, cwd, &mut workspace, config.default_mode)?;
+        // The user's own session in a folder they moved keeps all it has.
+        if let Some(old) = workspace.moved_from(home) {
+            workspace.take_moved(home)?;
+            println!("[+] Session moved from {}", sanitize_path_display(&old));
+            foreign = false;
+        } else {
+            accept_foreign_workspace(home, cwd, &mut workspace, config.default_mode)?;
+        }
     }
     let _lock = SessionLock::acquire(&workspace.lock_path()).map_err(|error| match error {
         LockError::Held { .. } => anyhow!("Workspace '{}' is {error}", workspace.name),
         LockError::Io(_) => anyhow!("Workspace '{}': {error}", workspace.name),
     })?;
+    // A helper writing its files with no session (`meow add`) ends first.
+    workspace.wait_for_helpers()?;
+    let seen = if created || foreign {
+        workspace::FilesSeen::AsLeft
+    } else {
+        workspace.files_seen(home)
+    };
+    // Session files a pull made git track, or let in.
+    let mut git = workspace::GitWatch::default();
+    let git_notes = git.check(&workspace.dir);
     // Files a pull or an unpacked archive replaced are not the user's: no
     // planted history or start folder. (A scan queued in them never runs:
-    // no session runs what it did not queue itself.)
-    let files_changed = !created && !foreign && workspace.files_changed(home);
+    // no session runs what it did not queue itself.) After an end meow did
+    // not see, files it rewrites whole cannot be told from planted ones:
+    // then git's word decides.
+    let files_changed = match seen {
+        workspace::FilesSeen::Changed => true,
+        workspace::FilesSeen::Unclean => git.files_doubtful(),
+        workspace::FilesSeen::AsLeft => false,
+    };
     if files_changed {
         println!("[!] Files changed outside meow: shell history and last folder not used");
         workspace.drop_carried_files();
+    } else if seen == workspace::FilesSeen::Unclean {
+        println!("[!] meow did not end cleanly last time");
     }
-    // Session files a pull made git track, or let in.
-    for note in workspace::GitWatch::default().check(&workspace.dir) {
+    for note in git_notes {
         println!("[!] {}", sanitize_terminal_line(&note, 400));
     }
     // Recorded once the shell and the coordinator have stopped; as meow's
@@ -862,7 +940,7 @@ fn accept_foreign_workspace(
             .map(|meta| meta.len())
     };
     println!(
-        "[!] {} is a meow workspace you did not make on this machine: it came with this folder.",
+        "[!] {} is a meow session from elsewhere: it came with this folder, or the folder was moved or copied.",
         sanitize_path_display(&workspace.dir)
     );
     println!(
@@ -877,20 +955,25 @@ fn accept_foreign_workspace(
     let histories = workspace::HISTORY_SHELLS.map(|shell| format!("{shell}_history"));
     let carried = [
         ("state.db", "queued scans and cached lookups"),
-        ("graph.json", "hosts and findings someone else recorded"),
+        ("graph.json", "hosts and findings"),
         ("replay.sh", "a log of commands"),
         ("last_cwd", "the directory its shell starts in"),
     ];
     let histories = histories
         .iter()
         .map(|file| (file.as_str(), "shell history"));
+    let mut drops = false;
     for (file, what) in carried.into_iter().chain(histories) {
         if let Some(bytes) = size(file) {
             println!(
                 "    It carries {what} ({file}, {} KB).",
                 bytes.div_ceil(1024)
             );
+            drops |= file == "last_cwd" || file.ends_with("_history");
         }
+    }
+    if drops {
+        println!("    Accepting it drops its shell history and start folder.");
     }
     println!("    Scans queued in it are dropped: none of them runs.");
     // Only a command that leads back to this folder: `meow delete <name>`

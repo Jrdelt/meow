@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use fd_lock::RwLock;
 
@@ -86,6 +87,100 @@ impl UpdateLock {
             }
         }
         Ok(Self { file: lock })
+    }
+}
+
+/// Held by a helper command (`meow add`) for as long as it writes a
+/// session's files itself, with no session running: a session that starts
+/// meanwhile waits for it ([`HelperLock::wait_free`]), and another such
+/// helper waits its turn. The command is written in the file, past byte 0
+/// as in `session.lock`, for those who wait to name it.
+#[derive(Debug)]
+pub struct HelperLock {
+    file: RwLock<File>,
+}
+
+impl Drop for HelperLock {
+    fn drop(&mut self) {
+        unlock(&mut self.file);
+    }
+}
+
+impl HelperLock {
+    /// Takes the lock on `path`, created private if missing, waiting at
+    /// most `wait` for another helper ([`LockError::Held`] after that), and
+    /// writes `command` (as `meow add`) in it.
+    pub fn acquire(path: &Path, command: &str, wait: Duration) -> Result<Self, LockError> {
+        let mut lock = RwLock::new(open_lock_file(path)?);
+        let deadline = Instant::now() + wait;
+        loop {
+            match lock.try_write() {
+                Ok(mut guard) => {
+                    let line = format!(" {command}\n");
+                    let written = guard
+                        .set_len(0)
+                        .and_then(|()| guard.seek(SeekFrom::Start(0)).map(|_| ()))
+                        .and_then(|()| guard.write_all(line.as_bytes()))
+                        .and_then(|()| guard.flush());
+                    if let Err(error) = written {
+                        drop(guard);
+                        return Err(LockError::Io(error));
+                    }
+                    // Kept with the open file, as in `SessionLock`.
+                    std::mem::forget(guard);
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(LockError::Held { pid: None });
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(LockError::Io(error)),
+            }
+        }
+        Ok(Self { file: lock })
+    }
+
+    /// True while a helper holds the lock on `path`. Read-only.
+    pub fn is_held(path: &Path) -> bool {
+        SessionLock::is_held(path)
+    }
+
+    /// Waits at most `wait` until no helper holds the lock on `path`
+    /// ([`LockError::Held`] after that). Never creates or writes `path`.
+    pub fn wait_free(path: &Path, wait: Duration) -> Result<(), LockError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match SessionLock::check_free(path) {
+                Err(LockError::Held { .. }) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// The command that holds the lock on `path`, as it wrote itself there:
+    /// `None` when none does, or what is there is no command's name.
+    pub fn holder(path: &Path) -> Option<String> {
+        if !Self::is_held(path) {
+            return None;
+        }
+        let mut file = open_readonly_lock(path).ok()??;
+        let text = read_text_from_file(&mut file)?;
+        let text = text.trim();
+        let named = !text.is_empty()
+            && text.len() <= 32
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b' ');
+        named.then(|| text.to_owned())
     }
 }
 
@@ -193,16 +288,25 @@ fn open_lock_file(path: &Path) -> Result<File, LockError> {
 }
 
 fn read_pid_from_file(file: &mut File) -> Option<u32> {
+    read_text_from_file(file)?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&pid| pid != 0)
+}
+
+/// The first 32 bytes of a lock file, as text.
+fn read_text_from_file(file: &mut File) -> Option<String> {
     let mut buf = String::new();
     let _ = file.seek(SeekFrom::Start(0));
     if (&*file).take(32).read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
         // On Windows fd-lock holds a mandatory byte-range lock on [0, 1);
-        // seeking to byte 1 reads the ASCII PID written past byte 0.
+        // seeking to byte 1 reads the ASCII text written past byte 0.
         buf.clear();
         file.seek(SeekFrom::Start(1)).ok()?;
         (&*file).take(32).read_to_string(&mut buf).ok()?;
     }
-    buf.trim().parse().ok().filter(|&pid| pid != 0)
+    Some(buf)
 }
 
 impl SessionLock {

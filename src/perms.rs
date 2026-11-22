@@ -11,9 +11,90 @@
 //! ([`foreign`]).
 
 #[cfg(unix)]
-pub use unix::others_can_change;
+pub use unix::{others_can_change, why_others_can_change};
 #[cfg(windows)]
 pub use windows::foreign;
+
+/// Why an account other than this user could change a file or folder.
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// Write permission for all others, or an access list entry that lets
+    /// another account write.
+    Others,
+    /// Write permission for a group other users are in.
+    Group,
+    /// Who may write cannot be read here (an SMB share keeps its access
+    /// list on the server): the item is taken as others may.
+    Unreadable(&'static str),
+}
+
+#[cfg(any(unix, test))]
+impl Why {
+    /// The reason in a few words, for `what` ("it", "a folder above it").
+    pub fn says(self, what: &str) -> String {
+        match self {
+            Why::Others => format!("other users can write to {what}"),
+            Why::Group => format!("a group shared with other users can write to {what}"),
+            Why::Unreadable(place) => format!("meow cannot read who may write to {what} ({place})"),
+        }
+    }
+}
+
+/// What an item's access list says.
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acl {
+    /// It has one, which lets others write or not.
+    Says(bool),
+    /// It has none, or its file system keeps none.
+    None,
+    /// Its file system may keep one that cannot be read here (NFS
+    /// without one shown, FUSE): its mode bits may not tell it all.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", test)),
+        allow(dead_code)
+    )]
+    Unknown(&'static str),
+    /// Its file system keeps one where it cannot be read, and makes up the
+    /// mode bits (an SMB share): nothing here tells who may write.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", test)),
+        allow(dead_code)
+    )]
+    Hidden(&'static str),
+}
+
+/// Why others could change an item with these mode bits, owning group and
+/// access list (`None` when it could not be read), if they could. On macOS
+/// (`additive`) an access list is checked first and the mode bits still
+/// grant what it does not decide, so group write counts beside it; a
+/// Linux access list holds the group bits itself.
+#[cfg(any(unix, test))]
+fn why_from(
+    mode: u32,
+    gid: u32,
+    acl: Option<Acl>,
+    additive: bool,
+    private: impl Fn(u32) -> bool,
+) -> Option<Why> {
+    if mode & 0o002 != 0 {
+        return Some(Why::Others);
+    }
+    let group_writes = mode & 0o020 != 0;
+    let shared_group = || (group_writes && !private(gid)).then_some(Why::Group);
+    match acl {
+        Some(Acl::Says(true)) => Some(Why::Others),
+        Some(Acl::Says(false)) if additive => shared_group(),
+        Some(Acl::Says(false)) => None,
+        // Without an access list the group bits are the group's.
+        Some(Acl::None) => shared_group(),
+        // One may be kept where it cannot be read: any group counts.
+        Some(Acl::Unknown(place)) => group_writes.then_some(Why::Unreadable(place)),
+        Some(Acl::Hidden(place)) => Some(Why::Unreadable(place)),
+        None => Some(Why::Unreadable("an unreadable access list")),
+    }
+}
 
 /// Write permission in a permission set (`rwx` = 4, 2, 1).
 #[cfg(any(target_os = "linux", target_os = "android", test))]
@@ -262,41 +343,38 @@ mod unix {
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
+    use super::{Acl, Why};
+
     /// Whether an account other than this user could change `path`, whose
-    /// metadata is `meta`: write permission for others, for a group that is
-    /// not this user's alone, or an access list entry that lets someone
-    /// else write. When the access list cannot be read, the answer is yes.
-    /// A sticky folder still counts: callers that accept one (like `/tmp`
-    /// above a folder) look at that bit themselves.
+    /// metadata is `meta` ([`why_others_can_change`]).
     pub fn others_can_change(path: &Path, meta: &Metadata) -> bool {
+        why_others_can_change(path, meta).is_some()
+    }
+
+    /// Why an account other than this user could change `path`, whose
+    /// metadata is `meta`, if it could: write permission for others, for a
+    /// group that is not this user's alone, or an access list entry that
+    /// lets someone else write. When the access list cannot be read, the
+    /// answer is yes. The access list read is that of what `meta`
+    /// describes: a link given with the metadata of what it leads to is
+    /// read as that. A sticky folder still counts: callers that accept one
+    /// (like `/tmp` above a folder) look at that bit themselves.
+    pub fn why_others_can_change(path: &Path, meta: &Metadata) -> Option<Why> {
         let mode = meta.mode();
         if mode & 0o002 != 0 {
-            return true;
+            return Some(Why::Others);
         }
         if meta.file_type().is_symlink() {
             // A link has no access list; what matters is its folder.
-            return false;
+            return None;
         }
-        match acl_lets_others_write(path, meta) {
-            Ok(Acl::Says(writes)) => writes,
-            // Without an access list the group bits are the group's.
-            Ok(Acl::None) => mode & 0o020 != 0 && !group_is_private(meta.gid()),
-            // One may be kept where it cannot be read: any group counts.
-            Ok(Acl::Unknown) => mode & 0o020 != 0,
-            Err(_) => true,
-        }
-    }
-
-    /// What an item's access list says.
-    enum Acl {
-        /// It has one, which lets others write or not.
-        Says(bool),
-        /// It has none, or its file system keeps none.
-        None,
-        /// Its file system may keep one that cannot be read here (NFS
-        /// without one shown, FUSE): its mode bits may not tell it all.
-        #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
-        Unknown,
+        super::why_from(
+            mode,
+            meta.gid(),
+            acl_lets_others_write(path, meta).ok(),
+            cfg!(target_os = "macos"),
+            group_is_private,
+        )
     }
 
     fn me() -> u32 {
@@ -370,10 +448,10 @@ mod unix {
         })
     }
 
-    /// What the access list of `path` says. Read as POSIX one, or as the
-    /// NFSv4 one an NFS mount shows instead. An SMB share keeps its list on
-    /// the server, where this cannot read it, and its mode bits are made
-    /// up by the mount: that is an error (others may write).
+    /// What the access list of `path` says, following links. Read as POSIX
+    /// one, or as the NFSv4 one an NFS mount shows instead. An SMB share
+    /// keeps its list on the server, where this cannot read it, and its
+    /// mode bits are made up by the mount: others may write.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn acl_lets_others_write(path: &Path, meta: &Metadata) -> io::Result<Acl> {
         let path = CString::new(path.as_os_str().as_bytes())?;
@@ -394,12 +472,11 @@ mod unix {
                                 group_is_private,
                             )))
                         }
-                        Xattr::Missing | Xattr::Unsupported => Ok(Acl::Unknown),
+                        Xattr::Missing | Xattr::Unsupported => Ok(Acl::Unknown("an NFS share")),
                     },
-                    Mount::Smb => Err(io::Error::other(
-                        "an SMB share keeps its access list on the server",
-                    )),
-                    Mount::Fuse => Ok(Acl::Unknown),
+                    // It keeps its access list on the server.
+                    Mount::Smb => Ok(Acl::Hidden("an SMB share")),
+                    Mount::Fuse => Ok(Acl::Unknown("a FUSE file system")),
                     Mount::Other => Ok(Acl::None),
                 };
             }
@@ -414,19 +491,22 @@ mod unix {
         )))
     }
 
+    /// What the access list of `path` says, following links as the
+    /// metadata callers pass does. It adds to the mode bits (see
+    /// [`super::why_from`]).
     #[cfg(target_os = "macos")]
     fn acl_lets_others_write(path: &Path, _meta: &Metadata) -> io::Result<Acl> {
         use std::ffi::{c_char, c_int, c_void};
         /// `ACL_TYPE_EXTENDED` in `<sys/acl.h>`.
         const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
         extern "C" {
-            fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
+            fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
             fn acl_to_text(acl: *mut c_void, len: *mut isize) -> *mut c_char;
             fn acl_free(item: *mut c_void) -> c_int;
         }
         let path = CString::new(path.as_os_str().as_bytes())?;
         // SAFETY: a valid C string; the result is freed below.
-        let acl = unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) };
+        let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
         if acl.is_null() {
             let error = io::Error::last_os_error();
             // ENOENT: no access list. The others: none can be kept there.
@@ -448,7 +528,7 @@ mod unix {
             unsafe { acl_free(text.cast()) };
             Ok(owned)
         };
-        // SAFETY: allocated by `acl_get_link_np`, freed once.
+        // SAFETY: allocated by `acl_get_file`, freed once.
         unsafe { acl_free(acl) };
         Ok(Acl::Says(super::macos_acl_lets_others_write(
             &read?,
@@ -1317,6 +1397,67 @@ mod tests {
         assert!(writes("user:x:bob:502:maybe:write\n"));
         assert!(!writes(header));
         assert!(!writes(""));
+    }
+
+    /// Why others could change an item, as callers say it: SMB, NFS or
+    /// FUSE without a readable access list is no permission chmod fixes.
+    #[test]
+    fn the_reason_others_could_write_is_told() {
+        let private = |gid: u32| gid == 1000;
+        let staff = 20;
+        let why = |mode, gid, acl, additive| why_from(mode, gid, acl, additive, private);
+        // Mode bits alone.
+        assert_eq!(why(0o757, 1000, Some(Acl::None), false), Some(Why::Others));
+        assert_eq!(why(0o775, staff, Some(Acl::None), false), Some(Why::Group));
+        assert_eq!(why(0o775, 1000, Some(Acl::None), false), None);
+        assert_eq!(why(0o755, staff, Some(Acl::None), false), None);
+        // A Linux access list holds the group bits itself.
+        assert_eq!(why(0o775, staff, Some(Acl::Says(false)), false), None);
+        assert_eq!(
+            why(0o755, 1000, Some(Acl::Says(true)), false),
+            Some(Why::Others)
+        );
+        // macOS checks its list first and the mode bits still grant what
+        // the list does not decide: `everyone deny delete` on a folder
+        // with group write for staff lets every staff account write.
+        assert_eq!(
+            why(0o775, staff, Some(Acl::Says(false)), true),
+            Some(Why::Group)
+        );
+        assert_eq!(why(0o755, staff, Some(Acl::Says(false)), true), None);
+        assert_eq!(why(0o775, 1000, Some(Acl::Says(false)), true), None);
+        assert_eq!(
+            why(0o755, 1000, Some(Acl::Says(true)), true),
+            Some(Why::Others)
+        );
+        // A list kept where it cannot be read.
+        assert_eq!(
+            why(0o700, 1000, Some(Acl::Hidden("an SMB share")), false),
+            Some(Why::Unreadable("an SMB share"))
+        );
+        assert_eq!(
+            why(0o775, 1000, Some(Acl::Unknown("an NFS share")), false),
+            Some(Why::Unreadable("an NFS share"))
+        );
+        assert_eq!(
+            why(0o755, 1000, Some(Acl::Unknown("an NFS share")), false),
+            None
+        );
+        assert_eq!(
+            why(0o755, 1000, None, false),
+            Some(Why::Unreadable("an unreadable access list"))
+        );
+        assert_eq!(why(0o757, 1000, None, false), Some(Why::Others));
+        // As callers say it.
+        assert_eq!(Why::Others.says("it"), "other users can write to it");
+        assert_eq!(
+            Why::Group.says("it"),
+            "a group shared with other users can write to it"
+        );
+        assert_eq!(
+            Why::Unreadable("an SMB share").says("a folder above it"),
+            "meow cannot read who may write to a folder above it (an SMB share)"
+        );
     }
 
     #[test]
