@@ -125,6 +125,17 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
     }
 }
 
+/// Whether this meow (`current`) updates to the release `candidate`: a
+/// newer one, and not a pre-release (`v1.2.3-rc.1`) unless this meow is
+/// one itself.
+fn is_update(current: &str, candidate: &str) -> bool {
+    let wanted = match (parse_version(current), parse_version(candidate)) {
+        (Some(current), Some(candidate)) => candidate.pre.is_none() || current.pre.is_some(),
+        _ => false,
+    };
+    wanted && is_newer(current, candidate)
+}
+
 fn validate_version_token(version: &str) -> Result<&str> {
     let trimmed = version.trim();
     let v = trimmed
@@ -660,7 +671,7 @@ pub fn run_with(
             .context("GitHub's answer about the newest release could not be read")?;
     validate_version_token(&release.tag_name)?;
     let safe_tag = sanitize(&release.tag_name, 64);
-    if !is_newer(current, &release.tag_name) {
+    if !is_update(current, &release.tag_name) {
         println!("[+] Already up to date: meow {safe_current} is the newest release.");
         return Ok(ExitCode::SUCCESS);
     }
@@ -779,6 +790,16 @@ mod tests {
         assert!(!is_newer("0.1.1", "v0.1.2+"));
         assert!(!is_newer("0.2.0", "v0.1.9"));
         assert!(!is_newer("0.1.1", "nightly"));
+        // A pre-release is newer, but only a pre-release updates to one.
+        assert!(is_newer("0.2.5", "v0.3.0-rc.1"));
+        assert!(!is_update("0.2.5", "v0.3.0-rc.1"));
+        assert!(is_update("0.2.5", "v0.3.0"));
+        assert!(is_update("0.3.0-rc.1", "v0.3.0-rc.2"));
+        assert!(is_update("0.3.0-rc.1", "v0.3.0"));
+        assert!(is_update("0.2.5-beta", "v0.3.0-rc.1"));
+        assert!(!is_update("0.3.0-rc.2", "v0.3.0-rc.1"));
+        assert!(!is_update("0.2.5", "v0.2.5"));
+        assert!(!is_update("0.2.5", "nightly"));
         assert!(validate_version_token("v0.1.2").is_ok());
         assert!(validate_version_token("-v0.1.2").is_err());
         assert!(validate_version_token("../0.1.2").is_err());
@@ -1023,6 +1044,79 @@ mod tests {
         assert!(format!("{error:#}").contains("no meow-0.2.0-linux-riscv64.tar.gz"));
     }
 
+    /// PoC (SUP-6): GitHub named a release candidate as its newest release,
+    /// and every release install took it. Only a pre-release takes one.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_release_is_installed_only_over_a_pre_release() {
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "meow-0.3.0-rc.1-linux-x86_64.tar.gz";
+        let packed = dir.path().join("packed");
+        std::fs::create_dir(&packed).unwrap();
+        std::fs::write(packed.join("meow"), "#!/bin/sh\necho meow 0.3.0-rc.1\n").unwrap();
+        let archive = dir.path().join(name);
+        assert!(Command::new(tar())
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&packed)
+            .arg("meow")
+            .status()
+            .unwrap()
+            .success());
+        let bytes = std::fs::read(&archive).unwrap();
+        let hex: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let sum = format!("{hex}  {name}\n");
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let latest = serde_json::json!({ "tag_name": "v0.3.0-rc.1", "assets": [
+            { "name": name, "browser_download_url": format!("{base}/archive") },
+            { "name": format!("{name}.sha256"), "browser_download_url": format!("{base}/sum") },
+        ]});
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetched);
+        let app = axum::Router::new()
+            .route("/latest", get(move || async move { axum::Json(latest) }))
+            .route(
+                "/archive",
+                get(move || async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    bytes
+                }),
+            )
+            .route("/sum", get(move || async move { sum }));
+        runtime.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let exe = dir.path().join("bin").join("meow");
+        std::fs::create_dir(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "old").unwrap();
+        let url = format!("{base}/latest");
+        for check in [true, false] {
+            let _ = run_with(&url, "linux-x86_64", "0.2.5", &exe, check).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+        assert_eq!(
+            fetched.load(Ordering::SeqCst),
+            0,
+            "the candidate was fetched"
+        );
+        // A pre-release of this meow does update to a newer one.
+        let _ = run_with(&url, "linux-x86_64", "0.3.0-beta.2", &exe, false).unwrap();
+        assert!(std::fs::read_to_string(&exe)
+            .unwrap()
+            .contains("meow 0.3.0-rc.1"));
+    }
+
     /// Every workflow file, by file name, with Windows line ends undone so
     /// the checks below read the same on any checkout.
     fn workflow_files() -> Vec<(String, String)> {
@@ -1159,6 +1253,7 @@ mod tests {
             ids,
             [
                 "draft",
+                "test",
                 "build-macos-arm64",
                 "build-macos-x86_64",
                 "build-linux-x86_64",
@@ -1167,8 +1262,9 @@ mod tests {
                 "publish"
             ]
         );
+        let compiles = |id: &str| id.starts_with("build-") || id == "test";
         for (id, job) in &jobs {
-            let wanted = if id.starts_with("build-") {
+            let wanted = if compiles(id) {
                 "contents: read"
             } else {
                 "contents: write"
@@ -1177,12 +1273,7 @@ mod tests {
         }
         assert_eq!(workflow.matches("contents: write").count(), 2);
         assert!(!workflow.contains("write-all"));
-
-        let builds: Vec<(&str, &String)> = jobs
-            .iter()
-            .filter_map(|(id, job)| Some((id.strip_prefix("build-")?, job)))
-            .collect();
-        for (name, build) in &builds {
+        for (id, job) in jobs.iter().filter(|(id, _)| compiles(id)) {
             for needle in [
                 "GH_TOKEN",
                 "GITHUB_TOKEN",
@@ -1191,8 +1282,15 @@ mod tests {
                 "gh release",
                 ": write",
             ] {
-                assert!(!build.contains(needle), "build-{name} has {needle}");
+                assert!(!job.contains(needle), "{id} has {needle}");
             }
+        }
+
+        let builds: Vec<(&str, &String)> = jobs
+            .iter()
+            .filter_map(|(id, job)| Some((id.strip_prefix("build-")?, job)))
+            .collect();
+        for (_, build) in &builds {
             assert!(build.contains("uses: actions/upload-artifact@"));
             assert!(build.contains("if-no-files-found: error"));
             // A failed job can be re-run for 30 days; the publish job then
@@ -1230,6 +1328,77 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 5);
         assert_eq!(listed, names);
+    }
+
+    /// SUP-7: a tag was published without any test. The publish job waits
+    /// for one that runs the gates of checks.yml on the released commit.
+    #[test]
+    fn a_release_is_published_only_once_its_tests_pass() {
+        let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+        let jobs = workflow_jobs(&workflow);
+        let job = |wanted: &str| {
+            jobs.iter()
+                .find(|(id, _)| *id == wanted)
+                .map(|(_, job)| job.as_str())
+                .unwrap_or_else(|| panic!("no {wanted} job"))
+        };
+        let test = job("test");
+        let mut runs = test
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- run: "));
+        assert_eq!(runs.next(), Some("cargo fmt --check"));
+        assert_eq!(
+            runs.next(),
+            Some("cargo clippy --locked --all-targets -- -D warnings")
+        );
+        assert_eq!(runs.next(), Some("cargo test --locked --lib --bins"));
+        assert_eq!(runs.next(), None);
+        assert!(!test.contains("continue-on-error"));
+        assert!(!test.contains("\n    if:"));
+        let publish = job("publish");
+        assert!(publish.contains("    needs:\n      - draft\n      - test\n"));
+        assert!(!publish.contains("always()"));
+        assert!(!publish.contains("\n    if:"));
+    }
+
+    /// SUP-6: a pre-release version (`1.2.3-rc.1`) was published as the
+    /// latest release, which every release install updates to. It is made
+    /// and published as a pre-release, never as the latest.
+    #[test]
+    fn a_pre_release_is_never_published_as_the_latest_release() {
+        let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+        let jobs = workflow_jobs(&workflow);
+        let (_, draft) = &jobs[0];
+        let (_, publish) = jobs.last().unwrap();
+        let split = "          case \"$TAG\" in\n            *-*) ";
+        // The draft: a pre-release for a '-' in the tag, and only then.
+        assert!(draft.contains(&format!(
+            "{split}prerelease=true ;;\n            *) prerelease=false ;;\n          esac\n"
+        )));
+        assert!(draft.contains(" --target \"$GITHUB_SHA\" --prerelease=\"$prerelease\"\n"));
+        assert!(draft.contains(" --draft --prerelease=\"$prerelease\" "));
+        // Publishing: the flags for each kind, and nothing else marks a
+        // release as the latest.
+        assert!(publish.contains(&format!(
+            "{split}kind=\"--prerelease --latest=false\" ;;\n            \
+             *) kind=\"--prerelease=false --latest\" ;;\n          esac\n"
+        )));
+        let edits: Vec<&str> = publish
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("gh release edit"))
+            .collect();
+        assert_eq!(edits.len(), 2);
+        for edit in edits {
+            assert!(
+                edit.ends_with(" --draft=false --verify-tag $kind")
+                    || edit.ends_with(" --draft=false $kind"),
+                "{edit}"
+            );
+        }
+        assert_eq!(workflow.matches("--latest").count(), 2);
+        // The tag the workflow accepts may have a pre-release part.
+        assert!(draft.contains("(-[0-9A-Za-z.-]+)?$"));
     }
 
     #[test]

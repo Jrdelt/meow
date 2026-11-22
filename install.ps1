@@ -70,6 +70,58 @@ function Test-IsReparsePoint([string]$Path) {
     return [bool]($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
+# Whether $Path is owned by this user (or by SYSTEM, Administrators or
+# TrustedInstaller, which can change any file anyway) and no other account
+# may change it: write, append, delete, or change its access list or owner.
+function Test-OwnPath([string]$Path) {
+    try {
+        $Acl = Get-Acl -LiteralPath $Path
+        $Trusted = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+            'S-1-5-18',
+            'S-1-5-32-544',
+            'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+        )
+        $Owner = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($Trusted -notcontains $Owner) {
+            return $false
+        }
+        # CREATOR OWNER and OWNER RIGHTS stand for the owner.
+        $Trusted += @('S-1-3-0', 'S-1-3-4')
+        $Change = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+        foreach ($Rule in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            # An inherit-only entry is for what is made inside, not for this.
+            if (($Rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) -and
+                (([int]$Rule.PropagationFlags -band 2) -eq 0) -and
+                (([int]$Rule.FileSystemRights -band $Change) -ne 0) -and
+                ($Trusted -notcontains $Rule.IdentityReference.Value)) {
+                return $false
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Cargo and rustup take settings, which can name programs to run, from
+# .cargo\config.toml and rust-toolchain.toml here and in every folder above,
+# and any account may make a folder in C:\. Stop if another account owns or
+# can change one of them.
+function Assert-OwnCargoSettings {
+    $Dir = (Get-Location).ProviderPath
+    while ($Dir) {
+        foreach ($Name in @('.cargo', '.cargo\config', '.cargo\config.toml', 'rust-toolchain', 'rust-toolchain.toml')) {
+            $Candidate = [System.IO.Path]::Combine($Dir, $Name)
+            if ((Test-Path -LiteralPath $Candidate) -and
+                ((Test-IsReparsePoint $Candidate) -or -not (Test-OwnPath $Candidate))) {
+                Die "$Candidate can be changed by another account, and cargo would obey it. Have it removed, then run this again."
+            }
+        }
+        $Dir = [System.IO.Path]::GetDirectoryName($Dir)
+    }
+}
+
 # Strip empty and relative PATH segments so command lookups never run binaries from CWD.
 if ($env:PATH) {
     $CleanPathEntries = @()
@@ -114,6 +166,8 @@ if (-not $ToolsOnly) {
     $SafeWorkDir = if ($env:SystemRoot -and (Test-Path -LiteralPath $env:SystemRoot)) { $env:SystemRoot } else { $HOME }
     Set-Location -LiteralPath $SafeWorkDir
 }
+# Before rustc or cargo first runs here.
+Assert-OwnCargoSettings
 
 $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
 $CargoBin = Join-Path $CargoHome "bin"
@@ -388,6 +442,7 @@ try {
             Die "meow needs Rust 1.$MIN_RUST_MINOR or newer. Run: rustup update stable"
         }
 
+        Assert-OwnCargoSettings
         Say "Building meow (release). The first build takes a few minutes."
         & cargo install --path . --locked
         if ($LASTEXITCODE -ne 0) {

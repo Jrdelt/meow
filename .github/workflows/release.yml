@@ -3,7 +3,10 @@
 # workflow) for the version in Cargo.toml: GitHub then makes the tag itself
 # when it publishes. The files go on that version's GitHub Release: a .pkg
 # installer for macOS, plus .tar.gz / .zip archives that `meow update`
-# fetches, each with a .sha256 file.
+# fetches, each with a .sha256 file. Nothing is published until the test
+# job (fmt, clippy, unit tests) passes. A version with a pre-release part
+# (1.2.3-rc.1) is published as a GitHub pre-release, never as the latest
+# release that `meow update` installs.
 #
 # The build jobs compile third-party crates, whose build scripts can run any
 # code, so they get a read-only token and no GH_TOKEN. Each platform has a
@@ -76,15 +79,41 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
+          # A version with a pre-release part (1.2.3-rc.1) is a GitHub
+          # pre-release, never the latest release that `meow update` installs.
+          case "$TAG" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
           # A draft release made already (on github.com, or by an earlier run
           # that stopped half-way) is kept; the builds are added to it.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "The draft release exists already; updating target and adding the builds to it."
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease="$prerelease"
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --prerelease="$prerelease" --target "$GITHUB_SHA" \
               --title "meow $TAG" --notes-file .github/release-notes.md
           fi
+
+  # The checks of checks.yml, for the commit that is released: the publish
+  # job needs this one. Read-only, like the build jobs: it builds crates too.
+  test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --lib --bins
 
   build-macos-arm64:
     name: build (macos-arm64)
@@ -595,6 +624,7 @@ jobs:
     name: publish the release
     needs:
       - draft
+      - test
       - build-macos-arm64
       - build-macos-x86_64
       - build-linux-x86_64
@@ -726,9 +756,15 @@ jobs:
             v[0-9]*) ;;
             *) echo "Invalid release tag: $TAG" >&2; exit 1 ;;
           esac
+          # A pre-release (a tag with a '-') is never the latest release.
+          case "$TAG" in
+            *-*) kind="--prerelease --latest=false" ;;
+            *) kind="--prerelease=false --latest" ;;
+          esac
           # Publishing makes the tag, at the commit that was built.
+          # shellcheck disable=SC2086 # $kind is two plain flags
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag --latest
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag $kind
           else
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft=false --latest
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft=false $kind
           fi

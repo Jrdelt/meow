@@ -1653,10 +1653,8 @@ async fn locate_target(state: Shared, address: String, generation: u64) {
             match place {
                 Err(None) => {
                     target.status = "no_database";
-                    target.note = Some(
-                        "the location database is not installed: run meow tools, install.sh, or meow update"
-                            .to_owned(),
-                    );
+                    target.note =
+                        Some("the location database is not installed: run meow tools".to_owned());
                 }
                 Err(Some(reason)) => target.note = Some(reason),
                 Ok(None) => target.note = Some("not in the location database".to_owned()),
@@ -2776,7 +2774,9 @@ mod tests {
         // nothing was asked of anyone.
         let public = target(Some("8.8.8.8"));
         assert_eq!(public["status"], "no_database", "{public}");
-        assert!(public["note"].as_str().unwrap().contains("install.sh"));
+        // `meow update` of a release install does not install it.
+        let note = public["note"].as_str().unwrap();
+        assert!(note.ends_with("run meow tools"), "{note}");
         assert_eq!(target(Some("www.example.com"))["status"], "name_only");
         assert_eq!(target(None), Value::Null);
         coordinator.shutdown();

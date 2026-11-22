@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
     Checks the downloads in install.ps1 on Windows: HTTPS only, size limits
-    that hold, and no partial file left behind when a download fails.
+    that hold, and no partial file left behind when a download fails. Also
+    its check of who may change the Cargo settings above it (Test-OwnPath).
 
 .DESCRIPTION
     The installer is never run. Only the functions and constants these checks
@@ -196,7 +197,7 @@ try {
 
     # The installer's own functions. Its Invoke-SafeDownload is loaded as
     # Invoke-InstallerDownload; the stand-in above takes its name.
-    foreach ($Name in @('Test-IsReparsePoint', 'Get-GeoFile')) {
+    foreach ($Name in @('Test-IsReparsePoint', 'Get-GeoFile', 'Test-OwnPath')) {
         . ([ScriptBlock]::Create((Get-InstallerFunction $Name).Extent.Text))
     }
     $Download = Get-InstallerFunction 'Invoke-SafeDownload'
@@ -282,6 +283,32 @@ try {
 
     $Work = Join-Path ([System.IO.Path]::GetTempPath()) ('meow-install-checks-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $Work | Out-Null
+
+    # The check of the Cargo settings in the folders above the installer:
+    # what this user made is its own; once every account may change it, not.
+    $Dir = New-CheckFolder 'owner'
+    $Target = Join-Path $Dir 'config.toml'
+    [System.IO.File]::WriteAllText($Target, '')
+    if ((Test-OwnPath $Dir) -and (Test-OwnPath $Target)) {
+        Pass 'Test-OwnPath counts a folder and a file this user made as its own'
+    } else {
+        Fail 'Test-OwnPath does not count a folder and a file this user made as its own'
+    }
+    $Acl = Get-Acl -LiteralPath $Target
+    $Everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+    $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule($Everyone, [System.Security.AccessControl.FileSystemRights]::Modify, [System.Security.AccessControl.AccessControlType]::Allow)
+    $Acl.AddAccessRule($Rule)
+    Set-Acl -LiteralPath $Target -AclObject $Acl
+    if (Test-OwnPath $Target) {
+        Fail 'Test-OwnPath counts a file every account may change as its own'
+    } else {
+        Pass 'Test-OwnPath does not count a file every account may change as its own'
+    }
+    if (Test-OwnPath (Join-Path $Dir 'missing')) {
+        Fail 'Test-OwnPath counts a file it cannot read as its own'
+    } else {
+        Pass 'Test-OwnPath does not count a file it cannot read as its own'
+    }
 
     # Only HTTPS is fetched; nothing is requested or written for another scheme.
     $Dir = New-CheckFolder 'scheme'

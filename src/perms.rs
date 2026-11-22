@@ -6,9 +6,14 @@
 //! in it and put something of its own in its place, whatever the
 //! permissions of the entries themselves. meow keeps sessions, and runs
 //! code it updates, only in places no other account can change that way.
+//!
+//! On Windows the same is read from an item's owner and access list
+//! ([`foreign`]).
 
 #[cfg(unix)]
 pub use unix::others_can_change;
+#[cfg(windows)]
+pub use windows::foreign;
 
 /// Write permission in a permission set (`rwx` = 4, 2, 1).
 #[cfg(any(target_os = "linux", target_os = "android", test))]
@@ -706,6 +711,384 @@ mod unix {
     }
 }
 
+/// What keeps a file or folder on Windows from being this user's alone.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Foreign {
+    /// Another account owns it: an owner can always let itself write.
+    Owner,
+    /// An entry of its access list lets another account change it.
+    Writable,
+}
+
+/// A Windows security identifier (SID): its authority and sub-authorities.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sid {
+    authority: u64,
+    subs: Vec<u32>,
+}
+
+#[cfg(any(windows, test))]
+impl Sid {
+    /// The SID at the start of `bytes`, and its length: revision 1, the
+    /// number of sub-authorities, the authority in six big-endian bytes,
+    /// then each sub-authority in four little-endian ones.
+    fn parse(bytes: &[u8]) -> Option<(Self, usize)> {
+        let &[revision, count, ..] = bytes else {
+            return None;
+        };
+        let len = 8 + 4 * usize::from(count);
+        if revision != 1 || count > 15 || bytes.len() < len {
+            return None;
+        }
+        let authority = bytes[2..8]
+            .iter()
+            .fold(0u64, |value, &byte| (value << 8) | u64::from(byte));
+        let subs = bytes[8..len]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        Some((Self { authority, subs }, len))
+    }
+
+    /// This user, or an account that can change any file anyway: SYSTEM,
+    /// Administrators and TrustedInstaller.
+    fn is_trusted_owner(&self, user: &Self) -> bool {
+        self == user
+            || matches!(
+                (self.authority, self.subs.as_slice()),
+                (5, [18])
+                    | (5, [32, 544])
+                    | (
+                        5,
+                        [
+                            80,
+                            956_008_885,
+                            3_418_522_649,
+                            1_831_038_044,
+                            1_853_292_631,
+                            2_271_478_464
+                        ]
+                    )
+            )
+    }
+
+    /// [`Sid::is_trusted_owner`], or CREATOR OWNER and OWNER RIGHTS, which
+    /// stand for the owner (checked on its own).
+    fn is_trusted_entry(&self, user: &Self) -> bool {
+        self.is_trusted_owner(user)
+            || matches!((self.authority, self.subs.as_slice()), (3, [0 | 4]))
+    }
+}
+
+/// Rights that let an account change a file or folder, what is in it, or
+/// who may: write or append (in a folder: add a file or folder), delete it
+/// or what is in it, change its access list or owner, and the generic
+/// rights that hold these.
+#[cfg(any(windows, test))]
+const CHANGE_RIGHTS: u32 = 0x0000_0002 // FILE_WRITE_DATA, FILE_ADD_FILE
+    | 0x0000_0004 // FILE_APPEND_DATA, FILE_ADD_SUBDIRECTORY
+    | 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
+
+/// What a self-relative security descriptor `sd` (with owner and access
+/// list) says keeps what it guards from being `user`'s alone: an owner
+/// other than [`Sid::is_trusted_owner`], or an allow entry that applies
+/// to the item itself (inherited ones too; inherit-only ones do not) and
+/// gives another account a right in [`CHANGE_RIGHTS`]. No access list at
+/// all lets everyone in. Deny entries are not counted.
+#[cfg(any(windows, test))]
+fn foreign_in(sd: &[u8], user: &Sid) -> std::io::Result<Option<Foreign>> {
+    const SE_DACL_PRESENT: u16 = 0x0004;
+    const SE_SELF_RELATIVE: u16 = 0x8000;
+    const INHERIT_ONLY_ACE: u8 = 0x08;
+    let unreadable = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cannot read its access list",
+        )
+    };
+    let u16_at = |bytes: &[u8], at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let u32_at = |bytes: &[u8], at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let offset = |at: usize| u32_at(sd, at).and_then(|value| usize::try_from(value).ok());
+    let control = u16_at(sd, 2).ok_or_else(unreadable)?;
+    if sd.first() != Some(&1) || control & SE_SELF_RELATIVE == 0 {
+        return Err(unreadable());
+    }
+    let owner = offset(4)
+        .filter(|&at| at != 0)
+        .and_then(|at| Sid::parse(sd.get(at..)?))
+        .ok_or_else(unreadable)?
+        .0;
+    if !owner.is_trusted_owner(user) {
+        return Ok(Some(Foreign::Owner));
+    }
+    let dacl = offset(16).ok_or_else(unreadable)?;
+    if control & SE_DACL_PRESENT == 0 || dacl == 0 {
+        return Ok(Some(Foreign::Writable));
+    }
+    let acl = sd.get(dacl..).ok_or_else(unreadable)?;
+    let size = usize::from(u16_at(acl, 2).ok_or_else(unreadable)?);
+    let count = u16_at(acl, 4).ok_or_else(unreadable)?;
+    let acl = acl
+        .get(..size)
+        .filter(|_| size >= 8)
+        .ok_or_else(unreadable)?;
+    let mut at = 8;
+    for _ in 0..count {
+        let ace = acl.get(at..).ok_or_else(unreadable)?;
+        let ace_size = usize::from(u16_at(ace, 2).ok_or_else(unreadable)?);
+        let ace = ace
+            .get(..ace_size)
+            .filter(|_| ace_size >= 8)
+            .ok_or_else(unreadable)?;
+        at += ace_size;
+        let (kind, flags) = (ace[0], ace[1]);
+        if flags & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        let mask = u32_at(ace, 4).ok_or_else(unreadable)?;
+        let sid_at = match kind {
+            // Allowed, allowed with a condition.
+            0 | 9 => 8,
+            // Allowed for an object type: its flags say which of two
+            // GUIDs come before the SID.
+            5 | 11 => {
+                let object = u32_at(ace, 8).ok_or_else(unreadable)?;
+                12 + 16 * usize::from(object & 1 != 0) + 16 * usize::from(object & 2 != 0)
+            }
+            // A compound entry (impersonation) names two accounts.
+            4 if mask & CHANGE_RIGHTS != 0 => return Ok(Some(Foreign::Writable)),
+            // Deny, audit and label entries let nobody write.
+            _ => continue,
+        };
+        if mask & CHANGE_RIGHTS == 0 {
+            continue;
+        }
+        let (sid, _) = ace
+            .get(sid_at..)
+            .and_then(Sid::parse)
+            .ok_or_else(unreadable)?;
+        if !sid.is_trusted_entry(user) {
+            return Ok(Some(Foreign::Writable));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::io;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    use super::{foreign_in, Foreign, Sid};
+
+    /// What keeps `path` from being this user's alone, read from its owner
+    /// and access list ([`foreign_in`]): `None` when it is. The item is
+    /// read as itself: a link is not followed.
+    pub fn foreign(path: &Path) -> io::Result<Option<Foreign>> {
+        foreign_in(&descriptor(path)?, current_user()?)
+    }
+
+    /// The user this process runs as.
+    fn current_user() -> io::Result<&'static Sid> {
+        static USER: OnceLock<Sid> = OnceLock::new();
+        if let Some(user) = USER.get() {
+            return Ok(user);
+        }
+        let user = read_current_user()?;
+        Ok(USER.get_or_init(|| user))
+    }
+
+    fn read_current_user() -> io::Result<Sid> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo handle of this process is always valid and
+        // never closed; `token` is a valid place for the handle opened.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Room for a TOKEN_USER and the longest SID (68 bytes), in u64
+        // words so it is aligned for the structure.
+        let mut buffer = vec![0u64; 64];
+        let size =
+            u32::try_from(std::mem::size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
+        let mut used = 0u32;
+        // SAFETY: the token is open for queries; the buffer is `size`
+        // writable bytes, aligned for a TOKEN_USER and alive through the
+        // call; `used` is a valid place for the length written.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                size,
+                &mut used,
+            )
+        };
+        let error = io::Error::last_os_error();
+        // SAFETY: the token handle is open, and closed once, here.
+        unsafe {
+            CloseHandle(token);
+        }
+        if read == 0 {
+            return Err(error);
+        }
+        // SAFETY: the call wrote a TOKEN_USER at the start of the buffer.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        // The SID it points to lies in the same buffer, after it.
+        let bytes: Vec<u8> = buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        sid.addr()
+            .checked_sub(buffer.as_ptr().addr())
+            .and_then(|at| Sid::parse(bytes.get(at..)?))
+            .map(|(sid, _)| sid)
+            .ok_or_else(|| io::Error::other("cannot read this user's SID"))
+    }
+
+    /// The owner and access list of `path`, as a self-relative security
+    /// descriptor.
+    fn descriptor(path: &Path) -> io::Result<Vec<u8>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+        use windows_sys::Win32::Security::{
+            GetKernelObjectSecurity, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        };
+        /// A descriptor is some hundreds of bytes; one that claims to need
+        /// more than this is not read.
+        const MAX: u32 = 1024 * 1024;
+        // Opened for its security alone, folders too, as itself (never
+        // what a link points to), and in nobody's way.
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let mut size: u32 = 1024;
+        for _ in 0..4 {
+            // In u64 words: aligned for the descriptor.
+            let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+            let mut needed = 0u32;
+            // SAFETY: the handle is open until `file` is dropped; the
+            // buffer is `size` writable bytes, aligned and alive through
+            // the call; `needed` is a valid place for the length needed.
+            let read = unsafe {
+                GetKernelObjectSecurity(
+                    file.as_raw_handle(),
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    buffer.as_mut_ptr().cast(),
+                    size,
+                    &mut needed,
+                )
+            };
+            if read != 0 {
+                return Ok(buffer
+                    .iter()
+                    .flat_map(|word| word.to_ne_bytes())
+                    .take(size as usize)
+                    .collect());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+                || needed <= size
+                || needed > MAX
+            {
+                return Err(error);
+            }
+            size = needed;
+        }
+        Err(io::Error::other("its security descriptor keeps growing"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Runs icacls (`System32`) on `path` with `args`.
+        fn icacls(path: &Path, args: &[&str]) {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+            let status =
+                std::process::Command::new(Path::new(&root).join("System32").join("icacls.exe"))
+                    .arg(path)
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+            assert!(status.success(), "icacls {args:?}");
+        }
+
+        #[test]
+        fn a_folder_of_this_users_own_is_not_foreign() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("f.txt");
+            std::fs::write(&file, "x").unwrap();
+            assert_eq!(foreign(tmp.path()).unwrap(), None);
+            assert_eq!(foreign(&file).unwrap(), None);
+        }
+
+        #[test]
+        fn an_entry_that_lets_everyone_write_makes_it_foreign() {
+            let tmp = tempfile::tempdir().unwrap();
+            let folder = tmp.path().join("shared");
+            std::fs::create_dir(&folder).unwrap();
+            let file = folder.join("f.txt");
+            std::fs::write(&file, "x").unwrap();
+            // Everyone may change the file, read-only first.
+            icacls(&file, &["/grant", "*S-1-1-0:(R)"]);
+            assert_eq!(foreign(&file).unwrap(), None);
+            icacls(&file, &["/grant", "*S-1-1-0:(M)"]);
+            assert_eq!(foreign(&file).unwrap(), Some(Foreign::Writable));
+            // As C:\ gives Authenticated Users: inherit-only on the folder,
+            // which then counts for what is made in it, not for itself.
+            icacls(&folder, &["/grant", "*S-1-5-11:(OI)(CI)(IO)(M)"]);
+            assert_eq!(foreign(&folder).unwrap(), None);
+            let made = folder.join("new.txt");
+            std::fs::write(&made, "x").unwrap();
+            assert_eq!(foreign(&made).unwrap(), Some(Foreign::Writable));
+            icacls(&folder, &["/grant", "*S-1-5-11:(OI)(CI)(M)"]);
+            assert_eq!(foreign(&folder).unwrap(), Some(Foreign::Writable));
+        }
+
+        #[test]
+        fn a_link_is_read_as_itself() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            icacls(&target, &["/grant", "*S-1-1-0:(OI)(CI)(M)"]);
+            let link = tmp.path().join("link");
+            // Making a link needs a right not every account has.
+            if std::os::windows::fs::symlink_dir(&target, &link).is_ok() {
+                assert_eq!(foreign(&link).unwrap(), None);
+            }
+            assert_eq!(foreign(&target).unwrap(), Some(Foreign::Writable));
+        }
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 pub(crate) use unix::grant_write_acl;
 #[cfg(unix)]
@@ -949,5 +1332,271 @@ mod tests {
         assert!(!is_private_group(Some("staff"), &only_me, Some("j"), false));
         assert!(!is_private_group(None, &none, Some("j"), false));
         assert!(!is_private_group(Some("j"), &none, None, false));
+    }
+}
+
+/// Windows access lists, read from bytes laid out as Windows gives them.
+#[cfg(test)]
+mod windows_access_list_tests {
+    use super::*;
+
+    const ME: (u64, &[u32]) = (5, &[21, 1, 2, 3, 1001]);
+    const OTHER_USER: (u64, &[u32]) = (5, &[21, 1, 2, 3, 1002]);
+    const SYSTEM: (u64, &[u32]) = (5, &[18]);
+    const ADMINISTRATORS: (u64, &[u32]) = (5, &[32, 544]);
+    const TRUSTED_INSTALLER: (u64, &[u32]) = (
+        5,
+        &[
+            80,
+            956_008_885,
+            3_418_522_649,
+            1_831_038_044,
+            1_853_292_631,
+            2_271_478_464,
+        ],
+    );
+    const USERS: (u64, &[u32]) = (5, &[32, 545]);
+    const AUTHENTICATED_USERS: (u64, &[u32]) = (5, &[11]);
+    const EVERYONE: (u64, &[u32]) = (1, &[0]);
+    const CREATOR_OWNER: (u64, &[u32]) = (3, &[0]);
+    const OWNER_RIGHTS: (u64, &[u32]) = (3, &[4]);
+
+    const FULL: u32 = 0x001F_01FF;
+    const MODIFY: u32 = 0x0013_01BF;
+    const READ_EXECUTE: u32 = 0x0012_00A9;
+    const WRITE: u32 = 0x0000_0116;
+    const ALLOW: u8 = 0;
+    const DENY: u8 = 1;
+    const INHERITED: u8 = 0x10;
+    const INHERIT_ONLY: u8 = 0x08;
+    const OI_CI_IO: u8 = 0x0B;
+
+    fn sid((authority, subs): (u64, &[u32])) -> Vec<u8> {
+        let mut bytes = vec![1, u8::try_from(subs.len()).unwrap()];
+        bytes.extend(&authority.to_be_bytes()[2..]);
+        for sub in subs {
+            bytes.extend(sub.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn user() -> Sid {
+        Sid::parse(&sid(ME)).unwrap().0
+    }
+
+    /// An entry: its header (type, flags, size), mask, then `body` (the SID,
+    /// or what comes before it too).
+    fn entry_with(kind: u8, flags: u8, mask: u32, body: &[u8]) -> Vec<u8> {
+        let size = u16::try_from(8 + body.len()).unwrap();
+        let mut bytes = vec![kind, flags];
+        bytes.extend(size.to_le_bytes());
+        bytes.extend(mask.to_le_bytes());
+        bytes.extend(body);
+        bytes
+    }
+
+    fn entry(kind: u8, flags: u8, mask: u32, who: (u64, &[u32])) -> Vec<u8> {
+        entry_with(kind, flags, mask, &sid(who))
+    }
+
+    /// A self-relative descriptor with `owner` and, when given, an access
+    /// list of `entries`.
+    fn descriptor(owner: (u64, &[u32]), entries: Option<&[Vec<u8>]>) -> Vec<u8> {
+        let owner = sid(owner);
+        let mut control: u16 = 0x8000;
+        let dacl_at = 20 + owner.len();
+        let mut acl = Vec::new();
+        if let Some(entries) = entries {
+            control |= 0x0004;
+            let body: Vec<u8> = entries.concat();
+            acl.extend([2, 0]);
+            acl.extend(u16::try_from(8 + body.len()).unwrap().to_le_bytes());
+            acl.extend(u16::try_from(entries.len()).unwrap().to_le_bytes());
+            acl.extend([0, 0]);
+            acl.extend(body);
+        }
+        let mut bytes = vec![1, 0];
+        bytes.extend(control.to_le_bytes());
+        bytes.extend(20u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes());
+        let dacl_offset = if entries.is_some() { dacl_at } else { 0 };
+        bytes.extend(u32::try_from(dacl_offset).unwrap().to_le_bytes());
+        bytes.extend(owner);
+        bytes.extend(acl);
+        bytes
+    }
+
+    /// What a profile folder holds: SYSTEM, Administrators and the user.
+    fn own_entries() -> Vec<Vec<u8>> {
+        vec![
+            entry(ALLOW, INHERITED, FULL, SYSTEM),
+            entry(ALLOW, INHERITED, FULL, ADMINISTRATORS),
+            entry(ALLOW, INHERITED, FULL, ME),
+        ]
+    }
+
+    fn verdict(owner: (u64, &[u32]), extra: &[Vec<u8>]) -> Option<Foreign> {
+        let entries: Vec<Vec<u8>> = own_entries().into_iter().chain(extra.to_vec()).collect();
+        foreign_in(&descriptor(owner, Some(&entries)), &user()).unwrap()
+    }
+
+    #[test]
+    fn a_folder_of_the_users_profile_is_the_users_alone() {
+        assert_eq!(verdict(ME, &[]), None);
+        // Owners that can change any file anyway.
+        for owner in [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER] {
+            assert_eq!(verdict(owner, &[]), None);
+        }
+        // Others may read and run.
+        let read = entry(ALLOW, INHERITED, READ_EXECUTE, USERS);
+        assert_eq!(verdict(ME, &[read]), None);
+        // TrustedInstaller's full control, as system files have it.
+        let installer = entry(ALLOW, 0, FULL, TRUSTED_INSTALLER);
+        assert_eq!(verdict(ME, &[installer]), None);
+    }
+
+    #[test]
+    fn another_owner_counts() {
+        assert_eq!(verdict(OTHER_USER, &[]), Some(Foreign::Owner));
+        assert_eq!(verdict(USERS, &[]), Some(Foreign::Owner));
+    }
+
+    /// PoC (SUP-3): a folder made under C:\ inherits Authenticated Users:
+    /// Modify, so every account can change it while the owner stays the
+    /// user.
+    #[test]
+    fn an_entry_that_lets_another_account_change_it_counts() {
+        let modify = entry(ALLOW, INHERITED, MODIFY, AUTHENTICATED_USERS);
+        assert_eq!(verdict(ME, &[modify]), Some(Foreign::Writable));
+        let write = entry(ALLOW, 0, WRITE, EVERYONE);
+        assert_eq!(verdict(ME, &[write]), Some(Foreign::Writable));
+        let other = entry(ALLOW, 0, FULL, OTHER_USER);
+        assert_eq!(verdict(ME, &[other]), Some(Foreign::Writable));
+        // Each right that changes it, alone.
+        for right in [
+            0x0000_0002,
+            0x0000_0004,
+            0x0000_0040,
+            0x0001_0000,
+            0x0004_0000,
+            0x0008_0000,
+            0x1000_0000,
+            0x4000_0000,
+        ] {
+            let alone = entry(ALLOW, 0, right, USERS);
+            assert_eq!(verdict(ME, &[alone]), Some(Foreign::Writable), "{right:#x}");
+        }
+        // Rights that do not: reading, and its attributes and times.
+        for right in [READ_EXECUTE, 0x0000_0100, 0x0000_0010, 0x8000_0000] {
+            let harmless = entry(ALLOW, 0, right, EVERYONE);
+            assert_eq!(verdict(ME, &[harmless]), None, "{right:#x}");
+        }
+    }
+
+    #[test]
+    fn inherit_only_entries_do_not_count_for_the_item_itself() {
+        // C:\ itself: Authenticated Users may change what is made in it.
+        let template = entry(ALLOW, OI_CI_IO, MODIFY, AUTHENTICATED_USERS);
+        assert_eq!(verdict(ME, &[template]), None);
+        let inherited_template = entry(ALLOW, INHERITED | INHERIT_ONLY, FULL, EVERYONE);
+        assert_eq!(verdict(ME, &[inherited_template]), None);
+        // Once it applies to the item too, it counts.
+        let both = entry(ALLOW, 0x03, MODIFY, AUTHENTICATED_USERS);
+        assert_eq!(verdict(ME, &[both]), Some(Foreign::Writable));
+    }
+
+    #[test]
+    fn deny_entries_and_owner_placeholders_do_not_count() {
+        let deny = entry(DENY, 0, FULL, EVERYONE);
+        assert_eq!(verdict(ME, &[deny]), None);
+        // Both stand for the owner, who is checked on its own.
+        for placeholder in [CREATOR_OWNER, OWNER_RIGHTS] {
+            let owner = entry(ALLOW, 0, FULL, placeholder);
+            assert_eq!(verdict(ME, &[owner]), None);
+        }
+        let creator = entry(ALLOW, 0, FULL, CREATOR_OWNER);
+        assert_eq!(verdict(OTHER_USER, &[creator]), Some(Foreign::Owner));
+    }
+
+    #[test]
+    fn conditional_object_and_compound_entries_are_read() {
+        // Allowed with a condition: the SID, then the condition.
+        let mut body = sid(EVERYONE);
+        body.extend([0x61, 0x72, 0x74, 0x78]);
+        let callback = entry_with(9, 0, MODIFY, &body);
+        assert_eq!(verdict(ME, &[callback]), Some(Foreign::Writable));
+        // Allowed for an object type, with each of its GUIDs or none.
+        for flags in [0u32, 1, 2, 3] {
+            let mut body = flags.to_le_bytes().to_vec();
+            let guids = usize::from(flags & 1 != 0) + usize::from(flags & 2 != 0);
+            body.extend(vec![0xAB; 16 * guids]);
+            body.extend(sid(EVERYONE));
+            for kind in [5, 11] {
+                let object = entry_with(kind, 0, MODIFY, &body);
+                assert_eq!(
+                    verdict(ME, &[object]),
+                    Some(Foreign::Writable),
+                    "{kind} {flags}"
+                );
+            }
+            let mut mine = flags.to_le_bytes().to_vec();
+            mine.extend(vec![0xAB; 16 * guids]);
+            mine.extend(sid(ME));
+            assert_eq!(verdict(ME, &[entry_with(5, 0, MODIFY, &mine)]), None);
+        }
+        let compound = entry_with(4, 0, MODIFY, &[0; 20]);
+        assert_eq!(verdict(ME, &[compound]), Some(Foreign::Writable));
+        let compound_read = entry_with(4, 0, READ_EXECUTE, &[0; 20]);
+        assert_eq!(verdict(ME, &[compound_read]), None);
+        // Audit and label entries let nobody write.
+        let label = entry(0x11, 0, 0x1, (16, &[12288]));
+        assert_eq!(verdict(ME, &[label]), None);
+    }
+
+    #[test]
+    fn no_access_list_lets_everyone_in_and_an_empty_one_nobody() {
+        let none = descriptor(ME, None);
+        assert_eq!(foreign_in(&none, &user()).unwrap(), Some(Foreign::Writable));
+        let empty = descriptor(ME, Some(&[]));
+        assert_eq!(foreign_in(&empty, &user()).unwrap(), None);
+        // Present, but at offset 0: none either.
+        let mut zero = descriptor(ME, Some(&[]));
+        zero[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(foreign_in(&zero, &user()).unwrap(), Some(Foreign::Writable));
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_read_is_an_error() {
+        let good = descriptor(ME, Some(&own_entries()));
+        assert_eq!(foreign_in(&good, &user()).unwrap(), None);
+        // Cut short anywhere.
+        for len in 0..good.len() {
+            assert!(foreign_in(&good[..len], &user()).is_err(), "{len}");
+        }
+        let mut changed = good.clone();
+        changed[0] = 2;
+        assert!(foreign_in(&changed, &user()).is_err(), "revision");
+        let mut absolute = good.clone();
+        absolute[3] &= 0x7F;
+        assert!(foreign_in(&absolute, &user()).is_err(), "not self-relative");
+        let mut no_owner = good.clone();
+        no_owner[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(foreign_in(&no_owner, &user()).is_err(), "no owner");
+        let mut more = good.clone();
+        let dacl = 20 + sid(ME).len();
+        more[dacl + 4] += 1;
+        assert!(foreign_in(&more, &user()).is_err(), "an entry too many");
+        let mut long_sid = sid(ME);
+        long_sid[1] = 16;
+        assert!(Sid::parse(&long_sid).is_none());
+        assert_eq!(Sid::parse(&sid(ME)).unwrap().1, 28);
+        assert_eq!(
+            user(),
+            Sid {
+                authority: 5,
+                subs: vec![21, 1, 2, 3, 1001]
+            }
+        );
     }
 }

@@ -125,30 +125,61 @@ fn verify_checkout_security(dir: &Path, explicit_source: bool) -> Result<()> {
     Ok(())
 }
 
-/// git, and then the folder's `install.sh`, are run in `dir`: it must be
-/// this user's own. A folder (or any file git tracks in it, or what git
-/// keeps of its history) that another account owns or can write to, also
-/// through a shared group or an access list, could make both run that
-/// account's code. Its git settings are vetted ([`vet_git_folder`]) before
-/// git first reads it.
+/// Why `path` (whose metadata is `meta`) is not this user's alone, if it
+/// is not: a link, another account's, or one others can change, also
+/// through a shared group or an access list.
 #[cfg(unix)]
-fn ensure_own_checkout(dir: &Path) -> Result<()> {
+fn not_own(path: &Path, meta: &std::fs::Metadata) -> Option<&'static str> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: this call has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
+    if meta.file_type().is_symlink() {
+        Some("is a symbolic link")
+    } else if meta.uid() != me {
+        Some("belongs to another user")
+    } else if crate::perms::others_can_change(path, meta) {
+        Some("can be changed by other users")
+    } else {
+        None
+    }
+}
+
+/// [`not_own`] on Windows, read from the owner and access list: a folder
+/// made under `C:\` lets every account change what is in it.
+#[cfg(windows)]
+fn not_own(path: &Path, meta: &std::fs::Metadata) -> Option<&'static str> {
+    use crate::perms::Foreign;
+    if meta.file_type().is_symlink() {
+        return Some("is a symbolic link");
+    }
+    match crate::perms::foreign(path) {
+        Ok(None) => None,
+        Ok(Some(Foreign::Owner)) => Some("belongs to another account"),
+        Ok(Some(Foreign::Writable)) => Some("can be changed by other accounts"),
+        Err(_) => Some("cannot be checked"),
+    }
+}
+
+/// What to do about a checkout that is not the user's alone.
+#[cfg(unix)]
+const USE_OWN_CHECKOUT: &str = "Update from a meow folder of your own \
+     (clone it again and run ./install.sh there), or pass --source <folder>";
+#[cfg(windows)]
+const USE_OWN_CHECKOUT: &str = "Clone meow into your own user folder and update from there";
+
+/// git, and then the folder's installer, are run in `dir`: it must be this
+/// user's own. A folder (or any file git tracks in it, or what git keeps
+/// of its history) that another account owns or can write to ([`not_own`])
+/// could make both run that account's code. Its git settings are vetted
+/// ([`vet_git_folder`]) before git first reads it.
+#[cfg(any(unix, windows))]
+fn ensure_own_checkout(dir: &Path) -> Result<()> {
     let check = |path: &Path, meta: &std::fs::Metadata| -> Result<()> {
-        let problem = if meta.file_type().is_symlink() {
-            "is a symbolic link"
-        } else if meta.uid() != me {
-            "belongs to another user"
-        } else if crate::perms::others_can_change(path, meta) {
-            "can be changed by other users"
-        } else {
+        let Some(problem) = not_own(path, meta) else {
             return Ok(());
         };
         bail!(
-            "{} {problem}, so nothing is run in it. Update from a meow folder of your own \
-             (clone it again and run ./install.sh there), or pass --source <folder>",
+            "{} {problem}, so nothing is run in it. {USE_OWN_CHECKOUT}",
             sanitize(&path.display().to_string(), 400)
         );
     };
@@ -190,23 +221,37 @@ fn ensure_own_checkout(dir: &Path) -> Result<()> {
 }
 
 /// More entries than a meow checkout has; past this, nothing is run.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_CHECKOUT_ENTRIES: usize = 500_000;
+
+/// A file name as `git ls-files -z` gives it, as a path.
+#[cfg(unix)]
+fn tracked_path(name: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(name)))
+}
+
+/// A file name as `git ls-files -z` gives it (UTF-8, with `/`), as a
+/// path: with `\`, which a `\\?\` path needs.
+#[cfg(windows)]
+fn tracked_path(name: &[u8]) -> Result<PathBuf> {
+    let name = std::str::from_utf8(name).context("git lists a file name that is not UTF-8")?;
+    Ok(PathBuf::from(name.replace('/', "\\")))
+}
 
 /// Every file git tracks in `dir` and the folders they are in, and what
 /// git keeps that decides what is checked out: its index, `HEAD`,
 /// `packed-refs`, and everything under `refs` and `objects`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn checkout_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     use std::collections::BTreeSet;
-    use std::os::unix::ffi::OsStrExt;
     let listed = git_output(dir, &["ls-files", "-z"])?;
     let mut paths = BTreeSet::new();
     for name in listed
         .split(|&byte| byte == 0)
         .filter(|name| !name.is_empty())
     {
-        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        let path = dir.join(tracked_path(name)?);
         paths.extend(
             path.ancestors()
                 .take_while(|above| above.starts_with(dir) && *above != dir)
@@ -245,29 +290,6 @@ fn checkout_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(paths.into_iter().collect())
-}
-
-#[cfg(windows)]
-fn ensure_own_checkout(dir: &Path) -> Result<()> {
-    for (path, must_exist) in [
-        (dir.to_path_buf(), true),
-        (dir.join(".git"), true),
-        (dir.join("Cargo.toml"), true),
-        (dir.join("src"), false),
-        (dir.join("install.ps1"), false),
-        (dir.join(".cargo"), false),
-    ] {
-        if !must_exist && std::fs::symlink_metadata(&path).is_err() {
-            continue;
-        }
-        crate::workspace::verify_windows_owner(&path).with_context(|| {
-            format!(
-                "refusing untrusted checkout path {}",
-                sanitize(&path.display().to_string(), 400)
-            )
-        })?;
-    }
-    vet_git_folder(dir)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -309,31 +331,45 @@ fn audit_untracked_build_overrides(dir: &Path) -> Result<()> {
     }
     // Cargo and rustup also walk parent directories above the checkout; allow
     // the user's own private `~/.cargo/config.toml`, but refuse any parent
-    // override file owned or writable by another account.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: this call has no preconditions and cannot fail.
-        let me = unsafe { libc::geteuid() };
-        for ancestor in dir.ancestors().skip(1) {
-            for rel in OVERRIDES {
-                let candidate = ancestor.join(rel);
-                let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
-                    continue;
-                };
-                let untrusted = meta.file_type().is_symlink()
-                    || (meta.uid() != me && meta.uid() != 0)
-                    || crate::perms::others_can_change(&candidate, &meta);
-                if untrusted {
-                    bail!(
-                        "refusing to build {safe_dir}: untrusted parent override {}",
-                        sanitize(&candidate.display().to_string(), 400)
-                    );
-                }
+    // override file owned or writable by another account, and a `.cargo`
+    // folder another account could put one in. On Windows any account may
+    // make `C:\.cargo`.
+    #[cfg(any(unix, windows))]
+    for ancestor in dir.ancestors().skip(1) {
+        for rel in std::iter::once(".cargo").chain(OVERRIDES) {
+            let candidate = ancestor.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+                continue;
+            };
+            if untrusted_override(&candidate, &meta) {
+                bail!(
+                    "refusing to build {safe_dir}: untrusted parent override {}",
+                    sanitize(&candidate.display().to_string(), 400)
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Whether cargo or rustup must not take settings from `path`, above the
+/// checkout: a link, or what an account other than this user or root
+/// owns or can change.
+#[cfg(unix)]
+fn untrusted_override(path: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: this call has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    meta.file_type().is_symlink()
+        || (meta.uid() != me && meta.uid() != 0)
+        || crate::perms::others_can_change(path, meta)
+}
+
+/// [`untrusted_override`] on Windows: SYSTEM, Administrators and
+/// TrustedInstaller count as the user ([`not_own`]).
+#[cfg(windows)]
+fn untrusted_override(path: &Path, meta: &std::fs::Metadata) -> bool {
+    not_own(path, meta).is_some()
 }
 
 #[cfg(unix)]
@@ -400,6 +436,7 @@ fn resolve_git() -> Result<PathBuf> {
     }
 }
 
+#[cfg(unix)]
 fn resolve_sh() -> PathBuf {
     for candidate in ["/bin/sh", "/usr/bin/sh"] {
         let path = Path::new(candidate);
@@ -530,6 +567,9 @@ fn is_allowed_local_git_config_key(key: &str) -> bool {
         ("pull", None) => matches!(leaf, "rebase" | "ff"),
         // meow passes `-c gc.auto=0` itself.
         ("gc", None) => leaf == "auto",
+        // Written by `git maintenance register` (or `start`): meow passes
+        // `-c maintenance.auto=false` itself and never runs maintenance.
+        ("maintenance", None) => matches!(leaf, "auto" | "strategy"),
         _ => false,
     }
 }
@@ -897,23 +937,76 @@ fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// A new folder of this user's alone (`0700` from the start: cargo makes
-/// what is in it with the user's umask) for cargo to build in.
-fn build_dir() -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("meow-build-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
+/// meow's own folder for cargo to build updates in, `build` in meow's
+/// folder (`~/.meow`): kept from one update to the next, so each builds
+/// only what changed, and on the user's own disk (a temporary folder may
+/// run no programs, may be memory, and was left full when an update was
+/// stopped). cargo links what it finds there into meow, so it and meow's
+/// folder must be this user's alone ([`not_own`]), checked each time.
+#[cfg(unix)]
+fn build_dir(home: &crate::workspace::MeowHome) -> Result<PathBuf> {
+    let dir = home.root().join("build");
+    crate::workspace::create_private_dir(&dir).context("cannot make a folder to build in")?;
+    // meow's folder as it really is: it may be a link the user made.
+    let root = std::fs::canonicalize(home.root())
+        .with_context(|| format!("cannot resolve {}", home.root().display()))?;
+    for path in [root.clone(), root.join("build")] {
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        if let Some(problem) = not_own(&path, &meta) {
+            bail!(
+                "{} {problem}, so meow does not build in it",
+                sanitize(&path.display().to_string(), 400)
+            );
+        }
     }
-    builder.tempdir()
+    Ok(root.join("build"))
+}
+
+/// Whether `name` is that of a build folder older meow versions made in
+/// the system's temporary folder: `meow-build-` and six letters or digits.
+#[cfg(any(unix, test))]
+fn is_old_build_dir_name(name: &str) -> bool {
+    name.strip_prefix("meow-build-")
+        .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Removes from `tmp` the build folders older meow versions left there when
+/// an update was stopped: only real folders named as they named them
+/// ([`is_old_build_dir_name`]), this user's and private (`0700`) as they
+/// made them. Links are never followed, and what cannot be removed stays.
+#[cfg(unix)]
+fn remove_old_build_dirs(tmp: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: this call has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_old_build_dir_name)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_dir() && meta.uid() == me && meta.mode() & 0o7777 == 0o700 {
+            // Does not follow links inside either.
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// `sh install.sh --yes` in `dir`, with cargo building in `target`: a
 /// `--path` install otherwise builds in the folder's own `./target`, which
 /// git does not track, so no check covers it, and a shared group can
 /// write to it (a planted build output would be linked into meow).
+#[cfg(unix)]
 fn install_command(dir: &Path, target: &Path) -> Command {
     let mut cmd = Command::new(resolve_sh());
     if let Some(path) = sanitized_path_env() {
@@ -1137,6 +1230,20 @@ fn run_homebrew_update(hb: &HomebrewInstall, brew_bin: &Path, check: bool) -> Re
 }
 
 pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
+    update(
+        args,
+        crate::workspace::MeowHome::from_env,
+        &std::env::temp_dir(),
+    )
+}
+
+/// [`run`], with meow's own folder given by `home` once a build needs it,
+/// and `tmp` the temporary folder older versions built in.
+fn update(
+    args: &UpdateArgs,
+    home: impl FnOnce() -> Result<crate::workspace::MeowHome>,
+    tmp: &Path,
+) -> Result<ExitCode> {
     // Installed from a GitHub Release: download the newest release instead,
     // unless a checkout to update was named.
     let explicit_source =
@@ -1273,16 +1380,37 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
     // build.rs runs git as well.
     ensure_own_checkout(&dir)?;
     audit_untracked_build_overrides(&dir)?;
-    if cfg!(windows) {
-        // A running program cannot be replaced on Windows.
-        println!(
-            "[+] Pulled. Close meow, then run in PowerShell: & \"{safe_dir}\\install.ps1\" -Yes  (or: cargo install --path \"{safe_dir}\" --locked)"
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
+    install_pulled(&dir, &safe_dir, home, tmp)
+}
+
+/// Windows: a running program cannot be replaced, so the user runs the
+/// installer once meow is closed.
+#[cfg(windows)]
+fn install_pulled(
+    _dir: &Path,
+    safe_dir: &str,
+    _home: impl FnOnce() -> Result<crate::workspace::MeowHome>,
+    _tmp: &Path,
+) -> Result<ExitCode> {
+    println!(
+        "[+] Pulled. Close meow, then run in PowerShell: & \"{safe_dir}\\install.ps1\" -Yes  (or: cargo install --path \"{safe_dir}\" --locked)"
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the pulled checkout's `install.sh`, which builds meow in meow's
+/// own build folder ([`build_dir`]) and installs it.
+#[cfg(unix)]
+fn install_pulled(
+    dir: &Path,
+    _safe_dir: &str,
+    home: impl FnOnce() -> Result<crate::workspace::MeowHome>,
+    tmp: &Path,
+) -> Result<ExitCode> {
+    let build = build_dir(&home()?)?;
+    remove_old_build_dirs(tmp);
     println!("[+] Rebuilding with install.sh");
-    let build = build_dir().context("cannot make a folder to build in")?;
-    let status = install_command(&dir, build.path())
+    let status = install_command(dir, &build)
         .status()
         .context("cannot run install.sh")?;
     if !status.success() {
@@ -1292,6 +1420,16 @@ pub fn run(args: &UpdateArgs) -> Result<ExitCode> {
         "[+] Updated. Sessions that are open keep the old version until you close and reopen them."
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_pulled(
+    _dir: &Path,
+    safe_dir: &str,
+    _home: impl FnOnce() -> Result<crate::workspace::MeowHome>,
+    _tmp: &Path,
+) -> Result<ExitCode> {
+    bail!("meow cannot rebuild itself here; run install.sh in {safe_dir}")
 }
 
 /// Repositories prepared to make git run a program of theirs, for tests.
@@ -1457,8 +1595,19 @@ pub(crate) mod git_traps {
 mod tests {
     use super::*;
 
-    /// cargo builds the update in a fresh private folder, never in the
-    /// checkout's own `./target`.
+    /// [`run`], with meow's own folder (`meow-home`) and the temporary
+    /// folder older versions built in next to the checkout, in the test's
+    /// own folder.
+    #[cfg(unix)]
+    fn run_here(args: &UpdateArgs) -> Result<ExitCode> {
+        let source = args.source.clone().expect("a test names its checkout");
+        let tmp = source.parent().unwrap().to_path_buf();
+        let home = tmp.join("meow-home");
+        update(args, move || crate::workspace::MeowHome::at(home), &tmp)
+    }
+
+    /// cargo builds the update in meow's own private folder, never in the
+    /// checkout's own `./target`, and the same one each time.
     #[cfg(unix)]
     #[test]
     fn install_sh_builds_in_a_private_folder_of_its_own() {
@@ -1471,20 +1620,130 @@ mod tests {
             "printf '%s' \"$CARGO_TARGET_DIR\" > built-in\n",
         )
         .unwrap();
-        let build = build_dir().unwrap();
-        let mode = std::fs::metadata(build.path())
-            .unwrap()
-            .permissions()
-            .mode();
+        let home = crate::workspace::MeowHome::at(tmp.path().join("meow-home")).unwrap();
+        let build = build_dir(&home).unwrap();
+        let real_home = std::fs::canonicalize(home.root()).unwrap();
+        assert_eq!(build, real_home.join("build"));
+        let mode = std::fs::metadata(&build).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
-        let mut command = install_command(&checkout, build.path());
+        let mut command = install_command(&checkout, &build);
         // A target folder from the user's settings does not apply either.
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "CARGO_BUILD_TARGET_DIR" && value.is_none()));
         assert!(command.status().unwrap().success());
         let built_in = std::fs::read_to_string(checkout.join("built-in")).unwrap();
-        assert_eq!(built_in, build.path().display().to_string());
+        assert_eq!(built_in, build.display().to_string());
+        // What a build left is kept for the next one.
+        std::fs::write(build.join("kept"), "x").unwrap();
+        assert_eq!(build_dir(&home).unwrap(), build);
+        assert!(build.join("kept").exists());
+    }
+
+    /// PoC (SUP-4): the build folder was made in the system's temporary
+    /// folder and left there, full, when the update was stopped. A folder
+    /// others can change, or that is a link, is not built in.
+    #[cfg(unix)]
+    #[test]
+    fn the_build_folder_must_be_the_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("meow-home");
+        let home = crate::workspace::MeowHome::at(&root).unwrap();
+        let build = build_dir(&home).unwrap();
+        // Made private again when it is not.
+        std::fs::set_permissions(&build, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(build_dir(&home).is_ok());
+        let mode = std::fs::metadata(&build).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // meow's folder that others can change: not built in.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = build_dir(&home).unwrap_err();
+        assert!(
+            format!("{err:#}")
+                .contains("can be changed by other users, so meow does not build in it"),
+            "{err:#}"
+        );
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A link in place of the build folder: refused, never followed.
+        std::fs::remove_dir(&build).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &build).unwrap();
+        assert!(build_dir(&home).is_err());
+        // meow's folder may be a link the user made to a folder of theirs.
+        std::fs::remove_file(&build).unwrap();
+        let linked = tmp.path().join("linked-home");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        let through_link = crate::workspace::MeowHome::at(&linked).unwrap();
+        assert_eq!(
+            build_dir(&through_link).unwrap(),
+            std::fs::canonicalize(&root).unwrap().join("build")
+        );
+    }
+
+    #[test]
+    fn old_build_folders_are_known_by_their_name() {
+        for name in [
+            "meow-build-EeBX4p",
+            "meow-build-O0efPZ",
+            "meow-build-abc123",
+        ] {
+            assert!(is_old_build_dir_name(name), "{name}");
+        }
+        for name in [
+            "meow-build-",
+            "meow-build-abc12",
+            "meow-build-abc1234",
+            "meow-build-abc-12",
+            "meow-build-abc.12",
+            "meow-build-ab\u{e9}12",
+            "xmeow-build-abc123",
+            "meow-builds-abc123",
+            "build",
+        ] {
+            assert!(!is_old_build_dir_name(name), "{name}");
+        }
+    }
+
+    /// Only the user's own private folders named as older versions named
+    /// them are removed; links are not followed.
+    #[cfg(unix)]
+    #[test]
+    fn old_build_folders_in_the_temporary_folder_are_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |name: &str, mode: u32| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(dir.join("release").join("deps")).unwrap();
+            std::fs::write(dir.join("release").join("deps").join("libbig.rlib"), "x").unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir
+        };
+        let left = make("meow-build-EeBX4p", 0o700);
+        let shared = make("meow-build-Shared", 0o755);
+        let other_name = make("meow-build-toolong1", 0o700);
+        let not_meow = make("cargo-build-AbC123", 0o700);
+        // A link named like one, to a folder of the user's.
+        let keep = make("keep", 0o700);
+        let link = tmp.path().join("meow-build-Lnk123");
+        std::os::unix::fs::symlink(&keep, &link).unwrap();
+        // A file named like one.
+        let file = tmp.path().join("meow-build-File12");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        remove_old_build_dirs(tmp.path());
+        assert!(!left.exists());
+        for kept in [&shared, &other_name, &not_meow, &file] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(keep
+            .join("release")
+            .join("deps")
+            .join("libbig.rlib")
+            .exists());
     }
 
     #[test]
@@ -1542,8 +1801,9 @@ mod tests {
             // write or read a file, or reach the network.
             "gc.recentobjectshook",
             "gc.autopacklimit",
-            "maintenance.auto",
-            "maintenance.strategy",
+            "maintenance.repo",
+            "maintenance.gc.enabled",
+            "maintenance.main.auto",
             "http.cookiefile",
             "http.savecookies",
             "http.https://github.com/.cookiefile",
@@ -1598,6 +1858,8 @@ mod tests {
             "pull.rebase",
             "pull.ff",
             "gc.auto",
+            "maintenance.auto",
+            "maintenance.strategy",
         ] {
             assert!(
                 is_allowed_local_git_config_key(benign_key),
@@ -1688,7 +1950,7 @@ mod tests {
         test_git(&work, &["push", "-q", "origin", "HEAD:main"]);
 
         // Non-checkout folder is refused.
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: true,
             source: Some(tmp.path().join("missing")),
         })
@@ -1697,7 +1959,7 @@ mod tests {
 
         // World-writable checkout folder is refused before git runs.
         std::fs::set_permissions(&clone, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: false,
             source: Some(clone.clone()),
         })
@@ -1709,7 +1971,7 @@ mod tests {
         // macOS every user's group is staff), and so does every file git
         // tracks, every folder it is in, and what git keeps.
         let check_only = || {
-            run(&UpdateArgs {
+            run_here(&UpdateArgs {
                 check: true,
                 source: Some(clone.clone()),
             })
@@ -1762,7 +2024,7 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // --check changes nothing; full update pulls and runs install.sh without running hooks.
-        let _ = run(&UpdateArgs {
+        let _ = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -1770,7 +2032,7 @@ mod tests {
         assert!(!clone.join("feat.txt").exists());
         assert!(!install_log.exists());
 
-        let _ = run(&UpdateArgs {
+        let _ = run_here(&UpdateArgs {
             check: false,
             source: Some(clone.clone()),
         })
@@ -1803,7 +2065,7 @@ mod tests {
         );
         test_git(&clone, &["config", "branch.main.remote", "evil"]);
         tighten_tree(&clone);
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: false,
             source: Some(clone.clone()),
         })
@@ -1820,7 +2082,7 @@ mod tests {
         test_git(&clone, &["remote", "remove", "evil"]);
         tighten_tree(&clone);
         // Back to normal, the checked fetch is merged without a second one.
-        let _ = run(&UpdateArgs {
+        let _ = run_here(&UpdateArgs {
             check: false,
             source: Some(clone.clone()),
         })
@@ -1829,7 +2091,7 @@ mod tests {
 
         // Local modifications refuse pulling.
         std::fs::write(clone.join("install.sh"), "echo dirty\n").unwrap();
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: false,
             source: Some(clone.clone()),
         })
@@ -1853,7 +2115,7 @@ mod tests {
             ],
         );
         tighten_tree(&clone);
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -1996,13 +2258,13 @@ mod tests {
             ("http.saveCookies", "true"),
             ("http.https://example.invalid/.cookieFile", victim),
             ("http.https://example.invalid/.saveCookies", "true"),
-            ("maintenance.auto", "true"),
+            ("maintenance.repo", "/dev/null"),
             ("core.sharedRepository", "0666"),
             ("branch.main.mergeOptions", "--no-ff"),
         ] {
             repo_git(&clone, &["config", key, value]);
             private_tree(&clone);
-            let err = run(&UpdateArgs {
+            let err = run_here(&UpdateArgs {
                 check: true,
                 source: Some(clone.clone()),
             })
@@ -2031,11 +2293,14 @@ mod tests {
             ("user.email", "test@example.invalid"),
             ("branch.main.rebase", "false"),
             ("gc.auto", "0"),
+            // What `git maintenance register` writes.
+            ("maintenance.auto", "false"),
+            ("maintenance.strategy", "incremental"),
         ] {
             repo_git(&clone, &["config", key, value]);
         }
         private_tree(&clone);
-        let _ = run(&UpdateArgs {
+        let _ = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -2130,7 +2395,7 @@ mod tests {
         set_old_mtime(&clone.join("sub/f.txt"));
         private_tree(&clone);
 
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -2191,7 +2456,7 @@ mod tests {
         set_old_mtime(&clone.join("docs/a.md"));
         private_tree(&clone);
 
-        let _ = run(&UpdateArgs {
+        let _ = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -2233,7 +2498,7 @@ mod tests {
         private_tree(&clone);
         private_tree(&shared);
 
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -2491,7 +2756,7 @@ mod tests {
         // listed it.
         let shared = clone.join("top").join("f");
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o666)).unwrap();
-        let err = run(&UpdateArgs {
+        let err = run_here(&UpdateArgs {
             check: true,
             source: Some(clone.clone()),
         })
@@ -2502,6 +2767,148 @@ mod tests {
             "{said}"
         );
         assert!(!marker.exists(), "git ran the checkout's ssh command");
+    }
+
+    /// cargo and rustup take settings from every folder above the
+    /// checkout: one another account owns or can change is refused, and so
+    /// is a `.cargo` folder it could put one in.
+    #[cfg(unix)]
+    #[test]
+    fn parent_cargo_settings_others_can_change_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("src").join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        let cargo = tmp.path().join(".cargo");
+        std::fs::create_dir(&cargo).unwrap();
+        let config = cargo.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(&cargo, 0o755);
+        set_mode(&config, 0o644);
+        audit_untracked_build_overrides(&clone).unwrap();
+        for (path, mode, back) in [(&config, 0o666, 0o644), (&cargo, 0o777, 0o755)] {
+            set_mode(path, mode);
+            let err = audit_untracked_build_overrides(&clone).unwrap_err();
+            let expected = format!("untrusted parent override {}", path.display());
+            assert!(format!("{err:#}").contains(&expected), "{err:#}");
+            set_mode(path, back);
+        }
+        audit_untracked_build_overrides(&clone).unwrap();
+    }
+
+    /// Runs icacls (`System32`) on `path` with `args`.
+    #[cfg(windows)]
+    fn icacls(path: &Path, args: &[&str]) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let status = Command::new(Path::new(&root).join("System32").join("icacls.exe"))
+            .arg(path)
+            .args(args)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls {args:?}");
+    }
+
+    /// git for a Windows test, without the system's settings.
+    #[cfg(windows)]
+    fn windows_git(dir: &Path, args: &[&str]) {
+        let status = Command::new(resolve_git().unwrap())
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=meow-test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// PoC (SUP-3): on Windows only the owner of six paths was checked. A
+    /// clone under `C:\` lets every account change `.git\config` and any
+    /// tracked file while the owner stays the user, and meow then fetched
+    /// from the address that account chose.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_checkout_other_accounts_can_change_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("clone");
+        std::fs::create_dir_all(clone.join("src")).unwrap();
+        windows_git(&clone, &["init", "-q"]);
+        std::fs::write(clone.join("Cargo.toml"), "[package]\nname = \"meow\"\n").unwrap();
+        std::fs::write(clone.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        windows_git(&clone, &["add", "."]);
+        windows_git(&clone, &["commit", "-qm", "initial"]);
+        ensure_own_checkout(&clone).unwrap();
+        let refused = |path: &Path| {
+            let said = format!("{:#}", ensure_own_checkout(&clone).unwrap_err());
+            let expected = format!("{} can be changed by other accounts", path.display());
+            assert!(said.contains(&expected), "{said}");
+            assert!(
+                said.contains("Clone meow into your own user folder"),
+                "{said}"
+            );
+        };
+        // A tracked file, and the git settings that name where to fetch.
+        let main = clone.join("src").join("main.rs");
+        let config = clone.join(".git").join("config");
+        for path in [&main, &config] {
+            icacls(path, &["/grant", "*S-1-1-0:(M)"]);
+            refused(path);
+            icacls(path, &["/remove:g", "*S-1-1-0"]);
+            ensure_own_checkout(&clone).unwrap();
+        }
+        // As under C:\: what is in the folder inherits Authenticated
+        // Users: Modify, which does not apply to the folder itself.
+        icacls(&clone, &["/grant", "*S-1-5-11:(OI)(CI)(IO)(M)"]);
+        assert!(ensure_own_checkout(&clone).is_err());
+        icacls(&clone, &["/remove:g", "*S-1-5-11"]);
+        ensure_own_checkout(&clone).unwrap();
+    }
+
+    /// PoC (SUP-V2): any account may make `C:\.cargo\config.toml`, which
+    /// `cargo install --path` reads from every folder above the checkout.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_parent_cargo_settings_other_accounts_can_change_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("src").join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        let cargo = tmp.path().join(".cargo");
+        std::fs::create_dir(&cargo).unwrap();
+        let config = cargo.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        audit_untracked_build_overrides(&clone).unwrap();
+        for path in [&config, &cargo] {
+            icacls(path, &["/grant", "*S-1-5-11:(M)"]);
+            let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
+            let expected = format!("untrusted parent override {}", path.display());
+            assert!(said.contains(&expected), "{said}");
+            icacls(path, &["/remove:g", "*S-1-5-11"]);
+        }
+        audit_untracked_build_overrides(&clone).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_git_file_names_become_paths() {
+        assert_eq!(
+            tracked_path(b"src/parsers/mod.rs").unwrap(),
+            PathBuf::from(r"src\parsers\mod.rs")
+        );
+        assert!(tracked_path(b"src/\xff.rs").is_err());
     }
 
     #[cfg(windows)]
