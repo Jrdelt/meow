@@ -681,7 +681,7 @@ fn start_session(
     if foreign {
         // The user's own session in a folder they moved keeps all it has.
         if let Some(old) = workspace.moved_from(home) {
-            workspace.take_moved(home)?;
+            workspace.take_moved(home, &old)?;
             println!("[+] Session moved from {}", sanitize_path_display(&old));
             foreign = false;
         } else {

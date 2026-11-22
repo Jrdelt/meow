@@ -512,20 +512,44 @@ fn program_name(program: &str) -> String {
 /// folder: one list per workspace, never shared by two.
 fn fish_history_name(dir: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = resolved(dir);
     let digest = Sha256::digest(dir.as_os_str().as_encoded_bytes());
     let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     format!("meow_{hex}")
 }
 
-/// The file fish keeps that history in: `$XDG_DATA_HOME/fish`, else
-/// `~/.local/share/fish`.
-pub fn fish_history_file(dir: &Path) -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
+/// `dir` with links resolved; for one that is gone (a session folder that
+/// was moved), as far as it is still there.
+fn resolved(dir: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        return real;
+    }
+    for base in dir.ancestors().skip(1) {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            let rest = dir.strip_prefix(base).unwrap_or(dir);
+            if rest
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return real.join(rest);
+            }
+            break;
+        }
+    }
+    dir.to_path_buf()
+}
+
+/// fish's data folder: `$XDG_DATA_HOME/fish`, else `~/.local/share/fish`.
+fn fish_data() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))?;
-    Some(fish_history_in(&data, dir))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
+}
+
+/// The file fish keeps that history in, in its data folder.
+pub fn fish_history_file(dir: &Path) -> Option<PathBuf> {
+    Some(fish_history_in(&fish_data()?, dir))
 }
 
 fn fish_history_in(data: &Path, dir: &Path) -> PathBuf {
@@ -538,6 +562,22 @@ fn fish_history_in(data: &Path, dir: &Path) -> PathBuf {
 pub fn forget_fish_history(dir: &Path) {
     if let Some(file) = fish_history_file(dir) {
         let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Gives the session the user moved from `old` to `new` the history fish
+/// kept for it there. Without one, a list fish kept for an earlier
+/// workspace in the new place is dropped: it is not this one's.
+pub fn move_fish_history(old: &Path, new: &Path) {
+    if let Some(data) = fish_data() {
+        move_fish_history_in(&data, old, new);
+    }
+}
+
+fn move_fish_history_in(data: &Path, old: &Path, new: &Path) {
+    let (from, to) = (fish_history_in(data, old), fish_history_in(data, new));
+    if from != to && std::fs::rename(&from, &to).is_err() {
+        let _ = std::fs::remove_file(&to);
     }
 }
 
@@ -903,6 +943,48 @@ mod tests {
             fish_history_in(Path::new("/data"), &ws.dir),
             Path::new("/data/fish").join(format!("{name}_history"))
         );
+    }
+
+    /// fish keeps a session's history by its folder's path: a session
+    /// the user moved takes its list along, and none left at the new
+    /// place by an earlier one.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_session_keeps_its_fish_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("fish")).unwrap();
+        // Named through a link, as a folder typed at the prompt may be.
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("proj/meow/acme")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let old = link.join("proj/meow/acme");
+        let name = fish_history_name(&old);
+        std::fs::write(fish_history_in(&data, &old), "- cmd: echo mine\n").unwrap();
+        std::fs::rename(real.join("proj"), real.join("moved")).unwrap();
+        // Gone, it has the name it had.
+        assert_eq!(fish_history_name(&old), name);
+        let real_proj = std::fs::canonicalize(&real).unwrap().join("proj/meow/acme");
+        assert_eq!(resolved(&old), real_proj);
+        // `..` in what is gone is not guessed at.
+        assert_eq!(resolved(&link.join("x/../y")), link.join("x/../y"));
+        let new = real.join("moved/meow/acme");
+        assert_ne!(fish_history_name(&new), name);
+        // Another session's list there before.
+        std::fs::write(fish_history_in(&data, &new), "- cmd: theirs\n").unwrap();
+        move_fish_history_in(&data, &old, &new);
+        assert!(!fish_history_in(&data, &old).exists());
+        assert_eq!(
+            std::fs::read_to_string(fish_history_in(&data, &new)).unwrap(),
+            "- cmd: echo mine\n"
+        );
+        // Moved again with no list of its own: the one there goes.
+        let again = tmp.path().join("again/meow/acme");
+        std::fs::create_dir_all(&again).unwrap();
+        std::fs::write(fish_history_in(&data, &again), "- cmd: theirs\n").unwrap();
+        move_fish_history_in(&data, &old, &again);
+        assert!(!fish_history_in(&data, &again).exists());
     }
 
     #[test]

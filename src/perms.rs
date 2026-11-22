@@ -24,9 +24,15 @@ pub enum Why {
     Others,
     /// Write permission for a group other users are in.
     Group,
+    /// Write permission for any group, on a file system that may keep an
+    /// access list that cannot be read here (NFS, FUSE): the group bits
+    /// may let in more than the group. Without group write it is fine.
+    GroupUnknown(&'static str),
     /// Who may write cannot be read here (an SMB share keeps its access
     /// list on the server): the item is taken as others may.
-    Unreadable(&'static str),
+    Hidden(&'static str),
+    /// Its access list could not be read: taken as others may write.
+    Unreadable,
 }
 
 #[cfg(any(unix, test))]
@@ -36,7 +42,15 @@ impl Why {
         match self {
             Why::Others => format!("other users can write to {what}"),
             Why::Group => format!("a group shared with other users can write to {what}"),
-            Why::Unreadable(place) => format!("meow cannot read who may write to {what} ({place})"),
+            Why::GroupUnknown(place) => {
+                format!(
+                    "a group can write to {what}, and meow cannot read its access list ({place})"
+                )
+            }
+            Why::Hidden(place) => format!("meow cannot read who may write to {what} ({place})"),
+            Why::Unreadable => {
+                format!("meow cannot read who may write to {what} (an unreadable access list)")
+            }
         }
     }
 }
@@ -90,9 +104,9 @@ fn why_from(
         // Without an access list the group bits are the group's.
         Some(Acl::None) => shared_group(),
         // One may be kept where it cannot be read: any group counts.
-        Some(Acl::Unknown(place)) => group_writes.then_some(Why::Unreadable(place)),
-        Some(Acl::Hidden(place)) => Some(Why::Unreadable(place)),
-        None => Some(Why::Unreadable("an unreadable access list")),
+        Some(Acl::Unknown(place)) => group_writes.then_some(Why::GroupUnknown(place)),
+        Some(Acl::Hidden(place)) => Some(Why::Hidden(place)),
+        None => Some(Why::Unreadable),
     }
 }
 
@@ -1433,20 +1447,18 @@ mod tests {
         // A list kept where it cannot be read.
         assert_eq!(
             why(0o700, 1000, Some(Acl::Hidden("an SMB share")), false),
-            Some(Why::Unreadable("an SMB share"))
+            Some(Why::Hidden("an SMB share"))
         );
+        // Only group write makes one that may be there count.
         assert_eq!(
             why(0o775, 1000, Some(Acl::Unknown("an NFS share")), false),
-            Some(Why::Unreadable("an NFS share"))
+            Some(Why::GroupUnknown("an NFS share"))
         );
         assert_eq!(
             why(0o755, 1000, Some(Acl::Unknown("an NFS share")), false),
             None
         );
-        assert_eq!(
-            why(0o755, 1000, None, false),
-            Some(Why::Unreadable("an unreadable access list"))
-        );
+        assert_eq!(why(0o755, 1000, None, false), Some(Why::Unreadable));
         assert_eq!(why(0o757, 1000, None, false), Some(Why::Others));
         // As callers say it.
         assert_eq!(Why::Others.says("it"), "other users can write to it");
@@ -1455,8 +1467,16 @@ mod tests {
             "a group shared with other users can write to it"
         );
         assert_eq!(
-            Why::Unreadable("an SMB share").says("a folder above it"),
+            Why::GroupUnknown("an NFS share").says("it"),
+            "a group can write to it, and meow cannot read its access list (an NFS share)"
+        );
+        assert_eq!(
+            Why::Hidden("an SMB share").says("a folder above it"),
             "meow cannot read who may write to a folder above it (an SMB share)"
+        );
+        assert_eq!(
+            Why::Unreadable.says("it"),
+            "meow cannot read who may write to it (an unreadable access list)"
         );
     }
 
