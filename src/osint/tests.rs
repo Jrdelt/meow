@@ -682,6 +682,11 @@ pub(crate) async fn stand_in_dns(reply: fn(&str, u16) -> Reply) -> (SocketAddr, 
 /// A question and "no records" to the others, and the questions it was
 /// asked (`TYPE name`).
 pub(crate) async fn stand_in_doh(a: Option<[u8; 4]>) -> (String, Asked) {
+    stand_in_doh_saying(0, a).await
+}
+
+/// [`stand_in_doh`] with `status` as the answers' Status: 2 is SERVFAIL.
+pub(crate) async fn stand_in_doh_saying(status: u8, a: Option<[u8; 4]>) -> (String, Asked) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -709,11 +714,11 @@ pub(crate) async fn stand_in_doh(a: Option<[u8; 4]>) -> (String, Asked) {
                 .push(format!("{} {}", field("type"), field("name")));
             let body = match a.filter(|_| field("type") == "A") {
                 Some(ip) => format!(
-                    r#"{{"Status":0,"Answer":[{{"name":"{}","type":1,"TTL":60,"data":"{}"}}]}}"#,
+                    r#"{{"Status":{status},"Answer":[{{"name":"{}","type":1,"TTL":60,"data":"{}"}}]}}"#,
                     field("name"),
                     std::net::Ipv4Addr::from(ip)
                 ),
-                None => r#"{"Status":0,"Answer":[]}"#.to_owned(),
+                None => format!(r#"{{"Status":{status},"Answer":[]}}"#),
             };
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -739,19 +744,50 @@ pub(crate) fn taken(asked: &Asked) -> Vec<String> {
     asked.lock().unwrap().clone()
 }
 
+/// Interfaces by name, as `if_nametoindex` would find them.
+fn stand_in_zone(zone: &str) -> Option<u32> {
+    match zone {
+        "eth0" => Some(2),
+        "wlan0" | "en0" => Some(6),
+        "utun3" => Some(18),
+        other => other.parse().ok().filter(|index| *index != 0),
+    }
+}
+
 #[test]
 fn resolv_conf_names_the_servers_and_nothing_stands_in_for_none() {
     let text = "# comment\nsearch corp.example.org\nnameserver 192.0.2.53\n\
                 nameserver 192.0.2.53\nnameserverx 198.51.100.1\n\
-                nameserver fe80::53%eth0\n  nameserver 2001:db8::53 # trailing\n";
-    let servers: Vec<String> = parse_resolv_conf(text)
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+                nameserver fe80::53%eth0\n  nameserver 2001:db8::53 # trailing\n\
+                nameserver fe80::54%7\nnameserver fe80::55%nosuch0\nnameserver fe80::56\n";
+    let servers = parse_resolv_conf_with(text, &stand_in_zone);
+    let shown: Vec<String> = servers.iter().map(ToString::to_string).collect();
+    // A link-local server keeps its interface, named or numbered; one on
+    // an interface this machine does not have, or on none, is left out.
     assert_eq!(
-        servers,
-        ["192.0.2.53:53", "[fe80::53]:53", "[2001:db8::53]:53"]
+        shown,
+        [
+            "192.0.2.53:53",
+            "[fe80::53%2]:53",
+            "[2001:db8::53]:53",
+            "[fe80::54%7]:53"
+        ]
     );
+    let SocketAddr::V6(link) = servers[1] else {
+        panic!("{servers:?}")
+    };
+    assert_eq!(link.scope_id(), 2);
+    // The system's own interfaces: the loopback one exists everywhere.
+    let lo = if cfg!(target_os = "linux") {
+        "lo"
+    } else {
+        "lo0"
+    };
+    let real = parse_resolv_conf(&format!(
+        "nameserver fe80::1%{lo}\nnameserver fe80::2%nosuch0\n"
+    ));
+    assert_eq!(real.len(), 1, "{real:?}");
+    assert!(matches!(real[0], SocketAddr::V6(v6) if v6.scope_id() != 0));
     // No file, or one without servers: no public resolver takes their place.
     assert!(parse_resolv_conf("").is_empty());
     assert!(parse_resolv_conf("search example.org\n").is_empty());
@@ -811,15 +847,28 @@ async fn doh_is_asked_only_when_the_system_resolver_gives_no_answer() {
     let (doh, doh_asked) = stand_in_doh(None).await;
     let resolver = stand_in_resolver(vec![server], &doh);
     // A final answer, records or none, is not asked of anyone else.
-    assert!(resolver.resolve("gone.example.org", 1).await.is_empty());
-    assert!(resolver.resolve("www.example.org", 16).await.is_empty());
+    assert_eq!(
+        resolver.resolve("gone.example.org", 1).await,
+        Lookup::NoRecords
+    );
+    assert_eq!(
+        resolver.resolve("www.example.org", 16).await,
+        Lookup::NoRecords
+    );
     assert!(taken(&doh_asked).is_empty());
-    // No answer: a public name goes over DNS-over-HTTPS, a private one not.
-    assert!(resolver.resolve("broken.example.org", 15).await.is_empty());
-    assert!(resolver.resolve("refused.example.org", 15).await.is_empty());
+    // No answer: a public name goes over DNS-over-HTTPS (which says there
+    // is none), a private one not.
+    assert_eq!(
+        resolver.resolve("broken.example.org", 15).await,
+        Lookup::NoRecords
+    );
+    assert_eq!(
+        resolver.resolve("refused.example.org", 15).await,
+        Lookup::NoRecords
+    );
     let private_ptr = reverse_dns_name("10.0.0.5".parse().unwrap());
-    assert!(resolver.resolve(&private_ptr, 12).await.is_empty());
-    assert!(resolver.resolve("dc01.corp.local", 1).await.is_empty());
+    assert_eq!(resolver.resolve(&private_ptr, 12).await, Lookup::Failed);
+    assert_eq!(resolver.resolve("dc01.corp.local", 1).await, Lookup::Failed);
     assert_eq!(
         taken(&doh_asked),
         ["MX broken.example.org", "MX refused.example.org"]
@@ -838,7 +887,7 @@ async fn without_a_system_resolver_only_public_names_go_out_and_only_over_doh() 
         ("_dmarc.dc01.corp.local".to_owned(), 16),
         ("www.example.org".to_owned(), 16),
     ] {
-        assert!(resolver.resolve(&name, rrtype).await.is_empty());
+        assert!(resolver.resolve(&name, rrtype).await.records().is_empty());
     }
     assert_eq!(taken(&doh_asked), ["TXT www.example.org"]);
 }
@@ -846,8 +895,12 @@ async fn without_a_system_resolver_only_public_names_go_out_and_only_over_doh() 
 #[tokio::test]
 async fn an_internal_target_is_never_asked_over_doh() {
     // The system resolver answers nothing (SERVFAIL), which would send a
-    // public name over DNS-over-HTTPS.
-    let (server, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
+    // public name over DNS-over-HTTPS; it knows the target's own name.
+    let (server, asked) = stand_in_dns(|name, _| match name {
+        "dc01.corp.example.org" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::ServFail,
+    })
+    .await;
     let (doh, doh_asked) = stand_in_doh(None).await;
     let target = Target::parse("dc01.corp.example.org").unwrap();
     // The dns stage: the system resolved the name to a private address.
@@ -955,10 +1008,477 @@ async fn the_dns_stage_takes_the_addresses_the_system_resolves() {
         .collect();
     assert_eq!(resolved, ["192.0.2.10"]);
     assert!(!format!("{observations:?}").contains("198.51.100.66"));
-    assert!(!taken(&asked).contains(&"1 www.example.org".to_owned()));
+    // DNS is asked for the name's address once, only to learn whether it
+    // knows the name (its "no such record" counts then).
+    let a_asked = taken(&asked)
+        .iter()
+        .filter(|q| *q == "1 www.example.org")
+        .count();
+    assert_eq!(a_asked, 1, "{:?}", taken(&asked));
     // The system's own resolution reads /etc/hosts and its like.
     let (v4, _) = system_addresses("localhost").await;
     assert!(v4.contains(&"127.0.0.1".to_owned()), "{v4:?}");
+}
+
+/// A resolver that sends each name where `routes` say, with `doh` for
+/// DNS-over-HTTPS.
+fn stand_in_routed(routes: DnsRoutes, doh: &str) -> Resolver {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    Resolver::with_routes(client, routes, vec![doh.to_owned()])
+}
+
+fn route_to(domain: &str, servers: Option<Vec<SocketAddr>>) -> DomainRoute {
+    DomainRoute {
+        domain: domain.to_owned(),
+        exact: false,
+        network: None,
+        servers,
+        order: 0,
+    }
+}
+
+fn routed(routes: &DnsRoutes, name: &str) -> (Vec<String>, bool) {
+    let route = routes.route(name);
+    let servers = route.servers.iter().map(ToString::to_string).collect();
+    (servers, route.matched)
+}
+
+/// `scutil --dns` on a Mac with a split-tunnel VPN (two domains), a
+/// tailnet, a reverse zone on another port and the multicast DNS domains.
+const SCUTIL_DNS: &str = "\
+DNS configuration
+
+resolver #1
+  search domain[0] : home.example.net
+  nameserver[0] : 192.0.2.1
+  nameserver[1] : fe80::1%en0
+  nameserver[2] : fe80::2
+  if_index : 6 (en0)
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : local
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300000
+
+resolver #3
+  domain   : 254.169.in-addr.arpa
+  options  : mdns
+  timeout  : 5
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00000000 (Not Reachable)
+  order    : 300200
+
+resolver #4
+  domain   : corp.example.com
+  search domain[0] : corp.example.com
+  nameserver[0] : 198.51.100.53
+  nameserver[1] : 198.51.100.54
+  if_index : 18 (utun3)
+  flags    : Supplemental, Request A records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+  order    : 102400
+
+resolver #5
+  domain   : eu.corp.example.com
+  nameserver[0] : 203.0.113.53
+  if_index : 18 (utun3)
+  flags    : Supplemental, Request A records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+  order    : 102401
+
+resolver #6
+  domain   : tail0123.example.net.
+  nameserver[0] : 203.0.113.100
+  if_index : 23 (utun4)
+  flags    : Supplemental, Request A records, Request AAAA records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+  order    : 102402
+
+resolver #7
+  domain   : 10.in-addr.arpa
+  nameserver[0] : 198.51.100.53
+  port     : 5353
+  flags    : Supplemental, Request A records
+  order    : 102403
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  search domain[0] : home.example.net
+  nameserver[0] : 192.0.2.1
+  if_index : 6 (en0)
+  flags    : Scoped, Request A records, Request AAAA records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : scoped.example.org
+  nameserver[0] : 198.51.100.99
+  if_index : 18 (utun3)
+  flags    : Scoped, Request A records
+  reach    : 0x00000003 (Reachable,Transient Connection)
+";
+
+#[test]
+fn macos_resolvers_are_read_from_scutil_and_chosen_by_domain() {
+    let routes = parse_scutil_dns(SCUTIL_DNS, &stand_in_zone);
+    // The default resolver; a link-local server keeps its interface, from
+    // its zone or the resolver's if_index.
+    let default: Vec<String> = routes.default.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        default,
+        ["192.0.2.1:53", "[fe80::1%6]:53", "[fe80::2%6]:53"]
+    );
+    let vpn = vec!["198.51.100.53:53".to_owned(), "198.51.100.54:53".to_owned()];
+    assert_eq!(
+        routed(&routes, "intranet.corp.example.com"),
+        (vpn.clone(), true)
+    );
+    assert_eq!(routed(&routes, "Corp.Example.com."), (vpn.clone(), true));
+    assert_eq!(
+        routed(&routes, "_ldap._tcp.dc._msdcs.corp.example.com"),
+        (vpn, true)
+    );
+    // The longest domain wins.
+    assert_eq!(
+        routed(&routes, "db.eu.corp.example.com"),
+        (vec!["203.0.113.53:53".to_owned()], true)
+    );
+    assert_eq!(
+        routed(&routes, "host.tail0123.example.net"),
+        (vec!["203.0.113.100:53".to_owned()], true)
+    );
+    assert_eq!(
+        routed(&routes, "5.0.0.10.in-addr.arpa"),
+        (vec!["198.51.100.53:5353".to_owned()], true)
+    );
+    // Multicast DNS: no unicast server at all.
+    assert_eq!(routed(&routes, "printer.local"), (Vec::new(), true));
+    // Everything else, and a name that only ends the same way, goes to the
+    // default; so do the names of resolvers for scoped questions.
+    for name in [
+        "www.example.org",
+        "notcorp.example.com",
+        "a.scoped.example.org",
+    ] {
+        assert_eq!(routed(&routes, name), (default.clone(), false), "{name}");
+    }
+    assert_eq!(routes.domains.len(), 6, "{routes:?}");
+    // Nothing to go by: no default and no routes.
+    assert_eq!(parse_scutil_dns("", &stand_in_zone), DnsRoutes::default());
+}
+
+#[test]
+fn macos_resolver_files_name_a_domain_and_its_servers() {
+    let route = parse_resolver_file(
+        "corp.example.com",
+        "# VPN\nnameserver 198.51.100.53\nnameserver fe80::53%utun3\nport 5353\nsearch_order 1\n",
+        &stand_in_zone,
+    )
+    .unwrap();
+    assert_eq!(route.domain, "corp.example.com");
+    assert_eq!(route.order, 1);
+    let servers: Vec<String> = route
+        .servers
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(servers, ["198.51.100.53:5353", "[fe80::53%18]:5353"]);
+    let named = parse_resolver_file(
+        "lab",
+        "domain lab.example.org\nnameserver 192.0.2.9\n",
+        &stand_in_zone,
+    )
+    .unwrap();
+    assert_eq!(named.domain, "lab.example.org");
+    assert!(parse_resolver_file("empty.example.org", "# none\n", &stand_in_zone).is_none());
+    assert!(parse_resolver_file("bad name", "nameserver 192.0.2.9\n", &stand_in_zone).is_none());
+}
+
+#[test]
+fn windows_nrpt_rules_route_by_the_most_specific_namespace() {
+    let rule = |names: &[&str], servers: &str, options: u32| NrptRule {
+        names: names.iter().map(|n| (*n).to_owned()).collect(),
+        servers: servers.to_owned(),
+        options,
+    };
+    let local = vec![
+        rule(
+            &[".corp.example.com"],
+            "198.51.100.53; 198.51.100.54",
+            NRPT_OVERRIDE_DNS,
+        ),
+        // DNSSEC only: it says nothing about where questions go.
+        rule(&["build.corp.example.com"], "", 0x2),
+        rule(&["10.0.0.0/8"], "198.51.100.53", NRPT_OVERRIDE_DNS),
+        rule(&[".lab.example.org"], "203.0.113.53", 0),
+    ];
+    let routes = DnsRoutes {
+        default: vec!["192.0.2.1:53".parse().unwrap()],
+        domains: nrpt_routes(&local, &stand_in_zone),
+    };
+    let default = vec!["192.0.2.1:53".to_owned()];
+    let vpn = vec!["198.51.100.53:53".to_owned(), "198.51.100.54:53".to_owned()];
+    assert_eq!(
+        routed(&routes, "intranet.corp.example.com"),
+        (vpn.clone(), true)
+    );
+    assert_eq!(routed(&routes, "corp.example.com"), (vpn.clone(), true));
+    assert_eq!(
+        routed(&routes, "build.corp.example.com"),
+        (default.clone(), false)
+    );
+    assert_eq!(
+        routed(&routes, "x.build.corp.example.com"),
+        (vpn.clone(), true)
+    );
+    assert_eq!(
+        routed(&routes, "5.0.0.10.in-addr.arpa"),
+        (vec!["198.51.100.53:53".to_owned()], true)
+    );
+    for name in [
+        "5.0.0.11.in-addr.arpa",
+        "www.lab.example.org",
+        "www.example.org",
+    ] {
+        assert_eq!(routed(&routes, name), (default.clone(), false), "{name}");
+    }
+    // A rule for every name (a full-tunnel VPN) yields to the specific ones.
+    let mut all = local.clone();
+    all.push(rule(&["."], "192.0.2.53", NRPT_OVERRIDE_DNS));
+    let routes = DnsRoutes {
+        default: vec!["192.0.2.1:53".parse().unwrap()],
+        domains: nrpt_routes(&all, &stand_in_zone),
+    };
+    assert_eq!(
+        routed(&routes, "www.example.org"),
+        (vec!["192.0.2.53:53".to_owned()], true)
+    );
+    assert_eq!(routed(&routes, "intranet.corp.example.com"), (vpn, true));
+    // Group Policy's rules replace the local ones when there are any.
+    let policy = vec![rule(&[".example.org"], "192.0.2.7", NRPT_OVERRIDE_DNS)];
+    assert_eq!(effective_nrpt(policy.clone(), local.clone()), policy);
+    assert_eq!(effective_nrpt(Vec::new(), local.clone()), local);
+}
+
+#[tokio::test]
+async fn split_dns_names_go_to_their_own_servers_and_a_default_none_is_not_final() {
+    // The VPN's server knows the internal domain; the default one (the
+    // Wi-Fi's) knows nothing of it.
+    let (vpn, vpn_asked) = stand_in_dns(|name, _| match name {
+        "intranet.corp.example.com" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let (wifi, wifi_asked) = stand_in_dns(|_, _| Reply::NxDomain).await;
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let routes = DnsRoutes {
+        default: vec![wifi],
+        domains: vec![
+            route_to("corp.example.com", Some(vec![vpn])),
+            route_to("local", Some(Vec::new())),
+        ],
+    };
+    let mut resolver = stand_in_routed(routes, &doh);
+    resolver.keep_private("intranet.corp.example.com");
+    // The domain's names: its own server, whose "none" is final.
+    assert_eq!(
+        resolver
+            .resolve("_dmarc.intranet.corp.example.com", 16)
+            .await,
+        Lookup::NoRecords
+    );
+    assert_eq!(
+        resolver.resolve("intranet.corp.example.com", 1).await,
+        Lookup::Found(vec!["10.0.0.5".to_owned()])
+    );
+    // A name outside it goes to the default server, which does not know
+    // the target: its "none" proves nothing.
+    assert_eq!(
+        resolver.resolve("_dmarc.example.com", 16).await,
+        Lookup::Unconfirmed
+    );
+    // A multicast DNS name: no unicast server is asked.
+    assert_eq!(resolver.resolve("printer.local", 1).await, Lookup::Failed);
+    // The default server never heard the internal names; DoH heard nothing.
+    assert_eq!(taken(&wifi_asked), ["16 _dmarc.example.com"]);
+    assert!(
+        taken(&vpn_asked)
+            .iter()
+            .all(|q| q.ends_with(".corp.example.com")),
+        "{:?}",
+        taken(&vpn_asked)
+    );
+    assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+}
+
+#[tokio::test]
+async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_it() {
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    // A domain controller as the only DNS server: it knows the target.
+    let (dc, _) = stand_in_dns(|name, _| match name {
+        "dc01.corp.example.org" => Reply::Address([10, 0, 0, 5]),
+        _ => Reply::NxDomain,
+    })
+    .await;
+    let mut resolver = stand_in_resolver(vec![dc], &doh);
+    resolver.keep_private("dc01.corp.example.org");
+    assert_eq!(
+        resolver.resolve("_dmarc.dc01.corp.example.org", 16).await,
+        Lookup::NoRecords
+    );
+    // A target the hosts file names: the DNS server knows nothing of it.
+    let (other, asked) = stand_in_dns(|_, _| Reply::NxDomain).await;
+    let mut resolver = stand_in_resolver(vec![other], &doh);
+    resolver.keep_private("target.example.org");
+    for _ in 0..3 {
+        assert_eq!(
+            resolver.resolve("_dmarc.target.example.org", 16).await,
+            Lookup::Unconfirmed
+        );
+    }
+    // Asked about the target once, A then AAAA.
+    let about: Vec<String> = taken(&asked)
+        .into_iter()
+        .filter(|q| q.ends_with(" target.example.org"))
+        .collect();
+    assert_eq!(about, ["1 target.example.org", "28 target.example.org"]);
+    // For a public target, the system's "none" is final.
+    let public = stand_in_resolver(vec![other], &doh);
+    assert_eq!(
+        public.resolve("_dmarc.www.example.org", 16).await,
+        Lookup::NoRecords
+    );
+    assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
+}
+
+#[tokio::test]
+async fn up_to_three_servers_are_asked_as_the_system_does() {
+    let (first, _) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (second, _) = stand_in_dns(|_, _| Reply::Refused).await;
+    let (third, third_asked) = stand_in_dns(|_, _| Reply::Address([192, 0, 2, 7])).await;
+    let (fourth, fourth_asked) = stand_in_dns(|_, _| Reply::Address([192, 0, 2, 8])).await;
+    let (doh, doh_asked) = stand_in_doh(None).await;
+    let resolver = stand_in_resolver(vec![first, second, third, fourth], &doh);
+    assert_eq!(
+        resolver.resolve("www.example.org", 1).await,
+        Lookup::Found(vec!["192.0.2.7".to_owned()])
+    );
+    assert_eq!(taken(&third_asked), ["1 www.example.org"]);
+    assert!(taken(&fourth_asked).is_empty());
+    assert!(taken(&doh_asked).is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
+    // Every DNS server fails (a domain with broken DNSSEC), and so does
+    // DNS-over-HTTPS.
+    let (failing, _) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (doh, doh_asked) = stand_in_doh_saying(2, None).await;
+    let target = Target::parse("www.example.org").unwrap();
+    let (observations, _, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![failing], &doh),
+        (Vec::new(), Vec::new()),
+    )
+    .await;
+    assert!(taken(&doh_asked).contains(&"AAAA www.example.org".to_owned()));
+    let text = format!("{observations:?}");
+    assert!(!text.contains("no AAAA record"), "{text}");
+    assert!(
+        observations
+            .iter()
+            .any(|o| matches!(o, Observation::HostMeta { ipv6_dns: None, .. })),
+        "{text}"
+    );
+    assert!(summary.ends_with("; some DNS lookups failed"), "{summary}");
+    // When DNS says there is none, that is said.
+    let (nodata, _) = stand_in_dns(|_, _| Reply::NoData).await;
+    let (observations, _, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![nodata], &doh),
+        (Vec::new(), Vec::new()),
+    )
+    .await;
+    assert!(format!("{observations:?}").contains("no AAAA record published"));
+    assert!(!summary.contains("failed"), "{summary}");
+    // An internal target: only a server that knows it may say "none".
+    let internal = (vec!["192.0.2.10".to_owned()], Vec::new());
+    let (observations, _, summary) = run_dns_with(
+        &target,
+        stand_in_resolver(vec![nodata], &doh),
+        internal.clone(),
+    )
+    .await;
+    assert!(!format!("{observations:?}").contains("no AAAA record"));
+    assert!(
+        summary.ends_with("; this machine's DNS server does not know the name"),
+        "{summary}"
+    );
+    let (knows, _) = stand_in_dns(|name, _| match name {
+        "www.example.org" => Reply::Address([192, 0, 2, 10]),
+        _ => Reply::NoData,
+    })
+    .await;
+    let (observations, _, _) =
+        run_dns_with(&target, stand_in_resolver(vec![knows], &doh), internal).await;
+    assert!(format!("{observations:?}").contains("no AAAA record published"));
+    // An address whose PTR lookup failed has not "no PTR record".
+    let address = Target::parse("192.0.2.10").unwrap();
+    let ptr = |server| {
+        run_dns_with(
+            &address,
+            stand_in_resolver(vec![server], &doh),
+            (Vec::new(), Vec::new()),
+        )
+    };
+    assert_eq!(ptr(failing).await.2, "PTR lookup failed");
+    assert_eq!(ptr(nodata).await.2, "no PTR record");
+}
+
+#[tokio::test]
+async fn mail_dns_ends_without_a_grade_when_no_lookup_answers() {
+    // The audit's run: every question gets SERVFAIL, DoH too.
+    let (failing, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
+    let (doh, _) = stand_in_doh_saying(2, None).await;
+    let (observations, summary) = crate::maildns::run_on(
+        stand_in_resolver(vec![failing], &doh),
+        "pub.example.org",
+        "192.0.2.10",
+        &[],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(observations.is_empty(), "{observations:?}");
+    assert_eq!(summary, "DNS lookups failed");
+    // It stopped after the first questions.
+    assert_eq!(taken(&asked).len(), 3, "{:?}", taken(&asked));
+    // An internal target this machine's DNS server does not know.
+    let (other, _) = stand_in_dns(|_, _| Reply::NxDomain).await;
+    let (observations, summary) = crate::maildns::run_on(
+        stand_in_resolver(vec![other], &doh),
+        "intranet.example.org",
+        "10.0.0.5",
+        &[],
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(observations.is_empty(), "{observations:?}");
+    assert_eq!(
+        summary,
+        "DNS lookups failed: this machine's DNS server does not know intranet.example.org"
+    );
 }
 
 #[cfg(windows)]

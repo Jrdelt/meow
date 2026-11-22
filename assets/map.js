@@ -2741,7 +2741,9 @@
     badge.appendChild(el('span', 'grade small ' + gradeKind(info.grade), info.grade || '?'));
     box.appendChild(hint(row('Grade', badge), 'SPF, DMARC, DKIM, CAA and DNSSEC graded together'));
     (info.checks || []).forEach(function (check) {
-      box.appendChild(hint(row(check.name, marked(check.value, check.status)), check.advice));
+      // 'unknown': its lookups got no answer.
+      var kind = check.status === 'unknown' ? 'info' : check.status;
+      box.appendChild(hint(row(check.name, marked(check.value, kind)), check.advice));
     });
     if ((info.wildcard || []).length) {
       box.appendChild(hint(row('Wildcard', marked(info.wildcard.join(', '), 'warn')),
@@ -2760,6 +2762,7 @@
       subs.forEach(function (sub) {
         var value = sub.status === 'wildcard' ? marked('wildcard only', 'warn')
           : sub.status === 'gone' ? marked('no record', 'info')
+          : sub.status === 'unknown' ? marked('lookup failed', 'info')
           : marked((sub.addresses || []).join(', '), 'ok');
         var line = box.appendChild(row(sub.name, value));
         if (sub.status !== 'resolves') { line.className += ' faded'; }

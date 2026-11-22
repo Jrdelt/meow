@@ -13,8 +13,12 @@
 //!
 //! Everything is a DNS question asked the way the `dns` stage asks: of this
 //! machine's resolvers, DNS-over-HTTPS only when they give no answer, only
-//! for public names and never for an internal target. Nothing is sent to
-//! the target's own servers.
+//! for public names and never for an internal target. The resolvers pass
+//! the questions on to the domain's own DNS servers, which see them all,
+//! the two made-up names of the wildcard check included.
+//!
+//! A check whose lookups got no definite answer is "could not be checked"
+//! and left out of the grade.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -24,7 +28,7 @@ use futures_util::future::join_all;
 
 use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::graph::{DnsCheck, DnsSecurity, DnsService, Observation, SubdomainCheck};
-use crate::osint::{build_http_client, root_domain, Resolver};
+use crate::osint::{build_http_client, root_domain, Lookup, Resolver};
 
 const A: u16 = 1;
 const CNAME: u16 = 5;
@@ -468,12 +472,36 @@ pub fn mail_provider(mx: &[String]) -> Option<&'static str> {
     })
 }
 
+/// The status of a check whose lookups got no definite answer.
+pub const NOT_CHECKED: &str = "unknown";
+
+/// A check whose `lookup` got no definite answer.
+fn not_checked(name: &str, lookup: &Lookup) -> DnsCheck {
+    check(
+        name,
+        NOT_CHECKED,
+        "could not be checked",
+        if matches!(lookup, Lookup::Unconfirmed) {
+            "This machine's DNS server does not know the domain."
+        } else {
+            "The DNS lookup failed."
+        },
+    )
+}
+
+/// The first answer of `lookups` that is not definite.
+fn first_unknown<'a>(lookups: &[&'a Lookup]) -> Option<&'a Lookup> {
+    lookups.iter().copied().find(|lookup| !lookup.is_known())
+}
+
 /// A to F: two points for each check that is fine, one for a warning or
-/// an unknown, none for a problem.
+/// an unknown, none for a problem. A check that could not be done is left
+/// out.
 pub fn overall_grade(checks: &[DnsCheck]) -> String {
     let graded: Vec<&DnsCheck> = checks
         .iter()
         .filter(|c| matches!(c.name.as_str(), "SPF" | "DMARC" | "DKIM" | "CAA" | "DNSSEC"))
+        .filter(|c| c.status != NOT_CHECKED)
         .collect();
     if graded.is_empty() {
         return "?".to_owned();
@@ -506,6 +534,16 @@ pub fn overall_grade(checks: &[DnsCheck]) -> String {
 }
 
 /// How a name from the certificate logs answers, given the wildcard's answer.
+/// `unknown` when its lookups got no definite answer.
+pub fn classify_lookup(found: &Lookup, wildcard: &[String]) -> &'static str {
+    match found {
+        Lookup::Found(addresses) => classify_subdomain(addresses, wildcard),
+        Lookup::NoRecords => "gone",
+        _ => "unknown",
+    }
+}
+
+/// How a name from the certificate logs answers, given the wildcard's answer.
 pub fn classify_subdomain(addresses: &[String], wildcard: &[String]) -> &'static str {
     if addresses.is_empty() {
         "gone"
@@ -516,7 +554,8 @@ pub fn classify_subdomain(addresses: &[String], wildcard: &[String]) -> &'static
     }
 }
 
-/// A label nobody would choose, for the wildcard check.
+/// A label nobody would choose, for the wildcard check: 16 random hex
+/// digits, which say nothing about who asks.
 fn random_label() -> String {
     let mut bytes = [0u8; 8];
     if getrandom::fill(&mut bytes).is_err() {
@@ -525,20 +564,27 @@ fn random_label() -> String {
             .map_or(0, |d| d.as_nanos());
         bytes.copy_from_slice(&(nanos as u64).to_le_bytes());
     }
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("meow-check-{hex}")
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn addresses<R, Fut>(ask: &R, name: &str) -> Vec<String>
+/// The A and AAAA records of `name`: definite when both answers are, or
+/// either has records.
+async fn addresses<R, Fut>(ask: &R, name: &str) -> Lookup
 where
     R: Fn(String, u16) -> Fut,
-    Fut: std::future::Future<Output = Vec<String>>,
+    Fut: std::future::Future<Output = Lookup>,
 {
-    let (mut v4, v6) = tokio::join!(ask(name.to_owned(), A), ask(name.to_owned(), AAAA));
-    v4.extend(v6);
-    v4.sort();
-    v4.dedup();
-    v4
+    let (v4, v6) = tokio::join!(ask(name.to_owned(), A), ask(name.to_owned(), AAAA));
+    let mut found: Vec<String> = v4.records().iter().chain(v6.records()).cloned().collect();
+    found.sort();
+    found.dedup();
+    if !found.is_empty() {
+        Lookup::Found(found)
+    } else {
+        first_unknown(&[&v4, &v6])
+            .cloned()
+            .unwrap_or(Lookup::NoRecords)
+    }
 }
 
 /// Runs `ask` on every item, `PARALLEL` at a time, keeping the order.
@@ -601,7 +647,8 @@ pub async fn run_on(
 }
 
 /// [`run_on`], telling `asked` after every answer how many questions have
-/// been answered so far.
+/// been answered so far. No observations when the first questions got no
+/// answer: the summary then says why.
 pub async fn run_on_counted(
     mut resolver: Resolver,
     domain: &str,
@@ -611,7 +658,7 @@ pub async fn run_on_counted(
     asked: impl Fn(usize),
 ) -> Result<(Vec<Observation>, String)> {
     if internal {
-        resolver.keep_private();
+        resolver.keep_private(domain);
     }
     let answered = std::sync::atomic::AtomicUsize::new(0);
     let (resolver, answered, asked) = (&resolver, &answered, &asked);
@@ -628,7 +675,10 @@ pub async fn run_on_counted(
     .await
 }
 
-/// The stage with `ask(name, type)` as the resolver.
+/// The stage with `ask(name, type)` as the resolver: it answers a
+/// [`Lookup`], or the records, none of them a definite "none". No
+/// observations when the first questions got no definite answer: the
+/// summary says why.
 pub async fn run_with<R, Fut>(
     domain: &str,
     primary_address: &str,
@@ -637,14 +687,21 @@ pub async fn run_with<R, Fut>(
 ) -> Result<(Vec<Observation>, String)>
 where
     R: Fn(String, u16) -> Fut,
-    Fut: std::future::Future<Output = Vec<String>>,
+    Fut: std::future::Future,
+    Fut::Output: Into<Lookup>,
 {
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
     if !domain.contains('.') {
         bail!("'{domain}' is not a domain name");
     }
     let zone = root_domain(&domain).unwrap_or_else(|| domain.clone());
-    let ask = &ask;
+    let ask = &|name: String, rrtype: u16| {
+        let asked = ask(name, rrtype);
+        async move {
+            let answer: Lookup = asked.await.into();
+            answer
+        }
+    };
     // Borrowed by the lookups that run side by side.
     let (in_domain, in_zone) = (domain.as_str(), zone.as_str());
 
@@ -657,29 +714,46 @@ where
         ask(domain.clone(), MX),
         ask(dmarc_at.clone(), TXT),
     );
-    if dmarc.is_empty() && zone != domain {
+    // Nothing to go by: the domain's DNS does not answer from here (it
+    // fails, or this machine's DNS server does not know the domain).
+    if !txt.is_known() && !mx.is_known() && !dmarc.is_known() {
+        let summary = if [&txt, &mx, &dmarc].contains(&&Lookup::Unconfirmed) {
+            format!("DNS lookups failed: this machine's DNS server does not know {domain}")
+        } else {
+            "DNS lookups failed".to_owned()
+        };
+        return Ok((Vec::new(), summary));
+    }
+    if dmarc == Lookup::NoRecords && zone != domain {
         dmarc = ask(dmarc_zone.clone(), TXT).await;
     }
     let selectors: Vec<String> = DKIM_SELECTORS.iter().map(|s| (*s).to_owned()).collect();
-    let mut dkim: Vec<(String, String)> = in_batches(selectors, |selector| async move {
+    let keys: Vec<(String, Lookup)> = in_batches(selectors, |selector| async move {
         let name = format!("{selector}._domainkey.{in_domain}");
-        let records = ask(name.clone(), TXT).await;
-        records
-            .into_iter()
-            .map(|r| unquote(&r))
-            .find(|r| r.to_ascii_lowercase().contains("p="))
-            .map(|r| (selector, r))
+        (selector, ask(name, TXT).await)
     })
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
+    .await;
+    let mut dkim: Vec<(String, String)> = keys
+        .iter()
+        .filter_map(|(selector, answer)| {
+            answer
+                .records()
+                .iter()
+                .map(|r| unquote(r))
+                .find(|r| r.to_ascii_lowercase().contains("p="))
+                .map(|r| (selector.clone(), r))
+        })
+        .collect();
     dkim.sort();
+    let dkim_unknown = keys
+        .iter()
+        .map(|(_, answer)| answer)
+        .find(|answer| !answer.is_known());
 
     // Certificates: CAA at the name, else at the registrable domain.
     let mut caa_at = domain.clone();
     let mut caa = ask(domain.clone(), CAA).await;
-    if caa.is_empty() && zone != domain {
+    if caa == Lookup::NoRecords && zone != domain {
         caa = ask(zone.clone(), CAA).await;
         caa_at = zone.clone();
     }
@@ -687,22 +761,41 @@ where
     // DNSSEC of the zone.
     let (ds, dnskey) = tokio::join!(ask(zone.clone(), DS), ask(zone.clone(), DNSKEY));
 
+    // Without its MX records, a domain may still receive mail.
+    let receives_mail = mx != Lookup::NoRecords;
     let mut checks = vec![
-        grade_spf(&txt, !mx.is_empty()),
-        grade_dmarc(&dmarc),
-        grade_dkim(&dkim, DKIM_SELECTORS.len()),
-        grade_caa(&caa, &caa_at),
-        grade_dnssec(&ds, &dnskey, &zone),
+        match first_unknown(&[&txt]) {
+            Some(unknown) => not_checked("SPF", unknown),
+            None => grade_spf(txt.records(), receives_mail),
+        },
+        match first_unknown(&[&dmarc]) {
+            Some(unknown) => not_checked("DMARC", unknown),
+            None => grade_dmarc(dmarc.records()),
+        },
+        match dkim_unknown.filter(|_| dkim.is_empty()) {
+            Some(unknown) => not_checked("DKIM", unknown),
+            None => grade_dkim(&dkim, DKIM_SELECTORS.len()),
+        },
+        match first_unknown(&[&caa]) {
+            Some(unknown) => not_checked("CAA", unknown),
+            None => grade_caa(caa.records(), &caa_at),
+        },
+        match first_unknown(&[&ds]) {
+            Some(unknown) => not_checked("DNSSEC", unknown),
+            None => grade_dnssec(ds.records(), dnskey.records(), &zone),
+        },
     ];
-    if let Some(provider) = mail_provider(&mx) {
+    if let Some(provider) = mail_provider(mx.records()) {
         checks.push(check("Mail", "info", format!("handled by {provider}"), ""));
-    } else if mx.is_empty() {
+    } else if mx == Lookup::NoRecords {
         checks.push(check(
             "Mail",
             "info",
             "no MX record: the domain receives no mail",
             "",
         ));
+    } else if let Some(unknown) = first_unknown(&[&mx]) {
+        checks.push(not_checked("Mail", unknown));
     }
 
     // Services the domain publishes.
@@ -715,6 +808,7 @@ where
         let name = format!("{record}.{in_zone}");
         ask(name.clone(), SRV)
             .await
+            .into_records()
             .into_iter()
             .filter_map(|answer| {
                 // priority weight port target
@@ -737,9 +831,9 @@ where
         in_batches(owned(WELL_KNOWN_NAMES), |(label, meaning)| async move {
             let name = format!("{label}.{in_zone}");
             let cname = ask(name.clone(), CNAME).await;
-            let target = match cname.first() {
+            let target = match cname.records().first() {
                 Some(alias) => alias.clone(),
-                None => addresses(ask, &name).await.first().cloned()?,
+                None => addresses(ask, &name).await.records().first().cloned()?,
             };
             Some(DnsService {
                 record: name,
@@ -774,10 +868,16 @@ where
     );
     let (made_up, made_up_too) = tokio::join!(addresses(ask, &first), addresses(ask, &second));
     let wildcard: Vec<String> = made_up
+        .records()
         .iter()
-        .filter(|a| made_up_too.contains(a))
+        .filter(|a| made_up_too.records().contains(a))
         .cloned()
         .collect();
+    if wildcard.is_empty() {
+        if let Some(unknown) = first_unknown(&[&made_up, &made_up_too]) {
+            checks.push(not_checked("Wildcard", unknown));
+        }
+    }
     let names: Vec<String> = ct_names
         .iter()
         .map(|n| n.trim_end_matches('.').to_ascii_lowercase())
@@ -790,9 +890,9 @@ where
     let mut subdomains: Vec<SubdomainCheck> = in_batches(names, |name| async move {
         let found = addresses(ask, &name).await;
         SubdomainCheck {
-            status: classify_subdomain(&found, wildcard_ref).to_owned(),
+            status: classify_lookup(&found, wildcard_ref).to_owned(),
             name,
-            addresses: found,
+            addresses: found.into_records(),
         }
     })
     .await;
@@ -829,8 +929,8 @@ where
             &format!("{first} and {second} both resolved"),
         ));
     }
-    // Say on each certificate-log name how it answers.
-    for sub in &subdomains {
+    // Say on each certificate-log name how it answers, if it did.
+    for sub in subdomains.iter().filter(|sub| sub.status != "unknown") {
         let claim = match sub.status.as_str() {
             "wildcard" => {
                 format!("DNS: only the wildcard *.{domain} answers for this name; it may not exist")
@@ -848,8 +948,11 @@ where
         "grade {grade}: {}{}{}",
         checks
             .iter()
-            .filter(|c| c.name != "Mail")
-            .map(|c| format!("{} {}", c.name, c.status))
+            .filter(|c| c.name != "Mail" && c.name != "Wildcard")
+            .map(|c| match c.status.as_str() {
+                NOT_CHECKED => format!("{} not checked", c.name),
+                status => format!("{} {status}", c.name),
+            })
             .collect::<Vec<_>>()
             .join(", "),
         if services.is_empty() {
@@ -1091,7 +1194,7 @@ mod tests {
             async move {
                 log.lock().unwrap().push(name.clone());
                 // Every made-up name answers: a wildcard.
-                if name.starts_with("meow-check-") && rrtype == A {
+                if is_made_up(&name) && rrtype == A {
                     return s(&["203.0.113.50"]);
                 }
                 t.get(&(name, rrtype)).cloned().unwrap_or_default()
@@ -1197,6 +1300,100 @@ mod tests {
         );
         assert_eq!(classify_subdomain(&[], &wildcard), "gone");
         assert_eq!(classify_subdomain(&s(&["203.0.113.9"]), &[]), "resolves");
+        assert_eq!(classify_lookup(&Lookup::NoRecords, &wildcard), "gone");
+        assert_eq!(classify_lookup(&Lookup::Failed, &wildcard), "unknown");
         assert!(random_label() != random_label());
+    }
+
+    /// A name of the wildcard check: 16 hex digits under the domain.
+    fn is_made_up(name: &str) -> bool {
+        let label = name.split('.').next().unwrap_or("");
+        label.len() == 16 && label.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn the_wildcard_check_names_say_nothing_about_the_tool() {
+        for _ in 0..8 {
+            let label = random_label();
+            assert!(is_made_up(&label), "{label}");
+            assert!(!label.contains("meow"), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_whose_lookups_failed_are_not_graded() {
+        // SPF and DKIM answer; DMARC, CAA and DNSSEC lookups fail (or the
+        // DNS server does not know the domain), and so do the MX and the
+        // made-up names.
+        let ask = |name: String, rrtype: u16| async move {
+            match (name.as_str(), rrtype) {
+                ("example.test", TXT) => Lookup::Found(s(&["v=spf1 -all"])),
+                ("google._domainkey.example.test", TXT) => {
+                    Lookup::Found(vec![format!("v=DKIM1; k=rsa; p={}", "A".repeat(392))])
+                }
+                ("_dmarc.example.test", TXT) => Lookup::Unconfirmed,
+                (_, CAA | DS | DNSKEY | MX) => Lookup::Failed,
+                (name, A | AAAA) if is_made_up(name) => Lookup::Failed,
+                ("gone.example.test", A | AAAA) => Lookup::Failed,
+                _ => Lookup::NoRecords,
+            }
+        };
+        let ct = s(&["gone.example.test"]);
+        let (observations, summary) = run_with("example.test", "198.51.100.1", &ct, ask)
+            .await
+            .unwrap();
+        let info = observations
+            .iter()
+            .find_map(|o| match o {
+                Observation::DnsSecurity { info, .. } => Some(info),
+                _ => None,
+            })
+            .expect("a DnsSecurity record");
+        let status = |name: &str| {
+            info.checks
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| (c.status.as_str(), c.value.as_str(), c.advice.as_str()))
+        };
+        assert_eq!(status("SPF"), Some(("ok", "v=spf1 -all", "")));
+        assert_eq!(status("DKIM").map(|c| c.0), Some("ok"));
+        assert_eq!(
+            status("DMARC"),
+            Some((
+                NOT_CHECKED,
+                "could not be checked",
+                "This machine's DNS server does not know the domain."
+            ))
+        );
+        for name in ["CAA", "DNSSEC", "Mail", "Wildcard"] {
+            assert_eq!(
+                status(name),
+                Some((
+                    NOT_CHECKED,
+                    "could not be checked",
+                    "The DNS lookup failed."
+                )),
+                "{name}"
+            );
+        }
+        // Graded on SPF and DKIM alone.
+        assert_eq!(info.grade, "A", "{summary}");
+        assert_eq!(
+            summary,
+            "grade A: SPF ok, DMARC not checked, DKIM ok, CAA not checked, DNSSEC not checked"
+        );
+        // No claim about the name whose lookups failed.
+        assert_eq!(info.subdomains[0].status, "unknown");
+        assert!(!observations.iter().any(|o| matches!(o,
+            Observation::Fact { address, .. } if address == "gone.example.test")));
+        let text = format!("{observations:?}");
+        for claim in [
+            "no DMARC record",
+            "not signed",
+            "receives no mail",
+            "no CAA record",
+        ] {
+            assert!(!text.contains(claim), "{claim}: {text}");
+        }
     }
 }

@@ -1800,9 +1800,21 @@ fn the_mail_dns_stage_keeps_an_internal_target_off_doh() {
         let (server, asked) = stand_in_dns(|_, _| Reply::ServFail).await;
         let (doh, doh_asked) = stand_in_doh(None).await;
         let cx = stages::Ctx::new(&state, &task, &target, Stage::MailDns).unwrap();
-        stages::mail_dns_with(&cx, stand_in_resolver(vec![server], &doh))
+        let end = stages::mail_dns_with(&cx, stand_in_resolver(vec![server], &doh))
             .await
             .unwrap();
+        // Nothing answered: no grade, and the stage says why.
+        let said = match end {
+            StageEnd::Skipped(why) => why,
+            StageEnd::Done(what) => format!("done: {what}"),
+            StageEnd::ModeChanged => "mode changed".to_owned(),
+        };
+        assert_eq!(said, "DNS lookups failed");
+        assert!(state
+            .graph()
+            .hosts
+            .values()
+            .all(|h| h.dns_security.is_none()));
         assert!(taken(&asked).contains(&format!("16 _dmarc.{name}")));
         assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
     });

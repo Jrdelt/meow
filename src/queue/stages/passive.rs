@@ -212,6 +212,10 @@ pub(crate) async fn mail_dns_with(
         Some(Ok(res)) => res,
         Some(Err(err)) => return Ok(StageEnd::Skipped(format!("DNS lookups unavailable: {err}"))),
     };
+    // Nothing answered: the summary says why.
+    if observations.is_empty() {
+        return Ok(StageEnd::Skipped(summary));
+    }
     register_mail_dns(&mut state.vault(), &observations);
     let (changed, _) = record(state, observations, None);
     Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))

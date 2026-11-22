@@ -584,9 +584,11 @@ fn render_dns(out: &mut String, dns: &DnsSecurity) {
         }
         out.push('\n');
     }
-    if dns.wildcard.is_empty() {
+    // Its lookups failed: the check in the table says so.
+    let unchecked = dns.checks.iter().any(|check| check.name == "Wildcard");
+    if dns.wildcard.is_empty() && !unchecked {
         out.push_str("Wildcard DNS: none.\n\n");
-    } else {
+    } else if !dns.wildcard.is_empty() {
         let addresses: Vec<String> = dns.wildcard.iter().map(|a| md(a)).collect();
         let _ = writeln!(
             out,
@@ -604,6 +606,7 @@ fn render_dns(out: &mut String, dns: &DnsSecurity) {
                 "resolves" => "resolves".to_owned(),
                 "wildcard" => "wildcard only (may not exist)".to_owned(),
                 "gone" => "no record".to_owned(),
+                "unknown" => "lookup failed".to_owned(),
                 other => md_cell(other),
             };
             let addresses: Vec<String> = sub.addresses.iter().map(|a| md(a)).collect();
@@ -1981,6 +1984,38 @@ mod tests {
         for absent in ["| Check |", "Services published", "certificate logs"] {
             assert!(!host.contains(absent), "{absent} in:\n{host}");
         }
+    }
+
+    #[test]
+    fn dns_lookups_that_failed_are_not_reported_as_absent() {
+        let mut data = inputs();
+        data.graph.hosts.get_mut("10.10.10.9").unwrap().dns_security = Some(DnsSecurity {
+            domain: "example.org".into(),
+            grade: "?".into(),
+            checks: vec![crate::graph::DnsCheck {
+                name: "Wildcard".into(),
+                status: "unknown".into(),
+                value: "could not be checked".into(),
+                advice: "The DNS lookup failed.".into(),
+            }],
+            subdomains: vec![crate::graph::SubdomainCheck {
+                name: "old.example.org".into(),
+                status: "unknown".into(),
+                addresses: Vec::new(),
+            }],
+            ..DnsSecurity::default()
+        });
+        let text = render(&data);
+        let host = host_section(&text, "### 10.10.10.9");
+        assert!(!host.contains("Wildcard DNS: none"), "{host}");
+        assert!(
+            host.contains("| Wildcard | unknown | could not be checked |"),
+            "{host}"
+        );
+        assert!(
+            host.contains("| old.example.org | lookup failed | - |"),
+            "{host}"
+        );
     }
 
     #[test]
