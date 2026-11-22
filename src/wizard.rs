@@ -17,8 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -236,7 +235,11 @@ pub struct Wizard {
     pub research_model: String,
     pub cloud_fallbacks: Vec<String>,
     pub cloud_api_key: Option<String>,
+    /// Where a key not typed here comes from for the service chosen now
+    /// (an environment variable or `config.toml`), as a session takes it.
     pub env_key_source: Option<String>,
+    /// `[ai]` of `config.toml`: what this setup's choices go on top of.
+    config_ai: AiSettings,
     pub cve_enabled: bool,
     pub nvd_api_key: Option<String>,
     pub location_enabled: bool,
@@ -278,10 +281,12 @@ impl Wizard {
 
         let own = AiOverrides::load(&ai_file)?;
         let effective = config.ai.effective();
-        let env_key_source = config
-            .ai
-            .key_source()
-            .filter(|src| src != "your setup file");
+        // Cloud AI switched off in the file: a key left there is not used,
+        // and not taken along to the service picked next.
+        let own_key = own
+            .api_key
+            .clone()
+            .filter(|key| !own.disable_cloud && !key.trim().is_empty());
 
         let cloud_choice = if !setup::cloud_in_use(&own, effective.api_key().is_some()) {
             CloudChoice::LocalOnly
@@ -311,7 +316,7 @@ impl Wizard {
             ""
         };
 
-        Ok(Self {
+        let mut wizard = Self {
             first_run,
             step: Step::Mode,
             cursors: [mode_cursor, 0, cloud_cursor, 0, launch_cursor],
@@ -331,8 +336,12 @@ impl Wizard {
                 .into_iter()
                 .map(|m| sanitize(&m, 120))
                 .collect(),
-            cloud_api_key: own.api_key.filter(|k| !k.trim().is_empty()),
-            env_key_source: env_key_source.map(|s| sanitize(&s, 80)),
+            cloud_api_key: own_key,
+            env_key_source: None,
+            config_ai: AiSettings {
+                user_file: None,
+                ..config.ai.clone()
+            },
             cve_enabled: config.cve.enabled,
             nvd_api_key: config.cve.nvd_api_key.filter(|k| !k.trim().is_empty()),
             location_enabled: config.location.enabled,
@@ -347,7 +356,64 @@ impl Wizard {
             test_results: Vec::new(),
             config_file,
             ai_file,
-        })
+        };
+        // A key made for another service is not kept for this one.
+        if let Some(key) = &wizard.cloud_api_key {
+            if let Some((_, made_for)) = setup::key_service(key) {
+                if !setup::key_fits(key, &wizard.cloud_url) {
+                    wizard.cloud_api_key = None;
+                    wizard.set_status(format!("Key removed: it is for {made_for}"), false);
+                }
+            }
+        }
+        wizard.refresh_key_source();
+        Ok(wizard)
+    }
+
+    /// The settings the choices made here give, as a session would read
+    /// them: the key typed here, or else one in `config.toml` while the
+    /// address is the one `config.toml` names.
+    fn preview(&self) -> AiSettings {
+        let local_only = self.cloud_choice == CloudChoice::LocalOnly;
+        let key = self.cloud_api_key.clone().or_else(|| self.config_key());
+        AiSettings {
+            local_url: self.local_url.clone(),
+            local_model: self.local_model.clone(),
+            cloud_url: self.cloud_url.clone(),
+            cloud_model: self.cloud_model.clone(),
+            research_model: self.research_model.clone(),
+            cloud_provider: match self.cloud_choice {
+                CloudChoice::Claude => Some(CloudProvider::Anthropic),
+                CloudChoice::OpenRouter | CloudChoice::LocalOnly => Some(CloudProvider::OpenAi),
+            },
+            cloud_fallbacks: (self.cloud_choice == CloudChoice::Claude)
+                .then(|| self.cloud_fallbacks.clone()),
+            openrouter_api_key: key.filter(|_| !local_only),
+            disable_cloud: local_only,
+            user_file: None,
+            setup_error: None,
+            ..self.config_ai.clone()
+        }
+    }
+
+    /// The key in `config.toml`, while the address is the one it names.
+    fn config_key(&self) -> Option<String> {
+        let same_host =
+            setup::url_host(&self.cloud_url) == setup::url_host(&self.config_ai.cloud_url);
+        let key = self.config_ai.openrouter_api_key.as_deref();
+        key.filter(|key| same_host && !key.trim().is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Works out again where a key not typed here comes from, for the
+    /// service and address chosen now: one that is not used for them is
+    /// not shown as the key.
+    fn refresh_key_source(&mut self) {
+        let settings = AiSettings {
+            openrouter_api_key: self.config_key(),
+            ..self.preview()
+        };
+        self.env_key_source = settings.key_source().map(|source| sanitize(&source, 80));
     }
 
     pub fn cursor(&self) -> usize {
@@ -437,9 +503,7 @@ impl Wizard {
                 self.set_status(msg, false);
             }
             CloudChoice::Claude => {
-                let cleared = prev != CloudChoice::Claude
-                    && prev != CloudChoice::LocalOnly
-                    && self.cloud_api_key.take().is_some();
+                let cleared = prev != CloudChoice::Claude && self.cloud_api_key.take().is_some();
                 self.cloud_url = anthropic::API_URL.to_owned();
                 if !self.cloud_model.starts_with("claude-") {
                     self.cloud_model = anthropic::DEFAULT_MODEL.to_owned();
@@ -456,9 +520,8 @@ impl Wizard {
                 self.set_status(if cleared { removed } else { String::new() }, false);
             }
             CloudChoice::OpenRouter => {
-                let cleared = prev != CloudChoice::OpenRouter
-                    && prev != CloudChoice::LocalOnly
-                    && self.cloud_api_key.take().is_some();
+                let cleared =
+                    prev != CloudChoice::OpenRouter && self.cloud_api_key.take().is_some();
                 let defaults = AiSettings::default();
                 if anthropic::is_claude_api(&self.cloud_url) || self.cloud_url.trim().is_empty() {
                     self.cloud_url = defaults.cloud_url;
@@ -473,7 +536,33 @@ impl Wizard {
                 self.set_status(if cleared { removed } else { String::new() }, false);
             }
         }
+        self.refresh_key_source();
         self.clamp_cursor_of(Step::CloudAi);
+    }
+
+    /// A key made for one service picks that service: a Claude key the
+    /// Claude API, an OpenRouter key OpenRouter.
+    fn use_service_of(&mut self, key: &str) {
+        let Some((made_for, _)) = setup::key_service(key) else {
+            return;
+        };
+        let provider = match self.cloud_choice {
+            CloudChoice::Claude => CloudProvider::Anthropic,
+            CloudChoice::OpenRouter | CloudChoice::LocalOnly => CloudProvider::OpenAi,
+        };
+        if setup::key_belongs(key, provider, &self.cloud_url) {
+            return;
+        }
+        match made_for {
+            CloudProvider::Anthropic => self.select_cloud_choice(CloudChoice::Claude),
+            CloudProvider::OpenAi => {
+                self.select_cloud_choice(CloudChoice::OpenRouter);
+                if !setup::key_fits(key, &self.cloud_url) {
+                    self.cloud_url = AiSettings::default().cloud_url;
+                    self.refresh_key_source();
+                }
+            }
+        }
     }
 
     fn start_edit(&mut self, field: EditField) {
@@ -527,19 +616,11 @@ impl Wizard {
                     self.set_status("Key refused: over 512 bytes or control characters", true);
                 } else {
                     let key = trimmed.to_owned();
-                    let service = self.cloud_choice;
-                    if key.starts_with("sk-ant-") {
-                        if self.cloud_choice != CloudChoice::Claude {
-                            self.select_cloud_choice(CloudChoice::Claude);
-                        }
-                    } else if key.starts_with("sk-or-")
-                        && self.cloud_choice != CloudChoice::OpenRouter
-                    {
-                        self.select_cloud_choice(CloudChoice::OpenRouter);
-                    }
+                    let service = (self.cloud_choice, self.cloud_url.clone());
+                    self.use_service_of(&key);
                     self.cloud_api_key = Some(key);
                     // The key chose its service: that is worth a line.
-                    if self.cloud_choice == service {
+                    if (self.cloud_choice, &self.cloud_url) == (service.0, &service.1) {
                         self.clear_status();
                     } else {
                         self.set_status("Service changed to match the key", false);
@@ -548,14 +629,8 @@ impl Wizard {
             }
             EditField::CloudUrl => match ai::checked_cloud_url(trimmed) {
                 Ok(url) => {
-                    let host_of = |raw: &str| {
-                        reqwest::Url::parse(raw)
-                            .ok()
-                            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-                            .unwrap_or_default()
-                    };
-                    let old_host = host_of(&self.cloud_url);
-                    let new_host = host_of(&url);
+                    let old_host = setup::url_host(&self.cloud_url);
+                    let new_host = setup::url_host(&url);
                     let mut cleared = false;
                     if !old_host.is_empty() && old_host != new_host {
                         cleared = self.cloud_api_key.take().is_some();
@@ -566,6 +641,7 @@ impl Wizard {
                         self.select_cloud_choice(CloudChoice::OpenRouter);
                     }
                     self.cloud_url = url;
+                    self.refresh_key_source();
                     let note = if cleared {
                         format!("Key removed: it was for {}", sanitize(&old_host, 80))
                     } else {
@@ -631,8 +707,25 @@ impl Wizard {
         }
     }
 
-    /// Handles pasted text (such as pasting an API key or URL).
+    /// The key the focused row holds, if it is a key's row.
+    fn focused_key_field(&self) -> Option<EditField> {
+        match (self.step, self.cursor()) {
+            (Step::CloudAi, 3) if self.cloud_choice != CloudChoice::LocalOnly => {
+                Some(EditField::CloudApiKey)
+            }
+            (Step::Toolkit, 1) => Some(EditField::NvdApiKey),
+            _ => None,
+        }
+    }
+
+    /// Handles pasted text (such as pasting an API key or URL). On a key's
+    /// row it opens the key's box: a key pasted there goes into it.
     pub fn on_paste(&mut self, text: &str) {
+        if self.editing.is_none() {
+            if let Some(field) = self.focused_key_field() {
+                self.start_edit(field);
+            }
+        }
         if let Some(edit) = &mut self.editing {
             edit.problem.clear();
             edit.paste_hint = false;
@@ -688,6 +781,22 @@ impl Wizard {
                 _ => {}
             }
             return WizardAction::None;
+        }
+
+        // On a key's row a typed character opens the key's box and goes
+        // into it: a key pasted as key presses (Windows, or a terminal
+        // without bracketed paste) is never taken for `s` save or `q`.
+        if let (Some(field), KeyCode::Char(ch)) = (self.focused_key_field(), key.code) {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if plain && ch != ' ' && !ch.is_control() {
+                self.start_edit(field);
+                if let Some(edit) = &mut self.editing {
+                    edit.buffer.push(ch);
+                }
+                return WizardAction::None;
+            }
         }
 
         match key.code {
@@ -969,24 +1078,7 @@ impl Wizard {
 
     /// Runs live connection checks against the local and the cloud AI as set here.
     pub fn test_connections(&mut self) {
-        let local_only = self.cloud_choice == CloudChoice::LocalOnly;
-        let preview = AiSettings {
-            local_url: self.local_url.clone(),
-            local_model: self.local_model.clone(),
-            cloud_url: self.cloud_url.clone(),
-            cloud_model: self.cloud_model.clone(),
-            research_model: self.research_model.clone(),
-            cloud_provider: match self.cloud_choice {
-                CloudChoice::Claude => Some(CloudProvider::Anthropic),
-                CloudChoice::OpenRouter | CloudChoice::LocalOnly => Some(CloudProvider::OpenAi),
-            },
-            cloud_fallbacks: (self.cloud_choice == CloudChoice::Claude)
-                .then(|| self.cloud_fallbacks.clone()),
-            openrouter_api_key: (!local_only).then(|| self.cloud_api_key.clone()).flatten(),
-            disable_cloud: local_only,
-            user_file: None,
-            ..AiSettings::default()
-        };
+        let preview = self.preview();
         let mut buf = Vec::new();
         match setup::check(&preview, &mut buf) {
             Ok(ok) => {
@@ -2226,8 +2318,11 @@ fn key_hints(wizard: &Wizard, enter: &str, width: usize) -> String {
         (format!("Enter {enter}"), 5),
         (help.to_owned(), 3),
     ];
-    // The last step has rows for saving and quitting.
-    if wizard.step != Step::Launch {
+    // The last step has rows for saving and quitting. On a key's row, a
+    // letter goes into the key.
+    if wizard.focused_key_field().is_some() {
+        hints.retain(|(hint, _)| hint != help);
+    } else if wizard.step != Step::Launch {
         hints.push(("s save".to_owned(), 2));
         hints.push(("q quit".to_owned(), 1));
     }
@@ -2392,7 +2487,48 @@ impl Drop for WizardTerminalGuard {
             .and_then(|()| std::io::stdout().flush());
         ratatui::restore();
         crate::pty::ensure_cooked_terminal();
+        drain_pending_input();
     }
+}
+
+/// Drops what was typed or pasted but not read yet, so that none of it
+/// (a key pasted as key presses) reaches the shell when the setup closes.
+fn drain_pending_input() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            drain_terminal(stdin.as_raw_fd());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+        // SAFETY: returns a handle owned by the process, or none.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        drain_console(handle);
+    }
+}
+
+/// Discards the input a terminal holds for `fd` that was not read yet.
+#[cfg(unix)]
+fn drain_terminal(fd: std::os::unix::io::RawFd) -> bool {
+    // SAFETY: `tcflush` only acts on the terminal's queue; a descriptor
+    // that is not a terminal makes it fail.
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) == 0 }
+}
+
+/// Discards the console input events of `handle` that were not read yet.
+#[cfg(windows)]
+fn drain_console(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    // SAFETY: `handle` is a console input handle or the call fails.
+    unsafe { FlushConsoleInputBuffer(handle) != 0 }
 }
 
 /// True when the current process can display an interactive full-screen TUI.
@@ -2410,7 +2546,11 @@ fn run_loop(home: &MeowHome, first_run: bool) -> Result<WizardOutcome> {
     crate::pty::ensure_cooked_terminal();
     let mut terminal = ratatui::try_init().context("cannot start the full-screen setup")?;
     let _guard = WizardTerminalGuard;
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // Not on Windows: crossterm reads the console key by key there, so a
+    // paste is never one event, and the marks a terminal asked for it puts
+    // around a paste would be read as keys, Esc (quit) first.
+    #[cfg(not(windows))]
+    let _ = execute!(std::io::stdout(), event::EnableBracketedPaste);
 
     loop {
         terminal
@@ -2755,7 +2895,9 @@ mod tests {
             "masked tail should be shown: {after_commit}"
         );
 
-        // Step 4: enter NVD API key (row 1), verify hidden
+        // Step 4: enter NVD API key (row 1), verify hidden. On a key's row
+        // a typed character goes into the key: move off it first.
+        wiz.on_key(key(KeyCode::Up));
         wiz.on_key(key(KeyCode::Char('4')));
         wiz.cursors[Step::Toolkit.index()] = 1;
         wiz.on_key(key(KeyCode::Enter));
@@ -2763,6 +2905,7 @@ mod tests {
         let nvd_edit_frame = render(&wiz, 120, 32);
         assert!(!nvd_edit_frame.contains(SECRET_NVD), "{nvd_edit_frame}");
         wiz.on_key(key(KeyCode::Enter));
+        wiz.on_key(key(KeyCode::Up));
 
         // Step 5: enter first workspace name "homelab" (row 0), then save!
         wiz.on_key(key(KeyCode::Char('5')));
@@ -3071,5 +3214,314 @@ mod tests {
             !err.contains(NVD_SECRET),
             "parse error leaked config secret: {err}"
         );
+    }
+
+    /// A setup file whose cloud AI was switched off by hand with a key
+    /// left in it: picking a service does not take that key along, and a
+    /// key made for another service is not kept for this one.
+    #[test]
+    fn a_key_left_in_a_locked_file_or_made_for_another_service_is_not_kept() {
+        const LEFT: &str = "sk-or-v1-left-in-a-locked-file-eeee";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        std::fs::create_dir_all(home.root()).unwrap();
+        let locked = AiOverrides {
+            cloud_url: Some(AiSettings::default().cloud_url),
+            cloud_provider: Some(CloudProvider::OpenAi),
+            api_key: Some(LEFT.into()),
+            disable_cloud: true,
+            ..AiOverrides::default()
+        };
+        locked.save(&home.ai_path()).unwrap();
+        for (row, choice) in [(1, CloudChoice::Claude), (2, CloudChoice::OpenRouter)] {
+            let mut wiz = Wizard::load(&home, false).unwrap();
+            assert_eq!(wiz.cloud_choice, CloudChoice::LocalOnly);
+            assert_eq!(wiz.cloud_api_key, None);
+            wiz.on_key(key(KeyCode::Char('3')));
+            wiz.cursors[Step::CloudAi.index()] = row;
+            wiz.on_key(key(KeyCode::Enter));
+            assert_eq!(wiz.cloud_choice, choice);
+            assert_eq!(wiz.build_ai_overrides().api_key, None);
+            let screen = render(&wiz, 100, 30);
+            assert!(!screen.contains("eeee"), "{screen}");
+            assert!(screen.contains(setup::KEY_MISSING), "{screen}");
+        }
+
+        // A key in hand while the cloud AI is off goes when a service is
+        // picked, like any key when the service changes.
+        let mut wiz = Wizard::load(&home, false).unwrap();
+        wiz.cloud_api_key = Some(LEFT.into());
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 1;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key, None);
+        assert_eq!(wiz.status, "Key removed: it was for openrouter.ai");
+
+        // A file that keeps another service's key for this one.
+        for (url, provider, made_for) in [
+            (
+                anthropic::API_URL,
+                CloudProvider::Anthropic,
+                "sk-or-v1-kept-for-the-claude-api-dddd",
+            ),
+            (
+                "https://openrouter.ai/api/v1",
+                CloudProvider::OpenAi,
+                "sk-ant-api03-kept-for-openrouter-bbbb",
+            ),
+        ] {
+            let mixed = AiOverrides {
+                cloud_url: Some(url.into()),
+                cloud_provider: Some(provider),
+                api_key: Some(made_for.into()),
+                ..AiOverrides::default()
+            };
+            mixed.save(&home.ai_path()).unwrap();
+            let wiz = Wizard::load(&home, false).unwrap();
+            assert_ne!(wiz.cloud_choice, CloudChoice::LocalOnly);
+            assert_eq!(wiz.cloud_api_key, None);
+            assert_eq!(wiz.build_ai_overrides().api_key, None);
+            let home_of_key = setup::key_service(made_for).unwrap().1;
+            assert_eq!(wiz.status, format!("Key removed: it is for {home_of_key}"));
+        }
+    }
+
+    /// The key a session would take from `config.toml` is named only for
+    /// the service and address it is used for.
+    #[test]
+    fn a_key_from_config_toml_is_named_only_where_it_is_used() {
+        const CONFIG_KEY: &str = "sk-or-v1-in-config-toml-cccc";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        std::fs::create_dir_all(home.root()).unwrap();
+        crate::workspace::write_private_atomic(
+            &home.config_path(),
+            format!("[ai]\nopenrouter_api_key = \"{CONFIG_KEY}\"\n").as_bytes(),
+        )
+        .unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+        assert_eq!(wiz.cloud_choice, CloudChoice::OpenRouter);
+        assert_eq!(wiz.env_key_source.as_deref(), Some("config.toml"));
+        wiz.on_key(key(KeyCode::Char('3')));
+        assert!(render(&wiz, 100, 30).contains("in config.toml"));
+        assert_eq!(
+            wiz.preview().openrouter_api_key.as_deref(),
+            Some(CONFIG_KEY)
+        );
+
+        // The Claude API: that key is not sent there, so it is not shown
+        // as the key, here or on the review card.
+        wiz.cursors[Step::CloudAi.index()] = 1;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_choice, CloudChoice::Claude);
+        assert_eq!(wiz.env_key_source, None);
+        assert_eq!(wiz.preview().openrouter_api_key, None);
+        let screen = render(&wiz, 100, 30);
+        assert!(!screen.contains("config.toml"), "{screen}");
+        assert!(screen.contains(setup::KEY_MISSING), "{screen}");
+        wiz.on_key(key(KeyCode::Char('5')));
+        let review = render(&wiz, 120, 40);
+        assert!(review.contains(setup::KEY_MISSING), "{review}");
+        assert!(!review.contains("in config.toml"), "{review}");
+
+        // Back to OpenRouter: used again.
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.env_key_source.as_deref(), Some("config.toml"));
+
+        // Another address: not sent there either.
+        wiz.cursors[Step::CloudAi.index()] = 4;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        wiz.on_paste("https://llm.example.com/v1");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_url, "https://llm.example.com/v1");
+        assert_eq!(wiz.env_key_source, None);
+        assert_eq!(wiz.preview().openrouter_api_key, None);
+        assert!(render(&wiz, 100, 30).contains(setup::KEY_MISSING));
+
+        // An OpenRouter key typed for that address goes to OpenRouter.
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_paste("sk-or-v1-typed-for-another-host-aaaa");
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_url, AiSettings::default().cloud_url);
+        assert_eq!(wiz.status, "Service changed to match the key");
+        assert!(wiz.cloud_api_key.is_some());
+    }
+
+    /// A key pasted as key presses on its row (Windows, or a terminal
+    /// without bracketed paste) goes into its hidden box: `s` does not
+    /// save, `q` does not quit, and the key is never drawn.
+    #[test]
+    fn a_key_typed_on_its_row_goes_into_its_box_not_to_the_keys() {
+        const PASTED: &str = "sk-or-v1-qstp?hjkl12345~-9f3a";
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let mut wiz = Wizard::load(&home, false).unwrap();
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 2;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.on_key(key(KeyCode::Down));
+        assert_eq!(wiz.focused_key_field(), Some(EditField::CloudApiKey));
+        // The keys that type into the key there are not offered.
+        let screen = render(&wiz, 100, 30);
+        assert!(screen.contains("Enter edit"), "{screen}");
+        for hint in ["s save", "q quit", "? help"] {
+            assert!(!screen.contains(hint), "{screen}");
+        }
+        for ch in PASTED.chars() {
+            let action = wiz.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT));
+            assert_eq!(action, WizardAction::None);
+            let frame = render(&wiz, 100, 30);
+            assert!(
+                !frame.contains("sk-or") && !frame.contains("qstp"),
+                "{frame}"
+            );
+        }
+        assert_eq!(wiz.step, Step::CloudAi);
+        assert_eq!(wiz.editing.as_ref().unwrap().buffer, PASTED);
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.cloud_api_key.as_deref(), Some(PASTED));
+        let screen = render(&wiz, 100, 30);
+        assert!(
+            screen.contains("ends in 9f3a") && !screen.contains("qstp"),
+            "{screen}"
+        );
+        // Chords are not typed: Ctrl+C still quits.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(wiz.on_key(ctrl_c), WizardAction::Quit);
+        assert!(wiz.editing.is_none());
+
+        // The NVD key's row the same; a bracketed paste there opens its box.
+        wiz.on_key(key(KeyCode::Up));
+        wiz.on_key(key(KeyCode::Char('4')));
+        wiz.on_key(key(KeyCode::Down));
+        assert_eq!(wiz.focused_key_field(), Some(EditField::NvdApiKey));
+        for ch in "5f1e-qs".chars() {
+            assert_eq!(wiz.on_key(key(KeyCode::Char(ch))), WizardAction::None);
+        }
+        wiz.on_key(key(KeyCode::Enter));
+        assert_eq!(wiz.nvd_api_key.as_deref(), Some("5f1e-qs"));
+        wiz.on_paste("nvd-pasted-on-its-row");
+        assert_eq!(
+            wiz.editing.as_ref().map(|edit| edit.buffer.as_str()),
+            Some("nvd-pasted-on-its-row")
+        );
+        assert!(!render(&wiz, 100, 30).contains("nvd-pasted"));
+        wiz.on_key(key(KeyCode::Esc));
+        assert_eq!(wiz.nvd_api_key.as_deref(), Some("5f1e-qs"));
+
+        // Off a key's row the keys keep their meaning, and a paste there
+        // goes nowhere.
+        wiz.on_key(key(KeyCode::Up));
+        wiz.on_paste("sk-or-v1-pasted-off-its-row");
+        assert!(wiz.editing.is_none());
+        assert_eq!(wiz.on_key(key(KeyCode::Char('s'))), WizardAction::Save);
+        assert_eq!(wiz.on_key(key(KeyCode::Char('q'))), WizardAction::Quit);
+        // With the cloud AI off there is no key row to type into.
+        wiz.on_key(key(KeyCode::Char('3')));
+        wiz.cursors[Step::CloudAi.index()] = 0;
+        wiz.on_key(key(KeyCode::Enter));
+        wiz.cursors[Step::CloudAi.index()] = 3;
+        assert_eq!(wiz.focused_key_field(), None);
+    }
+
+    /// What was typed or pasted and not read yet is dropped as the setup
+    /// closes: none of it reaches the shell after it.
+    #[cfg(unix)]
+    #[test]
+    fn input_left_unread_is_dropped_when_the_setup_closes() {
+        // SAFETY: plain calls on descriptors this test opens and owns.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let name = std::ffi::CStr::from_ptr(libc::ptsname(master)).to_owned();
+            let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave >= 0, "{}", std::io::Error::last_os_error());
+            let rest = b"k-or-v1-rest-of-a-pasted-key\n";
+            assert_eq!(
+                libc::write(master, rest.as_ptr().cast(), rest.len()),
+                rest.len() as isize
+            );
+            let waiting = |timeout_ms: libc::c_int| {
+                let mut poll = libc::pollfd {
+                    fd: slave,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                libc::poll(&mut poll, 1, timeout_ms) == 1
+            };
+            assert!(waiting(5_000), "the line never reached the terminal");
+            assert!(drain_terminal(slave));
+            assert!(!waiting(0), "the line is still there to read");
+            libc::close(slave);
+            libc::close(master);
+            // Not a terminal: nothing to drop, and no harm.
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            assert!(!drain_terminal(devnull));
+            libc::close(devnull);
+        }
+    }
+
+    /// The console input the setup did not read is dropped as it closes.
+    #[cfg(windows)]
+    #[test]
+    fn console_input_left_unread_is_dropped_when_the_setup_closes() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{
+            GetNumberOfConsoleInputEvents, WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0,
+            KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+        };
+        // No console: nothing to drop, and no harm.
+        assert!(!drain_console(std::ptr::null_mut()));
+        // A test run has no console of its own everywhere: without one,
+        // only the above is checked.
+        let Ok(console) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+        else {
+            return;
+        };
+        let handle = console.as_raw_handle();
+        let typed = INPUT_RECORD {
+            EventType: KEY_EVENT as u16,
+            Event: INPUT_RECORD_0 {
+                KeyEvent: KEY_EVENT_RECORD {
+                    bKeyDown: 1,
+                    wRepeatCount: 1,
+                    wVirtualKeyCode: 0x53,
+                    wVirtualScanCode: 0,
+                    uChar: KEY_EVENT_RECORD_0 {
+                        UnicodeChar: u16::from(b's'),
+                    },
+                    dwControlKeyState: 0,
+                },
+            },
+        };
+        let records = [typed; 3];
+        let mut count = 0u32;
+        // SAFETY: `records` holds three valid records and `count` is a
+        // valid place for the number written.
+        if unsafe { WriteConsoleInputW(handle, records.as_ptr(), 3, &mut count) } == 0 {
+            return;
+        }
+        // SAFETY: `count` is a valid place for the number of events.
+        assert_ne!(
+            unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) },
+            0
+        );
+        assert!(count >= 3, "{count}");
+        assert!(drain_console(handle));
+        // SAFETY: as above.
+        assert_ne!(
+            unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) },
+            0
+        );
+        assert_eq!(count, 0);
     }
 }

@@ -86,6 +86,9 @@ pub enum Command {
         /// Remove the stored key
         #[arg(long)]
         forget_key: bool,
+        /// Cloud AI off (local AI only); removes the stored key
+        #[arg(long, conflicts_with_all = ["provider", "cloud_url", "api_key_stdin"])]
+        cloud_off: bool,
     },
     /// Show the tools `meow recon` uses and install the missing ones
     Tools {

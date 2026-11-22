@@ -251,6 +251,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 fallback_models,
                 api_key_stdin,
                 forget_key,
+                cloud_off,
             } => setup::run(
                 &home,
                 &setup::SetupArgs {
@@ -266,6 +267,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     fallback_models: fallback_models.clone(),
                     api_key_stdin: *api_key_stdin,
                     forget_key: *forget_key,
+                    cloud_off: *cloud_off,
                 },
             ),
             Command::Tools { yes } => {

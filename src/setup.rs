@@ -64,12 +64,16 @@ pub struct SetupArgs {
     /// command line, where it would end up in the shell history.
     pub api_key_stdin: bool,
     pub forget_key: bool,
+    /// Cloud AI off: local AI only, also with a key in the environment.
+    /// The stored key is removed.
+    pub cloud_off: bool,
 }
 
 impl SetupArgs {
     fn changes_something(&self) -> bool {
         self.api_key_stdin
             || self.forget_key
+            || self.cloud_off
             || [
                 &self.local_url,
                 &self.local_model,
@@ -118,6 +122,40 @@ pub(crate) fn key_origin(source: &str) -> String {
         (_, Some(variable)) => format!("from ${variable}"),
         _ => format!("in {source}"),
     }
+}
+
+/// The host a URL names, in lower case; empty if it names none.
+pub(crate) fn url_host(url: &str) -> String {
+    url::Url::parse(url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default()
+}
+
+/// The service a key was made for, by its prefix: `sk-ant-` keys are the
+/// Claude API's, `sk-or-` keys OpenRouter's. Other keys do not say.
+pub(crate) fn key_service(key: &str) -> Option<(CloudProvider, &'static str)> {
+    let key = key.trim();
+    if key.starts_with("sk-ant-") {
+        Some((CloudProvider::Anthropic, "api.anthropic.com"))
+    } else if key.starts_with("sk-or-") {
+        Some((CloudProvider::OpenAi, "openrouter.ai"))
+    } else {
+        None
+    }
+}
+
+/// Whether `key` may be sent to `url`: a key made for one service goes to
+/// that service only, or to a server on this machine.
+pub(crate) fn key_fits(key: &str, url: &str) -> bool {
+    key_service(key)
+        .is_none_or(|(_, host)| url_host(url) == host || crate::ai::is_loopback_url(url))
+}
+
+/// Whether `key` is for the service at `url` that speaks `provider`. A key
+/// that is not picks its own service where the user named none.
+pub(crate) fn key_belongs(key: &str, provider: CloudProvider, url: &str) -> bool {
+    key_service(key).is_none_or(|(made_for, _)| made_for == provider) && key_fits(key, url)
 }
 
 /// Whether the user's file asks for a cloud AI: not switched off, and a
@@ -467,6 +505,11 @@ fn apply(
     key_from_stdin: Option<String>,
 ) -> Result<Vec<String>> {
     let mut notes = Vec::new();
+    if args.cloud_off
+        && (args.provider.is_some() || args.cloud_url.is_some() || key_from_stdin.is_some())
+    {
+        bail!("--cloud-off cannot be used with --provider, --cloud-url or --api-key-stdin");
+    }
     match args.provider.as_deref().map(str::to_lowercase).as_deref() {
         Some("claude" | "anthropic") => use_claude(own, current),
         Some("openrouter" | "openai") => use_openai_style(own, current, None),
@@ -508,15 +551,9 @@ fn apply(
     }
     // A key stays with the service it was entered for. Naming another
     // service without giving its key does not send the old one there.
-    let host = |url: &str| {
-        url::Url::parse(url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .unwrap_or_default()
-    };
     let (before, after) = (
-        host(&current.cloud_url),
-        host(own.cloud_url.as_deref().unwrap_or(&current.cloud_url)),
+        url_host(&current.cloud_url),
+        url_host(own.cloud_url.as_deref().unwrap_or(&current.cloud_url)),
     );
     if before != after && key_from_stdin.is_none() && own.api_key.take().is_some() {
         notes.push(format!("[+] Key removed: it was for {before}"));
@@ -538,24 +575,54 @@ fn apply(
         if key.len() > 512 || key.chars().any(char::is_control) {
             bail!("key refused: over 512 bytes or control characters");
         }
-        if key.starts_with("sk-ant-")
-            && args.provider.is_none()
-            && args.cloud_url.is_none()
-            && own.cloud_url.is_none()
-            && current.provider() == CloudProvider::OpenAi
-        {
-            use_claude(own, current);
-            if let Some(model) = args.cloud_model.as_deref().and_then(model_name) {
-                own.cloud_model = Some(model);
+        // A Claude key goes to the Claude API, an OpenRouter key to
+        // OpenRouter: with no service named, the key picks its own; with
+        // one named, another service's key is refused.
+        let url = own.cloud_url.clone().unwrap_or(current.cloud_url.clone());
+        let provider = AiSettings {
+            cloud_url: url.clone(),
+            cloud_provider: own.cloud_provider.or(current.cloud_provider),
+            ..AiSettings::default()
+        }
+        .provider();
+        let named = args.provider.is_some() || args.cloud_url.is_some();
+        match key_service(&key) {
+            Some((_, made_for)) if named && !key_fits(&key, &url) => {
+                bail!("key refused: it is for {made_for}, not {}", url_host(&url));
             }
-            if let Some(model) = args.research_model.as_deref().and_then(model_name) {
-                own.research_model = Some(model);
+            Some((made_for, _)) if !named && !key_belongs(&key, provider, &url) => {
+                match made_for {
+                    CloudProvider::Anthropic => use_claude(own, current),
+                    CloudProvider::OpenAi => {
+                        use_openai_style(own, current, Some(AiSettings::default().cloud_url));
+                    }
+                }
+                // The models named in this call stay.
+                if let Some(model) = args.cloud_model.as_deref().and_then(model_name) {
+                    own.cloud_model = Some(model);
+                }
+                if let Some(model) = args.research_model.as_deref().and_then(model_name) {
+                    own.research_model = Some(model);
+                }
             }
+            _ => {}
         }
         own.disable_cloud = false;
         own.api_key = Some(key);
+        let service = own.cloud_url.as_deref().unwrap_or(&current.cloud_url);
+        notes.push(format!("[+] Key saved for {}", url_host(service)));
+    }
+    if args.cloud_off {
+        notes.extend(turn_cloud_off(own));
     }
     Ok(notes)
+}
+
+/// Turns the cloud AI off: local AI only, also with a key in the
+/// environment. The stored key is removed; returns the line that says so.
+fn turn_cloud_off(own: &mut AiOverrides) -> Option<String> {
+    own.disable_cloud = true;
+    own.api_key.take().map(|_| "[+] Key removed".to_owned())
 }
 
 /// Said when a key is to be removed and none is stored.
@@ -593,10 +660,8 @@ impl Drop for RawModeGuard {
 /// Reads a secret from the terminal without showing it. `None` if the user
 /// cancelled (Esc, Ctrl-C) or typed nothing.
 fn ask_hidden(prompt: &str) -> Result<Option<String>> {
-    use ratatui::crossterm::event::{
-        self, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    };
-    use ratatui::crossterm::{execute, terminal};
+    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use ratatui::crossterm::terminal;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("cannot switch the terminal to hidden input (is this a TTY?)");
@@ -607,8 +672,11 @@ fn ask_hidden(prompt: &str) -> Result<Option<String>> {
     terminal::enable_raw_mode().context("cannot switch the terminal to hidden input")?;
     let raw_guard = RawModeGuard;
     let mut out = std::io::stdout();
-    // A paste then arrives whole, as one event.
-    let _ = execute!(out, EnableBracketedPaste);
+    // A paste then arrives whole, as one event. Not on Windows: crossterm
+    // reads the console key by key there, and the marks a terminal asked
+    // for it puts around a paste would be read as keys, Esc (cancel) first.
+    #[cfg(not(windows))]
+    let _ = ratatui::crossterm::execute!(out, event::EnableBracketedPaste);
     print!("{prompt}");
     out.flush().ok();
     let mut secret = String::new();
@@ -758,6 +826,9 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         println!("[+] Nothing changed");
         return Ok(false);
     };
+    if !may_keep_for(&key, anthropic::API_URL) {
+        return Ok(false);
+    }
     let mut next = own.clone();
     use_claude(&mut next, &settings.effective());
     let default = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
@@ -816,6 +887,9 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         println!("[+] Nothing changed");
         return Ok(false);
     };
+    if !may_keep_for(&key, &url) {
+        return Ok(false);
+    }
     // What would be kept if every question is answered with Enter: model
     // names of the Claude API are replaced by this service's own.
     let mut next = own.clone();
@@ -839,6 +913,17 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether `key` may be kept for the service at `url`; if not, says so.
+fn may_keep_for(key: &str, url: &str) -> bool {
+    match key_service(key) {
+        Some((_, made_for)) if !key_fits(key, url) => {
+            println!("[!] Not saved: that key is for {made_for}");
+            false
+        }
+        _ => true,
+    }
+}
+
 /// The line-mode menu shown by `meow setup --plain` (or `TERM=dumb`). The
 /// setup is printed at the start and after each change, not with every menu.
 fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Result<()> {
@@ -857,7 +942,8 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
              \x20 2  Claude key\n\
              \x20 3  OpenRouter or other key\n\
              \x20 4  Remove key\n\
-             \x20 5  Test\n\
+             \x20 5  Cloud AI off (local AI only)\n\
+             \x20 6  Test\n\
              \x20 q  Done"
         );
         let Some(answer) = ask("> ")? else {
@@ -875,13 +961,19 @@ fn interactive(settings: &AiSettings, file: &Path, own: &mut AiOverrides) -> Res
                 }
                 Ok(stored)
             }
-            "5" => check(settings, &mut std::io::stdout()).map(|_| false),
+            "5" => {
+                if let Some(said) = turn_cloud_off(own) {
+                    println!("{said}");
+                }
+                Ok(true)
+            }
+            "6" => check(settings, &mut std::io::stdout()).map(|_| false),
             "q" | "Q" | "" => {
                 done(saved_any);
                 return Ok(());
             }
             _ => {
-                println!("Type 1-5 or q");
+                println!("Type 1-6 or q");
                 Ok(false)
             }
         };
@@ -1237,8 +1329,9 @@ mod tests {
         )
         .unwrap();
         // The setup printed afterwards shows each of these: nothing is
-        // said twice, and the key's ending once.
-        assert!(notes.is_empty(), "{notes:?}");
+        // said twice, and the key's ending once. Where the key goes is
+        // said, and never the key.
+        assert_eq!(notes, ["[+] Key saved for openrouter.ai"]);
         assert_eq!(
             own,
             AiOverrides {
@@ -1352,7 +1445,7 @@ mod tests {
             Some(claude_key.into()),
         )
         .unwrap();
-        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(notes, ["[+] Key saved for api.anthropic.com"]);
         assert_eq!(
             own,
             AiOverrides {
@@ -1815,5 +1908,203 @@ mod tests {
             !rendered.chars().any(|c| c.is_control() && c != '\n'),
             "{rendered:?}"
         );
+    }
+
+    /// A Claude key goes to the Claude API and an OpenRouter key to
+    /// OpenRouter, whichever service was set before; one named service's
+    /// key is never stored for another.
+    #[test]
+    fn a_key_with_its_service_in_its_name_goes_to_that_service_only() {
+        const CLAUDE: &str = "sk-ant-api03-piped-without-provider-bbbb";
+        const OPENROUTER: &str = "sk-or-v1-piped-without-provider-cccc";
+        let openrouter = AiSettings::default();
+        let claude = AiSettings {
+            cloud_url: anthropic::API_URL.into(),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            ..AiSettings::default()
+        };
+        let other = AiSettings {
+            cloud_url: "https://llm.example.com/v1".into(),
+            cloud_provider: Some(CloudProvider::OpenAi),
+            ..AiSettings::default()
+        };
+        let piped = SetupArgs {
+            api_key_stdin: true,
+            ..SetupArgs::default()
+        };
+        let chosen = |current: &AiSettings| AiOverrides {
+            cloud_url: Some(current.cloud_url.clone()),
+            cloud_provider: current.cloud_provider,
+            ..AiOverrides::default()
+        };
+        // Set up for OpenRouter, a Claude key: the Claude API.
+        let mut own = chosen(&openrouter);
+        let notes = apply(&piped, &openrouter, &mut own, Some(format!("{CLAUDE}\n"))).unwrap();
+        assert_eq!(own.cloud_provider, Some(CloudProvider::Anthropic));
+        assert_eq!(own.cloud_url.as_deref(), Some(anthropic::API_URL));
+        assert_eq!(own.cloud_model.as_deref(), Some(anthropic::DEFAULT_MODEL));
+        assert_eq!(own.api_key.as_deref(), Some(CLAUDE));
+        assert_eq!(notes, ["[+] Key saved for api.anthropic.com"]);
+        // Set up for the Claude API, or another service, an OpenRouter
+        // key: OpenRouter, with its own model names.
+        for current in [&claude, &other] {
+            let mut own = chosen(current);
+            let notes = apply(&piped, current, &mut own, Some(OPENROUTER.into())).unwrap();
+            assert_eq!(own.cloud_provider, Some(CloudProvider::OpenAi));
+            assert_eq!(own.cloud_url, Some(openrouter.cloud_url.clone()));
+            assert_eq!(own.api_key.as_deref(), Some(OPENROUTER));
+            assert_eq!(notes, ["[+] Key saved for openrouter.ai"]);
+            let said = notes.join("\n");
+            assert!(!said.contains("cccc"), "{said}");
+        }
+        // Models named in the same call stay.
+        let mut own = chosen(&openrouter);
+        let with_models = SetupArgs {
+            cloud_model: Some("claude-sonnet-5-5".into()),
+            ..piped.clone()
+        };
+        apply(&with_models, &openrouter, &mut own, Some(CLAUDE.into())).unwrap();
+        assert_eq!(own.cloud_model.as_deref(), Some("claude-sonnet-5-5"));
+        // A key that does not say whose it is stays with the service set.
+        let mut own = chosen(&other);
+        let notes = apply(&piped, &other, &mut own, Some(GOOD_KEY.into())).unwrap();
+        assert_eq!(own.cloud_url.as_deref(), Some("https://llm.example.com/v1"));
+        assert_eq!(notes, ["[+] Key saved for llm.example.com"]);
+        // A server on this machine is the user's own: a Claude stand-in
+        // there keeps a Claude key.
+        let stand_in = AiSettings {
+            cloud_url: "http://127.0.0.1:9/v1".into(),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            ..AiSettings::default()
+        };
+        let mut own = chosen(&stand_in);
+        apply(&piped, &stand_in, &mut own, Some(CLAUDE.into())).unwrap();
+        assert_eq!(own.cloud_url.as_deref(), Some("http://127.0.0.1:9/v1"));
+
+        // A service named in the same call and another service's key: the
+        // key is refused, and nothing is changed.
+        for (args, key, said) in [
+            (
+                SetupArgs {
+                    provider: Some("openrouter".into()),
+                    ..piped.clone()
+                },
+                CLAUDE,
+                "key refused: it is for api.anthropic.com, not openrouter.ai",
+            ),
+            (
+                SetupArgs {
+                    provider: Some("claude".into()),
+                    ..piped.clone()
+                },
+                OPENROUTER,
+                "key refused: it is for openrouter.ai, not api.anthropic.com",
+            ),
+            (
+                SetupArgs {
+                    cloud_url: Some("https://llm.example.com/v1".into()),
+                    ..piped.clone()
+                },
+                OPENROUTER,
+                "key refused: it is for openrouter.ai, not llm.example.com",
+            ),
+        ] {
+            let mut own = chosen(&openrouter);
+            let error = apply(&args, &openrouter, &mut own, Some(key.into())).unwrap_err();
+            assert_eq!(format!("{error:#}"), said);
+        }
+        // Named, on this machine: the user's own server, as they asked.
+        let mut own = AiOverrides::default();
+        let local = SetupArgs {
+            cloud_url: Some("http://127.0.0.1:9/v1".into()),
+            ..piped.clone()
+        };
+        apply(&local, &openrouter, &mut own, Some(CLAUDE.into())).unwrap();
+        assert_eq!(own.api_key.as_deref(), Some(CLAUDE));
+
+        assert!(key_fits(CLAUDE, "https://api.anthropic.com/v1"));
+        assert!(!key_fits(CLAUDE, "https://openrouter.ai/api/v1"));
+        assert!(key_fits(OPENROUTER, "http://localhost:8080/v1"));
+        assert!(!key_fits(OPENROUTER, "https://api.anthropic.com/v1"));
+        assert!(key_fits(GOOD_KEY, "https://llm.example.com/v1"));
+    }
+
+    /// `--cloud-off`: local AI only, also with a key in the environment,
+    /// and the stored key goes.
+    #[test]
+    fn cloud_off_keeps_the_ai_local_and_removes_the_stored_key() {
+        let args = SetupArgs {
+            cloud_off: true,
+            ..SetupArgs::default()
+        };
+        assert!(args.changes_something());
+        let mut own = AiOverrides {
+            cloud_url: Some(AiSettings::default().cloud_url),
+            cloud_provider: Some(CloudProvider::OpenAi),
+            api_key: Some("sk-or-v1-stored-before-off-dddd".into()),
+            ..AiOverrides::default()
+        };
+        let notes = apply(&args, &AiSettings::default(), &mut own, None).unwrap();
+        assert_eq!(notes, ["[+] Key removed"]);
+        assert!(own.disable_cloud);
+        assert_eq!(own.api_key, None);
+        // Read back, the cloud AI is off and has no key.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai.toml");
+        own.save(&file).unwrap();
+        let settings = AiSettings {
+            user_file: Some(file.clone()),
+            ..AiSettings::default()
+        };
+        let effective = settings.effective();
+        assert!(effective.disable_cloud);
+        assert_eq!(effective.api_key(), None);
+        assert!(describe(&settings, &file).contains("  Cloud AI         off\n"));
+        // Again: nothing more to remove, nothing said.
+        let notes = apply(&args, &AiSettings::default(), &mut own, None).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        // A key piped in later turns it on again.
+        let piped = SetupArgs {
+            api_key_stdin: true,
+            ..SetupArgs::default()
+        };
+        apply(
+            &piped,
+            &AiSettings::default(),
+            &mut own,
+            Some(GOOD_KEY.into()),
+        )
+        .unwrap();
+        assert!(!own.disable_cloud);
+
+        // With a service or a key in the same call it means nothing.
+        for (args, key) in [
+            (
+                SetupArgs {
+                    provider: Some("claude".into()),
+                    ..args.clone()
+                },
+                None,
+            ),
+            (
+                SetupArgs {
+                    cloud_url: Some("https://llm.example.com/v1".into()),
+                    ..args.clone()
+                },
+                None,
+            ),
+            (
+                SetupArgs {
+                    api_key_stdin: true,
+                    ..args.clone()
+                },
+                Some(GOOD_KEY.to_owned()),
+            ),
+        ] {
+            let mut own = AiOverrides::default();
+            let error = apply(&args, &AiSettings::default(), &mut own, key).unwrap_err();
+            assert!(format!("{error:#}").starts_with("--cloud-off cannot be used with"));
+            assert_eq!(own, AiOverrides::default());
+        }
     }
 }
