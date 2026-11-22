@@ -1,12 +1,17 @@
-### What's New in `meow` v0.2.5
+### What's New in `meow` v0.2.6
 
-- **Recon progress in the map and the HUD.** A bar shows each stage as done, running, waiting, skipped, failed or stopped, with the running stage's name, nmap's own percent and time left, and the time so far. A finished recon keeps its stage names, so you can see what ran.
-- **Closing the terminal ends the recon cleanly.** The running stage stops and every tool it started (nmap, katana, feroxbuster, traceroute) is killed; stages already done keep their results; stages that had not started are dropped. The next start says once where it stopped. A recon is never carried into a later session.
-- **No leftover scanners.** If meow is killed outright, a small watchdog stops its tools; if both die, the next start finds and stops them (only processes meow started, matched by their exact start time).
-- **Simpler screens.**
-  - Setup: one question per step, one short line per choice, details behind `?` (about 55% fewer words; fits 80x24).
-  - HUD: a numbers-first header (`acme · mild · 3 hosts · 4 CVEs · 1 exploited`), only known facts, only keys that work, `?` for the rest.
-  - Map: one "Findings" card per host, short labels on the drawing, no "unknown" rows (about 45% fewer words).
+- **Security (high): a downloaded or cloned git folder can no longer run its own program.** Opening a session inside such a folder could run a program the folder named. Now meow's git check runs only on the top repository, reaches no remote, ignores the folder's `core.sshCommand` and credential helpers, never asks for a password, and stops after 3 s.
+- **Security: safer `meow update` from source.** It checks the clone before git first reads it, also with `--check`. It refuses `.cargo` or `rust-toolchain` settings above the clone that others can change, and builds in a private `~/.meow/build` instead of the temp folder. On Windows it checks the owner and access list of every tracked file, and `install.ps1` checks `.cargo` too.
+- **Security: AI replies keep placeholders in code and commands.** The host's own address and names come back only in prose. Words like `cve` are never taken for host names, and one-word names from certificates and banners are masked per host.
+- **Security: one daily cloud cap for all sessions.** `max_daily_usd` and `max_daily_calls` now count every session together, per local day, in `~/.meow/ai-usage`. If that file cannot be read, cloud AI stays off.
+- **Security: session files and keys.** A `git pull` during a session is now noticed, and the next start drops the shell history and last folder. Folder checks are stricter and name the reason and the fix. Setup refuses a key meant for the other service, and `mail-dns` test names no longer say "meow".
+- **New: `meow setup --cloud-off`** (and entry `6` in `meow setup --plain`) turns cloud AI off and removes the stored key.
+- **Recon: `trace` now runs after `ports`.** It traces the address nmap scanned and records only real hops. nmap scans a name at the address the `dns` stage found, so all findings land on one host, and `-6` or `-Pn` reach every scan.
+- **DNS: clearer answers.** Split DNS on macOS and Windows is followed, and up to 3 servers are asked. A failed lookup says `could not be checked` instead of "no record".
+- **CVEs and report.** Software is looked up once per host, fix lines name every port it runs on, and a rescan drops old versions. The report counts only scanned hosts.
+- **Map.** A connection badge (`live`, `reconnecting…`, `session closed`, `session ended`), a 2000-byte note limit with a counter, and at most 24 devices in a row (`+N more in Hosts`).
+- **Clean endings.** `kill -INT`, `Ctrl-C` with piped output, and closing a Windows console window now end the session in order. A moved project folder keeps its session and history.
+- **Releases.** Pre-releases are never marked Latest, and `meow update` skips them. Nothing is published until the tests pass.
 
 ---
 
