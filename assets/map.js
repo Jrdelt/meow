@@ -255,6 +255,7 @@
   function flash(message) {
     var box = byId('flash') || document.body.appendChild(el('div'));
     box.id = 'flash';
+    box.setAttribute('role', 'alert');
     box.textContent = message;
     clearTimeout(flash.timer);
     flash.timer = setTimeout(function () { box.remove(); }, 6000);
