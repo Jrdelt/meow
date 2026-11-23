@@ -8,7 +8,7 @@ session.lock
 tmp/
 .env*
 .DS_Store
-# Local agent, planning, and test notes
+# Local agent and planning notes, and the local integration tests (tests/)
 /AGENTS.md
 /CLAUDE.md
 /HANDOFF.md

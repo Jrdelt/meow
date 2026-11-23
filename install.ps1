@@ -3,7 +3,7 @@
 .SYNOPSIS
     Builds and installs meow on Windows with everything it uses: a C compiler,
     the Rust toolchain, the scanners `meow recon` drives (nmap, katana,
-    feroxbuster), and the pinned SecLists wordlist.
+    feroxbuster), the pinned SecLists wordlist and the DB-IP Lite location database.
 
 .EXAMPLE
     .\install.ps1               # show the plan, ask once, then do it
@@ -186,7 +186,7 @@ if ($Help) {
     Write-Host @"
 Builds and installs meow with everything it uses on Windows: a C compiler,
 the Rust toolchain, the scanners meow recon drives (nmap, katana, feroxbuster),
-and a wordlist for the directory stage.
+a wordlist for the directory stage and the DB-IP Lite location database.
 
   .\install.ps1               show the plan, ask once, then do it
   .\install.ps1 -Yes          do not ask
