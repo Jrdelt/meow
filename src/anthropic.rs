@@ -625,9 +625,7 @@ pub struct Answer {
     pub model: String,
 }
 
-/// Asks Claude one question. `model` is asked first; if a safety classifier
-/// declines, each model of `fallbacks` is asked in turn. `on_text` receives
-/// the reply as it arrives (in one piece for research).
+/// [`ask_with_spend`] without keeping the spend.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn ask(
@@ -657,9 +655,7 @@ pub async fn ask(
     .await
 }
 
-/// Like [`ask`], but writes accumulated `Usage` into `spent` after each
-/// attempt (including partial multi-turn or mid-stream failures) so billed
-/// tokens and web searches are never lost when an attempt declines or errors.
+/// [`ask_with_spend_and_reset`] with no budget and no reset.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn ask_with_spend(

@@ -69,7 +69,9 @@ flowchart LR
 | A local AI server | Unmasked only if meow counts it as yours ([SECURITY.md](../SECURITY.md#known-limits) says when); otherwise masked, and no key | When you ask local AI (`L`) |
 | crt.sh, DNS-over-HTTPS, RDAP, Team Cymru | Public names and addresses of your target; never internal names | Recon stages, mild and aggressive only |
 | GitHub | Release metadata and downloads | `meow update` |
-| raw.githubusercontent.com, download.db-ip.com, your package manager | The wordlist and the DB-IP Lite database; installs of missing scanners (else a `cargo`/`go` build) | `meow tools` and the first-session and `meow recon` offers (they ask first unless `--yes` or `--install-tools`); `meow update` of a source build, without asking |
+| raw.githubusercontent.com, download.db-ip.com, your package manager | Plain downloads of the wordlist and the DB-IP Lite database; installs of missing scanners (else a `cargo`/`go` build) | `meow tools` and the first-session and `meow recon` offers (they ask first unless `--yes` or `--install-tools`); `meow update` of a source build on macOS and Linux, without asking |
+| crates.io, static.rust-lang.org, sh.rustup.rs | Crate downloads for the rebuild; Rust itself only when it is missing or too old | `meow update` of a source build on macOS and Linux, without asking |
+| Homebrew | Its own update, and upgrades of meow and of outdated `nmap`, `katana` and `feroxbuster` | `meow update` of a Homebrew install, without asking |
 
 **CVE lookups carry no scanned host's address or name.** Lookups are built only
 from CPE names and product/version pairs (`plan` and `software_lookups` in
@@ -203,8 +205,8 @@ SECURITY.md lists every known limit. In short:
 - Some git and history tampering between sessions goes unnoticed.
 - A process a scan tool starts in a session of its own (`setsid`) is not
   stopped.
-- A local AI server meow counts as yours gets unmasked text, including, on
-  Linux, one run by root, and one reached over an `ssh -L` forward.
+- A local AI server meow counts as yours gets unmasked text, including one
+  reached over an `ssh -L` forward and, on Linux, one run by root.
 - Masking can miss a name shaped like an advisory ID, and free-text notes. This
   is why notes are not sent by default.
 - With OpenRouter, a day can end slightly over the cap.

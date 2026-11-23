@@ -102,7 +102,7 @@ enabled = true
 # url = "https://ipinfo.io/json"
 # Show the estimate on a small satellite map with a pin and a circle for the
 # rough area. meow fetches the few pictures around it (Sentinel-2 cloudless
-# by EOX, free for non-commercial use), which tells EOX the rough area; set
+# 2016 by EOX, CC BY 4.0), which tells EOX the rough area; set
 # map = false to show only a compass. `tiles` picks another picture source.
 map = true
 # tiles = "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg"
