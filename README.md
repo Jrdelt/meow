@@ -295,10 +295,10 @@ max_daily_calls = 20
 
 ### `meow update` refuses the clone
 
-meow checks the clone before it fetches or builds, also with `--check`. The message names the fix.
+meow checks the clone before it fetches, also with `--check`. Remove what the message names, or clone meow again.
 
-- Submodules, a `.git/commondir` and (macOS, Linux) a folder above that others can write to are refused.
-- `.git/config`, read without includes, may hold only what `git clone` writes and a few harmless settings.
+- Refused: submodules, a `.git/commondir` and (macOS, Linux) a folder above that others can write to.
+- `.git/config`, read without includes, may hold only what `git clone` writes and some harmless settings.
 - On Windows, a clone outside your user folder is usually refused.
 
 ### Other problems

@@ -39,17 +39,29 @@ fn source_dir(arg: Option<&Path>) -> PathBuf {
 
 /// [`source_dir`] as an absolute path, so that every check of the folders
 /// above it sees the ones cargo does (`--source .` has none). Links in it
-/// are kept, for [`verify_checkout_security`].
+/// are kept, for [`verify_checkout_security`], but what comes before a
+/// `..` is taken as it really is, as the system climbs out of it: the
+/// path then names only folders the clone is in.
 fn checkout_dir(arg: Option<&Path>) -> Result<PathBuf> {
+    use std::path::Component;
     let dir = source_dir(arg);
-    let absolute = std::path::absolute(&dir).with_context(|| {
+    let cannot = || {
         format!(
             "cannot resolve {}",
             sanitize(&dir.display().to_string(), 400)
         )
-    })?;
+    };
+    let absolute = std::path::absolute(&dir).with_context(cannot)?;
     // Without the `.` that `--source .` leaves at its end.
-    Ok(absolute.components().collect())
+    let parts: Vec<Component<'_>> = absolute.components().collect();
+    let Some(last_up) = parts.iter().rposition(|part| *part == Component::ParentDir) else {
+        return Ok(parts.iter().collect());
+    };
+    let climbed: PathBuf = parts[..=last_up].iter().collect();
+    let real = std::fs::canonicalize(&climbed).with_context(cannot)?;
+    Ok(parts[last_up + 1..]
+        .iter()
+        .fold(git_path(&real), |path, part| path.join(part)))
 }
 
 /// The folders above `dir`, as its path names them and as they really
@@ -529,7 +541,6 @@ fn untrusted_override(path: &Path, meta: &std::fs::Metadata, link_to: LinkTo) ->
     if let Some(problem) = link_problem(path, meta) {
         return Some(problem.to_owned());
     }
-    #[cfg(unix)]
     if let Some(problem) = links_on_the_way(path) {
         return Some(problem);
     }
@@ -550,7 +561,6 @@ fn untrusted_override(path: &Path, meta: &std::fs::Metadata, link_to: LinkTo) ->
     if let Some(problem) = override_problem(&target, &target_meta) {
         return Some(format!("leads to {shown}, which {problem}"));
     }
-    #[cfg(unix)]
     if let Some((folder, problem)) = swappable_in(&target) {
         return Some(format!("leads to {shown}, in {folder}, which {problem}"));
     }
@@ -558,55 +568,111 @@ fn untrusted_override(path: &Path, meta: &std::fs::Metadata, link_to: LinkTo) ->
 }
 
 /// How many links meow follows from one above the checkout.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_LINKS: usize = 16;
 
 /// Why another account could make the link `link` lead elsewhere through
-/// a link after it: one that belongs to another user (root aside), or one
-/// in a folder another account could change ([`swappable_in`]). The first
-/// link's own folder is above the checkout and checked as such.
-#[cfg(unix)]
+/// a link on the way, followed as the system does, one name at a time: a
+/// link in a folder `link` names, in what a link leads to, or a link to a
+/// folder. Each must be the user's (or root's, [`link_problem`]), in
+/// folders no other account could change ([`swappable_in`]). `link` itself
+/// is in a folder above the checkout, checked as such.
+#[cfg(any(unix, windows))]
 fn links_on_the_way(link: &Path) -> Option<String> {
-    let mut at = link.to_path_buf();
-    for hop in 0..MAX_LINKS {
-        // One that leads nowhere is said so by the caller.
-        let meta = std::fs::symlink_metadata(&at).ok()?;
-        if !meta.file_type().is_symlink() {
-            return None;
+    use std::collections::VecDeque;
+    use std::path::Component;
+    /// What is still to follow: a name, or `..`.
+    enum Step {
+        Name(std::ffi::OsString),
+        Up,
+    }
+    /// Puts the names in `path` before what is left, and moves `at` to its
+    /// root if it has one: a relative link leads on from its own folder.
+    fn follow(at: &mut PathBuf, left: &mut VecDeque<Step>, path: &Path) {
+        let mut root = PathBuf::new();
+        let mut steps = Vec::new();
+        for part in path.components() {
+            match part {
+                Component::Prefix(_) | Component::RootDir => root.push(part.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => steps.push(Step::Up),
+                Component::Normal(name) => steps.push(Step::Name(name.to_owned())),
+            }
         }
-        if hop > 0 {
-            let shown = sanitize(&at.display().to_string(), 400);
-            if let Some(problem) = link_problem(&at, &meta) {
+        if !root.as_os_str().is_empty() {
+            at.push(root);
+        }
+        for step in steps.into_iter().rev() {
+            left.push_front(step);
+        }
+    }
+    let (mut at, mut left) = (PathBuf::new(), VecDeque::new());
+    follow(&mut at, &mut left, link);
+    // The steps of `link`'s own name still to go: always the last ones.
+    let mut own = left.len();
+    let mut followed = 0;
+    while let Some(step) = left.pop_front() {
+        let own_step = left.len() < own;
+        if own_step {
+            own -= 1;
+        }
+        let is_link_itself = own_step && own == 0;
+        let name = match step {
+            // `at` is reached through no link: `..` is the folder it is in.
+            Step::Up => {
+                at.pop();
+                continue;
+            }
+            Step::Name(name) => name,
+        };
+        let path = at.join(name);
+        // One that leads nowhere is said so by the caller.
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.file_type().is_symlink() {
+            at = path;
+            continue;
+        }
+        if !is_link_itself {
+            let shown = sanitize(&git_path(&path).display().to_string(), 400);
+            if let Some(problem) = link_problem(&path, &meta) {
                 return Some(format!("leads through {shown}, which {problem}"));
             }
-            if let Some((folder, problem)) = swappable_in(&at) {
+            if let Some((folder, problem)) = swappable_in(&path) {
                 return Some(format!(
                     "leads through {shown}, in {folder}, which {problem}"
                 ));
             }
         }
-        let next = std::fs::read_link(&at).ok()?;
-        // A relative target is read from the link's own folder.
-        at = at
-            .parent()
-            .map_or_else(|| next.clone(), |folder| folder.join(&next));
+        if followed == MAX_LINKS {
+            return Some("leads through too many links".to_owned());
+        }
+        followed += 1;
+        let next = std::fs::read_link(&path).ok()?;
+        follow(&mut at, &mut left, &next);
     }
-    Some("leads through too many links".to_owned())
+    None
 }
 
 /// A folder that holds `path`, or one above it, where another account
-/// could put something else in its place, and why: one that belongs to
-/// another user (root aside), or one others can write to without the
-/// sticky bit `/tmp` has (with it, they cannot move what is not theirs).
+/// could put something else in its place, and why ([`swappable_from`]).
 #[cfg(unix)]
 fn swappable_in(path: &Path) -> Option<(String, &'static str)> {
+    swappable_from(path.parent()?)
+}
+
+/// `folder`, or one above it, as they really are, where another account
+/// could put something else in place of what is in it, and why: one that
+/// belongs to another user (root aside), or one others can write to
+/// without the sticky bit `/tmp` has (with it, they cannot move what is
+/// not theirs).
+#[cfg(unix)]
+fn swappable_from(folder: &Path) -> Option<(String, &'static str)> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: this call has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    let parent = path.parent()?;
     let shown = |folder: &Path| sanitize(&folder.display().to_string(), 400);
-    let Ok(real) = std::fs::canonicalize(parent) else {
-        return Some((shown(parent), "cannot be read"));
+    let Ok(real) = std::fs::canonicalize(folder) else {
+        return Some((shown(folder), "cannot be read"));
     };
     for folder in real.ancestors() {
         let Ok(meta) = std::fs::metadata(folder) else {
@@ -618,6 +684,33 @@ fn swappable_in(path: &Path) -> Option<(String, &'static str)> {
         if meta.mode() & 0o1000 == 0 && crate::perms::others_can_change(folder, &meta) {
             return Some((shown(folder), "can be changed by other users"));
         }
+    }
+    None
+}
+
+/// [`swappable_in`] on Windows, read from each folder's owner and access
+/// list: an account that may change a folder may move it and put another
+/// in its place. Any account may make a folder in a drive's root, but not
+/// move one it may not change, so the root itself does not count.
+#[cfg(windows)]
+fn swappable_in(path: &Path) -> Option<(String, &'static str)> {
+    use crate::perms::Foreign;
+    let parent = path.parent()?;
+    let shown = |folder: &Path| sanitize(&git_path(folder).display().to_string(), 400);
+    let Ok(real) = std::fs::canonicalize(parent) else {
+        return Some((shown(parent), "cannot be read"));
+    };
+    for folder in real
+        .ancestors()
+        .take_while(|folder| folder.parent().is_some())
+    {
+        let problem = match crate::perms::foreign(folder) {
+            Ok(None) => continue,
+            Ok(Some(Foreign::Owner)) => "belongs to another account",
+            Ok(Some(Foreign::Writable)) => "can be changed by other accounts",
+            Err(_) => "cannot be read",
+        };
+        return Some((shown(folder), problem));
     }
     None
 }
@@ -914,17 +1007,41 @@ fn audit_local_git_config(dir: &Path) -> Result<()> {
         ],
     )
     .with_context(|| format!("cannot audit local .git/config in {safe_dir}"))?;
-    for key in keys.lines() {
+    for key in keys.lines().map(str::trim) {
         if !is_allowed_local_git_config_key(key) {
-            let key = sanitize(key.trim(), 80);
+            let fix = unset_command(dir, key).map_or_else(
+                || "Remove it from .git/config.".to_owned(),
+                |command| format!("To remove it: {command}"),
+            );
             bail!(
-                "refusing unsafe local .git/config setting '{key}' in {safe_dir}: \
-                 meow allows only the settings a plain clone has. \
-                 To remove it: git -C \"{safe_dir}\" config --unset-all \"{key}\"",
+                "refusing unsafe local .git/config setting '{}' in {safe_dir}: \
+                 meow allows only the settings a plain clone has. {fix}",
+                sanitize(key, 80)
             );
         }
     }
     Ok(())
+}
+
+/// The git command that removes `key` from the settings of the checkout
+/// `dir`, when it can be shown so that pasting it runs nothing else. In
+/// sh, PowerShell and cmd a word in double quotes made of letters, digits
+/// and the marks here is taken as it is. A key may hold anything else (a
+/// branch name, which a pull request's author picks, may hold `$(...)`),
+/// and a folder name too: then there is no command.
+fn unset_command(dir: &Path, key: &str) -> Option<String> {
+    const MARKS: &str = "._/:-+,=@~ ";
+    let dir = git_path(dir).display().to_string();
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 400
+            && text
+                .chars()
+                .all(|c| c.is_alphanumeric() || MARKS.contains(c) || (cfg!(windows) && c == '\\'))
+    };
+    // On Windows a `\` before the closing quote would make it part of the word.
+    (plain(&dir) && !dir.ends_with('\\') && plain(key) && !key.starts_with('-'))
+        .then(|| format!("git -C \"{dir}\" config --unset-all \"{key}\""))
 }
 
 const GIT_ENV_SCRUB: &[&str] = &[
@@ -1284,35 +1401,54 @@ fn git_live(dir: &Path, local_remote: bool, args: &[&str]) -> Result<()> {
 /// only what changed, and on the user's own disk (a temporary folder may
 /// run no programs, may be memory, and was left full when an update was
 /// stopped). cargo links what it finds there into meow, so it and meow's
-/// folder must be this user's alone ([`not_own`]), checked each time.
+/// folder must be this user's alone ([`not_own`]), in folders no other
+/// account can change, checked each time.
 #[cfg(unix)]
 fn build_dir(home: &crate::workspace::MeowHome) -> Result<PathBuf> {
     check_build_place(home)?;
     let dir = home.root().join("build");
     crate::workspace::create_private_dir(&dir).context("cannot make a folder to build in")?;
-    check_build_place(home)?;
-    let build = std::fs::canonicalize(home.root())
-        .with_context(|| format!("cannot resolve {}", home.root().display()))?
-        .join("build");
+    // Where it really is now, checked: what cargo is given.
+    let root = std::fs::canonicalize(home.root())
+        .with_context(|| format!("cannot resolve {}", home.root().display()))?;
+    check_build_root(&root)?;
+    let build = root.join("build");
     mark_as_cache(&build);
     Ok(build)
 }
 
 /// Checks, without making anything, that meow's folder and the build
-/// folder in it, where they are, are this user's alone ([`build_dir`]).
-/// Run before anything is pulled, also with `--check`.
+/// folder in it, where they are, are this user's alone, in folders no
+/// other account can change ([`build_dir`]). Run before anything is
+/// pulled, also with `--check`.
 #[cfg(unix)]
 fn check_build_place(home: &crate::workspace::MeowHome) -> Result<()> {
     // meow's folder as it really is: it may be a link the user made.
-    let root = match std::fs::canonicalize(home.root()) {
-        Ok(root) => root,
-        // Made, private, when the update builds.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot resolve {}", home.root().display()))
+    match std::fs::canonicalize(home.root()) {
+        Ok(root) => check_build_root(&root),
+        // Made, private, when the update builds, in the nearest folder
+        // that is there.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let there = home
+                .root()
+                .ancestors()
+                .skip(1)
+                .find(|folder| folder.exists());
+            match there.and_then(swappable_from) {
+                Some((folder, problem)) => Err(home_can_be_moved(home.root(), &folder, problem)),
+                None => Ok(()),
+            }
         }
-    };
-    for (path, build) in [(root.clone(), false), (root.join("build"), true)] {
+        Err(error) => {
+            Err(error).with_context(|| format!("cannot resolve {}", home.root().display()))
+        }
+    }
+}
+
+/// [`check_build_place`] for meow's folder `root`, as it really is.
+#[cfg(unix)]
+fn check_build_root(root: &Path) -> Result<()> {
+    for (path, build) in [(root.to_path_buf(), false), (root.join("build"), true)] {
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(error) if build && error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1324,7 +1460,22 @@ fn check_build_place(home: &crate::workspace::MeowHome) -> Result<()> {
             bail!("{} {problem}", sanitize(&path.display().to_string(), 400));
         }
     }
-    Ok(())
+    // Another account that could move meow's folder, or one above it,
+    // could put its own in its place while cargo builds there.
+    match swappable_in(root) {
+        Some((folder, problem)) => Err(home_can_be_moved(root, &folder, problem)),
+        None => Ok(()),
+    }
+}
+
+/// The refusal of meow's folder `root`, in `folder`, which `problem`.
+#[cfg(unix)]
+fn home_can_be_moved(root: &Path, folder: &str, problem: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is in {folder}, which {problem}, so meow does not build in it. \
+         Set MEOW_HOME to a folder only you can change",
+        sanitize(&root.display().to_string(), 400)
+    )
 }
 
 /// Why meow does not build in `path` (meow's folder, or the build folder
@@ -1501,6 +1652,23 @@ fn install_command(dir: &Path, target: &Path, commit: &str) -> Command {
         .current_dir(dir);
     cmd
 }
+
+/// The fast-forward of an update. On macOS and Linux every file keeps the
+/// line ends it has in the commit, whatever the clone's `core.autocrlf` or
+/// `core.eol` says: sh cannot run an install.sh with CRLF line ends.
+#[cfg(unix)]
+const MERGE: &[&str] = &[
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.eol=lf",
+    "merge",
+    "--ff-only",
+    "--quiet",
+    "@{u}",
+];
+#[cfg(not(unix))]
+const MERGE: &[&str] = &["merge", "--ff-only", "--quiet", "@{u}"];
 
 /// Lists local changes. Nested repositories are left alone: `git status`
 /// would run their own git config.
@@ -1857,7 +2025,7 @@ fn update(
         // What was fetched and checked above, merged without contacting
         // anything again: a `git pull` would fetch once more, from whatever
         // remote the branch's settings name.
-        git(&dir, &["merge", "--ff-only", "--quiet", "@{u}"]).context(
+        git(&dir, MERGE).context(
             "the update could not fast-forward; the folder's branch has its own commits",
         )?;
     }
@@ -3474,6 +3642,81 @@ mod tests {
         assert!(folders_above(&dir).contains(&here));
     }
 
+    /// Review (UPDATE-1): `--source ../clone` kept the `..`, so the folder
+    /// meow was run from was taken for one above the clone, and a clone
+    /// that is fine was refused when run from a folder others can write
+    /// to. A `..` climbs out of the folder as it really is, as the system
+    /// does, also out of what a link leads to.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_named_with_dot_dot_names_only_the_folders_it_is_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap();
+        let open = real.join("open");
+        let inner = real.join("disk").join("inner");
+        for folder in [&open, &inner, &real.join("clone"), &real.join("disk/clone")] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let dir = checkout_dir(Some(&open.join("..").join("clone"))).unwrap();
+        assert_eq!(dir, real.join("clone"));
+        assert!(!folders_above(&dir).contains(&open));
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        assert_eq!(
+            checkout_dir(Some(&link.join("..").join("clone").join("."))).unwrap(),
+            real.join("disk").join("clone")
+        );
+        assert!(checkout_dir(Some(&real.join("missing/../clone"))).is_err());
+    }
+
+    /// Review (UPDATE-7): a refusal ended with `git config --unset-all
+    /// "<key>"`, the key as it was. A branch name, which the author of a
+    /// pull request picks (`gh pr checkout` writes
+    /// `branch.<name>.pushRemote`), may hold `$(...)`, so pasting that ran
+    /// the author's command. The command is shown only when a shell finds
+    /// nothing to expand in it, and the key is never cut.
+    #[test]
+    fn a_command_to_remove_a_setting_is_shown_only_when_pasting_it_runs_nothing_else() {
+        let dir = if cfg!(windows) {
+            Path::new(r"C:\Users\Jürgen Ö\meow_2")
+        } else {
+            Path::new("/home/jürgen ö/meow_2")
+        };
+        assert_eq!(
+            unset_command(dir, "branch.feature/x-1.pushremote").unwrap(),
+            format!(
+                "git -C \"{}\" config --unset-all \"branch.feature/x-1.pushremote\"",
+                dir.display()
+            )
+        );
+        for key in [
+            "branch.pr$(touch${IFS}x).pushremote",
+            "branch.a`id`.remote",
+            "branch.a\"b.remote",
+            "branch.%PATH%.remote",
+            "branch.a!b.remote",
+            "branch.a;b.remote",
+            "branch.a\nb.remote",
+            "-x",
+            "",
+        ] {
+            assert_eq!(unset_command(dir, key), None, "{key:?}");
+        }
+        #[cfg(unix)]
+        assert_eq!(unset_command(dir, "branch.a\\b.remote"), None);
+        let long = format!("branch.{}.remote", "a".repeat(300));
+        assert!(unset_command(dir, &long).unwrap().contains(&long));
+        assert_eq!(
+            unset_command(dir, &format!("branch.{}.remote", "a".repeat(400))),
+            None
+        );
+        // Nor a folder a shell would expand something in.
+        assert_eq!(
+            unset_command(Path::new("/home/$(id)/meow"), "core.editor"),
+            None
+        );
+    }
+
     /// PoC (UPDATE-2): the folders above were checked once, for what was
     /// there. Another account that can write to one, sticky or not, then
     /// put a `.cargo` there while install.sh ran. Such a folder is refused.
@@ -3613,7 +3856,7 @@ mod tests {
         refused(&format!(
             "{} leads through {}, in {}, which can be changed by other users",
             link.display(),
-            hop.display(),
+            real(&open).join("hop.toml").display(),
             real(&open).display()
         ));
         set_mode(&open, 0o755);
@@ -3634,6 +3877,83 @@ mod tests {
             "{} is a symbolic link",
             home.join("Cargo.toml").display()
         ));
+    }
+
+    /// Review (UPDATE-6): only the links a link's own name led to were
+    /// followed, so a folder link on the way (`d` in `~/.cargo/config.toml
+    /// -> shared/d/config.toml`) was never checked: another account that
+    /// could move it, or whose it was, could point it at its own folder
+    /// once meow had looked. Every link on the way is checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_link_on_the_way_is_checked_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = real.join("home");
+        let (clone, cargo, dotfiles) = (
+            home.join("meow"),
+            home.join(".cargo"),
+            home.join("dotfiles"),
+        );
+        let shared = real.join("shared");
+        for folder in [&clone, &cargo, &dotfiles, &shared] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for folder in [&home, &clone, &cargo, &dotfiles] {
+            set_mode(folder, 0o755);
+        }
+        std::fs::write(dotfiles.join("config.toml"), "").unwrap();
+        set_mode(&dotfiles.join("config.toml"), 0o644);
+        let hop = shared.join("d");
+        std::os::unix::fs::symlink(&dotfiles, &hop).unwrap();
+        let link = cargo.join("config.toml");
+        let said = || {
+            audit_untracked_build_overrides(&clone)
+                .err()
+                .map(|err| format!("{err:#}"))
+        };
+        let moved = format!(
+            "{} leads through {}, in {}, which can be changed by other users",
+            link.display(),
+            hop.display(),
+            shared.display()
+        );
+        // Named outright, and climbed into with `..` after a link.
+        for target in [
+            hop.join("config.toml"),
+            PathBuf::from("../../shared/d/../dotfiles/config.toml"),
+        ] {
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            set_mode(&shared, 0o755);
+            assert_eq!(said(), None);
+            set_mode(&shared, 0o777);
+            let refused = said().unwrap();
+            assert!(refused.contains(&moved), "{refused}");
+            // Sticky, others cannot move the user's link.
+            set_mode(&shared, 0o1777);
+            assert_eq!(said(), None);
+            std::fs::remove_file(&link).unwrap();
+        }
+        // Unless it is theirs (root may make one here).
+        // SAFETY: this call has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            std::os::unix::fs::symlink(hop.join("config.toml"), &link).unwrap();
+            let path = std::ffi::CString::new(hop.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a plain system call on a valid C string.
+            assert_eq!(unsafe { libc::lchown(path.as_ptr(), 4242, 4242) }, 0);
+            let refused = said().unwrap();
+            let expected = format!(
+                "{} leads through {}, which is a link that belongs to another user",
+                link.display(),
+                hop.display()
+            );
+            assert!(refused.contains(&expected), "{refused}");
+        }
     }
 
     /// PoC (UPDATE-3): meow made its build folder before cargo did, so
@@ -3736,6 +4056,50 @@ mod tests {
         let _ = update(true).unwrap();
         let _ = update(false).unwrap();
         assert!(clone.join("new.txt").exists());
+    }
+
+    /// Review (UPDATE-4): only meow's folder and its build folder were
+    /// checked. With MEOW_HOME in a folder others can write to, another
+    /// account could move meow's folder while cargo built in it, and put
+    /// its own in its place. Refused, also before meow's folder is made.
+    #[cfg(unix)]
+    #[test]
+    fn a_meow_folder_in_a_folder_others_can_change_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let open = std::fs::canonicalize(tmp.path()).unwrap().join("open");
+        std::fs::create_dir(&open).unwrap();
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let root = open.join("mh");
+        let home = crate::workspace::MeowHome::at(&root).unwrap();
+        let deeper = crate::workspace::MeowHome::at(open.join("a").join("mh")).unwrap();
+        let expected = |root: &Path| {
+            format!(
+                "{} is in {}, which can be changed by other users, so meow does not build in it. \
+                 Set MEOW_HOME to a folder only you can change",
+                root.display(),
+                open.display()
+            )
+        };
+        set_mode(&open, 0o777);
+        for made in [false, true] {
+            if made {
+                std::fs::create_dir(&root).unwrap();
+                set_mode(&root, 0o700);
+            }
+            let said = format!("{:#}", check_build_place(&home).unwrap_err());
+            assert!(said.contains(&expected(&root)), "{said}");
+            assert!(build_dir(&home).is_err());
+        }
+        assert!(!root.join("build").exists());
+        let said = format!("{:#}", check_build_place(&deeper).unwrap_err());
+        assert!(said.contains(&expected(deeper.root())), "{said}");
+        // Sticky, as /tmp: no other account can move a folder of the user's.
+        set_mode(&open, 0o1777);
+        check_build_place(&deeper).unwrap();
+        assert_eq!(build_dir(&home).unwrap(), root.join("build"));
     }
 
     /// Runs icacls (`System32`) on `path` with `args`.
@@ -3853,15 +4217,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("config.toml"), "").unwrap();
         let link = tmp.path().join("home").join(".cargo");
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-        let status = Command::new(Path::new(&root).join("System32").join("cmd.exe"))
-            .args(["/D", "/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .stdout(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "mklink /J");
+        junction(&link, &target);
         audit_untracked_build_overrides(&clone).unwrap();
         icacls(&target, &["/grant", "*S-1-5-11:(M)"]);
         let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
@@ -3872,6 +4228,53 @@ mod tests {
         assert!(said.contains("can be changed by other accounts"), "{said}");
         icacls(&target, &["/remove:g", "*S-1-5-11"]);
         audit_untracked_build_overrides(&clone).unwrap();
+    }
+
+    /// Makes `link` a junction to the folder `target` (`mklink /J`), which
+    /// any account may make.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let status = Command::new(Path::new(&root).join("System32").join("cmd.exe"))
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J");
+    }
+
+    /// Review (UPDATE-6) on Windows: only what a link leads to was
+    /// checked, not the folders it is in, so a file with an access list
+    /// of its own, in a folder other accounts may change (and so move),
+    /// was taken. Nor was a junction on the way. Both are refused.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_link_into_or_through_a_folder_others_can_change_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let clone = home.join("meow");
+        std::fs::create_dir_all(&clone).unwrap();
+        let disk = tmp.path().join("disk");
+        std::fs::create_dir_all(disk.join("cargo-home")).unwrap();
+        std::fs::write(disk.join("cargo-home").join("config.toml"), "").unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        junction(&open.join("hop"), &disk);
+        junction(&home.join(".cargo"), &open.join("hop").join("cargo-home"));
+        audit_untracked_build_overrides(&clone).unwrap();
+        // On the folder alone: what is in it stays the user's.
+        for (folder, through) in [(&open, true), (&disk, false)] {
+            icacls(folder, &["/grant", "*S-1-5-11:(M)"]);
+            let said = format!("{:#}", audit_untracked_build_overrides(&clone).unwrap_err());
+            let name = folder.file_name().unwrap().to_str().unwrap();
+            let expected = format!("{name}, which can be changed by other accounts");
+            assert!(said.contains(&expected), "{said}");
+            assert_eq!(said.contains("leads through "), through, "{said}");
+            icacls(folder, &["/remove:g", "*S-1-5-11"]);
+            audit_untracked_build_overrides(&clone).unwrap();
+        }
     }
 
     /// UPDATE-M2: below `C:\`, outside the user folder (`C:\src\meow`),
