@@ -1,5 +1,11 @@
 # meow
 
+[![checks](https://github.com/Jrdelt/meow/actions/workflows/checks.yml/badge.svg)](https://github.com/Jrdelt/meow/actions/workflows/checks.yml)
+[![fuzz](https://github.com/Jrdelt/meow/actions/workflows/fuzz.yml/badge.svg)](https://github.com/Jrdelt/meow/actions/workflows/fuzz.yml)
+[![release](https://img.shields.io/github/v/release/Jrdelt/meow)](https://github.com/Jrdelt/meow/releases/latest)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)](Cargo.toml)
+
 ```text
   /\_/\
  ( ^w^ )  meow — local security triage shell, topology mapper & grounded audit workspace
@@ -11,6 +17,22 @@
 meow keeps session data on your machine, in a private session folder, and masks private values before any text goes to a cloud AI.
 
 > **Authorized use only.** Use meow only on systems you own or have written permission to test. meow lists services, settings and public advisories so you can patch and verify. It never writes exploits or attacks.
+
+## See it
+
+`meow hud`: a saved Nmap scan of a lab network ([docs/demo/scan.nmap](docs/demo/scan.nmap)) printed in a session. meow found 4 hosts, matched their versions to 9 CVEs, and lists what to update.
+
+![meow hud moving through hosts, CVEs, this machine and the key list](docs/images/hud-demo.gif)
+
+`meow map`: the same session in the browser. The red ring marks a host with a critical or high CVE; its CVE tab says what to update.
+
+| Topology | A host's CVEs |
+|---|---|
+| ![The map: you, and four lab hosts ringed by CVE severity](docs/images/map.png) | ![The CVE tab of files.lab.internal: vsftpd 2.3.4, CVE-2011-2523, critical](docs/images/map-cves.png) |
+
+`meow report`: the same session as Markdown, with no network and no AI: [docs/sample-report.md](docs/sample-report.md).
+
+**How it works:** [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Fuzzing](fuzz/README.md) · [Security policy](SECURITY.md)
 
 ## Install
 
