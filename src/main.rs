@@ -387,7 +387,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!(
                 "[+] Session '{}' now has {} hosts",
                 sanitize_terminal_line(&workspace.name, 64),
-                graph.hosts.len()
+                meow::topology::map_host_count(&graph)
             );
             let config = Config::load_or_create(&home)?;
             if config.cve.enabled && !no_cve {

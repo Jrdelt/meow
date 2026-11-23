@@ -40,7 +40,8 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     found.save(&state.db_lock(), task.id, stage)?;
     let (changed, _) = record(state, observations, None);
     let silent = if answered == Some(0) {
-        discovery_hint(&cx.scan_flags().shared)
+        cx.no_address()
+            .unwrap_or_else(|| discovery_hint(&cx.scan_flags().shared))
     } else {
         String::new()
     };
@@ -112,7 +113,9 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
     Found::of(&observations, target).save(&state.db_lock(), task.id, cx.stage)?;
     if answered == Some(0) {
         // No port was scanned: not "no UDP service".
-        let hint = discovery_hint(&flags.shared);
+        let hint = cx
+            .no_address()
+            .unwrap_or_else(|| discovery_hint(&flags.shared));
         return Ok(StageEnd::Skipped(hint.trim_start_matches("; ").to_owned()));
     }
     let (mut open, mut maybe) = (0usize, 0usize);

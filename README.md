@@ -36,7 +36,7 @@ After either, run `meow tools` to add any missing scanner, wordlist or location 
 git clone https://github.com/Jrdelt/meow.git && cd meow && ./install.sh
 ```
 
-It adds a C compiler and Rust 1.89 or newer (through `rustup`) if missing, and builds the clone into `~/.cargo/bin/meow`. Then it adds what is missing of `nmap`, `katana`, `feroxbuster`, the wordlist (`~/.meow/wordlists/common.txt`) and the DB-IP Lite location database (`~/.meow/geo/`, fetched again after 30 days). Flags: `--yes`, `--dry-run`, `--no-tools` (no scanners or wordlist), `--no-geo`, `--tools-only` (no build).
+It adds a C compiler and Rust 1.89 or newer (through `rustup`) if missing, and builds the clone into `~/.cargo/bin/meow`. Then it adds any missing `nmap`, `katana`, `feroxbuster`, `traceroute` (Linux), wordlist (`~/.meow/wordlists/common.txt`) and DB-IP Lite location database (`~/.meow/geo/`, refreshed after 30 days). Flags: `--yes`, `--dry-run`, `--no-tools` (no scanners or wordlist), `--no-geo`, `--tools-only` (no build).
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in the clone, with `-Yes`, `-DryRun`, `-NoTools`, `-NoGeo` or `-ToolsOnly`. It uses `winget` or `scoop`. It stops if this folder or one above has a `.cargo`, `.cargo\config`, `.cargo\config.toml`, `rust-toolchain` or `rust-toolchain.toml` that is a link, or that another account owns or can change. A `.cargo` link is fine in a folder only you can change, if it leads to a folder of yours.
 
@@ -305,7 +305,7 @@ meow checks the clone before it fetches or builds, also with `--check`. Remove w
 
 - **macOS blocks the `.pkg`** ("cannot be opened because it is from an unidentified developer"): on macOS 15 (Sequoia) and newer, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. On macOS 14 and earlier, Control-click the `.pkg` in Finder and choose **Open**.
 - **`meow recon` is refused in `light` mode:** run `meow mode mild` (or `aggressive`) first.
-- **Missing `nmap`, `katana`, `feroxbuster`, wordlist or location database:** run `meow tools`.
+- **Missing tools, wordlist or location database:** run `meow tools`.
 - **`meow map` opens no browser tab** (SSH, headless Linux): `meow map --no-open` prints the URL. Open it by hand, or forward the local port over SSH.
 - **Cloud or local AI requests fail:** `meow setup --check` names the server or key at fault. For a key (`sk-or-...`, `sk-ant-...`), run `meow setup` again. For Ollama (`http://localhost:11434`) or LM Studio (`http://localhost:1234`), check that it runs and has a model (`ollama list`).
 - **The `udp` stage is skipped:** it runs only in aggressive mode and as root, since UDP scans send raw packets and are slow. To run it yourself and add the result:

@@ -2694,8 +2694,20 @@
     Object.keys(notOpen).forEach(function (key) {
       var group = own(notOpen, key);
       if (!group) { return; }
-      ports.appendChild(hint(el('p', 'note', group.count + (keys.length ? ' other ' : ' ') +
-        String(group.protocol || '').toUpperCase() + (group.count === 1 ? ' port ' : ' ports ') + group.state),
+      // A port listed above (closed by a rescan) is not counted again.
+      var ranges = String(group.ports || '').split(',').map(function (part) {
+        var ends = part.split('-');
+        return [Number(ends[0]), Number(ends[ends.length - 1])];
+      });
+      var count = group.count - keys.filter(function (portKey) {
+        var port = hostPorts[portKey];
+        return (port.protocol || 'tcp') === group.protocol && ranges.some(function (range) {
+          return port.number >= range[0] && port.number <= range[1];
+        });
+      }).length;
+      if (count <= 0) { return; }
+      ports.appendChild(hint(el('p', 'note', count + (keys.length ? ' other ' : ' ') +
+        String(group.protocol || '').toUpperCase() + (count === 1 ? ' port ' : ' ports ') + group.state),
         group.ports ? group.ports.split(',').join(', ') : ''));
     });
 

@@ -902,6 +902,10 @@ impl State {
                         if let Observation::Hostname { record, .. } = &mut item {
                             record.confidence = record.confidence.min(Confidence::Medium);
                         }
+                        // Nor does it close a port the session found open.
+                        if let Observation::NotOpen { own_scan, .. } = &mut item {
+                            *own_scan = false;
+                        }
                         let address = observation_address(&item);
                         if graph.apply(item) {
                             changed += 1;
@@ -916,7 +920,7 @@ impl State {
                     }
                     graph.is_full()
                 };
-                let hosts = self.graph().hosts.len();
+                let hosts = crate::topology::map_host_count(&self.graph());
                 if changed > 0 {
                     self.mark_dirty();
                     self.notice(format!("imported {changed} new facts ({total} parsed)"));

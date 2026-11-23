@@ -256,7 +256,7 @@ fn merge_list(mine: &mut Vec<String>, theirs: Vec<String>, max: usize) -> bool {
 
 /// `jQuery 1.12.4 (older than ...)` as `("jquery", Some("1.12.4"))`: the
 /// words before the version, and the version.
-fn tech_name(entry: &str) -> (String, Option<&str>) {
+pub(crate) fn tech_name(entry: &str) -> (String, Option<&str>) {
     let mut name = Vec::new();
     for word in entry.split_whitespace() {
         if word.starts_with(|c: char| c.is_ascii_digit()) {
@@ -707,7 +707,8 @@ impl Port {
     /// the terminal does not rewrite what a scanner's probe recorded.
     fn absorb(&mut self, other: Port) -> bool {
         let mut changed = false;
-        // "open" is never downgraded by a weaker observation.
+        // "open" is not taken back by a line of text or a file: only this
+        // session's own scan closes a port (`Observation::NotOpen`).
         if !other.state.is_empty()
             && (other.is_open() || !self.is_open())
             && self.state != other.state
@@ -1005,6 +1006,101 @@ fn clean_port_list(text: &str) -> String {
     }
 }
 
+/// Marks the `protocol` ports of `host` that `list` (`1-79,8080`) names as
+/// `state` (`closed`, `filtered`): this session's own scan found them so.
+/// Each keeps its history in its facts. The CVEs looked up for one go to
+/// another open port that runs the same software, or else go. `None` when
+/// no port changed; otherwise the weight of the CVEs removed.
+fn close_ports(
+    host: &mut Host,
+    protocol: &str,
+    state: &str,
+    list: &str,
+    record: &EvidenceRecord,
+) -> Option<usize> {
+    let mut ranges: Vec<(u16, u16)> = list
+        .split(',')
+        .filter_map(|part| {
+            let (low, high) = part.split_once('-').unwrap_or((part, part));
+            Some((low.trim().parse().ok()?, high.trim().parse().ok()?))
+        })
+        .collect();
+    ranges.sort_unstable();
+    // The highest end of the ranges up to each one: a port is in the list
+    // when one of the ranges that start at or below it reaches it.
+    let mut reach = 0u16;
+    let reaches: Vec<u16> = ranges
+        .iter()
+        .map(|&(_, high)| {
+            reach = reach.max(high);
+            reach
+        })
+        .collect();
+    let listed = |number: u16| {
+        let starts = ranges.partition_point(|&(low, _)| low <= number);
+        starts > 0 && reaches[starts - 1] >= number
+    };
+    let mut closed = Vec::new();
+    for port in host.ports.values_mut() {
+        if port.protocol != protocol || port.state == state || !listed(port.number) {
+            continue;
+        }
+        port.state = state.to_owned();
+        let claim = format!("{} {state}", port.label());
+        push_fact(
+            &mut port.facts,
+            Fact {
+                claim,
+                record: record.clone(),
+            },
+        );
+        closed.push(port.key());
+    }
+    if closed.is_empty() {
+        return None;
+    }
+    Some(resettle_advisories(host, &closed, false))
+}
+
+/// The CVEs looked up for the ports `keys` that their port no longer asks
+/// about (it was closed, or for a guessed library, the page's stack shows
+/// it updated) go to another open port that asks, or else go. With
+/// `guesses_only`, only those of a library guessed from a script file.
+/// Returns the weight of those removed.
+fn resettle_advisories(host: &mut Host, keys: &[String], guesses_only: bool) -> usize {
+    let ports = &host.ports;
+    let asks = |port: &Port, matched: &str| port.is_open() && crate::cve::port_asks(port, matched);
+    let mut freed = 0;
+    host.advisories.retain_mut(|advisory| {
+        let looked_up = matches!(advisory.record.source, Source::NvdApi | Source::OsvApi);
+        // `jquery@1.12.4 (npm)`, as a guess from a file name is asked.
+        let guessed =
+            advisory.record.source == Source::OsvApi && advisory.matched.ends_with(" (npm)");
+        let Some(key) = advisory.port.as_ref().filter(|key| keys.contains(key)) else {
+            return true;
+        };
+        if !looked_up
+            || (guesses_only && !guessed)
+            || ports
+                .get(key)
+                .is_some_and(|port| asks(port, &advisory.matched))
+        {
+            return true;
+        }
+        match ports.values().find(|port| asks(port, &advisory.matched)) {
+            Some(port) => {
+                advisory.port = Some(port.key());
+                true
+            }
+            None => {
+                freed += advisory_weight(advisory);
+                false
+            }
+        }
+    });
+    freed
+}
+
 impl Host {
     pub fn open_ports(&self) -> impl Iterator<Item = &Port> {
         self.ports.values().filter(|port| port.is_open())
@@ -1167,6 +1263,10 @@ pub enum Observation {
         state: String,
         count: u32,
         ports: String,
+        /// The session's own scan said so: a port of the list the host has
+        /// as open is not open now. A file or the terminal does not close one.
+        #[serde(default)]
+        own_scan: bool,
         record: EvidenceRecord,
     },
     /// What an nmap script reported, about one port or (`port: None`) about
@@ -1559,6 +1659,17 @@ fn push_fact(facts: &mut Vec<Fact>, mut fact: Fact) -> bool {
     }
     facts.push(fact);
     true
+}
+
+/// A route traced again is the latest one again: the earlier fact of it is
+/// taken out, so the new one goes last and the latest route is the last.
+fn move_route_last(facts: &mut Vec<Fact>, claim: &str) {
+    let routes = |f: &&Fact| f.record.source == Source::Traceroute;
+    let latest = facts.iter().rposition(|f| routes(&f));
+    let same = facts.iter().position(|f| routes(&f) && f.claim == claim);
+    if let Some(at) = same.filter(|at| Some(*at) != latest) {
+        facts.remove(at);
+    }
 }
 
 /// What an advisory adds to `graph.json`, counted like an observation.
@@ -2600,7 +2711,8 @@ impl Graph {
                 state,
                 count,
                 ports,
-                record: _,
+                own_scan,
+                record,
             } => {
                 let Some(protocol) = normalize_protocol(&protocol) else {
                     return false;
@@ -2609,6 +2721,12 @@ impl Graph {
                 let Some(host) = self.host_entry(&address) else {
                     return false;
                 };
+                // `unfiltered` (an ACK scan) and `open|filtered` do not say
+                // a port is not open.
+                let shut = matches!(state.as_str(), "closed" | "filtered" | "closed|filtered");
+                let closed = (own_scan && shut)
+                    .then(|| close_ports(host, &protocol, &state, &ports, &record))
+                    .flatten();
                 let ports = clean_port_list(&ports);
                 let group = NotOpen {
                     protocol: protocol.clone(),
@@ -2619,10 +2737,13 @@ impl Graph {
                 // The latest scan says which ports are not open now. The
                 // states are words from the file: only so many are kept.
                 let key = format!("{protocol} {state}");
-                if !host.not_open.contains_key(&key) && host.not_open.len() >= MAX_NOT_OPEN_GROUPS {
-                    return false;
+                let listed = (host.not_open.contains_key(&key)
+                    || host.not_open.len() < MAX_NOT_OPEN_GROUPS)
+                    && host.not_open.insert(key, group.clone()) != Some(group);
+                if let Some(freed) = closed {
+                    self.tally.weight = self.tally.weight.saturating_sub(freed);
                 }
-                host.not_open.insert(key, group.clone()) != Some(group)
+                listed || closed.is_some()
             }
             Observation::Script {
                 address,
@@ -2670,7 +2791,12 @@ impl Graph {
                         None => false,
                     },
                     None => match self.host_entry(&address) {
-                        Some(host) => push_fact(&mut host.facts, fact),
+                        Some(host) => {
+                            if fact.record.source == Source::Traceroute {
+                                move_route_last(&mut host.facts, &fact.claim);
+                            }
+                            push_fact(&mut host.facts, fact)
+                        }
                         None => false,
                     },
                 }
@@ -2683,7 +2809,7 @@ impl Graph {
                 ipv6_dns,
                 waf_cdn,
                 hops,
-                record: _,
+                record,
             } => {
                 let Some(host) = self.host_entry(&address) else {
                     return false;
@@ -2707,7 +2833,10 @@ impl Graph {
                     .filter(|h| !h.is_empty())
                     .take(MAX_HOPS)
                     .collect();
-                if !clean_hops.is_empty() && host.hops != clean_hops {
+                // A new trace says the route now, also when it went
+                // straight to the target.
+                let traced = record.source == Source::Traceroute;
+                if (traced || !clean_hops.is_empty()) && host.hops != clean_hops {
                     host.hops = clean_hops;
                     changed = true;
                 }
@@ -2727,6 +2856,7 @@ impl Graph {
                     entry.state = "open".to_owned();
                     changed = true;
                 }
+                let stack = entry.http.as_ref().map(|h| h.tech.clone());
                 match &mut entry.http {
                     Some(existing) => {
                         let page = record.source == Source::HttpHeader;
@@ -2738,6 +2868,15 @@ impl Graph {
                         h.tls_complete = false;
                         entry.http = Some(h);
                         changed = true;
+                    }
+                }
+                if entry.http.as_ref().map(|h| &h.tech) != stack.as_ref() {
+                    // A library the page shows updated: the CVEs guessed
+                    // from an old file of it go.
+                    let key = entry.key();
+                    if let Some(host) = self.host_mut(&address) {
+                        let freed = resettle_advisories(host, &[key], true);
+                        self.tally.weight = self.tally.weight.saturating_sub(freed);
                     }
                 }
                 changed
@@ -3022,6 +3161,7 @@ mod tests {
             state: state.into(),
             count,
             ports: ports.into(),
+            own_scan: true,
             record: rec(Source::NmapXml),
         };
         let mut graph = Graph::default();
@@ -3045,8 +3185,137 @@ mod tests {
             state: "closed".into(),
             count: 1,
             ports: "1".into(),
+            own_scan: true,
             record: rec(Source::NmapXml),
         }));
+    }
+
+    #[test]
+    fn a_cve_guessed_from_an_old_file_goes_when_the_page_shows_the_library_updated() {
+        let mut graph = Graph::default();
+        graph.apply(port("192.0.2.10", 80, "http", Some("nginx")));
+        graph.apply(path("192.0.2.10", 80, "/static/jquery-1.12.4.min.js", 200));
+        graph.add_advisory(
+            "192.0.2.10",
+            Advisory {
+                matched: "jquery@1.12.4 (npm)".into(),
+                fixed_in: Some("3.5.0".into()),
+                record: EvidenceRecord::observed(Source::OsvApi, Confidence::Medium, "{}"),
+                ..advisory("GHSA-gxr4-xjj5-5px2")
+            },
+        );
+        graph.add_advisory("192.0.2.10", advisory("CVE-2021-23017"));
+        let page = |tech: &str| Observation::WebMeta {
+            address: "192.0.2.10".into(),
+            port: 80,
+            http: Box::new(HttpInfo {
+                scheme: "http".into(),
+                tech: vec![tech.into()],
+                ..HttpInfo::default()
+            }),
+            record: rec(Source::HttpHeader),
+        };
+        let ids = |graph: &Graph| {
+            graph.hosts["192.0.2.10"]
+                .advisories
+                .iter()
+                .map(|a| a.id.clone())
+                .collect::<Vec<_>>()
+        };
+        graph.apply(page("jQuery 1.12.4"));
+        assert_eq!(ids(&graph), ["GHSA-gxr4-xjj5-5px2", "CVE-2021-23017"]);
+        // The page loads 3.7.1 now: the stack and the CVEs agree. The
+        // CVE of the server's software is left to the next lookup.
+        graph.apply(page("jQuery 3.7.1"));
+        assert_eq!(ids(&graph), ["CVE-2021-23017"]);
+        let plan = crate::cve::fix_plan(&graph.hosts["192.0.2.10"]);
+        assert!(plan.iter().all(|item| !item.software.contains("jquery")));
+    }
+
+    #[test]
+    fn a_rescan_that_finds_a_port_closed_closes_it_and_its_cves_go() {
+        let nginx = |number: u16, version: &str| Observation::Port {
+            address: "192.0.2.10".into(),
+            port: number,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            service: Some("http".into()),
+            product: Some("nginx".into()),
+            version: Some(version.into()),
+            extra_info: None,
+            cpes: vec![],
+            record: rec(Source::NmapXml),
+        };
+        let not_open = |state: &str, ports: &str, own_scan: bool| Observation::NotOpen {
+            address: "192.0.2.10".into(),
+            protocol: "tcp".into(),
+            state: state.into(),
+            count: 1,
+            ports: ports.into(),
+            own_scan,
+            record: rec(Source::NmapXml),
+        };
+        let closed = |ports: &str, own_scan: bool| not_open("closed", ports, own_scan);
+        let cve = |id: &str, port: &str| Advisory {
+            matched: "keywordSearch=nginx 1.18.0".into(),
+            port: Some(port.into()),
+            fixed_in: Some("1.20.1".into()),
+            ..advisory(id)
+        };
+        let mut graph = Graph::default();
+        graph.apply(nginx(80, "1.18.0"));
+        graph.apply(nginx(8080, "1.18.0"));
+        graph.add_advisory("192.0.2.10", cve("CVE-2021-23017", "8080/tcp"));
+        let ports = |graph: &Graph| {
+            graph.hosts["192.0.2.10"]
+                .open_ports()
+                .map(Port::key)
+                .collect::<Vec<_>>()
+        };
+
+        // A file or the terminal does not close a port.
+        assert!(graph.apply(closed("8080", false)));
+        assert_eq!(ports(&graph), ["80/tcp", "8080/tcp"]);
+        // Nor does a state that does not say it is not open (an ACK scan).
+        for state in ["unfiltered", "open|filtered"] {
+            graph.apply(not_open(state, "8080", true));
+        }
+        assert_eq!(ports(&graph), ["80/tcp", "8080/tcp"]);
+
+        // The session's own scan does. 80/tcp runs the same nginx: the CVE
+        // moves there, and the fix line names only that port.
+        assert!(graph.apply(closed("1-79,81-8079,8080", true)));
+        assert_eq!(ports(&graph), ["80/tcp"]);
+        let host = &graph.hosts["192.0.2.10"];
+        assert_eq!(host.ports["8080/tcp"].state, "closed");
+        let claims: Vec<&str> = host.ports["8080/tcp"]
+            .facts
+            .iter()
+            .map(|f| f.claim.as_str())
+            .collect();
+        assert_eq!(
+            claims,
+            [
+                "8080/tcp http nginx 1.18.0 open",
+                "8080/tcp http nginx 1.18.0 closed"
+            ]
+        );
+        assert_eq!(host.advisories[0].port.as_deref(), Some("80/tcp"));
+        let plan = crate::cve::fix_plan(host);
+        assert_eq!(
+            plan[0].action,
+            "Update nginx 1.18.0 to 1.20.1 or later, or close 80/tcp if the service is not needed."
+        );
+
+        // 80 is updated, then closed too: no port runs it, the CVE goes.
+        graph.apply(nginx(80, "1.20.1"));
+        assert!(graph.apply(closed("80,8080", true)));
+        let host = &graph.hosts["192.0.2.10"];
+        assert!(host.open_ports().next().is_none());
+        assert!(host.advisories.is_empty());
+        assert!(crate::cve::fix_plan(host).is_empty());
+        // Said again, nothing changes.
+        assert!(!graph.apply(closed("80,8080", true)));
     }
 
     #[test]
@@ -4306,6 +4575,7 @@ mod tests {
             state: "closed".into(),
             count: 999,
             ports: "1-79,81-1000".into(),
+            own_scan: true,
             record: rec(Source::NmapXml),
         }));
         assert!(graph.apply(hostname(
@@ -4329,6 +4599,7 @@ mod tests {
             state: "closed".into(),
             count: 998,
             ports: "1-79,82-1000".into(),
+            own_scan: true,
             record: rec(Source::NmapXml),
         }));
         assert!(!graph.is_full());

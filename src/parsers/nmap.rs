@@ -64,8 +64,8 @@ fn port_ranges(list: &str, into: &mut Vec<(u16, u16)>) {
     }
 }
 
-/// Ranges as nmap writes them: sorted, joined where they touch.
-fn format_ranges(mut ranges: Vec<(u16, u16)>) -> String {
+/// Ranges sorted and joined where they touch or overlap.
+fn merge_ranges(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
     ranges.sort_unstable();
     let mut merged: Vec<(u16, u16)> = Vec::new();
     for (low, high) in ranges {
@@ -75,6 +75,11 @@ fn format_ranges(mut ranges: Vec<(u16, u16)>) -> String {
         }
     }
     merged
+}
+
+/// Ranges as nmap writes them: sorted, joined where they touch.
+fn format_ranges(ranges: Vec<(u16, u16)>) -> String {
+    merge_ranges(ranges)
         .iter()
         .map(|&(low, high)| {
             if low == high {
@@ -85,6 +90,28 @@ fn format_ranges(mut ranges: Vec<(u16, u16)>) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// The ports of `tried` that are in none of the `known` ranges, as ranges.
+fn unlisted_ports(tried: &[(u16, u16)], known: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
+    let known = merge_ranges(known);
+    let (mut out, mut next) = (Vec::new(), 0);
+    for (low, high) in merge_ranges(tried.to_vec()) {
+        let mut from = u32::from(low);
+        while known.get(next).is_some_and(|k| u32::from(k.1) < from) {
+            next += 1;
+        }
+        for &(k_low, k_high) in known[next..].iter().take_while(|k| k.0 <= high) {
+            if u32::from(k_low) > from {
+                out.push((from as u16, k_low - 1));
+            }
+            from = from.max(u32::from(k_high) + 1);
+        }
+        if from <= u32::from(high) {
+            out.push((from as u16, high));
+        }
+    }
+    out
 }
 
 fn redirect_from_title(output: &str) -> Option<String> {
@@ -249,6 +276,24 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
         );
     }
 
+    // What this session's own scan tried, by protocol: a port it tried and
+    // did not list is in one of the host's `<extraports>` groups.
+    let mut scanned: std::collections::BTreeMap<String, Vec<(u16, u16)>> =
+        std::collections::BTreeMap::new();
+    if trusted_names {
+        for info in children(root, "scaninfo").take(MAX_NOT_OPEN_GROUPS) {
+            let Some(protocol) =
+                attr(info, "protocol").and_then(|p| crate::graph::normalize_protocol(&p))
+            else {
+                continue;
+            };
+            port_ranges(
+                info.attribute("services").unwrap_or(""),
+                scanned.entry(protocol).or_default(),
+            );
+        }
+    }
+
     let mut out = Vec::new();
     for host in children(root, "host") {
         let up = child(host, "status")
@@ -316,6 +361,11 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
         };
         // What was tried and not open: (protocol, state) -> (count, ranges).
         let mut not_open: NotOpenGroups = NotOpenGroups::new();
+        // The `<extraports>` states of each protocol, and the ports listed one by one.
+        let mut extra_states: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut listed: std::collections::BTreeSet<(String, u16)> =
+            std::collections::BTreeSet::new();
         for extra in children(ports, "extraports") {
             let state = attr(extra, "state").unwrap_or_else(|| "closed".to_owned());
             let count = extra
@@ -333,6 +383,10 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
             let key = (protocol, state);
             if !not_open.contains_key(&key) && not_open.len() >= MAX_NOT_OPEN_GROUPS {
                 continue;
+            }
+            let states = extra_states.entry(key.0.clone()).or_default();
+            if !states.contains(&key.1) {
+                states.push(key.1.clone());
             }
             let group = not_open.entry(key).or_default();
             group.0 = group.0.saturating_add(count);
@@ -354,6 +408,7 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
             let state = child(port, "state")
                 .and_then(|s| attr(s, "state"))
                 .unwrap_or_else(|| "open".to_owned());
+            listed.insert((protocol.clone(), number));
             if state != "open" && state != "open|filtered" {
                 let key = (protocol, state);
                 if not_open.contains_key(&key) || not_open.len() < MAX_NOT_OPEN_GROUPS {
@@ -477,6 +532,23 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
                 }
             }
         }
+        // An older nmap does not say which ports an `<extraports>` group
+        // holds: the ports the scan tried and did not list are in it.
+        for (protocol, tried) in &scanned {
+            if let Some([state]) = extra_states.get(protocol).map(Vec::as_slice) {
+                let key = (protocol.clone(), state.clone());
+                if let Some(group) = not_open.get_mut(&key) {
+                    let mut known = group.1.clone();
+                    known.extend(
+                        listed
+                            .iter()
+                            .filter(|(listed_protocol, _)| listed_protocol == protocol)
+                            .map(|&(_, port)| (port, port)),
+                    );
+                    group.1.extend(unlisted_ports(tried, known));
+                }
+            }
+        }
         for ((protocol, state), (count, ranges)) in not_open {
             let summary = format!(
                 "<extraports protocol=\"{protocol}\" state=\"{state}\" count=\"{count}\"/>"
@@ -487,6 +559,7 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
                 state,
                 count,
                 ports: format_ranges(ranges),
+                own_scan: trusted_names,
                 record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, &summary),
             });
         }
@@ -619,6 +692,68 @@ mod tests {
         assert_eq!(
             format_ranges(vec![(5, 5), (1, 3), (4, 4), (10, 12), (11, 20)]),
             "1-5,10-20"
+        );
+    }
+
+    #[test]
+    fn a_rescan_that_finds_an_open_port_closed_closes_it() {
+        // The first scan found 80 and 8080 open.
+        let first = r#"<nmaprun><host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.18.0"/></port>
+<port protocol="tcp" portid="8080"><state state="open"/><service name="http" product="nginx" version="1.18.0"/></port>
+<port protocol="tcp" portid="8443"><state state="open"/></port>
+<port protocol="tcp" portid="9000"><state state="open"/></port></ports></host></nmaprun>"#;
+        // The rescan: 8080 listed as closed, 8443 in a group of closed
+        // ports, 9000 tried (scaninfo) and not listed by an older nmap.
+        let rescan = r#"<nmaprun><scaninfo type="syn" protocol="tcp" numservices="6" services="22,80,8080,8443,9000-9001"/>
+<host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/>
+<ports><extraports state="filtered" count="3"/>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.20.1"/></port>
+<port protocol="tcp" portid="8080"><state state="closed"/></port>
+<port protocol="tcp" portid="8443"><state state="filtered"/></port></ports></host></nmaprun>"#;
+        let open = |graph: &Graph| {
+            graph.hosts["192.0.2.10"]
+                .open_ports()
+                .map(|p| p.key())
+                .collect::<Vec<_>>()
+        };
+        let mut graph = Graph::default();
+        graph.apply_all(parse(first, true).unwrap());
+        // The same file imported (`meow add`) closes nothing.
+        graph.apply_all(parse(rescan, false).unwrap());
+        assert_eq!(open(&graph), ["80/tcp", "8080/tcp", "8443/tcp", "9000/tcp"]);
+        graph.apply_all(parse(rescan, true).unwrap());
+        assert_eq!(open(&graph), ["80/tcp"]);
+        let host = &graph.hosts["192.0.2.10"];
+        assert_eq!(host.ports["8080/tcp"].state, "closed");
+        assert_eq!(host.ports["8443/tcp"].state, "filtered");
+        assert_eq!(host.ports["9000/tcp"].state, "filtered");
+        assert_eq!(host.not_open["tcp filtered"].ports, "22,8443,9000-9001");
+        // The port keeps its history.
+        assert!(host.ports["8080/tcp"]
+            .facts
+            .iter()
+            .any(|f| f.claim == "8080/tcp http nginx 1.18.0 open"));
+
+        // Two groups and no list of ports: which port is in which is not known.
+        let two = r#"<nmaprun><scaninfo type="syn" protocol="tcp" numservices="3" services="80,8080,9000"/>
+<host><status state="up"/><address addr="192.0.2.11" addrtype="ipv4"/>
+<ports><extraports state="filtered" count="1"/><extraports state="closed" count="1"/>
+<port protocol="tcp" portid="80"><state state="open"/></port></ports></host></nmaprun>"#;
+        for observation in parse(two, true).unwrap() {
+            if let Observation::NotOpen {
+                ports, own_scan, ..
+            } = observation
+            {
+                assert_eq!((ports.as_str(), own_scan), ("", true));
+            }
+        }
+        assert_eq!(
+            unlisted_ports(
+                &[(1, 10), (20, 30), (65535, 65535)],
+                vec![(3, 4), (8, 22), (5, 5)]
+            ),
+            [(1, 2), (6, 7), (23, 30), (65535, 65535)]
         );
     }
 

@@ -2368,6 +2368,84 @@ fn a_preset_s_up_check_holds_for_every_scan_and_its_hint() {
     coordinator.shutdown();
 }
 
+/// A name the dns stage found no address for (of the family scanned) is
+/// said to have none: `-- -Pn` cannot help it.
+#[cfg(unix)]
+#[test]
+fn a_name_with_no_address_says_so_instead_of_the_up_check_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = no_cve_config();
+    // nmap cannot resolve the name: nothing is up.
+    config.recon.nmap = stand_in_nmap(dir.path(), false);
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Aggressive, config);
+    let state = coordinator.state();
+    let name = "mail.example.net";
+    let target = Target::parse(name).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // What ports and udp end with for a task whose dns stage found `ips`
+    // (`None`: it gave no answer), with the operator's `flags`.
+    let ends = |ips: Option<&[&str]>, flags: &[&str]| {
+        let id = enqueue(&state.db_lock(), name, Mode::Aggressive, &strings_of(flags)).unwrap();
+        if let Some(ips) = ips {
+            Found {
+                ips: strings_of(ips),
+                ..Found::default()
+            }
+            .save(&state.db_lock(), id, Stage::Dns)
+            .unwrap();
+        }
+        let task = task(&state.db_lock(), id).unwrap().unwrap();
+        let mut said = Vec::new();
+        for stage in [Stage::Ports, Stage::Udp] {
+            let mut cx = stages::Ctx::new(&state, &task, &target, stage).unwrap();
+            cx.privileged = true;
+            let end = match stage {
+                Stage::Ports => runtime.block_on(stages::ports(&cx)),
+                _ => runtime.block_on(stages::udp(&cx)),
+            };
+            said.push(match end.unwrap() {
+                StageEnd::Done(what) => what,
+                StageEnd::Skipped(why) => format!("skipped: {why}"),
+                StageEnd::ModeChanged => "mode changed".to_owned(),
+            });
+        }
+        said
+    };
+    let none = "the name has no address (no A or AAAA record)";
+    let said = ends(Some(&[]), &[]);
+    assert!(
+        said[0].ends_with(&format!("(0 new facts); {none}")),
+        "{said:?}"
+    );
+    assert_eq!(said[1], format!("skipped: {none}"));
+    assert!(said.iter().all(|end| !end.contains("-Pn")), "{said:?}");
+    // With -Pn too: not "nothing answered".
+    let said = ends(Some(&[]), &["-Pn"]);
+    assert!(said[0].ends_with(none), "{said:?}");
+    // Only IPv6 addresses, scanned as IPv4; only IPv4, scanned with -6.
+    let said = ends(Some(&["2001:db8::7"]), &[]);
+    assert!(
+        said[0].ends_with("the name has only IPv6 addresses: run again with `-- -6`"),
+        "{said:?}"
+    );
+    let said = ends(Some(&["203.0.113.7"]), &["-6"]);
+    assert!(
+        said[0].ends_with("the name has no IPv6 address: run again with `-- -4`"),
+        "{said:?}"
+    );
+    // An address of the family scanned that did not answer, or no answer
+    // from the dns stage: the up check is what to change.
+    for ips in [Some(&["203.0.113.7"][..]), None] {
+        let said = ends(ips, &[]);
+        assert!(said[0].contains("run again with `-- -Pn`"), "{said:?}");
+        assert!(said[1].contains("run again with `-- -Pn`"), "{said:?}");
+    }
+    coordinator.shutdown();
+}
+
 #[test]
 fn the_mail_dns_stage_keeps_an_internal_target_off_doh() {
     use crate::coordinator::Coordinator;
@@ -2517,6 +2595,55 @@ fn the_waf_cdn_stage_does_not_deadlock_on_the_database() {
         .expect("the waf-cdn stage hung")
         .unwrap();
     assert!(detail.contains("no blocking WAF/CDN detected"), "{detail}");
+    coordinator.shutdown();
+}
+
+/// waf-cdn and asn judge a name at the address the scan went to: its
+/// other addresses (round robin, IPv6) do not each become a host.
+#[test]
+fn waf_cdn_and_asn_keep_to_the_scanned_address_of_a_name() {
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, no_cve_config());
+    let state = coordinator.state();
+    let name = "app.example.com";
+    let target = Target::parse(name).unwrap();
+    let id = enqueue(&state.db_lock(), name, Mode::Mild, &[]).unwrap();
+    let ips = strings_of(&["203.0.113.7", "203.0.113.8", "2001:db8::7"]);
+    Found {
+        primary: crate::osint::primary_address(&ips, false),
+        ips,
+        ..Found::default()
+    }
+    .save(&state.db_lock(), id, Stage::Dns)
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let task_now = || task(&state.db_lock(), id).unwrap().unwrap();
+    // Before the scan, asn looks up the address the scan will go to.
+    let row = task_now();
+    let cx = stages::Ctx::new(&state, &row, &target, Stage::Asn).unwrap();
+    let looked_up = runtime.block_on(stages::asn_addresses(&cx));
+    assert_eq!(
+        looked_up,
+        ["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+    );
+
+    Found {
+        up: 1,
+        hosts: BTreeMap::from([("203.0.113.7".to_owned(), vec![80])]),
+        web: vec![("203.0.113.7".to_owned(), 80, false)],
+        ..Found::default()
+    }
+    .save(&state.db_lock(), id, Stage::Ports)
+    .unwrap();
+    let row = task_now();
+    let cx = stages::Ctx::new(&state, &row, &target, Stage::WafCdn).unwrap();
+    let end = runtime.block_on(stages::waf_cdn(&cx)).unwrap();
+    assert!(matches!(end, StageEnd::Done(_)));
+    let graph = state.graph();
+    assert_eq!(graph.hosts.keys().collect::<Vec<_>>(), ["203.0.113.7"]);
+    drop(graph);
     coordinator.shutdown();
 }
 

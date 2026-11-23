@@ -4365,8 +4365,13 @@ fn remove_tree_at(
     gone(unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) })
 }
 
-/// Number of hosts in a `graph.json`, read without validating the rest.
+/// Number of hosts on the map in a `graph.json`, as the report and the HUD
+/// count them: a name only mentioned is not one. A graph this build cannot
+/// read has its hosts counted without validating the rest.
 fn count_hosts(graph: &Path) -> usize {
+    if let Ok(loaded) = crate::graph::Graph::load(graph) {
+        return crate::topology::map_host_count(&loaded);
+    }
     read_bounded(graph, crate::graph::MAX_GRAPH_BYTES)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())

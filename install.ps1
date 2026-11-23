@@ -277,6 +277,10 @@ foreach ($tool in @("nmap", "katana", "feroxbuster")) {
         $MissingTools += $tool
     }
 }
+# The route stage (trace) runs tracert, which comes with Windows.
+if (-not (Have "tracert")) {
+    Warn "tracert is not on PATH, so meow skips the route stage. It comes with Windows (System32)."
+}
 
 $MeowHome = if ($env:MEOW_HOME) { $env:MEOW_HOME } else { Join-Path $HOME ".meow" }
 $WordlistDir = Join-Path $MeowHome "wordlists"

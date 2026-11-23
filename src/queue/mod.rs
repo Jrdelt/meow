@@ -1111,6 +1111,12 @@ impl Found {
     }
 
     fn load(db: &Db, task: i64, stage: Stage, target: &Target) -> Self {
+        Self::saved(db, task, stage, target).unwrap_or_default()
+    }
+
+    /// What `stage` saved, or `None` when it saved nothing: it has not
+    /// run, or it ended without an answer.
+    fn saved(db: &Db, task: i64, stage: Stage, target: &Target) -> Option<Self> {
         db.conn()
             .query_row(
                 "SELECT found FROM task_stages WHERE task_id = ?1 AND stage = ?2",
@@ -1119,8 +1125,7 @@ impl Found {
             )
             .ok()
             .and_then(|json| serde_json::from_str::<Found>(&json).ok())
-            .unwrap_or_default()
-            .checked(target)
+            .map(|found| found.checked(target))
     }
 
     fn save(&self, db: &Db, task: i64, stage: Stage) -> Result<()> {
