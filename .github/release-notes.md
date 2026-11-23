@@ -14,7 +14,7 @@
 - **Map:** a connection badge and a 2000-byte note limit.
 - **Clean endings:** `kill -INT`, `Ctrl-C` with piped output and a closed Windows console end the session in order.
 - **Moved project folders** keep their session and history.
-- **Releases:** pre-releases are never marked Latest, nor installed by `meow update` unless meow is one. Nothing is published until the tests pass.
+- **Releases:** pre-releases are never marked Latest, nor installed by `meow update`. Nothing is published until the tests pass.
 
 ---
 

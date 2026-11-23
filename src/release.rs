@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crate::evidence::sanitize;
 
-/// GitHub's answer for the newest published release.
+/// GitHub's answer for the newest published release. It never names a
+/// pre-release (release.yml never marks one Latest), so `meow update`
+/// installs none: a pre-release meow moves to the next full release.
 pub const LATEST_URL: &str = "https://api.github.com/repos/Jrdelt/meow/releases/latest";
 /// Which release file this build is, set by `.github/workflows/release.yml`
 /// (`macos-arm64`, `linux-x86_64`, ...); `None` for a build from a checkout.
@@ -127,7 +129,7 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
 
 /// Whether this meow (`current`) updates to the release `candidate`: a
 /// newer one, and not a pre-release (`v1.2.3-rc.1`) unless this meow is
-/// one itself.
+/// one itself. [`LATEST_URL`] names no pre-release to begin with.
 fn is_update(current: &str, candidate: &str) -> bool {
     let wanted = match (parse_version(current), parse_version(candidate)) {
         (Some(current), Some(candidate)) => candidate.pre.is_none() || current.pre.is_some(),
