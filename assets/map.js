@@ -73,9 +73,11 @@
   var MAX_WIDTH = 15000;
   var askedWhere = false;
 
-  var LINE = { wifi: '#9aa3ad', ethernet: '#9aa3ad', other: '#9aa3ad', vpn: '#1aa6b3',
-    virtual: '#8a73d6', unknown: '#9aa3ad' };
-  var TEXT = '#2b2f36';
+  // The drawing is a dark sheet (map.css --sheet): light labels, lines in
+  // slate, a navy plate behind each device so its picture stands out.
+  var LINE = { wifi: '#7c8aa3', ethernet: '#7c8aa3', other: '#7c8aa3', vpn: '#22d3ee',
+    virtual: '#a78bfa', unknown: '#7c8aa3' };
+  var TEXT = '#cbd5e1', DIM = '#94a3b8', SHEET = '#0d1526';
   var FONT = 'system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
 
   // role, how the detail panel names it
@@ -124,38 +126,45 @@
         'background-fit': 'contain', 'background-clip': 'none',
         'label': 'data(text)', 'font-family': FONT, 'font-size': 13, 'color': TEXT, 'line-height': 1.3,
         'text-wrap': 'wrap', 'text-max-width': 230, 'text-valign': 'bottom', 'text-halign': 'center',
-        'text-margin-y': 6, 'text-background-color': '#ffffff', 'text-background-opacity': 0.92,
+        'text-margin-y': 6, 'text-background-color': SHEET, 'text-background-opacity': 0.92,
         'text-background-padding': 2, 'underlay-shape': 'ellipse', 'underlay-padding': 14, 'underlay-opacity': 0,
         'overlay-padding': 8, 'overlay-opacity': 0, 'z-index': 10 } }
     ].concat(PICTURES.map(function (name) {
       return { selector: 'node[icon = "' + name + '"]', style: { 'background-image': icon(name) } };
     })).concat([
+      // A plate behind each device, the picture inset on it.
+      { selector: 'node[icon]', style: {
+        'shape': 'round-rectangle', 'background-color': '#1a2640', 'background-opacity': 1,
+        'border-width': 1, 'border-color': '#33425f', 'background-fit': 'none',
+        'background-width': '78%', 'background-height': '78%' } },
+      { selector: 'node.cloud', style: { 'background-opacity': 0, 'border-width': 0,
+        'background-fit': 'contain', 'background-width': 'auto', 'background-height': 'auto' } },
       // What a device asks of you: a soft glow behind it, amber or red.
-      { selector: 'node.warn', style: { 'underlay-color': '#f2b84b', 'underlay-opacity': 0.45 } },
-      { selector: 'node.bad', style: { 'underlay-color': '#e5534b', 'underlay-opacity': 0.45 } },
-      { selector: 'node.kev', style: { 'underlay-opacity': 0.7, 'underlay-padding': 20 } },
-      { selector: 'node.none', style: { 'color': '#6b7178' } },
-      { selector: 'node.you', style: { 'font-weight': 700, 'color': '#1f6fb2' } },
+      { selector: 'node.warn', style: { 'underlay-color': '#fbbf24', 'underlay-opacity': 0.2, 'border-color': '#fbbf24', 'border-width': 2 } },
+      { selector: 'node.bad', style: { 'underlay-color': '#f87171', 'underlay-opacity': 0.26, 'border-color': '#f87171', 'border-width': 2 } },
+      { selector: 'node.kev', style: { 'underlay-opacity': 0.42, 'underlay-padding': 20, 'border-width': 3 } },
+      { selector: 'node.none', style: { 'color': DIM } },
+      { selector: 'node.you', style: { 'font-weight': 700, 'color': '#c8f02b' } },
       { selector: 'node.hub', style: { 'width': 96, 'height': 74, 'font-size': 13.5 } },
       { selector: 'node.egress', style: {
-        'width': 82, 'height': 64, 'font-size': 12.5, 'font-weight': 600, 'color': '#1f2d3d',
+        'width': 82, 'height': 64, 'font-size': 12.5, 'font-weight': 600, 'color': '#e2e8f0',
         'text-max-width': 260 } },
       { selector: 'node.cloud', style: {
         'width': 148, 'height': 100, 'text-valign': 'bottom', 'text-margin-y': 4, 'font-size': 13, 'font-weight': 700,
-        'color': '#1f2d3d', 'text-max-width': 260 } },
+        'color': '#e2e8f0', 'text-max-width': 260 } },
       { selector: 'node.hop', style: {
-        'width': 52, 'height': 42, 'font-size': 12, 'color': '#2b2f36',
+        'width': 52, 'height': 42, 'font-size': 12, 'color': TEXT,
         'text-halign': 'right', 'text-valign': 'center', 'text-margin-x': 10, 'text-margin-y': 0,
         'text-max-width': 360 } },
       { selector: 'node.waf', style: {
-        'width': 74, 'height': 58, 'font-size': 12.5, 'font-weight': 600, 'color': '#1f5f8b',
+        'width': 74, 'height': 58, 'font-size': 12.5, 'font-weight': 600, 'color': '#7dd3fc',
         'text-max-width': 240 } },
       { selector: 'node.asn-box', style: {
-        'shape': 'round-rectangle', 'background-color': '#f4f7fb', 'background-opacity': 0.9,
-        'border-width': 2, 'border-style': 'dashed', 'border-color': '#4a6fa5',
+        'shape': 'round-rectangle', 'background-color': '#111a2e', 'background-opacity': 0.9,
+        'border-width': 2, 'border-style': 'dashed', 'border-color': '#4b6a9b',
         'padding': 26, 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 6,
-        'font-size': 13, 'font-weight': 700, 'color': '#1f2d3d', 'text-max-width': 360,
-        'text-background-color': '#ffffff', 'text-background-opacity': 0.96, 'text-background-padding': 4,
+        'font-size': 13, 'font-weight': 700, 'color': '#e2e8f0', 'text-max-width': 360,
+        'text-background-color': SHEET, 'text-background-opacity': 0.96, 'text-background-padding': 4,
         'z-index': 2 } },
       { selector: 'node.title', style: {
         'width': 1, 'height': 1, 'events': 'no', 'text-valign': 'top', 'text-halign': 'right',
@@ -166,14 +175,14 @@
         'text-justification': 'left' } },
       { selector: 'node.ownbar', style: {
         'shape': 'round-rectangle', 'height': 4, 'width': 'data(width)', 'background-opacity': 1,
-        'background-color': '#9aa3ad', 'label': '', 'events': 'no' } },
+        'background-color': '#7c8aa3', 'label': '', 'events': 'no' } },
       { selector: 'node.anchor', style: { 'width': 1, 'height': 1, 'label': '', 'events': 'no' } },
-      { selector: 'node:selected', style: { 'overlay-color': '#1f6fb2', 'overlay-opacity': 0.14 } },
+      { selector: 'node:selected', style: { 'overlay-color': '#c8f02b', 'overlay-opacity': 0.1, 'overlay-padding': 6, 'overlay-shape': 'round-rectangle' } },
       { selector: 'edge', style: {
         'curve-style': 'taxi', 'taxi-direction': 'horizontal', 'taxi-turn': '50%', 'width': 2.2,
         'line-color': 'data(color)', 'target-arrow-shape': 'none', 'z-index': 5,
         'label': 'data(text)', 'font-family': FONT, 'font-size': 12, 'color': 'data(color)',
-        'text-background-color': '#ffffff', 'text-background-opacity': 0.9, 'text-background-padding': 3 } },
+        'text-background-color': SHEET, 'text-background-opacity': 0.9, 'text-background-padding': 3 } },
       { selector: 'edge.down', style: { 'taxi-direction': 'vertical' } },
       // From the router to each device: straight, solid when wired, dotted on Wi-Fi.
       { selector: 'edge.straight', style: { 'curve-style': 'straight', 'width': 2.2 } },
@@ -531,7 +540,7 @@
     }
     function link(from, to, color, kind, text) {
       lines.push({ group: 'edges', classes: kind || '',
-        data: { id: 'l:' + from + '>' + to, source: from, target: to, color: color || '#9aa3ad', text: text || '' } });
+        data: { id: 'l:' + from + '>' + to, source: from, target: to, color: color || LINE.other, text: text || '' } });
     }
     function title(id, text, x, y, color) {
       data[id] = { id: id, kind: 'title', label: text, color: color };
@@ -600,7 +609,7 @@
         });
         if (lanMore) {
           rowLeft -= STEP;
-          title('title:lan-more', '+' + lanMore + ' more in Hosts', rowLeft - 30, GW_Y + 140, '#6b7178');
+          title('title:lan-more', '+' + lanMore + ' more in Hosts', rowLeft - 30, GW_Y + 140, DIM);
         }
         link(hub, anchor(0, barY), LINE.ethernet, tree);
         link(anchor(rowLeft, barY), anchor(0, barY), LINE.ethernet, tree);
@@ -758,7 +767,7 @@
       data.ownbar = { id: 'ownbar', kind: 'bar', width: last - first + 8 };
       pos.ownbar = { x: (first + last) / 2, y: barY2 };
       classes.ownbar = 'ownbar';
-      link('local', anchor(you.x, barY2), '#9aa3ad', 'thin');
+      link('local', anchor(you.x, barY2), LINE.other, 'thin');
       hubs.forEach(function (h) { link(anchor(pos[h.hub].x, barY2), h.hub, h.color, 'dashed down'); });
     }
 
@@ -770,7 +779,7 @@
       var y0 = Object.keys(pos).reduce(function (y, id) { return Math.max(y, pos[id].y); }, 0) + 230;
       var restMore = Math.max(0, rest.length - NO_ROUTE_MAX);
       title('title:unknown', 'No route' + (restMore ? ' \u00b7 +' + restMore + ' more in Hosts' : ''),
-        rowLeft - 50, y0 - 62, '#6b7178');
+        rowLeft - 50, y0 - 62, DIM);
       rest.slice(0, NO_ROUTE_MAX).forEach(function (h, i) {
         put(h, rowLeft + (i % 6) * SUB_STEP, y0 + Math.floor(i / 6) * 170);
       });
@@ -931,15 +940,15 @@
   }
   function compass() {
     var face = svg('svg', { width: 44, height: 44, viewBox: '0 0 46 46', 'aria-hidden': 'true' });
-    svg('circle', { cx: 23, cy: 23, r: 21, fill: '#ffffff', stroke: '#9aa3ad', 'stroke-width': 1.5 }, face);
+    svg('circle', { cx: 23, cy: 23, r: 21, fill: '#111a2e', stroke: '#7c8aa3', 'stroke-width': 1.5 }, face);
     [['N', 23, 10.5], ['E', 37.5, 26], ['S', 23, 41.5], ['W', 8.5, 26]].forEach(function (mark) {
       var letter = svg('text', { x: mark[1], y: mark[2], 'text-anchor': 'middle', 'font-size': 8,
-        'font-weight': 700, 'font-family': FONT, fill: mark[0] === 'N' ? '#e5534b' : '#4a5260' }, face);
+        'font-weight': 700, 'font-family': FONT, fill: mark[0] === 'N' ? '#f87171' : DIM }, face);
       letter.textContent = mark[0];
     });
-    svg('path', { d: 'M23 13 L26.5 23 L19.5 23 Z', fill: '#e5534b' }, face);
-    svg('path', { d: 'M23 33 L26.5 23 L19.5 23 Z', fill: '#4a5260' }, face);
-    svg('circle', { cx: 23, cy: 23, r: 1.6, fill: '#ffffff' }, face);
+    svg('path', { d: 'M23 13 L26.5 23 L19.5 23 Z', fill: '#f87171' }, face);
+    svg('path', { d: 'M23 33 L26.5 23 L19.5 23 Z', fill: DIM }, face);
+    svg('circle', { cx: 23, cy: 23, r: 1.6, fill: '#e5eaf2' }, face);
     return face;
   }
   function degrees(value, positive, negative) {
