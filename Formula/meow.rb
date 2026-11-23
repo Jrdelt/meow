@@ -5,7 +5,7 @@ class Meow < Formula
   #   brew tap Jrdelt/meow https://github.com/Jrdelt/meow.git
   #   brew trust Jrdelt/meow   # Homebrew 7+
   #   brew install meow        # or `brew install --HEAD meow`
-  url "https://github.com/Jrdelt/meow.git", tag: "v0.2.7"
+  url "https://github.com/Jrdelt/meow.git", tag: "v0.2.7", revision: "1c2dcabd08cf249a2df7c99b3b1b54faecd6744e"
   license "MIT"
   head "https://github.com/Jrdelt/meow.git", branch: "main"
 
