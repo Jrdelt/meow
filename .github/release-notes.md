@@ -35,5 +35,5 @@ on ARM64): verify against `.sha256` with `Get-FileHash`, unzip it, and place
 Then run `meow`. On first run, the interactive Cat Setup wizard configures your
 mode and privacy preferences and `meow tools` offers to install the optional
 scanners (`nmap`, `katana`, `feroxbuster`), wordlist, and offline DB-IP Lite
-location database. Later, `meow update` downloads, SHA-256 verifies, and
-installs newer releases automatically.
+location database. Later, `meow update` downloads a newer release, checks
+its SHA-256 and installs it.
