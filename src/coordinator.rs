@@ -1340,10 +1340,8 @@ async fn post_command(
     }
 }
 
-async fn get_report(AxumState(state): AxumState<Shared>) -> Response {
-    let inputs = state.report_inputs();
-    let filename = format!("report-{}", crate::ai::chat_file_name(&inputs.session));
-    let markdown = crate::report::render(&inputs);
+/// `markdown` as a file to save, named `filename`.
+fn markdown_download(markdown: String, filename: &str) -> Response {
     let mut response = (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
         markdown,
@@ -1357,6 +1355,13 @@ async fn get_report(AxumState(state): AxumState<Shared>) -> Response {
     response
 }
 
+async fn get_report(AxumState(state): AxumState<Shared>) -> Response {
+    let inputs = state.report_inputs();
+    let filename = format!("report-{}", crate::ai::chat_file_name(&inputs.session));
+    let markdown = crate::report::render(&inputs);
+    markdown_download(markdown, &filename)
+}
+
 async fn get_host_report(
     AxumState(state): AxumState<Shared>,
     AxumPath(address): AxumPath<String>,
@@ -1366,17 +1371,7 @@ async fn get_host_report(
         return refuse(StatusCode::NOT_FOUND, "unknown host");
     };
     let filename = format!("report-{}", crate::ai::chat_file_name(&address));
-    let mut response = (
-        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
-        markdown,
-    )
-        .into_response();
-    if let Ok(disp) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_DISPOSITION, disp);
-    }
-    response
+    markdown_download(markdown, &filename)
 }
 
 async fn websocket(AxumState(state): AxumState<Shared>, upgrade: WebSocketUpgrade) -> Response {

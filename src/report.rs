@@ -116,15 +116,6 @@ fn md_item(text: &str) -> String {
     }
 }
 
-/// Whether `text` is a vault placeholder (`<<SEC_03>>`). The graph keeps
-/// nothing else for a key, but a hand-edited `graph.json` could: then the
-/// text may be the key itself, and it is not printed.
-fn is_placeholder(text: &str) -> bool {
-    text.strip_prefix("<<SEC_")
-        .and_then(|rest| rest.strip_suffix(">>"))
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-}
-
 fn clean_chat_line(line: &str) -> String {
     line.chars()
         .filter_map(|ch| match ch {
@@ -509,7 +500,10 @@ fn render_web_details(out: &mut String, port: &str, http: &HttpInfo) {
         );
         out.push_str("| Kind | File | Placeholder | Hint |\n|---|---|---|---|\n");
         for secret in &http.js_secrets {
-            let token = if is_placeholder(&secret.token) {
+            // The graph keeps nothing but a placeholder for a key, but a
+            // hand-edited `graph.json` could: then the text may be the key
+            // itself, and it is not printed.
+            let token = if crate::graph::is_secret_placeholder(&secret.token) {
                 code_cell(&secret.token)
             } else {
                 "withheld".to_owned()
@@ -739,13 +733,10 @@ fn render_host(out: &mut String, host: &Host) {
         render_dns(out, dns);
     }
 
-    let facts: Vec<&Fact> = host
+    let (notes, observed): (Vec<&Fact>, Vec<&Fact>) = host
         .facts
         .iter()
         .chain(host.ports.values().flat_map(|p| p.facts.iter()))
-        .collect();
-    let (notes, observed): (Vec<&Fact>, Vec<&Fact>) = facts
-        .into_iter()
         .partition(|f| f.record.source == Source::ManualNote);
     if !observed.is_empty() {
         out.push_str("Observations:\n\n");

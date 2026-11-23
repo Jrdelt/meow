@@ -30,6 +30,31 @@ fn internal_names_and_private_reverse_names_stay_off_public_services() {
     }
 }
 
+#[test]
+fn reverse_names_list_octets_and_nibbles_last_first() {
+    let v4: IpAddr = "192.0.2.10".parse().unwrap();
+    assert_eq!(reverse_dns_name(v4), "10.2.0.192.in-addr.arpa");
+    assert_eq!(cymru_origin_name(v4), "10.2.0.192.origin.asn.cymru.com");
+    let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
+    assert_eq!(cymru_origin_name(mapped), "10.2.0.192.origin.asn.cymru.com");
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    let nibbles = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2";
+    assert_eq!(reverse_dns_name(v6), format!("{nibbles}.ip6.arpa"));
+    assert_eq!(
+        cymru_origin_name(v6),
+        format!("{nibbles}.origin6.asn.cymru.com")
+    );
+}
+
+#[test]
+fn connect_addresses_put_ipv6_and_its_zone_in_brackets() {
+    assert_eq!(host_port("192.0.2.7", 22), "192.0.2.7:22");
+    assert_eq!(host_port("example.com", 443), "example.com:443");
+    assert_eq!(host_port("2001:db8::1", 22), "[2001:db8::1]:22");
+    assert_eq!(host_port("[2001:db8::1]", 443), "[2001:db8::1]:443");
+    assert_eq!(host_port("2001:db8::1%eth0", 22), "[2001:db8::1%eth0]:22");
+}
+
 #[tokio::test]
 async fn crt_sh_is_not_asked_about_an_internal_name() {
     // A stand-in for the log: nothing leaves this machine, whatever the

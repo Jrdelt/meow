@@ -841,12 +841,17 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     }
     let mut next = own.clone();
     use_claude(&mut next, &settings.effective());
-    let default = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
     let effective = settings.effective();
-    let triage_now =
-        crate::evidence::sanitize(&default(&next.cloud_model, &effective.cloud_model), 120);
+    let triage_now = crate::evidence::sanitize(
+        next.cloud_model
+            .as_deref()
+            .unwrap_or(&effective.cloud_model),
+        120,
+    );
     let research_now = crate::evidence::sanitize(
-        &default(&next.research_model, &effective.research_model),
+        next.research_model
+            .as_deref()
+            .unwrap_or(&effective.research_model),
         120,
     );
     let chain_now = next.cloud_fallbacks.clone().unwrap_or_default();
@@ -904,11 +909,18 @@ fn setup_cloud(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
     // names of the Claude API are replaced by this service's own.
     let mut next = own.clone();
     use_openai_style(&mut next, &effective, Some(url));
-    let kept = |own: &Option<String>, current: &str| own.clone().unwrap_or(current.to_owned());
-    let triage_now =
-        crate::evidence::sanitize(&kept(&next.cloud_model, &effective.cloud_model), 120);
-    let research_now =
-        crate::evidence::sanitize(&kept(&next.research_model, &effective.research_model), 120);
+    let triage_now = crate::evidence::sanitize(
+        next.cloud_model
+            .as_deref()
+            .unwrap_or(&effective.cloud_model),
+        120,
+    );
+    let research_now = crate::evidence::sanitize(
+        next.research_model
+            .as_deref()
+            .unwrap_or(&effective.research_model),
+        120,
+    );
     let triage = ask(&format!("Triage model (Enter keeps {triage_now}): "))?.unwrap_or_default();
     let research =
         ask(&format!("Research model (Enter keeps {research_now}): "))?.unwrap_or_default();

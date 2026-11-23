@@ -77,7 +77,9 @@ fn find_program_in(name: &str, path_env: Option<&std::ffi::OsStr>) -> Option<Pat
         .find(|path| runnable(path))
 }
 
-fn sanitized_path_env() -> Option<std::ffi::OsString> {
+/// `PATH` with its empty and relative entries left out; `None` when it is
+/// unset or cannot be joined again.
+pub(crate) fn sanitized_path_env() -> Option<std::ffi::OsString> {
     let raw = std::env::var_os("PATH")?;
     let clean: Vec<PathBuf> = std::env::split_paths(&raw)
         .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())

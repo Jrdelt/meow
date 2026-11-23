@@ -370,11 +370,7 @@ pub fn path_segments(path: &str) -> Vec<&str> {
         if out.len() >= MAX_PATH_DEPTH {
             break;
         }
-        let mut end = segment.len().min(MAX_SEGMENT_LEN);
-        while !segment.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.push(&segment[..end]);
+        out.push(crate::evidence::head(segment, MAX_SEGMENT_LEN));
     }
     out
 }

@@ -241,7 +241,8 @@ fn credit(template: &str) -> (String, Option<String>) {
     (format!("Map pictures from {host}"), None)
 }
 
-fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
+/// Whether `host` is `localhost` or a loopback address.
+pub(crate) fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
     match host {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
@@ -626,6 +627,22 @@ mod tests {
         let other = view(0.0, 0.0, "https://tile.example.org/{z}/{x}/{y}.png");
         assert_eq!(other.credit, "Map pictures from tile.example.org");
         assert_eq!(other.credit_url, None);
+    }
+
+    #[test]
+    fn loopback_hosts() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        use url::Host;
+        assert!(is_loopback_host(Some(Host::Domain("LocalHost"))));
+        let other_loopback = Ipv4Addr::new(127, 0, 0, 2);
+        assert!(is_loopback_host(Some(Host::Ipv4(other_loopback))));
+        assert!(is_loopback_host(Some(Host::Ipv6(Ipv6Addr::LOCALHOST))));
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert!(is_loopback_host(Some(Host::Ipv6(mapped))));
+        assert!(!is_loopback_host(Some(Host::Domain("example.com"))));
+        let documentation = Ipv4Addr::new(192, 0, 2, 1);
+        assert!(!is_loopback_host(Some(Host::Ipv4(documentation))));
+        assert!(!is_loopback_host(None));
     }
 
     #[test]

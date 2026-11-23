@@ -380,7 +380,7 @@ pub(crate) async fn pinned_web_client(
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
         .no_proxy()
-        .user_agent("meow-osint/0.1");
+        .user_agent(OSINT_USER_AGENT);
 
     match (&parsed_addr, &resolved_hostname) {
         (HostAddr::Ip { addr, zone }, Some(domain)) => {

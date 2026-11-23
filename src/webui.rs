@@ -117,7 +117,7 @@ const RELOAD_SCRIPT: &str = "(function () {\n\
 })();\n";
 
 pub fn reload_page() -> Response {
-    with_type("text/html; charset=utf-8", RELOAD_PAGE.to_owned())
+    with_static("text/html; charset=utf-8", RELOAD_PAGE)
 }
 
 pub fn stale_page() -> Response {

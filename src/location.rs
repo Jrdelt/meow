@@ -211,11 +211,7 @@ pub fn parse(value: &Value) -> Option<Place> {
             number(value, &["longitude", "lon", "lng"])?,
         ),
     };
-    let sane = latitude.is_finite()
-        && longitude.is_finite()
-        && (-90.0..=90.0).contains(&latitude)
-        && (-180.0..=180.0).contains(&longitude);
-    if !sane {
+    if !crate::geoip::is_valid_position(latitude, longitude) {
         return None;
     }
     let public_address = match text(value, &["ip", "query"]) {
@@ -241,22 +237,13 @@ pub fn parse(value: &Value) -> Option<Place> {
 
 const LOOKUP_MAX_BYTES: usize = 64 * 1024;
 
-fn is_loopback_url(parsed: &url::Url) -> bool {
-    match parsed.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
-        Some(url::Host::Ipv6(v6)) => v6.is_loopback() || v6.to_canonical().is_loopback(),
-        None => false,
-    }
-}
-
 pub fn validate_lookup_url(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url)
         .with_context(|| format!("the location service address '{url}' is not a web address"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         bail!("the location service address '{url}' must not embed credentials");
     }
-    let loopback = is_loopback_url(&parsed);
+    let loopback = tiles::is_loopback_host(parsed.host());
     if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
         bail!("the location service address '{url}' must start with https://");
     }
@@ -304,7 +291,7 @@ pub async fn lookup(url: &str) -> Result<Place> {
     validate_lookup_url(url)?;
     let parsed = url::Url::parse(url)
         .with_context(|| format!("the location service address '{url}' is not a web address"))?;
-    let client = if is_loopback_url(&parsed) {
+    let client = if tiles::is_loopback_host(parsed.host()) {
         local_lookup_client()?
     } else {
         lookup_client()?
