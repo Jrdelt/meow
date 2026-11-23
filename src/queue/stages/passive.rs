@@ -52,7 +52,7 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
     // The family the port scan takes for a name: IPv6 with `-6`, the
     // preset's or the operator's.
     let ipv6 = cx.scan_flags().ipv6();
-    let (observations, ips, summary) = match crate::osint::run_dns(target, ipv6).await {
+    let (observations, ips, summary, unresolved) = match crate::osint::run_dns(target, ipv6).await {
         Ok(res) => res,
         Err(err) => return Ok(StageEnd::Skipped(format!("DNS lookup unavailable: {err}"))),
     };
@@ -71,6 +71,7 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
         primary: crate::osint::primary_address(&ips, ipv6),
         ips,
         cnames,
+        unresolved,
         ..Found::default()
     }
     .checked(target);

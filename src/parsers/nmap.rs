@@ -280,6 +280,12 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
     // did not list is in one of the host's `<extraports>` groups.
     let mut scanned: std::collections::BTreeMap<String, Vec<(u16, u16)>> =
         std::collections::BTreeMap::new();
+    // Whether the scan of each protocol tells an open port from a closed or
+    // filtered one. An ACK or window scan does not test openness, and a
+    // FIN, NULL, Xmas or Maimon scan gets "closed" from every port of some
+    // systems.
+    let mut tells_open: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
     if trusted_names {
         for info in children(root, "scaninfo").take(MAX_NOT_OPEN_GROUPS) {
             let Some(protocol) =
@@ -287,6 +293,10 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
             else {
                 continue;
             };
+            let tells = attr(info, "type").is_some_and(|kind| {
+                matches!(kind.as_str(), "syn" | "connect" | "udp" | "sctpinit")
+            });
+            *tells_open.entry(protocol.clone()).or_insert(tells) &= tells;
             port_ranges(
                 info.attribute("services").unwrap_or(""),
                 scanned.entry(protocol).or_default(),
@@ -366,6 +376,12 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
             std::collections::BTreeMap::new();
         let mut listed: std::collections::BTreeSet<(String, u16)> =
             std::collections::BTreeSet::new();
+        // The protocols on which the host answered some port (open, closed
+        // or unfiltered). With every port filtered, nothing answered: a
+        // blocked or dropped scan, or a host that is off, says nothing
+        // about the ports.
+        let mut answered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let answers = |state: &str| matches!(state, "open" | "closed" | "unfiltered");
         for extra in children(ports, "extraports") {
             let state = attr(extra, "state").unwrap_or_else(|| "closed".to_owned());
             let count = extra
@@ -380,6 +396,9 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
                 },
                 None => "tcp".to_owned(),
             };
+            if answers(&state) {
+                answered.insert(protocol.clone());
+            }
             let key = (protocol, state);
             if !not_open.contains_key(&key) && not_open.len() >= MAX_NOT_OPEN_GROUPS {
                 continue;
@@ -409,6 +428,9 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
                 .and_then(|s| attr(s, "state"))
                 .unwrap_or_else(|| "open".to_owned());
             listed.insert((protocol.clone(), number));
+            if answers(&state) {
+                answered.insert(protocol.clone());
+            }
             if state != "open" && state != "open|filtered" {
                 let key = (protocol, state);
                 if not_open.contains_key(&key) || not_open.len() < MAX_NOT_OPEN_GROUPS {
@@ -553,13 +575,16 @@ pub fn parse(xml: &str, trusted_names: bool) -> Result<Vec<Observation>> {
             let summary = format!(
                 "<extraports protocol=\"{protocol}\" state=\"{state}\" count=\"{count}\"/>"
             );
+            let own_scan = trusted_names
+                && tells_open.get(&protocol) == Some(&true)
+                && answered.contains(&protocol);
             out.push(Observation::NotOpen {
                 address: address.clone(),
                 protocol,
                 state,
                 count,
                 ports: format_ranges(ranges),
-                own_scan: trusted_names,
+                own_scan,
                 record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, &summary),
             });
         }
@@ -755,6 +780,59 @@ mod tests {
             ),
             [(1, 2), (6, 7), (23, 30), (65535, 65535)]
         );
+    }
+
+    #[test]
+    fn a_rescan_that_got_no_answer_or_cannot_tell_closes_nothing() {
+        let first = r#"<nmaprun><host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="open"/></port>
+<port protocol="tcp" portid="8080"><state state="open"/></port></ports></host></nmaprun>"#;
+        let rescan = |kind: &str, ports: &str| {
+            format!(
+                r#"<nmaprun><scaninfo type="{kind}" protocol="tcp" numservices="1001" services="1-1000,8080"/>
+<host><status state="up" reason="user-set"/><address addr="192.0.2.10" addrtype="ipv4"/>
+<ports>{ports}</ports></host></nmaprun>"#
+            )
+        };
+        let all = |state: &str| {
+            format!(
+                r#"<extraports state="{state}" count="1001"><extrareasons reason="no-response" count="1001" proto="tcp" ports="1-1000,8080"/></extraports>"#
+            )
+        };
+        let open = |xml: &str| {
+            let mut graph = Graph::default();
+            graph.apply_all(parse(first, true).unwrap());
+            graph.apply_all(parse(xml, true).unwrap());
+            graph.hosts["192.0.2.10"]
+                .open_ports()
+                .map(|p| p.key())
+                .collect::<Vec<_>>()
+        };
+        // Nothing answered (`-Pn`, a blocked or dropped scan, a host that
+        // is off): every port filtered says nothing about them.
+        assert_eq!(
+            open(&rescan("syn", &all("filtered"))),
+            ["80/tcp", "8080/tcp"]
+        );
+        // An ACK scan does not test openness; a FIN scan gets "closed"
+        // from every port of some systems.
+        assert_eq!(
+            open(&rescan("ack", &all("filtered"))),
+            ["80/tcp", "8080/tcp"]
+        );
+        assert_eq!(open(&rescan("fin", &all("closed"))), ["80/tcp", "8080/tcp"]);
+        // No scaninfo: what the scan tested is not known.
+        let bare = rescan("syn", &all("closed")).replace(
+            r#"<scaninfo type="syn" protocol="tcp" numservices="1001" services="1-1000,8080"/>"#,
+            "",
+        );
+        assert_eq!(open(&bare), ["80/tcp", "8080/tcp"]);
+        // The host answered on 80: 8080, dropped now, is filtered.
+        let answered = r#"<extraports state="filtered" count="1000"><extrareasons reason="no-response" count="1000" proto="tcp" ports="1-79,81-1000,8080"/></extraports>
+<port protocol="tcp" portid="80"><state state="open"/></port>"#;
+        assert_eq!(open(&rescan("syn", answered)), ["80/tcp"]);
+        // A closed port is an answer too: a host with every service off.
+        assert!(open(&rescan("connect", &all("closed"))).is_empty());
     }
 
     #[test]

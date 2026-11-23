@@ -1263,8 +1263,10 @@ pub enum Observation {
         state: String,
         count: u32,
         ports: String,
-        /// The session's own scan said so: a port of the list the host has
-        /// as open is not open now. A file or the terminal does not close one.
+        /// The session's own scan said so, with a scan type that tests
+        /// openness, and the host answered on some port of this protocol:
+        /// a port of the list the host has as open is not open now. A file,
+        /// the terminal or a scan nothing answered does not close one.
         #[serde(default)]
         own_scan: bool,
         record: EvidenceRecord,

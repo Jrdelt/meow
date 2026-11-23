@@ -919,7 +919,7 @@ async fn an_internal_target_is_never_asked_over_doh() {
     let (doh, doh_asked) = stand_in_doh(None).await;
     let target = Target::parse("dc01.corp.example.org").unwrap();
     // The dns stage: the system resolved the name to a private address.
-    let (_, ips, _) = run_dns_with(
+    let (_, ips, _, unresolved) = run_dns_with(
         &target,
         stand_in_resolver(vec![server], &doh),
         (vec!["10.0.0.5".to_owned()], Vec::new()),
@@ -927,6 +927,7 @@ async fn an_internal_target_is_never_asked_over_doh() {
     )
     .await;
     assert_eq!(ips, ["10.0.0.5"]);
+    assert_eq!(unresolved, None);
     assert!(taken(&asked).contains(&"16 dc01.corp.example.org".to_owned()));
     assert!(taken(&doh_asked).is_empty(), "{:?}", taken(&doh_asked));
     // The mail-dns stage for that target.
@@ -984,7 +985,7 @@ async fn an_address_only_doh_gives_is_reported_and_never_the_target_s() {
     let (server, _) = stand_in_dns(|_, _| Reply::Refused).await;
     let (doh, doh_asked) = stand_in_doh(Some([203, 0, 113, 66])).await;
     let target = Target::parse("www.example.org").unwrap();
-    let (observations, ips, summary) = run_dns_with(
+    let (observations, ips, summary, unresolved) = run_dns_with(
         &target,
         stand_in_resolver(vec![server], &doh),
         (Vec::new(), Vec::new()),
@@ -993,6 +994,8 @@ async fn an_address_only_doh_gives_is_reported_and_never_the_target_s() {
     .await;
     assert!(taken(&doh_asked).contains(&"A www.example.org".to_owned()));
     assert!(ips.is_empty(), "{ips:?}");
+    // The name has an address; this system does not resolve it.
+    assert_eq!(unresolved, Some(Unresolved::NotHere));
     assert!(
         summary.starts_with("1 A,") && summary.contains("does not resolve"),
         "{summary}"
@@ -1018,7 +1021,7 @@ async fn the_dns_stage_takes_the_addresses_the_system_resolves() {
     .await;
     let (doh, _) = stand_in_doh(None).await;
     let target = Target::parse("www.example.org").unwrap();
-    let (observations, ips, _) = run_dns_with(
+    let (observations, ips, _, _) = run_dns_with(
         &target,
         stand_in_resolver(vec![server], &doh),
         (vec!["192.0.2.10".to_owned()], Vec::new()),
@@ -1403,7 +1406,7 @@ async fn a_default_none_counts_for_an_internal_target_only_if_the_server_knows_i
         ["16 _dmarc.intranet.example.org", "1 intranet.example.org"]
     );
     // The dns stage for that target claims no missing record.
-    let (observations, _, summary) = run_dns_with(
+    let (observations, _, summary, _) = run_dns_with(
         &Target::parse("intranet.example.org").unwrap(),
         stand_in_resolver(vec![hijack], &doh),
         (vec!["10.0.0.5".to_owned()], Vec::new()),
@@ -1468,7 +1471,7 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
     let (failing, _) = stand_in_dns(|_, _| Reply::ServFail).await;
     let (doh, doh_asked) = stand_in_doh_saying(2, None).await;
     let target = Target::parse("www.example.org").unwrap();
-    let (observations, _, summary) = run_dns_with(
+    let (observations, _, summary, unresolved) = run_dns_with(
         &target,
         stand_in_resolver(vec![failing], &doh),
         (Vec::new(), Vec::new()),
@@ -1485,9 +1488,11 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
         "{text}"
     );
     assert!(summary.ends_with("; some DNS lookups failed"), "{summary}");
+    // Not "the name has no address": the lookups failed.
+    assert_eq!(unresolved, Some(Unresolved::Failed));
     // When DNS says there is none, that is said.
     let (nodata, _) = stand_in_dns(|_, _| Reply::NoData).await;
-    let (observations, _, summary) = run_dns_with(
+    let (observations, _, summary, unresolved) = run_dns_with(
         &target,
         stand_in_resolver(vec![nodata], &doh),
         (Vec::new(), Vec::new()),
@@ -1496,9 +1501,10 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
     .await;
     assert!(format!("{observations:?}").contains("no AAAA record published"));
     assert!(!summary.contains("failed"), "{summary}");
+    assert_eq!(unresolved, Some(Unresolved::NoRecords));
     // An internal target: only a server that knows it may say "none".
     let internal = (vec!["192.0.2.10".to_owned()], Vec::new());
-    let (observations, _, summary) = run_dns_with(
+    let (observations, _, summary, unresolved) = run_dns_with(
         &target,
         stand_in_resolver(vec![nodata], &doh),
         internal.clone(),
@@ -1510,12 +1516,14 @@ async fn a_failed_lookup_is_never_reported_as_a_missing_record() {
         summary.ends_with("; this machine's DNS server does not know the name"),
         "{summary}"
     );
+    // The system resolves it.
+    assert_eq!(unresolved, None);
     let (knows, _) = stand_in_dns(|name, _| match name {
         "www.example.org" => Reply::Address([192, 0, 2, 10]),
         _ => Reply::NoData,
     })
     .await;
-    let (observations, _, _) = run_dns_with(
+    let (observations, _, _, _) = run_dns_with(
         &target,
         stand_in_resolver(vec![knows], &doh),
         internal,
@@ -2111,7 +2119,7 @@ async fn the_dns_stage_records_on_the_address_the_scan_goes_to() {
     let (doh, _) = stand_in_doh(None).await;
     let target = Target::parse("dual.example.org").unwrap();
     for (ipv6, bound) in [(false, "203.0.113.7"), (true, "2001:db8::7")] {
-        let (observations, found, _) = run_dns_with(
+        let (observations, found, _, _) = run_dns_with(
             &target,
             stand_in_resolver(vec![server], &doh),
             (ips(&["203.0.113.7"]), ips(&["2001:db8::7"])),

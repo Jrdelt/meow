@@ -940,6 +940,10 @@ pub struct Found {
     /// CNAME targets from the `dns` stage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cnames: Vec<String>,
+    /// For a name the system resolves to no address, what the `dns`
+    /// stage's lookups said of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<crate::osint::Unresolved>,
     /// Detected WAF/CDN per host from `headers` / `waf-cdn`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub waf: BTreeMap<String, String>,

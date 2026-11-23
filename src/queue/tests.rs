@@ -2369,10 +2369,12 @@ fn a_preset_s_up_check_holds_for_every_scan_and_its_hint() {
 }
 
 /// A name the dns stage found no address for (of the family scanned) is
-/// said to have none: `-- -Pn` cannot help it.
+/// said to have none, or not to resolve when the lookups failed: `-- -Pn`
+/// cannot help it.
 #[cfg(unix)]
 #[test]
 fn a_name_with_no_address_says_so_instead_of_the_up_check_hint() {
+    use crate::osint::Unresolved;
     let dir = tempfile::tempdir().unwrap();
     let mut config = no_cve_config();
     // nmap cannot resolve the name: nothing is up.
@@ -2386,12 +2388,14 @@ fn a_name_with_no_address_says_so_instead_of_the_up_check_hint() {
         .build()
         .unwrap();
     // What ports and udp end with for a task whose dns stage found `ips`
-    // (`None`: it gave no answer), with the operator's `flags`.
-    let ends = |ips: Option<&[&str]>, flags: &[&str]| {
+    // and said `unresolved` (`None`: it gave no answer), with the
+    // operator's `flags`.
+    let ends = |dns: Option<(&[&str], Option<Unresolved>)>, flags: &[&str]| {
         let id = enqueue(&state.db_lock(), name, Mode::Aggressive, &strings_of(flags)).unwrap();
-        if let Some(ips) = ips {
+        if let Some((ips, unresolved)) = dns {
             Found {
                 ips: strings_of(ips),
+                unresolved,
                 ..Found::default()
             }
             .save(&state.db_lock(), id, Stage::Dns)
@@ -2415,7 +2419,7 @@ fn a_name_with_no_address_says_so_instead_of_the_up_check_hint() {
         said
     };
     let none = "the name has no address (no A or AAAA record)";
-    let said = ends(Some(&[]), &[]);
+    let said = ends(Some((&[], Some(Unresolved::NoRecords))), &[]);
     assert!(
         said[0].ends_with(&format!("(0 new facts); {none}")),
         "{said:?}"
@@ -2423,23 +2427,43 @@ fn a_name_with_no_address_says_so_instead_of_the_up_check_hint() {
     assert_eq!(said[1], format!("skipped: {none}"));
     assert!(said.iter().all(|end| !end.contains("-Pn")), "{said:?}");
     // With -Pn too: not "nothing answered".
-    let said = ends(Some(&[]), &["-Pn"]);
+    let said = ends(Some((&[], Some(Unresolved::NoRecords))), &["-Pn"]);
     assert!(said[0].ends_with(none), "{said:?}");
-    // Only IPv6 addresses, scanned as IPv4; only IPv4, scanned with -6.
-    let said = ends(Some(&["2001:db8::7"]), &[]);
+    // The lookups failed (SERVFAIL, a timeout): nothing is known of the
+    // name's records.
+    let said = ends(Some((&[], Some(Unresolved::Failed))), &[]);
+    let failed = "the name did not resolve (DNS lookup failed)";
+    assert!(said[0].ends_with(failed), "{said:?}");
+    assert_eq!(said[1], format!("skipped: {failed}"));
+    // DNS has an address that this system does not resolve to.
+    let said = ends(Some((&[], Some(Unresolved::NotHere))), &[]);
     assert!(
-        said[0].ends_with("the name has only IPv6 addresses: run again with `-- -6`"),
+        said[0].ends_with("this system does not resolve the name"),
         "{said:?}"
     );
-    let said = ends(Some(&["203.0.113.7"]), &["-6"]);
+    // Only IPv6 addresses, scanned as IPv4; only IPv4, scanned with -6.
+    let said = ends(Some((&["2001:db8::7"], None)), &[]);
     assert!(
-        said[0].ends_with("the name has no IPv6 address: run again with `-- -4`"),
+        said[0].ends_with(
+            "this system resolves the name only to IPv6 addresses: run again with `-- -6`"
+        ),
+        "{said:?}"
+    );
+    let said = ends(Some((&["203.0.113.7"], None)), &["-6"]);
+    assert!(
+        said[0]
+            .ends_with("this system resolves the name to no IPv6 address: run again with `-- -4`"),
         "{said:?}"
     );
     // An address of the family scanned that did not answer, or no answer
-    // from the dns stage: the up check is what to change.
-    for ips in [Some(&["203.0.113.7"][..]), None] {
-        let said = ends(ips, &[]);
+    // from the dns stage (nor a saved one from an older meow): the up
+    // check is what to change.
+    for dns in [
+        Some((&["203.0.113.7"][..], None)),
+        Some((&[][..], None)),
+        None,
+    ] {
+        let said = ends(dns, &[]);
         assert!(said[0].contains("run again with `-- -Pn`"), "{said:?}");
         assert!(said[1].contains("run again with `-- -Pn`"), "{said:?}");
     }
