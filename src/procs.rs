@@ -910,7 +910,7 @@ pub fn guard_main() -> u8 {
 /// its process is gone, so a process is known by its id and the moment it
 /// started.
 #[cfg(unix)]
-mod identity {
+pub(crate) mod identity {
     /// A running process: when it started (in the system's own unit; only
     /// ever compared) and whose it is.
     pub struct Seen {

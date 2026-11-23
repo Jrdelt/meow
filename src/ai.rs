@@ -165,6 +165,11 @@ pub struct AiSettings {
     /// they count this session's own record.
     #[serde(skip)]
     pub usage_file: Option<PathBuf>,
+    /// `~/.meow/config.toml`, where these settings came from. Its daily
+    /// caps are read again for every request, so a raised cap applies to a
+    /// running session at once.
+    #[serde(skip)]
+    pub config_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for AiSettings {
@@ -188,6 +193,7 @@ impl std::fmt::Debug for AiSettings {
             .field("user_file", &self.user_file)
             .field("setup_error", &self.setup_error)
             .field("usage_file", &self.usage_file)
+            .field("config_file", &self.config_file)
             .finish()
     }
 }
@@ -210,7 +216,43 @@ impl Default for AiSettings {
             user_file: None,
             setup_error: None,
             usage_file: None,
+            config_file: None,
         }
+    }
+}
+
+/// Why the cloud is off when `config.toml` cannot be read now.
+const CONFIG_UNREADABLE: &str = "config.toml cannot be read";
+
+/// The daily caps of `config.toml`'s `[ai]`, read on their own.
+#[derive(Deserialize)]
+#[serde(default)]
+struct DailyCaps {
+    max_daily_usd: f64,
+    max_daily_calls: u32,
+}
+
+impl Default for DailyCaps {
+    fn default() -> Self {
+        let settings = AiSettings::default();
+        Self {
+            max_daily_usd: settings.max_daily_usd,
+            max_daily_calls: settings.max_daily_calls,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CapsFile {
+    ai: DailyCaps,
+}
+
+impl DailyCaps {
+    fn load(path: &Path) -> Result<Self> {
+        let text = read_private_bounded(path, crate::workspace::MAX_CONFIG_BYTES)?;
+        let file: CapsFile = crate::workspace::parse_toml(&text, path)?;
+        Ok(file.ai)
     }
 }
 
@@ -350,6 +392,25 @@ impl AiSettings {
     /// sent there.
     pub fn effective(&self) -> AiSettings {
         let mut settings = self.clone();
+        // The caps as `config.toml` says them now; one that cannot be read
+        // may have been lowered.
+        if let Some(path) = self.config_file.as_deref() {
+            match DailyCaps::load(path) {
+                Ok(caps) => {
+                    settings.max_daily_usd = caps.max_daily_usd;
+                    settings.max_daily_calls = caps.max_daily_calls;
+                }
+                Err(error) => {
+                    settings.disable_cloud = true;
+                    settings.openrouter_api_key = None;
+                    settings.setup_error = Some(format!(
+                        "{CONFIG_UNREADABLE} ({}): cloud AI is off until it is fixed",
+                        sanitize(&format!("{error:#}"), 200)
+                    ));
+                    return settings;
+                }
+            }
+        }
         let Some(path) = self.user_file.as_deref() else {
             return settings;
         };
@@ -374,6 +435,13 @@ impl AiSettings {
             }
         }
         settings
+    }
+
+    /// Whether the cloud is off because `config.toml` cannot be read.
+    pub fn config_unreadable(&self) -> bool {
+        self.setup_error
+            .as_deref()
+            .is_some_and(|why| why.starts_with(CONFIG_UNREADABLE))
     }
 
     /// The protocol to speak: what the settings say, or else what the
@@ -988,14 +1056,23 @@ pub struct Budget {
     /// so the cloud tiers are off.
     #[serde(default)]
     pub usage_unreadable: bool,
+    /// Of [`Budget::setup_unreadable`]: the file is `config.toml`.
+    #[serde(default)]
+    pub config_unreadable: bool,
+    /// What calls still running set aside, in `spent_usd`: they may cost
+    /// less.
+    #[serde(default)]
+    pub held_usd: f64,
 }
 
 impl Budget {
+    /// Whether no call fits today, whatever the calls still running end
+    /// up costing.
     pub fn exhausted(&self) -> bool {
         self.usage_unreadable
             || !self.spent_usd.is_finite()
             || !self.max_usd.is_finite()
-            || self.spent_usd >= self.max_usd
+            || self.spent_usd - self.held_usd.max(0.0).min(self.spent_usd.max(0.0)) >= self.max_usd
             || self.calls >= self.max_calls
     }
 }
@@ -1051,23 +1128,34 @@ fn record_usage(db: &Db, tier: Tier, model: &str, usage: &Usage) -> Result<()> {
 pub struct BudgetReached {
     /// The most the call could cost (0 where that is not known).
     pub most_usd: f64,
-    /// What was left of the day's budget for it.
+    /// What was left of the day's budget for it, not counting what calls
+    /// still running in other sessions set aside.
     pub left_usd: f64,
     /// The day's calls were used up.
     pub calls: bool,
+    /// It would fit but for what calls still running in other sessions
+    /// set aside: it may fit once they end.
+    pub busy: bool,
 }
 
 impl BudgetReached {
     /// Whether money is left today, only not enough for one more call:
     /// the cap is then too low for the model, not used up.
     pub fn too_dear(&self) -> bool {
-        !self.calls && self.left_usd >= 0.01 && self.most_usd > self.left_usd
+        !self.calls && !self.busy && self.left_usd >= 0.01 && self.most_usd > self.left_usd
+    }
+
+    /// Whether the message says more than that the budget is used up.
+    pub fn says_why(&self) -> bool {
+        self.busy || self.too_dear()
     }
 }
 
 impl std::fmt::Display for BudgetReached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.too_dear() {
+        if self.busy {
+            f.write_str("another session's AI call is running; try again in a moment")
+        } else if self.too_dear() {
             write!(
                 f,
                 "one call could cost up to ${:.2}; ${:.2} left today (raise max_daily_usd)",
@@ -1095,14 +1183,13 @@ pub struct Allowance {
 }
 
 /// A request's part of the day-wide record ([`crate::usage`]): what it
-/// has set aside or spent there, and on which day.
+/// has set aside or spent there, marked with this process and a number.
 #[derive(Debug)]
 struct Shared {
     ledger: crate::usage::Ledger,
     max_usd: f64,
     max_calls: u32,
-    day: String,
-    held: f64,
+    id: u64,
     /// What the request is known to cost should it end before it is
     /// settled (the session closed during a call): what it cost before
     /// that call, and that call's input. Set aside in place of the most.
@@ -1114,41 +1201,69 @@ impl Drop for Shared {
     fn drop(&mut self) {
         if !self.settled {
             // Kept set aside as it is if the record cannot be written.
-            let _ = self.hold(self.floor, 0.0, false);
+            let _ = self.hold(self.floor, 0.0, 0.0, false);
         }
     }
 }
 
 impl Shared {
     /// This request now holds `spent + most` of the day: what it has cost
-    /// so far and the most its next call can add. `call` counts that call,
-    /// if the caps allow it; without it this settles what was set aside.
-    fn hold(&mut self, spent: f64, most: f64, call: bool) -> Result<()> {
-        let (max_usd, max_calls) = (self.max_usd, self.max_calls);
-        let (held, day) = (self.held, self.day.clone());
+    /// so far and the most its next call can add, `floor` of it should
+    /// this process end first. `call` counts that call, if the caps allow
+    /// it; without it this settles what was set aside at `spent`.
+    fn hold(&mut self, spent: f64, most: f64, floor: f64, call: bool) -> Result<()> {
+        let (max_usd, max_calls, id) = (self.max_usd, self.max_calls, self.id);
+        let owner = crate::usage::Owner::this();
         let total = spent + most;
         let outcome = self.ledger.update(|today| {
-            // Another day's share is no longer in the record.
-            let mine = if today.day == day { held } else { 0.0 };
+            // Only this day's record holds what this request set aside.
+            let at = today
+                .held
+                .iter()
+                .position(|hold| hold.id == id && hold.owner == owner);
+            let mine = at.map_or(0.0, |at| today.held[at].usd);
             let others = (today.usd - mine).max(0.0);
+            let running = today.held_usd() - mine;
+            let ended = (others - running).max(0.0);
             // Written so that a NaN anywhere refuses.
             let fits = others + total <= max_usd;
-            if call && (today.calls >= max_calls || !fits) {
+            let room = at.is_some() || today.held.len() < crate::usage::MAX_HELD;
+            if call && (today.calls >= max_calls || !fits || !room) {
+                let calls = today.calls >= max_calls;
                 return Err(BudgetReached {
                     most_usd: most,
-                    left_usd: max_usd - others - spent,
-                    calls: today.calls >= max_calls,
+                    left_usd: max_usd - ended - spent,
+                    calls,
+                    busy: !calls && (!room || ended + total <= max_usd),
                 });
             }
             today.usd = others + total;
             today.calls += u32::from(call);
-            Ok(today.day.clone())
+            match (call, at) {
+                (true, Some(at)) => {
+                    today.held[at].usd = total;
+                    today.held[at].floor = floor;
+                }
+                (true, None) => today.held.push(crate::usage::Hold {
+                    id,
+                    owner,
+                    usd: total,
+                    floor,
+                }),
+                (false, Some(at)) => {
+                    today.held.remove(at);
+                }
+                (false, None) => {}
+            }
+            Ok(())
         })?;
-        self.day = outcome?;
-        self.held = total;
-        Ok(())
+        outcome.map_err(Into::into)
     }
 }
+
+/// A number for each request of this process, which marks what it sets
+/// aside in the day-wide record.
+static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Allowance {
     pub fn new(budget: &Budget) -> Self {
@@ -1162,18 +1277,19 @@ impl Allowance {
 
     /// [`Allowance::new`] where `budget` is the day of all the user's
     /// sessions, kept by `ledger`: each call is set aside there first.
+    /// The record decides: the budget read before may count calls of
+    /// other sessions that have ended since.
     pub fn shared(budget: &Budget, ledger: crate::usage::Ledger) -> Self {
         Self {
             shared: Some(Shared {
                 ledger,
                 max_usd: budget.max_usd,
                 max_calls: budget.max_calls,
-                day: String::new(),
-                held: 0.0,
+                id: NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 floor: 0.0,
                 settled: true,
             }),
-            ..Self::new(budget)
+            ..Self::unlimited()
         }
     }
 
@@ -1200,12 +1316,14 @@ impl Allowance {
                 most_usd: most,
                 left_usd: self.usd_left - spent,
                 calls: self.calls >= self.calls_left,
+                busy: false,
             }
             .into());
         }
         if let Some(shared) = &mut self.shared {
-            shared.hold(spent, most, true)?;
-            shared.floor = spent + least.clamp(0.0, most.max(0.0));
+            let floor = spent + least.clamp(0.0, most.max(0.0));
+            shared.hold(spent, most, floor, true)?;
+            shared.floor = floor;
             shared.settled = false;
         }
         self.calls += 1;
@@ -1220,7 +1338,7 @@ impl Allowance {
             Some(shared) if self.calls > 0 && cost.is_finite() && cost >= 0.0 => {
                 // Tried again when the request ends if it fails now.
                 shared.floor = cost;
-                shared.hold(cost, 0.0, false)?;
+                shared.hold(cost, 0.0, 0.0, false)?;
                 shared.settled = true;
                 Ok(())
             }
@@ -1254,25 +1372,27 @@ fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &
 /// Today's cloud spending against the configured caps: of all the user's
 /// sessions (see [`AiSettings::usage_file`]), or else of this one.
 pub fn budget(db: &Db, settings: &AiSettings) -> Result<Budget> {
-    let (spent, calls): (f64, i64) = match &settings.usage_file {
+    let (spent, calls, held): (f64, i64, f64) = match &settings.usage_file {
         Some(path) => {
             let today = crate::usage::Ledger::at(path).today()?;
-            (today.usd, i64::from(today.calls))
+            (today.usd, i64::from(today.calls), today.held_usd())
         }
         None => db.conn().query_row(
             "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM ai_usage
              WHERE day_utc = ?1 AND tier IN ('cloud', 'research')",
             [today_utc()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, 0.0)),
         )?,
     };
     Ok(Budget {
         spent_usd: spent,
+        held_usd: held,
         calls: calls.max(0) as u32,
         max_usd: settings.max_daily_usd,
         max_calls: settings.max_daily_calls,
         has_key: settings.api_key().is_some(),
         setup_unreadable: settings.setup_error.is_some(),
+        config_unreadable: settings.config_unreadable(),
         usage_unreadable: false,
     })
 }
@@ -2300,6 +2420,7 @@ impl AiEngine {
             max_calls: settings.max_daily_calls,
             has_key: settings.api_key().is_some(),
             setup_unreadable: settings.setup_error.is_some(),
+            config_unreadable: settings.config_unreadable(),
             usage_unreadable: true,
             ..Budget::default()
         })
@@ -2751,7 +2872,7 @@ impl AiEngine {
                 } else if let Some(reached) = error.downcast_ref::<BudgetReached>() {
                     // Not even the first call fits: as when it is spent,
                     // or the cap is below what one call could cost.
-                    let reason = match reached.too_dear() {
+                    let reason = match reached.says_why() {
                         true => unavailable(&reached.to_string())?,
                         false => unavailable(&budget_reached)?,
                     };
@@ -4983,6 +5104,8 @@ mod tests {
             has_key: true,
             setup_unreadable: false,
             usage_unreadable: false,
+            config_unreadable: false,
+            held_usd: 0.0,
         }
         .exhausted());
 
@@ -5799,6 +5922,182 @@ mod tests {
             .today()
             .unwrap();
         assert_eq!((day.usd, day.calls), (0.0, 0), "nothing was set aside");
+    }
+
+    /// v0.2.6 review AI-2: a call that does not fit only because another
+    /// session's call is still running says so, and goes ahead once that
+    /// call has ended.
+    #[tokio::test]
+    async fn a_call_held_up_by_another_sessions_call_says_so() {
+        if !no_env_key() || std::env::var(anthropic::KEY_ENV).is_ok() {
+            return;
+        }
+        let (base, mock) = mock_models().await;
+        let dir = tempfile::tempdir().unwrap();
+        let usage = dir.path().join(crate::usage::FILE);
+        let settings = AiSettings {
+            local_url: "http://127.0.0.1:1/v1".into(),
+            cloud_url: format!("{base}/claude"),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            cloud_model: "claude-opus-5-5".into(),
+            research_model: "claude-opus-5-5".into(),
+            cloud_fallbacks: Some(Vec::new()),
+            openrouter_api_key: Some("sk-ant-test".into()),
+            max_daily_usd: 1.0,
+            usage_file: Some(usage.clone()),
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(
+            settings,
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        // Another session's call runs, set aside at its most.
+        let mut other = Allowance::shared(&engine.budget(), crate::usage::Ledger::at(&usage));
+        other.take_call(0.0, 0.8, 0.01).unwrap();
+        let busy = "another session's AI call is running; try again in a moment";
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with(&format!("the cloud was not used: {busy}")),
+            "{error}"
+        );
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with(&format!("Research is off: {busy}")),
+            "{error}"
+        );
+        assert!(mock.cloud.lock().unwrap().is_empty());
+        // It ended at what it cost: the same request goes ahead.
+        other.settle(0.014).unwrap();
+        let (outcome, _) = run(&engine, Tier::Cloud, &graph, &vault).await;
+        assert_eq!(outcome.unwrap().tier, Tier::Cloud);
+        assert_eq!(mock.cloud.lock().unwrap().len(), 1);
+        // Money spent is told as before.
+        let mut other = Allowance::shared(&engine.budget(), crate::usage::Ledger::at(&usage));
+        other.take_call(0.0, 0.7, 0.01).unwrap();
+        other.settle(0.7).unwrap();
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("Research is off: one call could cost up to $0.5")
+                && error.contains(" left today (raise max_daily_usd)"),
+            "{error}"
+        );
+    }
+
+    /// v0.2.6 review AI-3: a cap raised in `config.toml` applies to a
+    /// running session at its next request; a `config.toml` that cannot
+    /// be read turns the cloud off.
+    #[tokio::test]
+    async fn a_raised_daily_cap_applies_to_a_running_session() {
+        if std::env::var(anthropic::KEY_ENV).is_ok() {
+            return;
+        }
+        let (base, seen) = pausing_claude().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        crate::workspace::write_private_atomic(&config, b"[ai]\nmax_daily_usd = 1.0\n").unwrap();
+        let settings = AiSettings {
+            local_url: "http://127.0.0.1:1/v1".into(),
+            cloud_url: format!("{base}/claude"),
+            cloud_provider: Some(CloudProvider::Anthropic),
+            research_model: "claude-fable-5".into(),
+            cloud_fallbacks: Some(Vec::new()),
+            openrouter_api_key: Some("sk-ant-test".into()),
+            usage_file: Some(dir.path().join(crate::usage::FILE)),
+            config_file: Some(config.clone()),
+            ..AiSettings::default()
+        };
+        let engine = AiEngine::new(
+            settings,
+            Arc::new(Mutex::new(Db::open_in_memory().unwrap())),
+        )
+        .unwrap();
+        let graph = lab();
+        let vault = Mutex::new(Vault::ephemeral());
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.ends_with("; $1.00 left today (raise max_daily_usd)"),
+            "{error}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        crate::workspace::write_private_atomic(
+            &config,
+            b"[ai]\nmax_daily_usd = 3.0\nmax_daily_calls = 5\n",
+        )
+        .unwrap();
+        let budget = engine.budget();
+        assert_eq!((budget.max_usd, budget.max_calls), (3.0, 5));
+        let _ = run(&engine, Tier::Research, &graph, &vault).await;
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the raised cap lets it go"
+        );
+        crate::workspace::write_private_atomic(&config, b"[ai\n").unwrap();
+        let (outcome, _) = run(&engine, Tier::Research, &graph, &vault).await;
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            error.starts_with("Research is off: config.toml cannot be read (")
+                && error.ends_with("): cloud AI is off until it is fixed"),
+            "{error}"
+        );
+        let budget = engine.budget();
+        assert!(
+            budget.setup_unreadable && budget.config_unreadable,
+            "{budget:?}"
+        );
+    }
+
+    /// v0.2.6 review AI-4: what a call of a session that was killed set
+    /// aside no longer counts against the day once that is seen.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn a_killed_sessions_call_no_longer_counts_at_its_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = dir.path().join(crate::usage::FILE);
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let day = crate::usage::Day {
+            day: crate::usage::today_local(),
+            usd: 0.58,
+            calls: 1,
+            held: vec![crate::usage::Hold {
+                id: 1,
+                owner: crate::usage::Owner {
+                    pid,
+                    ..crate::usage::Owner::this()
+                },
+                usd: 0.58,
+                floor: 0.04,
+            }],
+        };
+        crate::workspace::write_private_atomic(&usage, &serde_json::to_vec(&day).unwrap()).unwrap();
+        let settings = AiSettings {
+            usage_file: Some(usage.clone()),
+            ..AiSettings::default()
+        };
+        let db = Db::open_in_memory().unwrap();
+        let today = budget(&db, &settings).unwrap();
+        assert!((today.spent_usd - 0.04).abs() < 1e-9, "{today:?}");
+        assert_eq!((today.calls, today.held_usd), (1, 0.0));
+        let mut allowance = Allowance::shared(&today, crate::usage::Ledger::at(&usage));
+        allowance.take_call(0.0, 0.58, 0.04).unwrap();
+        allowance.settle(0.02).unwrap();
+        let day = crate::usage::Ledger::at(&usage).today().unwrap();
+        assert!((day.usd - 0.06).abs() < 1e-9, "{day:?}");
+        assert!(day.held.is_empty());
     }
 
     /// An `ai.toml` that is there but cannot be read (a typo, a link, a

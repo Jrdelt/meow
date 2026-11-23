@@ -263,12 +263,13 @@
     flash.timer = setTimeout(function () { box.remove(); }, 6000);
   }
 
-  // The socket that proved it is this page's session: its first state
+  // The socket that proved it is this page's session: its first message
   // carried the page's key. Nothing is sent to any other, and nothing it
   // sends is shown.
   var trusted = null;
-  // How long a socket may take to prove it (the session sends its state
-  // first thing, but a large one takes a while).
+  // How long a socket may take to prove it, from when it opens (the
+  // session says its key first thing, before its state). One that does
+  // not is let go of and tried again later.
   var KEY_WAIT = 10000;
   // What each command sent on the trusted socket waits for: the session
   // answers every command with one result, in the order sent.
@@ -305,14 +306,22 @@
     var ws = new WebSocket(proto + location.host + withToken('/ws'));
     socket = ws;
     waiting = [];
-    // No keyed state in time: whatever answered is not the session. It is
-    // let go of at once: one that never answers the close is not waited for.
-    var keyTimer = setTimeout(function () {
-      if (socket !== ws || trusted === ws) { return; }
-      if (ws.readyState === WebSocket.OPEN) { ended = true; }
-      ws.close();
-      closed();
-    }, KEY_WAIT);
+    // Nothing keyed in time (a busy session, or something else that
+    // answers and says nothing): let go of at once, as one that never
+    // answers the close is not waited for, and tried again later.
+    var keyTimer = null;
+    function keyWait() {
+      clearTimeout(keyTimer);
+      keyTimer = setTimeout(function () {
+        if (socket !== ws || trusted === ws) { return; }
+        ws.close();
+        closed();
+      }, KEY_WAIT);
+    }
+    keyWait();
+    ws.onopen = function () {
+      if (socket === ws && trusted !== ws) { keyWait(); }
+    };
     ws.onmessage = function (event) {
       if (socket !== ws) { return; }
       var message;
@@ -322,21 +331,24 @@
         return;
       }
       if (!message || typeof message !== 'object') { return; }
-      if (message.type === 'state') {
-        if (!pageKey || message.key !== pageKey) {
-          // Not the session this page came from: another program now has
-          // its port. Nothing it sends is shown.
+      if (trusted !== ws) {
+        if (!pageKey || message.key !== pageKey ||
+            (message.type !== 'hello' && message.type !== 'state')) {
+          // Not the session this page came from, which says its key
+          // first: another program now has its port. Nothing it sends is
+          // shown.
           ended = true;
           ws.close();
           closed();
           return;
         }
-        if (!message.state || typeof message.state !== 'object') { return; }
-        if (trusted !== ws) {
-          trusted = ws;
-          clearTimeout(keyTimer);
-          badge('live', 'on');
-        }
+        trusted = ws;
+        clearTimeout(keyTimer);
+      }
+      if (message.type === 'hello') { return; }
+      if (message.type === 'state') {
+        if (message.key !== pageKey || !message.state || typeof message.state !== 'object') { return; }
+        badge('live', 'on');
         reconnectDelay = 2000;
         state = message.state;
         render();
@@ -386,6 +398,7 @@
         badge(ended ? 'session ended' : 'session closed', 'off');
         if (ended) { flash('The session ended.'); }
         reconStill();
+        aiStill();
       }
       if (!ended) {
         var wait = reconnectDelay;
@@ -1738,6 +1751,19 @@
     if (stopped) { renderRecon(); }
     byId('recon').classList.add('still');
     reconTick();
+  }
+
+  // An AI reply cut off by the session's end is not coming: it is shown
+  // as stopped, not running.
+  var AI_STOPPED = 'stopped: the session ended';
+  function aiStill() {
+    var reply = state && state.ai;
+    if (!reply || typeof reply !== 'object' || !reply.running) { return; }
+    reply.running = false;
+    reply.stopped = true;
+    reply.error = AI_STOPPED;
+    renderDetail();
+    renderAiPanel();
   }
 
   function paintRow(view, model) {
@@ -3149,6 +3175,12 @@
   });
 
   function downloadReport(urlPath, fallbackName) {
+    // Only from the session: once another program may have its port, a
+    // file from there is not its report.
+    if (ended || !connected()) {
+      flash(ended ? 'The session ended.' : 'Not connected to the session.');
+      return;
+    }
     var link = document.createElement('a');
     link.href = withToken(urlPath);
     link.download = fallbackName;
@@ -3251,6 +3283,10 @@
         (budget.max_usd || 0).toFixed(2) + ' \u00b7 ' + (budget.calls || 0) + '/' + (budget.max_calls || 0) +
         ' calls \u00b7 masked first'),
         'Spent today by all sessions, and the daily cap. Past it, Cloud AI answers with the local AI.');
+    }
+    if (budget.config_unreadable) {
+      return hint(row('Cloud AI', 'off \u00b7 config.toml unreadable \u00b7 local AI answers instead'),
+        '~/.meow/config.toml cannot be read. Research is off until it is fixed.');
     }
     // No key, or the file with it cannot be read: the local AI answers.
     var why = el('span', null, budget.setup_unreadable ? 'ai.toml unreadable (' : 'no key (');
@@ -3961,6 +3997,8 @@
       var badges = clear(byId('ai-badges'));
       if (reply.running) {
         badges.appendChild(el('span', 'badge warn', 'running\u2026'));
+      } else if (reply.stopped) {
+        badges.appendChild(el('span', 'badge off', 'stopped'));
       } else if (reply.error) {
         badges.appendChild(el('span', 'badge bad', 'failed'));
       } else {

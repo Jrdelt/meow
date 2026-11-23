@@ -716,7 +716,7 @@ fn start_session(
     };
     if files_changed {
         println!("[!] Files changed outside meow: shell history and last folder not used");
-        workspace.drop_carried_files();
+        workspace.drop_carried_files()?;
     } else if seen == workspace::FilesSeen::Unclean {
         println!("[!] meow did not end cleanly last time");
     }
@@ -976,8 +976,14 @@ fn accept_foreign_workspace(
             drops |= file == "last_cwd" || file.ends_with("_history");
         }
     }
-    if drops {
-        println!("    Accepting it drops its shell history and start folder.");
+    let dropped = match (drops, size("state.db").is_some()) {
+        (true, true) => "its shell history, start folder and cached answers",
+        (true, false) => "its shell history and start folder",
+        (false, true) => "its cached answers",
+        (false, false) => "",
+    };
+    if !dropped.is_empty() {
+        println!("    Accepting it drops {dropped}.");
     }
     println!("    Scans queued in it are dropped: none of them runs.");
     // Only a command that leads back to this folder: `meow delete <name>`

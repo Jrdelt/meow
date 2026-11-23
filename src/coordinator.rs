@@ -1390,6 +1390,19 @@ async fn websocket(AxumState(state): AxumState<Shared>, upgrade: WebSocketUpgrad
         .on_upgrade(move |socket| serve_socket(state, socket, permit))
 }
 
+/// The whole state as one message. Made off the session's two async
+/// threads: a large one takes seconds, and the other sockets (a tab saying
+/// who it is to, the HUD) are not kept waiting meanwhile.
+async fn state_message(state: &Shared) -> Option<Message> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let text = json!({ "type": "state", "key": state.page_key, "state": state.snapshot() });
+        Message::Text(text.to_string().into())
+    })
+    .await
+    .ok()
+}
+
 /// Pushes a state snapshot on connect and after every change (rate-limited),
 /// the progress of the running stages alone when only that changed, and
 /// executes commands the client sends without blocking incoming frames.
@@ -1401,14 +1414,16 @@ async fn serve_socket(
     let mut revision = state.revision.subscribe();
     let mut progress = state.progress_revision.subscribe();
     let mut reply = state.ai_revision.subscribe();
-    let send_state = |state: &Shared| {
-        Message::Text(
-            json!({ "type": "state", "key": state.page_key, "state": state.snapshot() })
-                .to_string()
-                .into(),
-        )
+    // Who this is, before the state, which takes a while when it is large:
+    // the page trusts a socket that says its key.
+    let hello = json!({ "type": "hello", "key": state.page_key }).to_string();
+    if socket.send(Message::Text(hello.into())).await.is_err() {
+        return;
+    }
+    let Some(first) = state_message(&state).await else {
+        return;
     };
-    if socket.send(send_state(&state)).await.is_err() {
+    if socket.send(first).await.is_err() {
         return;
     }
     let mut pending_push = false;
@@ -1436,7 +1451,10 @@ async fn serve_socket(
                 let _ = progress.borrow_and_update();
                 let _ = reply.borrow_and_update();
                 pending_reply = false;
-                if socket.send(send_state(&state)).await.is_err() {
+                let Some(message) = state_message(&state).await else {
+                    break;
+                };
+                if socket.send(message).await.is_err() {
                     break;
                 }
             }
@@ -3294,6 +3312,9 @@ mod tests {
                     }
                 }
             };
+            // First who it is, then the state (v0.2.6 review MAP-1).
+            let hello = next().await;
+            assert_eq!(hello["type"], "hello");
             let first = next().await;
             assert_eq!(first["type"], "state");
             assert_eq!(first["state"]["graph"]["hosts"], json!({}));
@@ -3304,6 +3325,7 @@ mod tests {
             assert_eq!(page_key.len(), 64);
             assert_ne!(page_key, info.token);
             assert_eq!(first["key"], json!(page_key));
+            assert_eq!(hello, json!({ "type": "hello", "key": page_key }));
             assert!(!first["state"].to_string().contains(&page_key));
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
             let page = client
@@ -4156,6 +4178,8 @@ mod tests {
                 }
             };
             let patient = Duration::from_secs(10);
+            let (hello, _) = next(patient).await.unwrap();
+            assert_eq!(hello["type"], "hello");
             let (first, whole) = next(patient).await.unwrap();
             assert_eq!(first["type"], "state");
             // Whatever starting the session still pushes is over.

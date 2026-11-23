@@ -49,6 +49,8 @@ const MAX_FACT_LINES: usize = 60;
 /// The longest note the catch-up box takes from a paste: what the graph
 /// keeps of a note.
 const NOTE_MAX: usize = crate::evidence::EVIDENCE_MAX;
+/// An AI reply cut off by the end of its session.
+const AI_STOPPED: &str = "stopped: the session ended";
 
 /// What the coordinator pushes on every change.
 #[derive(Debug, Clone, Deserialize)]
@@ -224,7 +226,19 @@ impl Model {
         self.ended = true;
         if let Some(snapshot) = &mut self.snapshot {
             queue::show_ended(&mut snapshot.tasks);
+            // A reply cut off by the end is not coming.
+            if snapshot.ai.running {
+                snapshot.ai.running = false;
+                snapshot.ai.error = Some(AI_STOPPED.to_owned());
+            }
         }
+    }
+
+    /// What the session sent cannot be read: said, and the HUD stops
+    /// reading.
+    pub fn cannot_read(&mut self, error: &str) {
+        self.status = format!("Cannot read the session: {}", sanitize(error, 200));
+        self.session_ended();
     }
 
     /// A stage is running: its clock is worth drawing every second.
@@ -1347,7 +1361,13 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" =^..^= meow hud ", BRAND),
-                Span::styled("\u{b7} waiting for the session", DIM),
+                Span::styled(
+                    match model.ended {
+                        true => "\u{b7} session ended",
+                        false => "\u{b7} waiting for the session",
+                    },
+                    DIM,
+                ),
             ])),
             area,
         );
@@ -1389,7 +1409,9 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
         parts.push((1, Span::styled(format!("{exploited} exploited"), BAD)));
     }
     let budget = &snapshot.budget;
-    let capped = budget.calls >= budget.max_calls || budget.spent_usd >= budget.max_usd;
+    // What calls still running set aside may yet be given back.
+    let capped = budget.calls >= budget.max_calls
+        || budget.spent_usd - budget.held_usd.max(0.0) >= budget.max_usd;
     if budget.has_key && budget.usage_unreadable {
         parts.push((1, Span::styled("cloud AI off: ai-usage unreadable", WARN)));
     } else if budget.has_key && capped {
@@ -1413,7 +1435,11 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
             parts.push((1, Span::styled(calls, WARN)));
         }
     } else if budget.setup_unreadable {
-        parts.push((1, Span::styled("cloud AI off: ai.toml unreadable", WARN)));
+        let file = match budget.config_unreadable {
+            true => "cloud AI off: config.toml unreadable",
+            false => "cloud AI off: ai.toml unreadable",
+        };
+        parts.push((1, Span::styled(file, WARN)));
     }
     // The session on a lime badge; the separator's first space pads it.
     let head = Span::styled(format!(" =^..^= {}", snapshot.session), BRAND);
@@ -2517,12 +2543,38 @@ pub fn draw(frame: &mut Frame, model: &Model) {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// The largest message the HUD reads: the session sends its whole state
+/// as one, and a graph near its cap makes one of tens of MB.
+const MAX_MESSAGE_BYTES: usize = 2 * crate::graph::MAX_GRAPH_BYTES as usize;
+
+/// Whether a read failed on what the session sent (too large, not text),
+/// not because the session went away.
+fn is_unreadable(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::error::{Error, ProtocolError};
+    match error {
+        Error::Capacity(_) | Error::Utf8(_) | Error::AttackAttempt => true,
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => false,
+        Error::Protocol(_) => true,
+        _ => false,
+    }
+}
+
 async fn connect(workspace: &Workspace) -> Option<Socket> {
     let info = crate::ipc::runtime_info(workspace)?;
-    let url = format!("ws://127.0.0.1:{}/ws?token={}", info.port, info.token);
+    connect_to(&format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        info.port, info.token
+    ))
+    .await
+}
+
+async fn connect_to(url: &str) -> Option<Socket> {
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_frame_size(Some(MAX_MESSAGE_BYTES))
+        .max_message_size(Some(MAX_MESSAGE_BYTES));
     let attempt = tokio::time::timeout(
         Duration::from_secs(3),
-        tokio_tungstenite::connect_async(url),
+        tokio_tungstenite::connect_async_with_config(url, Some(config), false),
     )
     .await;
     attempt.ok()?.ok().map(|(socket, _)| socket)
@@ -2602,6 +2654,10 @@ async fn event_loop(
                     }
                 }
                 Some(Ok(_)) => {}
+                Some(Err(error)) if is_unreadable(&error) => {
+                    socket = None;
+                    model.cannot_read(&error.to_string());
+                }
                 _ => {
                     socket = None;
                     model.session_ended();
@@ -4380,6 +4436,17 @@ mod tests {
         // Near the cap the calls outrank the counts, even in 80 columns.
         let text = screen(&busy, 80, 24);
         assert!(text.contains(" · 15/20 calls"), "{text}");
+        // Money another session's running call set aside is no cap.
+        let mut held: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        held["state"]["budget"]["spent_usd"] = json!(1.05);
+        held["state"]["budget"]["held_usd"] = json!(0.8);
+        busy.apply_message(&held.to_string());
+        let text = screen(&busy, 120, 30);
+        assert!(text.contains(" · cloud AI $1.05/$1 today"), "{text}");
+        held["state"]["budget"]["held_usd"] = json!(0.0);
+        busy.apply_message(&held.to_string());
+        let text = screen(&busy, 120, 30);
+        assert!(text.contains(" · cloud AI cap reached"), "{text}");
         // At the cap C asks local AI and R is off: said in red.
         near["state"]["budget"]["calls"] = json!(20);
         busy.apply_message(&near.to_string());
@@ -4405,11 +4472,107 @@ mod tests {
             text.contains(" · cloud AI off: ai.toml unreadable"),
             "{text}"
         );
+        message["state"]["budget"]["config_unreadable"] = json!(true);
+        let mut unreadable = Model::new(true);
+        unreadable.apply_message(&message.to_string());
+        let text = screen(&unreadable, 120, 30);
+        assert!(
+            text.contains(" · cloud AI off: config.toml unreadable"),
+            "{text}"
+        );
         message["state"]["budget"]["setup_unreadable"] = json!(false);
+        message["state"]["budget"]["config_unreadable"] = json!(false);
         let mut keyless = Model::new(true);
         keyless.apply_message(&message.to_string());
         let text = screen(&keyless, 120, 30);
         assert!(!text.contains("cloud AI"), "{text}");
+    }
+
+    /// v0.2.6 review MAP-3: an AI reply cut off by the end of its session
+    /// is shown as stopped, not as running.
+    #[test]
+    fn an_ai_reply_cut_off_by_the_end_of_the_session_is_stopped() {
+        let mut state: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        state["state"]["ai"] = json!({
+            "running": true, "tier": "local", "address": "10.10.10.5",
+            "text": "## Risk\nword1", "error": null, "summary": null
+        });
+        let mut model = Model::new(true);
+        model.apply_message(&state.to_string());
+        model.on_key(key(KeyCode::Char('a')));
+        let text = screen(&model, 160, 46);
+        assert!(
+            text.contains("┌ Local AI · 10.10.10.5 · running ─"),
+            "{text}"
+        );
+        model.session_ended();
+        let ai = &model.snapshot.as_ref().unwrap().ai;
+        assert!(!ai.running);
+        assert_eq!(ai.error.as_deref(), Some("stopped: the session ended"));
+        let text = screen(&model, 160, 46);
+        assert!(text.contains("┌ Local AI · 10.10.10.5 ─"), "{text}");
+        assert!(text.contains("stopped: the session ended"), "{text}");
+        assert!(text.contains("session ended"), "{text}");
+        // One that had ended stays as it was.
+        let mut done = Model::new(true);
+        state["state"]["ai"]["running"] = json!(false);
+        done.apply_message(&state.to_string());
+        done.session_ended();
+        assert_eq!(done.snapshot.as_ref().unwrap().ai.error, None);
+    }
+
+    /// v0.2.6 review HUD-BIG: a state over 16 MiB, as a session near the
+    /// graph's cap sends, is read; one that cannot be read is said.
+    #[tokio::test]
+    async fn a_state_over_16_mib_is_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws?token=t", listener.local_addr().unwrap());
+        let mut state: Value = serde_json::from_str(&state_message(&graph())).unwrap();
+        state["state"]["notices"] =
+            json!([{ "at": "2026-11-23T00:00:00Z", "text": "x".repeat(20 << 20) }]);
+        let state = state.to_string();
+        assert!(state.len() > 16 << 20);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = json!({ "type": "hello", "key": "k" }).to_string();
+            socket.send(Message::Text(hello.into())).await.unwrap();
+            socket.send(Message::Text(state.into())).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let mut socket = connect_to(&url).await.expect("connected");
+        let mut model = Model::new(true);
+        for _ in 0..2 {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => model.apply_message(&text),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(model.status, "");
+        let snapshot = model.snapshot.as_ref().expect("the state was read");
+        assert_eq!(snapshot.notices[0].text.len(), 400);
+        drop(socket);
+        server.await.unwrap();
+
+        // What cannot be read is said, and the session is no longer read.
+        let too_big = tokio_tungstenite::tungstenite::Error::Capacity(
+            tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
+                size: 300 << 20,
+                max_size: MAX_MESSAGE_BYTES,
+            },
+        );
+        assert!(is_unreadable(&too_big));
+        assert!(!is_unreadable(
+            &tokio_tungstenite::tungstenite::Error::ConnectionClosed
+        ));
+        let mut model = Model::new(true);
+        model.cannot_read(&too_big.to_string());
+        let text = screen(&model, 120, 30);
+        assert!(text.contains(" =^..^= meow hud · session ended"), "{text}");
+        assert!(
+            text.contains("Cannot read the session: Space limit exceeded"),
+            "{text}"
+        );
     }
 
     /// `?` shows every key; any key closes it and does nothing else.
