@@ -1,20 +1,12 @@
-### What's New in `meow` v0.2.6
+### What's New in `meow` v0.2.7
 
-- **Security (high): a cloned or unpacked git folder can no longer run its own programs.** meow's git check now reaches no remote, ignores the folder's `core.sshCommand` and credential helpers, and never asks for a password.
-- **Security: safer `meow update` from source.** It checks the clone before git reads it, refuses cargo settings above it that others can change, and builds in a private `~/.meow/build`.
-- **Security: AI replies keep placeholders in code and commands.** A one-word name from a host's certificate or banner is masked everywhere in that host's requests. Elsewhere, only where it stands as a host.
-- **Security: a `git pull` during a session is noticed.** The next start drops the shell history and last folder.
-- **Security: stricter folder checks,** with the reason in each refusal.
-- **Security: setup refuses a key meant for the other service.**
-- **New: `meow setup --cloud-off`** (entry `6` in `--plain`) turns cloud AI off and removes the key.
-- **One daily cloud cap for all sessions,** kept in `~/.meow/ai-usage`.
-- **Recon:** `trace` runs after `ports` and records only real hops. `-6` and `-Pn` reach every scan.
-- **DNS:** split DNS is followed on macOS and Windows. A failed lookup says `could not be checked`. `mail-dns` test names no longer say "meow".
-- **CVEs and report:** fix lines name every port, rescans drop old versions, and the report counts only hosts on the map.
-- **Map:** a connection badge and a 2000-byte note limit.
-- **Clean endings:** `kill -INT`, `Ctrl-C` with piped output and a closed Windows console end the session in order.
-- **Moved project folders** keep their session and history.
-- **Releases:** pre-releases are never marked Latest, nor installed by `meow update` unless meow is one. Nothing is published until the tests pass.
+- **New look for the live map.** A dark theme with one top bar for the session, its counts and its status. The topology is drawn dark too: each device sits on a plate, a host with CVEs is ringed amber (or red when one is known exploited, critical or high), and the selected device is outlined in lime.
+- **Map: back to all hosts.** An **All hosts** button beside the selected host's name, and **Esc**, bring the host list back and put the keyboard on it. Before, only a click on an empty part of the drawing did.
+- **HUD and setup read in every terminal theme.** Secondary text, idle borders, panel titles and the key line no longer vanish in themes such as Solarized Dark. The selected row and the current setup step are black on lime.
+- **Security: `url` 2.5.9** fixes RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs.
+- **Dependencies:** cc 1.11.2, clap 4.6.8, petgraph 0.8, rusqlite 0.43, sha2 0.11.
+- **Fuzzing:** four cargo-fuzz targets cover the parsers and the C11 terminal filter, the C code under AddressSanitizer. They run weekly in CI.
+- **Docs:** a demo, map screenshots and a sample report in the README; [architecture](https://github.com/Jrdelt/meow/blob/main/docs/ARCHITECTURE.md) and [threat model](https://github.com/Jrdelt/meow/blob/main/docs/THREAT_MODEL.md).
 
 ---
 
