@@ -312,8 +312,9 @@ try {
     }
 
     # A .cargo the user keeps on another disk through a junction of their
-    # own is taken while what it leads to is theirs alone; any other link,
-    # and one that leads nowhere, is not.
+    # own is taken while what it leads to is theirs alone and a folder; a
+    # link in a folder others can change, to the wrong kind of thing, or
+    # that leads nowhere, is not.
     $UserDir = New-CheckFolder 'profile'
     $CargoHome = New-CheckFolder 'cargo-home'
     New-Item -ItemType Junction -Path (Join-Path $UserDir '.cargo') -Target $CargoHome | Out-Null
@@ -337,11 +338,26 @@ try {
     } else {
         Fail "a .cargo junction to a folder every account may change is not refused: $Problem"
     }
+    # A settings file may be a link of the user's own, but only to a file.
     New-Item -ItemType Junction -Path (Join-Path $UserDir 'rust-toolchain') -Target $CargoHome | Out-Null
-    if ((Get-CargoSettingProblem $UserDir 'rust-toolchain') -eq 'is a link') {
-        Pass 'a rust-toolchain link is refused'
+    $Problem = Get-CargoSettingProblem $UserDir 'rust-toolchain'
+    if (($null -ne $Problem) -and ($Problem -match 'which is not a file$')) {
+        Pass "a rust-toolchain link to a folder is refused: $Problem"
     } else {
-        Fail 'a rust-toolchain link is not refused'
+        Fail "a rust-toolchain link to a folder is not refused: $Problem"
+    }
+    # A link in a folder other accounts can change is refused, wherever it leads.
+    $OpenDir = New-CheckFolder 'open'
+    $OwnCargo = New-CheckFolder 'own-cargo'
+    New-Item -ItemType Junction -Path (Join-Path $OpenDir '.cargo') -Target $OwnCargo | Out-Null
+    $Acl = Get-Acl -LiteralPath $OpenDir
+    $Acl.AddAccessRule($Rule)
+    Set-Acl -LiteralPath $OpenDir -AclObject $Acl
+    $Problem = Get-CargoSettingProblem $OpenDir '.cargo'
+    if ($Problem -eq 'is a link') {
+        Pass 'a .cargo junction in a folder every account may change is refused'
+    } else {
+        Fail "a .cargo junction in a folder every account may change is not refused: $Problem"
     }
     $Gone = New-CheckFolder 'gone'
     $Dangling = New-CheckFolder 'dangling'

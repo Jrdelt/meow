@@ -139,6 +139,14 @@ function Get-CargoSettingProblem([string]$Dir, [string]$Name) {
     if ((-not $Target) -or -not (Test-Path -LiteralPath $Target)) {
         return 'is a link that leads nowhere'
     }
+    # .cargo is a folder; the others are files.
+    if ($Name -eq '.cargo') {
+        if (-not (Test-Path -LiteralPath $Target -PathType Container)) {
+            return "leads to $Target, which is not a folder"
+        }
+    } elseif (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
+        return "leads to $Target, which is not a file"
+    }
     # Get-Acl may read the link or what it leads to: both must pass.
     if ((Test-OwnPath $Path) -and (Test-OwnPath $Target)) {
         return $null
