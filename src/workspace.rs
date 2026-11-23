@@ -3344,18 +3344,62 @@ fn folds_case(sessions: &Path) -> bool {
     match (fs::symlink_metadata(sessions), fs::symlink_metadata(&other)) {
         (Ok(_), Err(error)) if error.kind() == io::ErrorKind::NotFound => false,
         (Ok(_), Ok(found)) if found.file_type().is_symlink() => false,
-        #[cfg(unix)]
-        (Ok(meta), Ok(found)) => {
-            use std::os::unix::fs::MetadataExt;
-            meta.dev() == found.dev() && meta.ino() == found.ino()
-        }
-        #[cfg(not(unix))]
-        (Ok(_), Ok(_)) => matches!(
-            (fs::canonicalize(sessions), fs::canonicalize(&other)),
-            (Ok(a), Ok(b)) if a == b
+        (Ok(meta), Ok(found)) => same_or(
+            folder_id(sessions, &meta),
+            folder_id(&other, &found),
+            fallback,
         ),
         _ => fallback,
     }
+}
+
+/// Whether `a` and `b` are the same; `fallback` when either is unknown.
+fn same_or<T: PartialEq>(a: Option<T>, b: Option<T>, fallback: bool) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => fallback,
+    }
+}
+
+/// The volume and number of the folder at `path`, which `meta` was just
+/// read of (as itself, not what a link points to).
+#[cfg(unix)]
+fn folder_id(_path: &Path, meta: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Windows tells a folder's number through an open handle only: opened for
+/// no access to what it holds, in nobody's way, as itself, and closed
+/// again at once. `None` where it cannot be opened, or its file system
+/// tells no number.
+#[cfg(windows)]
+fn folder_id(path: &Path, _meta: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open until `file` is dropped, and `info` is a
+    // valid place for what the call writes.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    (index != 0).then_some((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn folder_id(_path: &Path, _meta: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// Keeps git out of a session in `./meow` while it runs: a pull can
@@ -7923,6 +7967,37 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             fs::remove_file(&other).unwrap();
             assert!(!folds_case(&sessions));
         }
+    }
+
+    /// A folder whose number cannot be read (a volume that tells none)
+    /// takes the system's default, never "case is told apart".
+    #[test]
+    fn an_unknown_folder_number_takes_the_default() {
+        assert!(same_or(Some((1u64, 2u64)), Some((1, 2)), false));
+        assert!(!same_or(Some((1u64, 2u64)), Some((1, 3)), true));
+        for fallback in [false, true] {
+            assert_eq!(same_or(None, Some((1u64, 2u64)), fallback), fallback);
+            assert_eq!(same_or(Some((1u64, 2u64)), None, fallback), fallback);
+            assert_eq!(same_or::<(u64, u64)>(None, None, fallback), fallback);
+        }
+    }
+
+    /// Windows: a folder is told by its volume and number, so `MEOW` is
+    /// `./meow` on a volume that folds case and another folder is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_number_is_read_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("meow");
+        let elsewhere = tmp.path().join("acme");
+        fs::create_dir(&sessions).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let id = |path: &Path| folder_id(path, &fs::symlink_metadata(path).unwrap());
+        let own = id(&sessions);
+        assert!(own.is_some(), "NTFS tells a folder's number");
+        assert_eq!(id(&tmp.path().join("MEOW")), own);
+        assert_ne!(id(&elsewhere), own);
+        assert!(folds_case(&sessions));
     }
 
     /// PoC (v0.2.6 review, SESSION-3): on Linux, a project's own `MEOW/`
