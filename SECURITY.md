@@ -23,7 +23,7 @@ Out of scope: the systems you scan, and nmap, katana or feroxbuster themselves.
 ## Known limits
 
 - **Windows:** meow does not check who can write to folders above a session, or who owns `.git`. Use `meow <name> --home` there, and in any repository you do not trust.
-- Between sessions, a pull that knows a session's name can make git track its files; the next open warns. Linked work trees, submodules and, on macOS and Linux, shared or other users' `.git` folders get only the `.gitignore` files: no git check, no such warning, and a pull during a session is not noticed.
+- Between sessions, a pull that knows a session's name can make git track its files; the next open warns. Linked work trees, submodules, repositories meow's git cannot read and, on macOS and Linux, shared or other users' `.git` folders get only the `.gitignore` files: no git check, and a pull during a session goes unnoticed.
 - A file copied over the shell history during a session is not noticed. After an end meow did not see, a `graph.json` or history replaced without git looks like meow's own rewrite.
 - A program a scan tool starts in a session or process group of its own (`setsid`, `sudo` with its own terminal) is not stopped.
 - A local AI server gets unmasked text and keys when meow sees it is yours. On Linux that includes a server run by root or a system account (user ID below 1000), and a port with no listener meow can see (forwarded into a container or network namespace). Everywhere, it includes a port you forward to another machine (`ssh -L`). Another user's server, or one on another machine, gets masked text and no key. So does one meow cannot check: on Windows a system or service process, or a port whose process has exited; on macOS, when `lsof` fails.

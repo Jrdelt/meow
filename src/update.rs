@@ -818,7 +818,9 @@ pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 pub(crate) enum NoAnswer {
     /// git is not there, or was not started: the session is closing.
     NotStarted,
-    /// git failed, or was killed as the session closed.
+    /// git was stopped because the session closed: it tells nothing.
+    Stopped,
+    /// git failed: it cannot read the repository, say.
     Failed,
     /// git ran past its time, and was killed with what it started.
     TimedOut,
@@ -914,8 +916,22 @@ fn start_pinned(
 
 /// Runs `cmd` as `runs` says and gives what it prints to `read`; its
 /// result, if `cmd` ends well by `until`. Otherwise `cmd` is killed, with
-/// its tree when it has one.
+/// its tree when it has one. No answer once its tracker is closed is
+/// [`NoAnswer::Stopped`]: closing it killed `cmd`.
 fn output_until<T: Send + 'static>(
+    cmd: &mut Command,
+    until: Instant,
+    runs: GitRuns<'_>,
+    read: impl FnOnce(&mut dyn Read) -> std::io::Result<T> + Send + 'static,
+) -> Result<T, NoAnswer> {
+    match (answer_until(cmd, until, runs, read), runs) {
+        (Err(_), GitRuns::Tracked(tracker)) if tracker.is_closed() => Err(NoAnswer::Stopped),
+        (answer, _) => answer,
+    }
+}
+
+/// [`output_until`], whatever ended `cmd`.
+fn answer_until<T: Send + 'static>(
     cmd: &mut Command,
     until: Instant,
     runs: GitRuns<'_>,
@@ -2719,7 +2735,8 @@ mod tests {
             );
             assert!(!git_traps::fifo_has_reader(&fifo), "git still runs");
         }
-        // A session that ends kills the git it still waits for.
+        // A session that ends kills the git it still waits for: stopped,
+        // not failed.
         let tracker = crate::procs::Tracker::new();
         let waiting = {
             let (top, tracker) = (top.clone(), tracker.clone());
@@ -2736,7 +2753,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let start = Instant::now();
         tracker.close();
-        assert_eq!(waiting.join().unwrap(), Err(NoAnswer::Failed));
+        assert_eq!(waiting.join().unwrap(), Err(NoAnswer::Stopped));
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "{:?}",

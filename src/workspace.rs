@@ -1526,15 +1526,17 @@ fn profile_mark(dir: &Path) -> Option<Option<String>> {
 }
 
 /// An entry whose session is surely gone: its folder holds another mark, or
-/// its `./meow` is there without it. A folder that is out of reach (a drive
-/// not mounted) keeps its entry.
-fn is_stale(entry: &Entry) -> bool {
+/// its `./meow` is there without it and the session cannot have been moved
+/// ([`may_have_moved`]). A folder that is out of reach (a drive not
+/// mounted) keeps its entry.
+fn is_stale(home: &MeowHome, entry: &Entry) -> bool {
     let Some(dir) = &entry.dir else {
         return false;
     };
     match fs::symlink_metadata(dir) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             dir.parent().is_some_and(|sessions| sessions.is_dir())
+                && !may_have_moved(home, &entry.mark)
         }
         Err(_) => false,
         Ok(_) => profile_mark(dir).is_some_and(|mark| mark.as_deref() != Some(&entry.mark)),
@@ -1591,7 +1593,7 @@ fn remember(home: &MeowHome, mark: &str, dir: Option<&Path>) -> Result<()> {
     entries.retain(|known| {
         known.mark != entry.mark
             && (entry.dir.is_none() || known.dir != entry.dir)
-            && !is_stale(known)
+            && !is_stale(home, known)
     });
     entries.push(entry);
     write_record(home, &entries)
@@ -3147,6 +3149,13 @@ fn read_seen(home: &MeowHome, mark: &str) -> Option<Snapshot> {
     }
 }
 
+/// Whether the session `mark` could still turn up in a folder it was moved
+/// to: its last session ended as meow ends one, and nothing changed its
+/// files since ([`Workspace::moved_from`]).
+fn may_have_moved(home: &MeowHome, mark: &str) -> bool {
+    read_seen(home, mark).is_some_and(|seen| !seen.open && !seen.odd)
+}
+
 /// The record of the session `mark` as written: `Ok(None)` when there is
 /// none, `Err` when something else is in its place.
 fn read_seen_text(home: &MeowHome, mark: &str) -> Result<Option<String>, ()> {
@@ -3290,6 +3299,8 @@ struct WatchedRepo {
     top: PathBuf,
     git: PathBuf,
     below: String,
+    /// [`folds_case`] of `./meow`.
+    folds_case: bool,
 }
 
 impl WatchedRepo {
@@ -3313,7 +3324,37 @@ impl WatchedRepo {
             top,
             git,
             below: parts.join("/"),
+            folds_case: folds_case(&sessions_dir(&canonical)),
         })
+    }
+}
+
+/// Whether the file system takes `MEOW` beside the folder `sessions` (a
+/// `./meow`) for that folder, as macOS and Windows do by default: then
+/// git's `MEOW/Acme/zsh_history` is the session's `meow/acme/zsh_history`.
+/// Where case tells names apart (Linux, by default), a project's own
+/// `MEOW/` is another folder. When the file system cannot be asked, the
+/// system's default is taken.
+fn folds_case(sessions: &Path) -> bool {
+    let fallback = cfg!(any(target_os = "macos", windows));
+    let Some(name) = sessions.file_name().and_then(|name| name.to_str()) else {
+        return fallback;
+    };
+    let other = sessions.with_file_name(name.to_ascii_uppercase());
+    match (fs::symlink_metadata(sessions), fs::symlink_metadata(&other)) {
+        (Ok(_), Err(error)) if error.kind() == io::ErrorKind::NotFound => false,
+        (Ok(_), Ok(found)) if found.file_type().is_symlink() => false,
+        #[cfg(unix)]
+        (Ok(meta), Ok(found)) => {
+            use std::os::unix::fs::MetadataExt;
+            meta.dev() == found.dev() && meta.ino() == found.ino()
+        }
+        #[cfg(not(unix))]
+        (Ok(_), Ok(_)) => matches!(
+            (fs::canonicalize(sessions), fs::canonicalize(&other)),
+            (Ok(a), Ok(b)) if a == b
+        ),
+        _ => fallback,
     }
 }
 
@@ -3339,6 +3380,8 @@ pub struct GitWatch {
     said: (Listed, Listed),
     /// That git did not answer in time, said once.
     said_late: bool,
+    /// That git cannot read the repository, said once.
+    said_unreadable: bool,
     /// See [`GitWatch::files_doubtful`].
     doubtful: bool,
 }
@@ -3355,7 +3398,7 @@ impl GitWatch {
     /// Whether something outside meow may have put files in the session
     /// since this watch began: git tracks files of the session that meow
     /// reads back (a pull replaces them), a `.gitignore` of meow's had to
-    /// be put back, or git did not answer after its index changed.
+    /// be put back, or git did not answer in time after its index changed.
     pub fn files_doubtful(&self) -> bool {
         self.doubtful
     }
@@ -3414,9 +3457,11 @@ impl GitWatch {
         let cached = git_lists(&repo, &name, &["--cached"], until, runs);
         match &cached {
             Ok(listed) if listed.read_back => self.doubtful = true,
-            // A git that ran but gave no answer may hide a pull: taken as
-            // one. A git meow cannot start, as none.
-            Err(NoAnswer::Failed | NoAnswer::TimedOut) if again => self.doubtful = true,
+            // A pull can hold git up past its time (with a flood of names
+            // under `./meow`): taken as one. A git that cannot read this
+            // repository, that meow cannot start, or that the closing
+            // session stopped, tells nothing of a pull.
+            Err(NoAnswer::TimedOut) if again => self.doubtful = true,
             _ => {}
         }
         let others = match cached {
@@ -3429,15 +3474,21 @@ impl GitWatch {
             ),
             Err(no) => Err(no),
         };
-        let late = [&cached, &others]
-            .iter()
-            .any(|listed| matches!(listed, Err(NoAnswer::TimedOut)));
-        if late && !self.said_late {
+        let no_answer = |why: NoAnswer| {
+            [&cached, &others]
+                .iter()
+                .any(|listed| matches!(listed, Err(no) if *no == why))
+        };
+        if no_answer(NoAnswer::TimedOut) && !self.said_late {
             self.said_late = true;
             notes.push(format!(
                 "git did not answer in {} s: session files not checked",
                 GIT_CHECK_LIMIT.as_secs()
             ));
+        }
+        if no_answer(NoAnswer::Failed) && !self.said_unreadable {
+            self.said_unreadable = true;
+            notes.push("git cannot read this repository: session files not checked".to_owned());
         }
         let place = crate::evidence::sanitize(&folder.display().to_string(), 300);
         if let Ok(cached) = cached {
@@ -3486,8 +3537,9 @@ struct Listed {
 impl Listed {
     /// What `git ls-files -z` printed in `out`. `above`: the folder that
     /// holds `./meow` as a path from the top, with a `/` after it (or
-    /// empty). `session`: the session's name.
-    fn read(out: &mut dyn Read, above: &str, session: &str) -> io::Result<Self> {
+    /// empty). `session`: the session's name. `folds_case`: whether the
+    /// file system takes names in either case alike ([`folds_case`]).
+    fn read(out: &mut dyn Read, above: &str, session: &str, folds_case: bool) -> io::Result<Self> {
         use std::hash::Hasher;
         let mut listed = Self::default();
         let mut digest = std::hash::DefaultHasher::new();
@@ -3503,30 +3555,35 @@ impl Listed {
             digest.write(&chunk[..read]);
             for &byte in &chunk[..read] {
                 if byte == 0 {
-                    listed.add(&name, above, session);
+                    listed.add(&name, above, session, folds_case);
                     name.clear();
                 } else if name.len() < GIT_NAME_KEPT {
                     name.push(byte);
                 }
             }
         }
-        listed.add(&name, above, session);
+        listed.add(&name, above, session, folds_case);
         listed.digest = digest.finish();
         Ok(listed)
     }
 
-    fn add(&mut self, name: &[u8], above: &str, session: &str) {
+    fn add(&mut self, name: &[u8], above: &str, session: &str, folds_case: bool) {
         if name.is_empty() {
             return;
         }
         self.count += 1;
-        // git tells case apart in `above` no more than in `./meow`.
+        // git tells case apart in `above` as much as in `./meow`.
         let name = match name.split_at_checked(above.len()) {
-            Some((head, rest)) if head.eq_ignore_ascii_case(above.as_bytes()) => rest,
+            Some((head, rest))
+                if head == above.as_bytes()
+                    || (folds_case && head.eq_ignore_ascii_case(above.as_bytes())) =>
+            {
+                rest
+            }
             _ => name,
         };
         let name = String::from_utf8_lossy(name);
-        self.read_back |= is_read_back(&name, session);
+        self.read_back |= is_read_back(&name, session, folds_case);
         if self.first.len() < GIT_NAMES_SHOWN {
             self.first.push(name.into_owned());
         }
@@ -3549,22 +3606,25 @@ impl Listed {
 
 /// Whether `name`, a path from the folder that holds `./meow`, is the
 /// folder of the session `session` or a file in it that meow reads back
-/// ([`READ_BACK`], chats), with letters of either case alike: on macOS and
-/// Windows, a pull that brings `MEOW/Acme/zsh_history` replaces
-/// `meow/acme/zsh_history`.
-fn is_read_back(name: &str, session: &str) -> bool {
+/// ([`READ_BACK`], chats). Where the file system `folds_case` (macOS and
+/// Windows, by default), letters of either case are alike: a pull that
+/// brings `MEOW/Acme/zsh_history` replaces `meow/acme/zsh_history`.
+fn is_read_back(name: &str, session: &str, folds_case: bool) -> bool {
+    let alike = |part: &str, what: &str| {
+        if folds_case {
+            part.eq_ignore_ascii_case(what)
+        } else {
+            part == what
+        }
+    };
     let mut parts = name.split('/');
-    let is =
-        |part: Option<&str>, what: &str| part.is_some_and(|part| part.eq_ignore_ascii_case(what));
+    let is = |part: Option<&str>, what: &str| part.is_some_and(|part| alike(part, what));
     if !is(parts.next(), SESSIONS_DIR) || !is(parts.next(), session) {
         return false;
     }
     match parts.next() {
         None => true,
-        Some(file) => {
-            file.eq_ignore_ascii_case("chats")
-                || READ_BACK.iter().any(|kept| file.eq_ignore_ascii_case(kept))
-        }
+        Some(file) => alike(file, "chats") || READ_BACK.iter().any(|kept| alike(file, kept)),
     }
 }
 
@@ -3582,15 +3642,21 @@ fn git_lists(
     } else {
         format!("{}/", repo.below)
     };
-    // A folder name is a name, not a pattern, and in either case (see
-    // `is_read_back`).
-    let sessions = format!(":(literal,icase){above}{SESSIONS_DIR}");
+    // A folder name is a name, not a pattern, and in either case where the
+    // file system takes it so (see `is_read_back`).
+    let magic = if repo.folds_case {
+        "literal,icase"
+    } else {
+        "literal"
+    };
+    let sessions = format!(":({magic}){above}{SESSIONS_DIR}");
     let mut command = vec!["ls-files", "-z"];
     command.extend_from_slice(args);
     command.extend(["--", sessions.as_str()]);
     let session = session.to_owned();
+    let folds_case = repo.folds_case;
     crate::update::git_output_pinned(&repo.top, &command, until, runs, move |out| {
-        Listed::read(out, &above, &session)
+        Listed::read(out, &above, &session, folds_case)
     })
 }
 
@@ -7390,6 +7456,42 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert_eq!(ws.moved_from(&fx.home), None);
     }
 
+    /// PoC (v0.2.6 review, SESSION-4): once a session was made in a new
+    /// `./meow` at the old place of a moved folder, the record dropped the
+    /// moved session's entry as gone: it was asked about as a session from
+    /// elsewhere, and accepting it dropped its history.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_folder_keeps_its_session_after_a_new_one_at_its_old_place() {
+        let fx = fixture();
+        let proj = other_folder(&fx, "proj");
+        let made = open_in(&fx, &proj, "acme");
+        fs::write(made.history_path("bash"), "echo mine\n").unwrap();
+        drop(SessionFiles::for_session(&fx.home, &made, false));
+        let mark = made.profile.id.clone().unwrap();
+        let moved = fx.cwd.parent().unwrap().join("proj-v1");
+        fs::rename(&proj, &moved).unwrap();
+        fs::create_dir(&proj).unwrap();
+        open_in(&fx, &proj, "beta");
+        assert!(marks(&fx.home).contains(&mark));
+        let ws = Workspace::load(&sessions_dir(&moved).join("acme")).unwrap();
+        assert!(ws.is_foreign(&fx.home));
+        assert_eq!(ws.moved_from(&fx.home), Some(made.dir.clone()));
+        ws.take_moved(&fx.home, &made.dir).unwrap();
+        assert!(!ws.is_foreign(&fx.home));
+        assert_eq!(ws.files_seen(&fx.home), FilesSeen::AsLeft);
+        assert!(ws.history_path("bash").is_file());
+        // A session whose folder is gone and that cannot turn up moved
+        // (its last end was not clean) is still dropped.
+        let gamma = open_in(&fx, &proj, "gamma");
+        std::mem::forget(SessionFiles::for_session(&fx.home, &gamma, false));
+        let gone = gamma.profile.id.clone().unwrap();
+        fs::remove_dir_all(&gamma.dir).unwrap();
+        open_in(&fx, &proj, "delta");
+        assert!(!marks(&fx.home).contains(&gone));
+        assert!(marks(&fx.home).contains(&mark));
+    }
+
     /// A folder whose path is not text cannot be named in the record or
     /// in the shell's start-up files: no session is made or used there.
     #[cfg(unix)]
@@ -7740,33 +7842,49 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         );
         assert!(!watch.files_doubtful());
 
-        // As a pull brings it: the history, in another case.
+        // As a pull brings it: the history, in another case. Where case
+        // tells names apart, that is another folder: the project's own.
+        let folds = folds_case(&repo.join("meow"));
         let other_case = repo.join("MEOW").join("Acme");
         fs::create_dir_all(&other_case).unwrap();
         fs::write(other_case.join("zsh_history"), "echo planted\n").unwrap();
         assert!(test_git(&repo, &["add", "-f", "MEOW/Acme/zsh_history"]));
         let notes = watch.check(&acme.dir);
-        assert!(
-            notes
-                .iter()
-                .any(|note| note.to_ascii_lowercase().contains("meow/acme/zsh_history")),
-            "{notes:?}"
-        );
-        assert!(watch.files_doubtful());
+        if folds {
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.to_ascii_lowercase().contains("meow/acme/zsh_history")),
+                "{notes:?}"
+            );
+            assert!(watch.files_doubtful());
+        } else {
+            assert!(notes.is_empty(), "{notes:?}");
+            assert!(!watch.files_doubtful());
+        }
     }
 
     #[test]
-    fn read_back_files_are_told_by_name_in_either_case() {
+    fn read_back_files_are_told_by_name_in_case_as_the_file_system_does() {
         for name in [
             "meow/acme",
             "meow/acme/zsh_history",
-            "MEOW/Acme/BASH_HISTORY",
             "meow/acme/graph.json",
             "meow/acme/state.db-wal",
             "meow/acme/chats/192.0.2.6.md",
             "meow/acme/zsh_history/x",
         ] {
-            assert!(is_read_back(name, "acme"), "{name}");
+            assert!(is_read_back(name, "acme", false), "{name}");
+            assert!(is_read_back(name, "acme", true), "{name}");
+        }
+        for name in [
+            "MEOW/Acme/BASH_HISTORY",
+            "Meow/acme/zsh_history",
+            "meow/ACME",
+            "meow/acme/Chats/192.0.2.6.md",
+        ] {
+            assert!(is_read_back(name, "acme", true), "{name}");
+            assert!(!is_read_back(name, "acme", false), "{name}");
         }
         for name in [
             "meow/.gitignore",
@@ -7777,8 +7895,84 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             "x/meow/acme/zsh_history",
             "meow",
         ] {
-            assert!(!is_read_back(name, "acme"), "{name}");
+            assert!(!is_read_back(name, "acme", false), "{name}");
+            assert!(!is_read_back(name, "acme", true), "{name}");
         }
+    }
+
+    /// The file system is asked whether `MEOW` beside `./meow` is that
+    /// folder: by default so on macOS and Windows, not on Linux.
+    #[test]
+    fn case_folding_is_asked_of_the_file_system() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("meow");
+        fs::create_dir(&sessions).unwrap();
+        let other = tmp.path().join("MEOW");
+        // Where case is folded, `MEOW` is there already.
+        let folds = fs::create_dir(&other).is_err();
+        assert_eq!(folds_case(&sessions), folds);
+        if cfg!(any(target_os = "macos", windows)) {
+            assert!(folds, "the default file system folds case");
+        }
+        #[cfg(unix)]
+        if !folds {
+            // A link named `MEOW` is not the folder.
+            fs::remove_dir(&other).unwrap();
+            std::os::unix::fs::symlink(&sessions, &other).unwrap();
+            assert!(!folds_case(&sessions));
+            fs::remove_file(&other).unwrap();
+            assert!(!folds_case(&sessions));
+        }
+    }
+
+    /// PoC (v0.2.6 review, SESSION-3): on Linux, a project's own `MEOW/`
+    /// (an Xcode target, say) was taken for meow's `./meow`: each open
+    /// said git tracked session files and told the user to untrack them.
+    #[test]
+    fn a_projects_own_folder_named_meow_in_another_case_is_not_meows() {
+        let fx = fixture();
+        let repo = other_folder(&fx, "app");
+        if !test_git(&repo, &["init", "-q"]) {
+            return;
+        }
+        let acme = open_in(&fx, &repo, "acme");
+        let own = repo.join("MEOW");
+        if fs::create_dir(&own).is_err() {
+            // One folder there: the test is for a file system that tells
+            // case apart.
+            assert!(folds_case(&repo.join("meow")));
+            return;
+        }
+        assert!(!folds_case(&repo.join("meow")));
+        fs::write(own.join("main.c"), "// app\n").unwrap();
+        fs::write(repo.join(".gitignore"), "/meow/\n").unwrap();
+        assert!(test_git(&repo, &["add", "MEOW/main.c", ".gitignore"]));
+        // Its own session files in that case too.
+        let shadow = own.join("acme");
+        fs::create_dir(&shadow).unwrap();
+        fs::write(shadow.join("zsh_history"), "echo app\n").unwrap();
+        assert!(test_git(&repo, &["add", "-f", "MEOW/acme/zsh_history"]));
+        fs::write(own.join("New.swift"), "// new\n").unwrap();
+        let mut watch = GitWatch::default();
+        assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+        assert!(!watch.files_doubtful());
+        // Its files change; still not meow's.
+        fs::write(own.join("main.c"), "// app 2\n").unwrap();
+        assert!(test_git(&repo, &["add", "MEOW/main.c"]));
+        assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+        assert!(!watch.files_doubtful());
+        // meow's own, in its case, still count.
+        fs::write(acme.dir.join("zsh_history"), "echo planted\n").unwrap();
+        assert!(test_git(&repo, &["add", "-f", "meow/acme/zsh_history"]));
+        let notes = watch.check(&acme.dir);
+        assert!(
+            notes.iter().any(|note| note.starts_with(
+                "git tracks session files (meow/acme/zsh_history): a commit would take them in. \
+                 Run `git rm -r --cached meow`"
+            )),
+            "{notes:?}"
+        );
+        assert!(watch.files_doubtful());
     }
 
     /// Review of WS-3: past 8 MiB of names, git's answer was dropped, so a
@@ -7792,7 +7986,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             printed.extend_from_slice(format!("Sub/meow/pad/{i:05}{pad}\0").as_bytes());
         }
         assert!(printed.len() > 8 * 1024 * 1024);
-        let listed = Listed::read(&mut &printed[..], "sub/", "acme").unwrap();
+        let listed = Listed::read(&mut &printed[..], "sub/", "acme", true).unwrap();
         assert_eq!(listed.count, 9001);
         assert!(listed.read_back);
         assert_eq!(listed.first[0], "meow/acme/zsh_history");
@@ -7801,10 +7995,14 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert!(listed.shown().ends_with(" and 8998 more"));
         // Told apart from another list with the same first names.
         printed.extend_from_slice(b"meow/pad/z\0");
-        let more = Listed::read(&mut &printed[..], "sub/", "acme").unwrap();
+        let more = Listed::read(&mut &printed[..], "sub/", "acme", true).unwrap();
         assert_ne!(more, listed);
-        let none = Listed::read(&mut &b""[..], "", "acme").unwrap();
+        let none = Listed::read(&mut &b""[..], "", "acme", true).unwrap();
         assert_eq!((none.count, none.read_back), (0, false));
+        // Where case tells names apart, `Sub/` is another folder.
+        let exact = Listed::read(&mut &printed[..], "sub/", "acme", false).unwrap();
+        assert!(exact.read_back);
+        assert_eq!(exact.first[1], format!("Sub/meow/pad/00000{pad}"));
     }
 
     /// The same through git: a pull that brought the history and more than
@@ -7864,6 +8062,98 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert!(watch.files_doubtful());
         let mut first = GitWatch::default();
         first.check(&acme.dir);
+        assert!(!first.files_doubtful());
+    }
+
+    /// PoC (v0.2.6 review, SESSION-1): a session that ended while its 2 s
+    /// check of git ran killed that git, and the check took it for a pull:
+    /// the next open dropped the shell history. A git the closing session
+    /// stopped tells nothing, and is not said to have failed.
+    #[cfg(unix)]
+    #[test]
+    fn git_stopped_as_the_session_closes_tells_nothing() {
+        use crate::update::git_traps;
+        let fx = fixture();
+        let repo = other_folder(&fx, "repo");
+        git_traps::git(&repo, &["init", "-q"]);
+        fs::write(repo.join("README"), "x\n").unwrap();
+        git_traps::git(&repo, &["add", "README"]);
+        let acme = open_in(&fx, &repo, "acme");
+        let tracker = crate::procs::Tracker::new();
+        let mut watch = GitWatch::using(tracker.clone());
+        assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+        // The index changed (a `git add`), and git still reads it as the
+        // session closes.
+        let index = repo.join(".git").join("index");
+        fs::remove_file(&index).unwrap();
+        git_traps::fifo(&index);
+        let start = Instant::now();
+        let notes = std::thread::scope(|scope| {
+            let check = scope.spawn(|| watch.check(&acme.dir));
+            while tracker.running() == 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "git did not start"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            tracker.close();
+            check.join().unwrap()
+        });
+        assert!(start.elapsed() < GIT_CHECK_LIMIT, "{:?}", start.elapsed());
+        assert_eq!(notes, Vec::<String>::new());
+        assert!(!watch.files_doubtful());
+    }
+
+    /// Sets the last write of `path` to `at` seconds after 1970.
+    fn written_at(path: &Path, at: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(at))
+            .unwrap();
+    }
+
+    /// PoC (v0.2.6 review, SESSION-2): in a repository meow's git cannot
+    /// read (a newer format, as reftable is to git before 2.45), each check
+    /// made after the index changed was taken as a pull, and nothing said
+    /// why the next open dropped the shell history. That git tells nothing
+    /// of a pull: it is said once, at the first look or later.
+    #[test]
+    fn a_repository_git_cannot_read_is_said_once_and_is_no_pull() {
+        let fx = fixture();
+        let repo = other_folder(&fx, "repo");
+        if !test_git(&repo, &["init", "-q"]) {
+            return;
+        }
+        fs::write(repo.join("README"), "x\n").unwrap();
+        assert!(test_git(&repo, &["add", "README"]));
+        let acme = open_in(&fx, &repo, "acme");
+        let mut watch = GitWatch::default();
+        assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+        // A format no git knows.
+        let config = repo.join(".git").join("config");
+        let text = fs::read_to_string(&config)
+            .unwrap()
+            .replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+        fs::write(
+            &config,
+            format!("{text}[extensions]\n\tmeowformat = true\n"),
+        )
+        .unwrap();
+        assert!(!test_git(&repo, &["ls-files"]), "git still reads it");
+        let index = repo.join(".git").join("index");
+        written_at(&index, 1_000_000);
+        let said = "git cannot read this repository: session files not checked";
+        assert_eq!(watch.check(&acme.dir), [said]);
+        assert!(!watch.files_doubtful());
+        written_at(&index, 2_000_000);
+        assert_eq!(watch.check(&acme.dir), Vec::<String>::new());
+        assert!(!watch.files_doubtful());
+        // At the first look too.
+        let mut first = GitWatch::default();
+        assert_eq!(first.check(&acme.dir), [said]);
         assert!(!first.files_doubtful());
     }
 

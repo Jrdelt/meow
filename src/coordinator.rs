@@ -523,10 +523,13 @@ impl State {
     }
 
     /// Checks git once more, as the timer does: for the end of the
-    /// session, so that a pull just before it is seen too. Skipped while
-    /// a check runs.
+    /// session, so that a pull just before it is seen too. A check that
+    /// runs is waited for first (git is given no longer than
+    /// [`crate::workspace::GIT_CHECK_LIMIT`]): closing the session would
+    /// stop its git, and a pull after it began would go unseen.
     pub fn check_git(&self) {
-        if let Ok(mut watch) = self.git_watch.try_lock() {
+        let deadline = Instant::now() + crate::workspace::GIT_CHECK_LIMIT + STOP_STEP;
+        if let Some(mut watch) = lock_until(&self.git_watch, deadline) {
             self.watch_git(&mut watch);
         }
     }
@@ -2530,6 +2533,44 @@ mod tests {
         assert!(coordinator.shutdown().is_empty());
         let graph = std::fs::read_to_string(workspace.graph_path()).unwrap();
         assert!(!graph.contains("198.51.100.9"), "{graph}");
+    }
+
+    /// PoC (v0.2.6 review, SESSION-1): the check at the end of a session
+    /// was skipped while the timer's check ran; closing the session then
+    /// killed that check's git. It now waits for it, then checks again: a
+    /// pull while that check ran is seen.
+    #[test]
+    fn the_end_check_waits_for_a_check_that_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (workspace, _) =
+            Workspace::open_or_create(&home, &project, "acme", true, Mode::Light).unwrap();
+        let _lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
+        let mut config = Config::default();
+        config.cve.enabled = false;
+        let coordinator = Coordinator::start(workspace.clone(), config).unwrap();
+        let state = coordinator.state();
+        let marker = workspace.dir.join(".gitignore");
+        let meows = std::fs::read_to_string(&marker).unwrap();
+        let (held, holding) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // A check that takes a while.
+            scope.spawn(|| {
+                let _watch = lock(&state.git_watch);
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+            });
+            holding.recv().unwrap();
+            // A pull meanwhile.
+            std::fs::write(&marker, "!*\n").unwrap();
+            state.check_git();
+            assert!(state.files_doubtful());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), meows);
+        });
+        drop(state);
+        coordinator.shutdown();
     }
 
     #[test]
