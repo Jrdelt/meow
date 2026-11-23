@@ -69,7 +69,7 @@ flowchart LR
 | A local AI server | Unmasked only if meow counts it as yours ([SECURITY.md](../SECURITY.md#known-limits) says when); otherwise masked, and no key | When you ask local AI (`L`) |
 | crt.sh, DNS-over-HTTPS, RDAP, Team Cymru | Public names and addresses of your target; never internal names | Recon stages, mild and aggressive only |
 | GitHub | Release metadata and downloads | `meow update` |
-| raw.githubusercontent.com, download.db-ip.com, your package manager | Plain downloads of the wordlist and the DB-IP Lite location database; package installs of missing scanners (or a `cargo`/`go` build of feroxbuster or katana when no package has them) | `meow tools`, and the offers of the first session and of `meow recon` (they ask first, unless `--yes` or `--install-tools`) |
+| raw.githubusercontent.com, download.db-ip.com, your package manager | The wordlist and the DB-IP Lite database; installs of missing scanners (else a `cargo`/`go` build) | `meow tools` and the first-session and `meow recon` offers (they ask first unless `--yes` or `--install-tools`); `meow update` of a source build, without asking |
 
 **CVE lookups carry no scanned host's address or name.** Lookups are built only
 from CPE names and product/version pairs (`plan` and `software_lookups` in
