@@ -543,7 +543,9 @@ mod tests {
     /// Runs the map's renderer of AI replies under Node, with a small
     /// stand-in for the page, on replies written to stall it: 200 KB each
     /// (a reply's limit), formatted in full, then the cap on what is. No
-    /// reply makes many more elements than it has characters.
+    /// reply makes many more elements than it has characters. Each takes
+    /// about 150 ms here; the 5 s limit leaves room for a busy CI runner
+    /// (15-25 times slower), while a quadratic path takes minutes.
     const RENDER_CHECK: &str = r#"'use strict';
 const src = require('fs').readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('  function codeSpanCloser(');
@@ -572,7 +574,7 @@ function time(name, render, text) {
   render(root, text);
   const ms = Date.now() - t;
   console.log(`${name}: ${ms} ms, ${made} elements`);
-  failed = failed || ms > 1500 || made > text.length + 10000;
+  failed = failed || ms > 5000 || made > text.length + 10000;
   return root;
 }
 let backticks = '';
