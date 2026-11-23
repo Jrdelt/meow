@@ -4,12 +4,13 @@
 //!   OpenAI-compatible server on this machine (`http://localhost:1234/v1`).
 //!   A "local" server on another machine, or one another login user runs
 //!   on this machine, gets masked text instead, as the cloud does.
-//! * `[C]` **Cloud triage** (OpenRouter): everything is masked by the
-//!   Privacy Vault first. The SHA-256 prompt cache and the daily budget are
-//!   checked before any request; when the budget is spent or no API key is
-//!   set, the request falls back to `[L]`.
-//! * `[R]` **Grounded research** (OpenRouter `openrouter:web_search`): only
-//!   public software identifiers and advisory IDs are sent.
+//! * `[C]` **Cloud triage** (the Claude API or OpenRouter): everything is
+//!   masked by the Privacy Vault first. The SHA-256 prompt cache and the
+//!   daily budget are checked before any request; when the budget is spent
+//!   or no API key is set, the request falls back to `[L]`.
+//! * `[R]` **Grounded research** (Claude's own web search tool, or
+//!   OpenRouter `openrouter:web_search`): only public software identifiers
+//!   and advisory IDs are sent.
 //!
 //! Prompt injection (OWASP LLM01): text scraped from the audited systems is
 //! never mixed into the instructions. It travels inside one JSON field,

@@ -1,10 +1,12 @@
 //! Command-line interface definitions (`clap` derive).
 //!
-//! `meow` and `meow <name>` start a session (a new one asks where to save
-//! it); `meow list` shows every saved workspace and `meow delete` removes
-//! one; every other subcommand is a helper that targets an existing
-//! workspace: `--local`, `--session`, or the session of the current shell
-//! (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
+//! `meow` runs the first-time setup on a new machine (which can then open a
+//! session) and otherwise lists the saved sessions; `meow <name>` starts a
+//! session (a new one asks where to save it). `meow list` shows every saved
+//! workspace and `meow delete` removes one; `setup`, `tools` and `update`
+//! act on meow itself; every other subcommand is a helper that targets an
+//! existing workspace: `--local`, `--session`, or the session of the
+//! current shell (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
 
 use std::path::PathBuf;
 

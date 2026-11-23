@@ -48,7 +48,6 @@ fn sans_from_ssl_cert(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// The target of "Did not follow redirect to <url>" in an `http-title`.
 /// Ports tried and not open: (protocol, state) -> (count, port ranges).
 type NotOpenGroups = std::collections::BTreeMap<(String, String), (u32, Vec<(u16, u16)>)>;
 
@@ -114,6 +113,7 @@ fn unlisted_ports(tried: &[(u16, u16)], known: Vec<(u16, u16)>) -> Vec<(u16, u16
     out
 }
 
+/// The target of "Did not follow redirect to `<url>`" in an `http-title`.
 fn redirect_from_title(output: &str) -> Option<String> {
     let rest = output.split("redirect to ").nth(1)?;
     let url = rest.split_whitespace().next()?;

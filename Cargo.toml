@@ -17,7 +17,6 @@ path = "src/main.rs"
 # from a folder above the checkout.
 [workspace]
 
-# Crates are added in the step that first uses them.
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
