@@ -60,7 +60,6 @@
   // Plenty of room between devices, so nothing looks cluttered.
   var STEP = 250, SUB_STEP = 215;           // in the row; below you
   var YOU_Y = -360, GW_Y = -190, EGRESS_Y = -20, CLOUD_Y = 155, TARGET_Y = 365;
-  var BAR_Y = 110, ROW_Y = 215;
   // The most devices drawn in the row under the router, and in the group
   // without a route: the rest are counted (the Hosts card lists them all).
   var LAN_ROW = 24, NO_ROUTE_MAX = 12;
@@ -187,8 +186,6 @@
       // From the router to each device: straight, solid when wired, dotted on Wi-Fi.
       { selector: 'edge.straight', style: { 'curve-style': 'straight', 'width': 2.2 } },
       { selector: 'edge.wifi', style: { 'line-style': 'dotted', 'width': 2.6 } },
-      // To a network below the rings: across only after clearing them.
-      { selector: 'edge.low', style: { 'taxi-turn': '92%' } },
       { selector: 'edge.thin', style: { 'curve-style': 'straight', 'width': 1.4 } },
       { selector: 'edge.dashed', style: { 'line-style': 'dashed', 'line-dash-pattern': [8, 6], 'width': 2.6 } }
     ])
@@ -851,11 +848,11 @@
       canvas.style.height = '';
       cy.resize();
     }
-    var short = Math.ceil(bh * READABLE_ZOOM + 2 * FIT_PADDING) - scroller.clientHeight;
+    var shortBy = Math.ceil(bh * READABLE_ZOOM + 2 * FIT_PADDING) - scroller.clientHeight;
     // Expanded, the card is the window: the drawing shrinks to fit it.
-    if (short > 0 && !mapExpanded) {
+    if (shortBy > 0 && !mapExpanded) {
       card.style.maxHeight = 'none';
-      card.style.height = Math.min(CARD_MAX, card.offsetHeight + short) + 'px';
+      card.style.height = Math.min(CARD_MAX, card.offsetHeight + shortBy) + 'px';
     }
     if (!scroller.clientHeight || !scroller.clientWidth) { return; }
     cy.resize();
@@ -1173,6 +1170,11 @@
     if (first) { first.focus(); }
   }
   byId('host-close').addEventListener('click', closeHost);
+  // Whether a key goes to a text box (a note being typed), not to the page.
+  function typing(event) {
+    var target = event.target;
+    return !!target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || !!target.isContentEditable);
+  }
   document.addEventListener('keydown', function (event) {
     if (event.key !== 'Escape') { return; }
     if (mapExpanded) {
@@ -1180,8 +1182,7 @@
       return;
     }
     // Not while a note is being typed: Esc there is the text box's own.
-    var target = event.target;
-    if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) { return; }
+    if (typing(event)) { return; }
     if (selected) { closeHost(); }
   });
   // Extracts the VPN adapter name from `"{name} {cidr}: carries ..."` across
@@ -1346,9 +1347,8 @@
     return name && data.why ? 'Shown as ' + name + ': ' + data.why + '.' : '';
   }
 
-  function renderList(target, items, empty, build) {
+  function renderList(target, items, build) {
     clear(target);
-    if (!items.length && empty) { target.appendChild(el('li', 'dim', empty)); }
     items.forEach(function (item) { target.appendChild(build(item)); });
   }
 
@@ -1605,9 +1605,6 @@
     }
     model.main = parts.join(' \u00b7 ');
     model.spoken = now ? model.main.replace(/^(\d+)\/(\d+)/, '$1 of $2 stages over') : model.main;
-    // A run that is over keeps its bar and, where there is room, the
-    // names: which stages ran and which were skipped stays readable.
-    model.over = entry.rank === 2;
     var settled = over + (now && now.progress.part ? now.progress.part : 0);
     model.percent = total ? Math.round(100 * settled / total) : 0;
     return model;
@@ -1818,7 +1815,6 @@
     view.eta = now ? now.progress.eta : null;
     view.etaAt = reconArrived;
     setText(view.main, model.main);
-    view.item.classList.toggle('over', model.over);
     setText(view.queued, model.others ? ' ' + model.others : '');
     var meter = model.percent + ' ' + model.main;
     if (view.meterText !== meter) {
@@ -2346,7 +2342,7 @@
     if (unchanged('notices', notices)) { return; }
     byId('card-notices').hidden = !notices.length;
     byId('notices-count').textContent = notices.length ? String(notices.length) : '';
-    renderList(byId('notices'), notices, '', function (notice) {
+    renderList(byId('notices'), notices, function (notice) {
       var item = el('li');
       item.appendChild(el('span', 'dim', String(notice.at || '').slice(11, 19) + ' '));
       item.appendChild(document.createTextNode(String(notice.text || '')));
@@ -2511,7 +2507,7 @@
     });
     var fixes = state.fixes || {};
     var mine = table();
-    ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
+    ((local && local.interfaces) || []).forEach(function (iface) {
       (iface.addresses || []).forEach(function (cidr) { mine[cidr.split('/')[0]] = true; });
     });
     // The card shows once there are hosts.
@@ -2558,7 +2554,6 @@
     }
   }
 
-  // The cards of a selected host: only the ones there is something to say in.
   // "2026-11-17T09:41:00Z" as "3 min ago", or the date when it is older.
   function sinceText(at) {
     var then = Date.parse(at || '');
@@ -2676,7 +2671,8 @@
     return /^(ssl\/http|https)$/.test(port.service || '') ? 'https' : (port.service || '');
   }
 
-  function hostCards(host, data) {
+  // The cards of a selected host: only the ones there is something to say in.
+  function hostCards(host) {
     var hostPorts = host.ports || {};
 
     // One line per port: number, service and the software that answered,
@@ -3099,7 +3095,7 @@
   }
 
   function buildHostTabs(host, data, refocus) {
-    var made = hostCards(host, data);
+    var made = hostCards(host);
     var cves = cveCounts(host.address);
     var reply = state.ai || {};
     var aiHere = reply.address === host.address && !!(reply.running || reply.text || reply.error);
@@ -3115,9 +3111,10 @@
       cves: [movable['card-cves'].node],
       notes: aiHere ? [made.ai, made.note, movable['card-ai'].node] : [made.ai, made.note]
     };
+    var keys = exposedKeys(host);
     var badge = {
       ports: [String(openPorts), ''],
-      web: exposedKeys(host) ? [exposedKeys(host) + (exposedKeys(host) === 1 ? ' key' : ' keys'), 'bad'] : null,
+      web: keys ? [keys + (keys === 1 ? ' key' : ' keys'), 'bad'] : null,
       dns: host.dns_security ? [host.dns_security.grade || '?',
         { ok: '', warn: 'warn', bad: 'bad', info: '' }[gradeKind(host.dns_security.grade)]] : null,
       cves: cves.total ? [String(cves.total), cves.serious ? 'bad' : 'warn'] : null,
@@ -3164,9 +3161,7 @@
     showTab(tabs[to].getAttribute('data-tab'), true);
   });
   document.addEventListener('keydown', function (event) {
-    if (event.altKey || event.ctrlKey || event.metaKey || byId('card-host').hidden) { return; }
-    var target = event.target;
-    if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) { return; }
+    if (event.altKey || event.ctrlKey || event.metaKey || byId('card-host').hidden || typing(event)) { return; }
     var number = /^[1-9]$/.test(event.key) ? Number(event.key) : 0;
     var tabs = byId('host-tabs').querySelectorAll('[role="tab"]');
     if (!number || number > tabs.length) { return; }
@@ -3403,7 +3398,7 @@
     if (data.kind === 'interface') {
       var name = String(data.id || '').slice(3);
       if (data.network) { detail.appendChild(row('Network', data.network)); }
-      ((state.graph && state.graph.local && state.graph.local.interfaces) || []).forEach(function (iface) {
+      ((local && local.interfaces) || []).forEach(function (iface) {
         if (iface.name !== name) { return; }
         detail.appendChild(row('Interface', name + ' · ' + iface.kind + ' · ' + (iface.up ? 'up' : 'down')));
         (iface.addresses || []).forEach(function (address) { detail.appendChild(row('Your address', address)); });
