@@ -1,0 +1,7 @@
+$ curl -sI http://192.0.2.10:8080/portal/
+HTTP/1.1 200 OK
+Server: Apache-Coyote/1.1
+X-Powered-By: PHP/7.2.24
+
+$ ssh -v admin@192.0.2.10
+debug1: Remote protocol version 2.0, remote software version OpenSSH_7.4

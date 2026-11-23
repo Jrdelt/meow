@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-23T10:00:00Z","request":{"method":"GET","endpoint":"https://web01.example.test/login","tag":"a","attribute":"href","source":"https://web01.example.test/"},"response":{"status_code":200,"headers":{"server":"nginx/1.18.0"}}}
+{"type":"response","url":"http://192.0.2.10/admin/","original_url":"http://192.0.2.10/admin","path":"/admin/","status":301,"method":"GET","content_length":178,"line_count":7,"word_count":13}

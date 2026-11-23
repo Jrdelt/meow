@@ -1,0 +1,5 @@
+[1;32m$ [0mnmap -sV 192.0.2.10
+]0;titleNmap scan report for 192.0.2.10
+22/tcp open  ssh[K OpenSSH 7.4
+[?1049h[2J[Halt screen[?1049l[sudo] password for you: 
+âœ“ doneÿþ

@@ -1,0 +1,48 @@
+# Fuzz targets for meow's parsers and its C terminal filter.
+# Run one with nightly Rust and cargo-fuzz, from the repository root:
+#   cargo +nightly fuzz run parse_text -- -max_total_time=60
+# The weekly `fuzz` workflow runs each target for a few minutes.
+[package]
+name = "meow-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+meow = { path = ".." }
+
+# A workspace of its own, apart from meow's.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_text"
+path = "fuzz_targets/parse_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nmap_xml"
+path = "fuzz_targets/nmap_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal_lines"
+path = "fuzz_targets/terminal_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tap_filter"
+path = "fuzz_targets/tap_filter.rs"
+test = false
+doc = false
+bench = false
