@@ -21,14 +21,13 @@
 //! and left out of the grade.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use anyhow::{bail, Result};
 use futures_util::future::join_all;
 
 use crate::evidence::{Confidence, EvidenceRecord, Source};
 use crate::graph::{DnsCheck, DnsSecurity, DnsService, Observation, SubdomainCheck};
-use crate::osint::{build_http_client, root_domain, Lookup, Resolver};
+use crate::osint::{root_domain, Lookup, Resolver};
 
 const A: u16 = 1;
 const CNAME: u16 = 5;
@@ -614,23 +613,12 @@ fn fact(address: &str, claim: String, evidence: &str) -> Observation {
     }
 }
 
-/// Runs the stage for `domain`, whose records are kept on `primary_address`
-/// (the address it resolves to, or the name itself). `ct_names` are names
-/// the certificate logs gave for the same domain. `internal` holds the
-/// system's addresses for an internal target (see
-/// [`crate::osint::internal_target_addresses`]): then no question leaves
-/// this machine's resolvers.
-pub async fn run(
-    domain: &str,
-    primary_address: &str,
-    ct_names: &[String],
-    internal: Option<&[String]>,
-) -> Result<(Vec<Observation>, String)> {
-    let resolver = Resolver::system(build_http_client(Duration::from_secs(6))?);
-    run_on(resolver, domain, primary_address, ct_names, internal).await
-}
-
-/// [`run`] with `resolver` for the questions.
+/// Runs the stage for `domain` with `resolver` for the questions. Its
+/// records are kept on `primary_address` (the address it resolves to, or
+/// the name itself). `ct_names` are names the certificate logs gave for the
+/// same domain. `internal` holds the system's addresses for an internal
+/// target (see [`crate::osint::internal_target_addresses`]): then no
+/// question leaves this machine's resolvers.
 pub async fn run_on(
     resolver: Resolver,
     domain: &str,

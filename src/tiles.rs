@@ -2,9 +2,10 @@
 //!
 //! Map pictures come as tiles: 256-pixel squares of a world map in the Web
 //! Mercator projection, numbered by zoom level, column and row. When an
-//! estimate arrives meow fetches the few tiles around it (at most six), keeps
-//! them in memory for the session and serves them to the map page itself, so
-//! the page never contacts anything outside. Fetching them tells the tile
+//! estimate arrives meow fetches the few tiles around it (at most nine, and
+//! as many again for the closer view a click shows), keeps them in memory
+//! for the session and serves them to the map page itself, so the page
+//! never contacts anything outside. Fetching them tells the tile
 //! service roughly which area is being looked at, the area the estimate
 //! already names; the requests carry nothing else.
 

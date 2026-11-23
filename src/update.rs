@@ -1,8 +1,11 @@
 //! `meow update`: for a meow installed from a GitHub Release, downloads the
-//! newest release (`release.rs`). Otherwise pulls the latest meow from
-//! GitHub into the folder it was built from, then runs that folder's `install.sh`, which rebuilds meow and
-//! adds any tool it now needs. Nothing is pulled while the folder has local
-//! changes, and only fast-forward pulls are made.
+//! newest release (`release.rs`); for a Homebrew install, runs `brew update`
+//! and `brew upgrade`. Otherwise, or with `--source`/`MEOW_SOURCE`, pulls the
+//! latest meow into the folder it was built from (or the one named), then
+//! runs that folder's `install.sh`, which rebuilds meow and adds any tool it
+//! now needs; on Windows it asks the user to close meow and run
+//! `install.ps1 -Yes`. Nothing is pulled while the folder has local changes,
+//! and only fast-forward pulls are made.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

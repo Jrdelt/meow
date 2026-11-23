@@ -17,11 +17,10 @@ path = "src/main.rs"
 # from a folder above the checkout.
 [workspace]
 
-# Crates are added in the step that first uses them.
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive"] }
 dirs = "7"
 fd-lock = "4.0"
 futures-util = "0.3"

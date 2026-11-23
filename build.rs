@@ -1,5 +1,6 @@
 //! Compiles the stateful ECMA-48 tap filter (`src/c/tap_filter.c`) into a
-//! static library that Cargo links into the `meow` binary.
+//! static library linked into meow, and gives meow the commit it is built
+//! from (`MEOW_BUILD_COMMIT`; see `src/build_commit.rs`).
 
 #[path = "src/build_commit.rs"]
 mod build_commit;

@@ -657,6 +657,7 @@ impl NvdCve {
     }
 
     /// [`NvdCve::relevance`] for a keyword hit on a host of unknown family.
+    #[cfg(test)]
     pub fn applies_to(&self, product: &str, version: &str) -> Option<Confidence> {
         self.relevance(product, version, None, false)
             .map(|found| found.confidence)
@@ -1360,10 +1361,12 @@ impl CveClient {
         Ok((found, truncated))
     }
 
+    #[cfg(test)]
     pub async fn nvd_by_cpe(&self, cpe23: &str) -> Result<Vec<NvdCve>> {
         self.nvd_query_paged("cpeName", cpe23).await.map(|(v, _)| v)
     }
 
+    #[cfg(test)]
     pub async fn nvd_by_keyword(&self, product: &str, version: &str) -> Result<Vec<NvdCve>> {
         self.nvd_query_paged("keywordSearch", &format!("{product} {version}"))
             .await
@@ -1413,6 +1416,9 @@ impl CveClient {
         }
     }
 
+    /// Queries OSV for several packages at once, following
+    /// `next_page_token` for up to `OSV_MAX_PAGES` pages. Returns
+    /// `(package index, vulnerability id)` pairs and whether pages were left unread.
     async fn osv_batch_paged(&self, packages: &[Package]) -> Result<(Vec<(usize, String)>, bool)> {
         crate::ai::validate_cloud_url(&self.settings.osv_url)?;
         let url = format!(
@@ -1479,12 +1485,6 @@ impl CveClient {
             pending = next;
         }
         Ok((found, !pending.is_empty()))
-    }
-
-    /// Queries OSV for several packages at once, following
-    /// `next_page_token`. Returns `(package index, vulnerability id)` pairs.
-    pub async fn osv_batch(&self, packages: &[Package]) -> Result<Vec<(usize, String)>> {
-        self.osv_batch_paged(packages).await.map(|(found, _)| found)
     }
 
     /// Full OSV record for one id (cached for a day).

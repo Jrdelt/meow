@@ -99,11 +99,6 @@ fn trace_program() -> Option<PathBuf> {
         .find_map(|(program, _)| find_program(program))
 }
 
-/// What `meow recon` would have to skip on this machine.
-pub fn gaps(settings: &ReconSettings) -> Vec<Gap> {
-    gaps_with_db(settings, None)
-}
-
 /// What `meow recon` and the map would have to skip, honoring any configured
 /// `[location] database` path override.
 pub fn gaps_with_db(settings: &ReconSettings, location_db: Option<&str>) -> Vec<Gap> {

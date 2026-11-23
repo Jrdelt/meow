@@ -422,7 +422,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             // Light mode refuses recon anyway; otherwise say now what is
             // missing and offer to install it, before any stage starts.
-            if workspace.profile.mode != meow::mode::Mode::Light {
+            if workspace.profile.mode != Mode::Light {
                 let config = Config::load_or_create(&home)?;
                 tools::offer(
                     &config.recon,

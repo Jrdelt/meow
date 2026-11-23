@@ -603,13 +603,8 @@ impl State {
         self.cve.is_some()
     }
 
-    /// Runs CVE grounding for `address` immediately and adds the CVEs found to the graph.
-    pub async fn ground_host(&self, address: &str) -> Option<(cve::Merged, usize, Vec<String>)> {
-        self.ground_host_for(address, cve::Asked::Operator).await
-    }
-
-    /// [`Self::ground_host`] for whoever `asked`: what text asked for is
-    /// limited.
+    /// Runs CVE grounding for `address` immediately, for whoever `asked`,
+    /// and adds the CVEs found to the graph: what text asked for is limited.
     pub async fn ground_host_for(
         &self,
         address: &str,

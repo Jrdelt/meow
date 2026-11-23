@@ -66,7 +66,7 @@ typedef struct tap_state {
     uint32_t str_len;      /* bytes consumed by the current OSC/STRING */
 
     uint8_t mode;           /* tap_mode_t */
-    uint8_t alt_screen;     /* 1 between ?1049h and ?1049l */
+    uint8_t alt_screen;     /* 1 while ?47, ?1047 or ?1049 is set */
     uint8_t pending_cr;     /* CR seen; rewind on next text, emit on LF */
     uint8_t line_truncated; /* line[] hit TAP_LINE_MAX */
 
@@ -100,9 +100,12 @@ void tap_init(tap_state_t *st);
  * Feed in_len raw bytes. Completed clean lines are written to out, each
  * terminated by '\n'. Returns the number of bytes written.
  *
- * Callers should size out_cap generously (e.g. 2 * in_len + TAP_LINE_MAX + 2,
- * since CSI n C cursor-forward sequences expand to spaces). Any line that
- * does not fit in out_cap is dropped whole and counted in dropped_nospace.
+ * Size out_cap for the worst case so no line is lost: in_len + 256 per 'C'
+ * byte (a CSI n C cursor-forward expands to at most 256 spaces) +
+ * TAP_LINE_MAX + 1, or, if smaller, TAP_LINE_MAX + 1 per '\n', 'E', 'F',
+ * 'H' or 'f' byte (every emitted line ends at one of those). TapFilter::feed
+ * in src/tap.rs sizes it so. Any line that does not fit in out_cap is
+ * dropped whole and counted in dropped_nospace.
  */
 size_t tap_feed(tap_state_t *st, const uint8_t *in, size_t in_len,
                 uint8_t *out, size_t out_cap);

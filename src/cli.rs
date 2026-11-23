@@ -1,16 +1,18 @@
 //! Command-line interface definitions (`clap` derive).
 //!
-//! `meow` and `meow <name>` start a session (a new one asks where to save
-//! it); `meow list` shows every saved workspace and `meow delete` removes
-//! one; every other subcommand is a helper that targets an existing
-//! workspace: `--local`, `--session`, or the session of the current shell
-//! (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
+//! `meow` runs the first-time setup on a new machine (which can then open a
+//! session) and otherwise lists the saved sessions; `meow <name>` starts a
+//! session (a new one asks where to save it). `meow list` shows every saved
+//! workspace and `meow delete` removes one; `setup`, `tools` and `update`
+//! act on meow itself; every other subcommand is a helper that targets an
+//! existing workspace: `--local`, `--session`, or the session of the
+//! current shell (`$MEOW_WORKSPACE` / `$MEOW_SESSION`).
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-pub use crate::mode::Mode;
+use crate::mode::Mode;
 use crate::workspace::validate_name;
 
 #[derive(Debug, Parser)]
@@ -103,7 +105,7 @@ pub enum Command {
         check: bool,
         /// The meow checkout to update (default: the folder meow was built from)
         #[arg(long, value_name = "DIR")]
-        source: Option<std::path::PathBuf>,
+        source: Option<PathBuf>,
     },
     /// Delete a saved workspace and everything in it
     #[command(visible_alias = "rm")]

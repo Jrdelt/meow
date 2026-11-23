@@ -15,17 +15,6 @@ pub(super) use routes::{
 // 1. DNS (`dns` task) — DoH JSON + RFC 1035 UDP wire query + system resolver
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DnsSummary {
-    pub a: Vec<String>,
-    pub aaaa: Vec<String>,
-    pub cname: Vec<String>,
-    pub mx: Vec<String>,
-    pub ns: Vec<String>,
-    pub txt: Vec<String>,
-    pub ptr: Vec<String>,
-}
-
 /// Converts an IPv4 or IPv6 address into its reverse DNS `.in-addr.arpa` or
 /// `.ip6.arpa` domain name for `PTR` queries.
 pub fn reverse_dns_name(ip: IpAddr) -> String {

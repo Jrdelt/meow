@@ -264,7 +264,6 @@ pub struct Wizard {
     pub tools: Vec<ToolCheck>,
     pub test_results: Vec<String>,
     pub config_file: PathBuf,
-    pub ai_file: PathBuf,
 }
 
 impl Wizard {
@@ -362,7 +361,6 @@ impl Wizard {
             tools,
             test_results: Vec::new(),
             config_file,
-            ai_file,
         };
         // A key made for another service is not kept for this one.
         if let Some(key) = &wizard.cloud_api_key {
