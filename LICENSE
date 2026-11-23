@@ -25,7 +25,7 @@ SOFTWARE.
 Third-Party Notices
 
 1. Cytoscape.js (`assets/cytoscape.min.js`, `assets/cytoscape.LICENSE`)
-   Copyright (c) 2016-2024, The Cytoscape Consortium.
+   Copyright (c) 2016-2025, The Cytoscape Consortium.
    Licensed under the MIT License (full text in `assets/cytoscape.LICENSE` and
    `THIRD-PARTY-CYTOSCAPE.LICENSE` in release archives).
 

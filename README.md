@@ -46,8 +46,8 @@ brew install meow        # --HEAD for the main branch
 
 **Release downloads** ([latest release](https://github.com/Jrdelt/meow/releases/latest)) each have a `.sha256` file:
 
-- **macOS:** `meow-<version>-macos-arm64.pkg` (Apple Silicon) or `-macos-x86_64.pkg` (Intel) installs `/usr/local/bin/meow`. If macOS blocks it, see [Other problems](#other-problems), or run `sudo installer -pkg meow-0.2.6-macos-arm64.pkg -target /`.
-- **Linux:** `meow-<version>-linux-x86_64.tar.gz` or `-linux-arm64.tar.gz`. Run `sha256sum -c meow-0.2.6-linux-x86_64.tar.gz.sha256`, unpack it, then `sudo install -m 0755 meow /usr/local/bin/meow`.
+- **macOS:** `meow-<version>-macos-arm64.pkg` (Apple Silicon) or `-macos-x86_64.pkg` (Intel) installs `/usr/local/bin/meow`. If macOS blocks it, see [Other problems](#other-problems), or run `sudo installer -pkg meow-*-macos-arm64.pkg -target /`.
+- **Linux:** `meow-<version>-linux-x86_64.tar.gz` or `-linux-arm64.tar.gz`. Run `sha256sum -c meow-*-linux-x86_64.tar.gz.sha256`, unpack it, then `sudo install -m 0755 meow /usr/local/bin/meow`.
 - **Windows:** `meow-<version>-windows-x86_64.zip` (x64, or ARM64 under emulation). Check it with `Get-FileHash`, unzip it, and put `meow.exe` in a folder on your `PATH`.
 
 After either, run `meow tools` to add any missing scanner, wordlist or location database.

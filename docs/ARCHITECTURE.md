@@ -5,7 +5,7 @@ your shell, reads a copy of everything the shell prints, and turns what it
 recognises into a graph of hosts, ports, services and findings. Everything
 else (the HUD, the map, the report, the AI tiers) reads that graph.
 
-File and line references point at the source as of v0.2.6 and may drift.
+File references point at the source as of v0.2.7 and may drift.
 
 ```mermaid
 flowchart LR
@@ -144,8 +144,8 @@ A cloud request goes through these steps in order:
 
 Placeholders look like `<<HOST_01>>`. The same value always gets the same one,
 and the mapping is stored in `state.db` (src/vault.rs). A local AI server gets
-unmasked text only when meow can verify that it runs on this machine as
-you; otherwise it gets masked text, like a cloud server.
+unmasked text only when meow counts it as yours ([SECURITY.md](../SECURITY.md#known-limits)
+says what that includes); otherwise it gets masked text, like a cloud server.
 [THREAT_MODEL.md](THREAT_MODEL.md) covers what is sent where.
 
 ## 7. Why Rust, and why one C11 file
@@ -162,7 +162,7 @@ you; otherwise it gets masked text, like a cloud server.
   or `/std:c11 /W4` on MSVC; build.rs). Its interface is eight small
   functions, so the unsafe surface stays small and easy to audit.
 - **Keeping the C safe.** The C code never sees your terminal's display path,
-  only copies, on a worker thread. 24 unit tests cover it (src/tap.rs), and
+  only copies, on a worker thread. 28 unit tests cover it (src/tap.rs), and
   the `tap_filter` fuzz target runs it under AddressSanitizer
   ([fuzzing](../fuzz/README.md)).
 

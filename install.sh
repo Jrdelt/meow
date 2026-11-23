@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds and installs meow with everything it uses, first installing what
 # is missing: a C compiler, the Rust toolchain, the scanners `meow recon`
-# drives (nmap, katana, feroxbuster, traceroute) and a wordlist for the
-# directory stage.
+# drives (nmap, katana, feroxbuster, traceroute), a wordlist for the
+# directory stage and the DB-IP Lite location database for the map.
 # For macOS and Linux. `meow update` pulls the latest code and runs this again.
 #
 #   ./install.sh               show the plan, ask once, then do it
@@ -225,7 +225,7 @@ if [ "$os" = linux ] && ! have traceroute && ! have tracepath; then
 fi
 missing_tools=${missing_tools# }
 
-# A wordlist anywhere meow looks for one (see queue.rs) is enough.
+# A wordlist anywhere meow looks for one (see find_wordlist in src/queue/mod.rs) is enough.
 meow_home=${MEOW_HOME:-$HOME/.meow}
 wordlist_dir="$meow_home/wordlists"
 need_wordlist=yes
@@ -372,7 +372,8 @@ if [ "$dry_run" = yes ]; then
 fi
 
 # Problems that would stop the install half-way are reported before it
-# starts. Only the wordlist needing curl is not one: it is skipped instead.
+# starts. The wordlist and the location database needing curl are not:
+# they are skipped instead.
 must_fetch=no
 [ "$need_fetcher$need_rust" = yesyes ] && must_fetch=yes
 if [ "$os" = linux ] && [ "$need_compiler$must_fetch" != "nono" ]; then
@@ -418,7 +419,8 @@ if [ "$need_fetcher" = yes ]; then
     say "Installing curl"
     if ! pm_install curl; then
         [ "$must_fetch" = no ] || die "Could not install curl."
-        warn "Could not install curl, so the wordlist is not downloaded. Put any .txt wordlist in $wordlist_dir and meow will use it."
+        [ "$need_wordlist" = no ] || warn "Could not install curl, so the wordlist is not downloaded. Put any .txt wordlist in $wordlist_dir and meow will use it."
+        [ "$need_geo" = no ] || warn "Could not install curl, so the location database is not downloaded."
         need_wordlist=no
         need_geo=no
     fi

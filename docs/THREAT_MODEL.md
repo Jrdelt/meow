@@ -5,7 +5,7 @@ the masking of private values is tested. [SECURITY.md](../SECURITY.md) has the
 reporting policy, the full scope and the known limits.
 [ARCHITECTURE.md](ARCHITECTURE.md) explains the parts named here.
 
-File references point at the source as of v0.2.6 and may drift.
+File references point at the source as of v0.2.7 and may drift.
 
 ## What meow protects
 
@@ -66,9 +66,10 @@ flowchart LR
 | ipinfo.io | Nothing; it sees your public address. Never while a VPN carries all traffic | Map open (`[location] enabled`) |
 | tiles.maps.eox.at | Tile numbers for a rough area | Map open (`[location] map`) |
 | api.anthropic.com, openrouter.ai | **Masked** prompts and your key for that service only | When you ask cloud AI (`C`, `R`) |
-| A local AI server | Unmasked only if meow verifies it runs as you on this machine; otherwise masked, and no key | When you ask local AI (`L`) |
+| A local AI server | Unmasked only if meow counts it as yours ([SECURITY.md](../SECURITY.md#known-limits) says when); otherwise masked, and no key | When you ask local AI (`L`) |
 | crt.sh, DNS-over-HTTPS, RDAP, Team Cymru | Public names and addresses of your target; never internal names | Recon stages, mild and aggressive only |
 | GitHub | Release metadata and downloads | `meow update` |
+| raw.githubusercontent.com, download.db-ip.com, your package manager | The wordlist and the DB-IP Lite database; installs of missing scanners (else a `cargo`/`go` build) | `meow tools` and the first-session and `meow recon` offers (they ask first unless `--yes` or `--install-tools`); `meow update` of a source build, without asking |
 
 **CVE lookups carry no scanned host's address or name.** Lookups are built only
 from CPE names and product/version pairs (`plan` and `software_lookups` in
@@ -202,8 +203,8 @@ SECURITY.md lists every known limit. In short:
 - Some git and history tampering between sessions goes unnoticed.
 - A process a scan tool starts in a session of its own (`setsid`) is not
   stopped.
-- A local AI server meow counts as yours gets unmasked text, including one run
-  by root or reached over an `ssh -L` forward.
+- A local AI server meow counts as yours gets unmasked text, including, on
+  Linux, one run by root, and one reached over an `ssh -L` forward.
 - Masking can miss a name shaped like an advisory ID, and free-text notes. This
   is why notes are not sent by default.
 - With OpenRouter, a day can end slightly over the cap.
