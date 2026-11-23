@@ -30,6 +30,7 @@ pub mod report;
 pub mod setup;
 pub mod shims;
 pub mod tap;
+pub mod theme;
 pub mod tiles;
 pub mod timeutil;
 pub mod tools;

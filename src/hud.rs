@@ -609,11 +609,7 @@ impl Model {
 // Rendering
 // ---------------------------------------------------------------------------
 
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const GOOD: Style = Style::new().fg(Color::Green);
-const WARN: Style = Style::new().fg(Color::Yellow);
-const BAD: Style = Style::new().fg(Color::Red);
-const TITLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+use crate::theme::{BAD, BRAND, DIM, FOCUS, GOOD, SELECTED, TITLE, WARN};
 /// Between the parts of a line: `3 hosts · 8 CVEs`.
 const SEP: &str = " \u{b7} ";
 
@@ -647,8 +643,32 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {
-    let style = if focused { TITLE } else { DIM };
-    Block::bordered().title(title).border_style(style)
+    // The panel with the keys: a green border and a bold title.
+    let (border, heading) = if focused { (FOCUS, TITLE) } else { (DIM, DIM) };
+    Block::bordered()
+        .title(Span::styled(format!(" {title} "), heading))
+        .border_style(border)
+}
+
+/// How a list shows its selected row: black on lime while the list has the
+/// keys, reversed when it does not. The row's own colours are dropped
+/// (`plain`), so every part of it reads on either.
+fn selected_style(focused: bool) -> Style {
+    if focused {
+        SELECTED
+    } else {
+        Style::new().add_modifier(Modifier::REVERSED)
+    }
+}
+
+/// `line` without its colours: the selected row's highlight shows whole.
+fn plain(line: Line<'_>) -> Line<'_> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::raw(span.content))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// `$0.25`, and `$1` for a whole amount.
@@ -1326,8 +1346,8 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     let Some(snapshot) = &model.snapshot else {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" =^..^= meow hud", TITLE),
-                Span::styled(" \u{b7} waiting for the session", DIM),
+                Span::styled(" =^..^= meow hud ", BRAND),
+                Span::styled("\u{b7} waiting for the session", DIM),
             ])),
             area,
         );
@@ -1395,11 +1415,17 @@ fn draw_header(frame: &mut Frame, area: Rect, model: &Model) {
     } else if budget.setup_unreadable {
         parts.push((1, Span::styled("cloud AI off: ai.toml unreadable", WARN)));
     }
-    let head = Span::styled(format!(" =^..^= {}", snapshot.session), TITLE);
+    // The session on a lime badge; the separator's first space pads it.
+    let head = Span::styled(format!(" =^..^= {}", snapshot.session), BRAND);
     let line = |parts: &[(u8, Span<'static>)]| {
         let mut spans = vec![head.clone()];
-        for (_, part) in parts {
-            spans.push(Span::styled(SEP, DIM));
+        for (at, (_, part)) in parts.iter().enumerate() {
+            if at == 0 {
+                spans.push(Span::styled(" ", BRAND));
+                spans.push(Span::styled(&SEP[1..], DIM));
+            } else {
+                spans.push(Span::styled(SEP, DIM));
+            }
             spans.push(part.clone());
         }
         spans
@@ -1481,11 +1507,16 @@ fn draw_hosts(frame: &mut Frame, area: Rect, model: &Model) {
     let items: Vec<ListItem> = model
         .hosts()
         .iter()
-        .map(|host| ListItem::new(host_row(host, room)))
+        .enumerate()
+        .map(|(index, host)| match index == model.host_index {
+            true => ListItem::new(plain(host_row(host, room))),
+            false => ListItem::new(host_row(host, room)),
+        })
         .collect();
+    let focused = model.focused() == Focus::Hosts;
     let list = List::new(items)
-        .block(panel("Hosts", model.focused() == Focus::Hosts))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .block(panel("Hosts", focused))
+        .highlight_style(selected_style(focused));
     let mut state = ListState::default().with_selected(Some(model.host_index));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -1518,15 +1549,21 @@ fn draw_advisories(frame: &mut Frame, area: Rect, model: &Model) {
     let fits = |advisory: &Advisory| width_of(&row(advisory, true)) <= room;
     let items: Vec<ListItem> = advisories
         .iter()
-        .map(|advisory| {
+        .enumerate()
+        .map(|(index, advisory)| {
             // Too narrow for the word: the colour and the detail say it.
-            ListItem::new(fit_line(Line::from(row(advisory, fits(advisory))), room))
+            let line = fit_line(Line::from(row(advisory, fits(advisory))), room);
+            match index == model.advisory_index {
+                true => ListItem::new(plain(line)),
+                false => ListItem::new(line),
+            }
         })
         .collect();
     // How many: the host's row says it.
+    let focused = model.focused() == Focus::Advisories;
     let list = List::new(items)
-        .block(panel("CVEs", model.focused() == Focus::Advisories))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .block(panel("CVEs", focused))
+        .highlight_style(selected_style(focused));
     let mut state = ListState::default()
         .with_selected((!advisories.is_empty()).then_some(model.advisory_index));
     frame.render_stateful_widget(list, list_area, &mut state);
@@ -2737,10 +2774,10 @@ mod tests {
         let text = screen(&model, 160, 64);
         for expected in [
             " =^..^= acme · mild · 2 hosts · 3 CVEs · 1 exploited · cloud AI $0.25/$1 today ",
-            "┌Hosts─",
+            "┌ Hosts ─",
             "10.10.10.5  2 ports · 3 CVEs · 1 exploited",
             "10.10.10.9  1 port",
-            "┌10.10.10.5 · Server─",
+            "┌ 10.10.10.5 · Server ─",
             "│Update  cpe:2.3:a:nginx:nginx:1.18.0 to its newest release, or close 80/tcp \u{b7} \
              3 CVEs \u{b7} 1 exploited ",
             "│Ports   22/tcp svc OpenSSH 8.2p1 ",
@@ -2749,18 +2786,18 @@ mod tests {
             "/config  200",
             "/login.php  200",
             "│Facts   ssh-hostkey 2048 aa:bb (RSA)  nmap",
-            "┌CVEs─",
+            "┌ CVEs ─",
             "CVE-2020-0002  4.0  exploited",
             "CVE-2021-23017  7.7 ",
-            "┌CVE-2020-0002─",
+            "┌ CVE-2020-0002 ─",
             // The list row says the score and that it is exploited.
             "│High   ",
             "title of CVE-2020-0002",
             "cpe:2.3:a:nginx:nginx:1.18.0 · 80/tcp",
-            "┌Recon─",
+            "┌ Recon ─",
             "10.10.10.0/23  █>·· 1/4  services",
             "  ports: 2 hosts up",
-            "┌Notices─",
+            "┌ Notices ─",
             "09:41 not running as root: -sS replaced with -sT (connect scan)",
             " ↑↓ move · Tab CVEs · L/C/R ask AI · ? help · q quit",
         ] {
@@ -2874,7 +2911,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let top = lines
             .iter()
-            .position(|line| line.contains("┌Recon─"))
+            .position(|line| line.contains("┌ Recon ─"))
             .expect("the queue panel");
         let bottom = top
             + lines[top..]
@@ -3068,7 +3105,7 @@ mod tests {
         let none = screen(&shown(&runs_message(&[])), 160, 40);
         assert!(!none.contains("Recon"), "{none}");
         assert!(
-            none.contains(&format!("┌Notices{}┐", "─".repeat(151))),
+            none.contains(&format!("┌ Notices {}┐", "─".repeat(149))),
             "{none}"
         );
     }
@@ -3400,7 +3437,8 @@ mod tests {
                 Color::Blue,
                 Color::Red,
                 Color::Magenta,
-                Color::DarkGray
+                // Pending: the terminal's own text colour, faint.
+                Color::Reset
             ]
         );
 
@@ -3803,7 +3841,7 @@ mod tests {
         let text = screen(&model, 160, 46);
         // Nothing back yet: the keys, and what the cloud gets.
         for expected in [
-            "┌AI─",
+            "┌ AI ─",
             "│L local AI · C cloud AI · R research ",
             "│C and R send masked text to cloud AI ",
             " a back ",
@@ -3834,7 +3872,10 @@ mod tests {
         });
         model.apply_message(&state.to_string());
         let text = screen(&model, 160, 46);
-        assert!(text.contains("┌Cloud AI · 10.10.10.5 · running─"), "{text}");
+        assert!(
+            text.contains("┌ Cloud AI · 10.10.10.5 · running ─"),
+            "{text}"
+        );
         // A heading without its marks.
         assert!(text.contains("│1. Evidence-Backed Risk "), "{text}");
         assert!(!text.contains("##"), "{text}");
@@ -3846,7 +3887,10 @@ mod tests {
         model.apply_message(&json!({ "type": "ai", "key": "k", "ai": reply }).to_string());
         let text = screen(&model, 160, 46);
         assert!(text.contains("│Then restart it."), "{text}");
-        assert!(text.contains("┌Cloud AI · 10.10.10.5 · running─"), "{text}");
+        assert!(
+            text.contains("┌ Cloud AI · 10.10.10.5 · running ─"),
+            "{text}"
+        );
 
         state["state"]["ai"]["running"] = json!(false);
         state["state"]["ai"]["error"] =
@@ -3856,7 +3900,7 @@ mod tests {
         );
         model.apply_message(&state.to_string());
         let text = screen(&model, 160, 46);
-        assert!(text.contains("┌Cloud AI · 10.10.10.5─"), "{text}");
+        assert!(text.contains("┌ Cloud AI · 10.10.10.5 ─"), "{text}");
         assert!(!text.contains("· running"), "{text}");
         assert!(text.contains("HTTP 402: Insufficient credits"), "{text}");
         assert!(text.contains("saved to chats/10.10.10.5.md"), "{text}");
@@ -3864,7 +3908,7 @@ mod tests {
         // `a` goes back to the inspector.
         model.on_key(key(KeyCode::Char('a')));
         let text = screen(&model, 160, 46);
-        assert!(text.contains("┌10.10.10.5 · Server─"), "{text}");
+        assert!(text.contains("┌ 10.10.10.5 · Server ─"), "{text}");
         assert!(text.contains(" a answer "), "{text}");
 
         // Without a session nothing is sent, and without a host nothing is asked.
@@ -4079,13 +4123,13 @@ mod tests {
         // An idle tunnel with only a link-local address is not a VPN, and
         // is not listed as an interface in use.
         for expected in [
-            "┌This machine─",
+            "┌ This machine ─",
             // No VPN is something to know before scanning.
             "│MacBook Pro · macOS 15.1 · no VPN ",
             "│Ports  631/tcp local only ",
             "│en0    10.44.8.20/22 · gateway 10.44.8.1 ",
             // The selected host is said the same way.
-            "┌10.10.10.5 · Server─",
+            "┌ 10.10.10.5 · Server ─",
             "│Ports   22/tcp svc OpenSSH 8.2p1 ",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
@@ -4103,7 +4147,7 @@ mod tests {
         assert_eq!(model.on_key(key(KeyCode::Char('m'))), Action::None);
         let text = screen(&model, 160, 50);
         for expected in [
-            "┌This machine─",
+            "┌ This machine ─",
             "│MacBook Pro · macOS 15.1 · no VPN ",
             "│Routes ",
             "│  +1 more: host routes, multicast, idle ",
@@ -4113,7 +4157,7 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
-        assert!(!text.contains("┌10.10.10.5"), "{text}");
+        assert!(!text.contains("┌ 10.10.10.5"), "{text}");
         assert!(!text.contains("default via"), "{text}");
         assert_eq!(text.matches("10.44.8.20/22").count(), 1, "{text}");
         assert_eq!(text.matches("This machine").count(), 1, "{text}");
@@ -4134,7 +4178,7 @@ mod tests {
         model.on_key(key(KeyCode::PageUp));
         assert!(screen(&model, 160, 30).contains("│MacBook Pro"));
         model.on_key(key(KeyCode::Char('m')));
-        assert!(screen(&model, 160, 50).contains("┌10.10.10.5 · Server─"));
+        assert!(screen(&model, 160, 50).contains("┌ 10.10.10.5 · Server ─"));
 
         // A tunnel with a real address is reported as the VPN it is.
         graph.local.interfaces[1]
@@ -4376,7 +4420,7 @@ mod tests {
         assert!(model.help);
         let text = screen(&model, 120, 40);
         for expected in [
-            "┌Keys─",
+            "┌ Keys ─",
             "│ C          ask cloud AI · masked text · daily cap ",
             "│ 3          aggressive · fast scans · labs and authorized hosts only │",
             "│ exploited  known exploited in the wild (CISA KEV) ",

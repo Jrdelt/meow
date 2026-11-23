@@ -1304,16 +1304,13 @@ fn scan_tools(config: &Config, home: &MeowHome) -> Vec<ToolCheck> {
 // Rendering (Ratatui)
 // ---------------------------------------------------------------------------
 
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const GOOD: Style = Style::new().fg(Color::Green);
-const WARN: Style = Style::new().fg(Color::Yellow);
-const BAD: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
-const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+use crate::theme::{BRAND, DIM, FOCUS, GOOD, SELECTED, TITLE, WARN};
+const BAD: Style = crate::theme::BAD.add_modifier(Modifier::BOLD);
+/// Titles, labels and the prompt: the terminal's text colour, bold.
+const ACCENT: Style = TITLE;
+/// The cats keep a colour of their own per step.
+const CAT_CYAN: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const PURR: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
-const SELECTED: Style = Style::new()
-    .fg(Color::Black)
-    .bg(Color::Cyan)
-    .add_modifier(Modifier::BOLD);
 
 /// A smaller terminal is told so instead of being drawn a clipped screen.
 const MIN_WIDTH: u16 = 32;
@@ -1343,11 +1340,7 @@ fn rows_of(count: usize) -> u16 {
 }
 
 fn card(title: &str, focused: bool) -> Block<'_> {
-    let border = if focused {
-        Style::new().fg(Color::Cyan)
-    } else {
-        DIM
-    };
+    let border = if focused { FOCUS } else { DIM };
     Block::bordered()
         .title(Span::styled(format!(" {title} "), ACCENT))
         .border_style(border)
@@ -1388,7 +1381,7 @@ fn cat_art(wizard: &Wizard) -> ([&'static str; 3], Style) {
                 "  ( ^.^ )  /| |\\  ",
                 "   > ~ <  (_|_|_) ",
             ],
-            ACCENT,
+            CAT_CYAN,
         ),
         Step::CloudAi => (
             [
@@ -1459,9 +1452,9 @@ fn step_bar(wizard: &Wizard, width: usize) -> Line<'static> {
         if step == wizard.step {
             spans.push(Span::styled(format!("[{}]", step.short_title()), SELECTED));
         } else if compact {
-            spans.push(Span::styled(format!(" {} ", idx + 1), ACCENT));
+            spans.push(Span::raw(format!(" {} ", idx + 1)));
         } else {
-            spans.push(Span::styled(format!(" {} ", step.short_title()), ACCENT));
+            spans.push(Span::raw(format!(" {} ", step.short_title())));
         }
     }
     Line::from(spans)
@@ -1487,9 +1480,9 @@ fn header(wizard: &Wizard, width: u16, height: u16) -> Header {
     };
     let mut lines = Vec::new();
     if roomy {
-        let mut title = vec![Span::styled("meow setup", ACCENT)];
+        let mut title = vec![Span::styled(" meow setup ", BRAND)];
         if wizard.first_run {
-            title.push(Span::styled(" · first run", DIM));
+            title.push(Span::styled("· first run", DIM));
         }
         lines.push(Line::from(title));
     }

@@ -196,7 +196,7 @@ Every mode watches the shell; switch with `meow mode light`, `mild` or `aggressi
 - **Drawing:** you, your router, your public address or VPN, the Internet (click it for each hop's place, network and latency), then the hosts by network and provider. A red glow is a CVE that is known exploited, critical or high. The legend lists only what is drawn.
 - **Location:** a satellite map, top right. **−** folds it; it also folds by itself when it would cover a device. **Expand** fills the window; **Esc** goes back.
 - **This machine:** only what could be read: system, interfaces with their gateway, listening ports. Routes, neighbours and all interfaces fold away below.
-- **Host tabs:** Overview, Ports, Web & TLS, DNS & Mail, CVEs, Notes & AI (`←`/`→` or `1`–`6`). Hover a row for details.
+- **Host tabs:** Overview, Ports, Web & TLS, DNS & Mail, CVEs, Notes & AI (`←`/`→` or `1`–`6`). Hover a row for details. **All hosts** (or **Esc**) goes back to the list.
 - **Check now** (mild and aggressive mode): one connection to up to 6 known open ports.
 - **CVEs:** one line per update, hosts with known exploited CVEs first, such as `Update nginx 1.18.0 to 1.20.1 or later, or close 80/tcp and 443/tcp if the service is not needed.` Each line unfolds into its CVEs.
 - **AI:** **Local AI**, **Cloud AI** and **Research**, with today's cloud spend and cap. Answers come as a **Red team** plan (authorized testing, no exploit code) and a **Blue team** plan (defense). Saved notes show under the host and in the report.

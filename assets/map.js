@@ -177,7 +177,7 @@
         'shape': 'round-rectangle', 'height': 4, 'width': 'data(width)', 'background-opacity': 1,
         'background-color': '#7c8aa3', 'label': '', 'events': 'no' } },
       { selector: 'node.anchor', style: { 'width': 1, 'height': 1, 'label': '', 'events': 'no' } },
-      { selector: 'node:selected', style: { 'overlay-color': '#c8f02b', 'overlay-opacity': 0.1, 'overlay-padding': 6, 'overlay-shape': 'round-rectangle' } },
+      { selector: 'node:selected', style: { 'overlay-opacity': 0, 'border-color': '#c8f02b', 'border-width': 3 } },
       { selector: 'edge', style: {
         'curve-style': 'taxi', 'taxi-direction': 'horizontal', 'taxi-turn': '50%', 'width': 2.2,
         'line-color': 'data(color)', 'target-arrow-shape': 'none', 'z-index': 5,
@@ -1153,8 +1153,23 @@
     if (state) { renderWhere(); }
   }
   byId('map-full').addEventListener('click', function () { expandMap(!mapExpanded); });
+  // Back to all hosts: the host list comes back, and the keyboard lands on it.
+  function closeHost() {
+    select(null);
+    var first = byId('hosts').querySelector('button');
+    if (first) { first.focus(); }
+  }
+  byId('host-close').addEventListener('click', closeHost);
   document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape' && mapExpanded) { expandMap(false); }
+    if (event.key !== 'Escape') { return; }
+    if (mapExpanded) {
+      expandMap(false);
+      return;
+    }
+    // Not while a note is being typed: Esc there is the text box's own.
+    var target = event.target;
+    if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) { return; }
+    if (selected) { closeHost(); }
   });
   // Extracts the VPN adapter name from `"{name} {cidr}: carries ..."` across
   // Linux/macOS (`tun0`, `utun3`) and Windows (`WireGuard Tunnel`) + IPv6.
