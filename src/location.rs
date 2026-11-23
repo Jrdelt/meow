@@ -5,10 +5,10 @@
 //! outside service can tell. The request carries nothing about the operator
 //! or the targets: it has no parameters, and the service learns only the
 //! address it comes from. It is made when the map asks for it, then again
-//! only when this machine's network changes. While a VPN carries all
-//! traffic nothing is looked up: the answer would be the VPN's exit. The
-//! estimate is drawn on a small satellite map (`tiles.rs`) unless
-//! `[location] map` is off.
+//! when this machine's network changes, or a while after a failed try.
+//! While a VPN carries all traffic nothing is looked up: the answer would
+//! be the VPN's exit. The estimate is drawn on a small satellite map
+//! (`tiles.rs`) unless `[location] map` is off.
 
 use std::time::Duration;
 

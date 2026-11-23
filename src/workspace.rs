@@ -92,11 +92,12 @@ default_mode = "light"
 
 [location]
 # When the map is open, estimate where this machine is from its public
-# address, asking the service below once and again when the network
-# changes. The request carries nothing about you or your targets; the
-# service sees only the address it comes from. Nothing is looked up while
-# a VPN carries all traffic. Set to false to turn it off: no place is looked
-# up and no map picture is fetched, for this machine or for a selected server.
+# address, asking the service below once, again when the network changes
+# and again a while after a failed try. The request carries nothing about
+# you or your targets; the service sees only the address it comes from.
+# Nothing is looked up while a VPN carries all traffic. Set to false to turn
+# it off: no place is looked up and no map picture is fetched, for this
+# machine or for a selected server.
 enabled = true
 # url = "https://ipinfo.io/json"
 # Show the estimate on a small satellite map with a pin and a circle for the
@@ -132,7 +133,8 @@ output_cap_mb = 50
 # nmap_ports = ["-sS", "-T3", "--top-ports", "1000"]
 
 [ai]
-# On-demand AI help, started by hand from `meow hud` ([L], [C], [R]).
+# On-demand AI help, started by hand from `meow hud` ([L], [C], [R]) or
+# from the map's Notes & AI tab.
 # [L] local: an OpenAI-compatible server on this machine. Free, nothing leaves.
 local_url = "http://localhost:1234/v1"
 # local_model = ""
@@ -1132,9 +1134,9 @@ impl Config {
 
     /// Updates `default_mode` and `[cve]` (`enabled`, `nvd_api_key`) in
     /// `config.toml` atomically while preserving comments and other sections.
+    #[cfg(test)]
     pub fn save_setup_preferences(
         home: &MeowHome,
-    #[cfg(test)]
         default_mode: Mode,
         cve_enabled: bool,
         nvd_api_key: Option<&str>,
