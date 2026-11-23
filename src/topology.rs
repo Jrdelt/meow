@@ -285,6 +285,16 @@ pub fn only_mentioned(host: &Host) -> bool {
         })
 }
 
+/// How many hosts are on the map: all but the names only mentioned. The
+/// report, the HUD, `meow list` and `meow add` count these.
+pub fn map_host_count(graph: &Graph) -> usize {
+    graph
+        .hosts
+        .values()
+        .filter(|host| !only_mentioned(host))
+        .count()
+}
+
 /// A fact that only says a name came up: in the terminal, a log or the
 /// certificate logs, or how such a name answers in DNS (the `mail-dns`
 /// stage's `DNS: ` line on a certificate-log name).
@@ -734,17 +744,17 @@ impl Topology {
             .find(|r| is_default_route(r))
             .and_then(|r| r.gateway.as_deref());
         let primary_name = Self::host_primary_hostname(host);
-        let trace_evidence = host
+        // The latest route, as the report shows it: a route traced again
+        // is moved last (see `Graph::record`).
+        let route = host
             .facts
             .iter()
-            .find(|f| f.record.source == crate::evidence::Source::Traceroute)
-            .map(|f| f.record.evidence.as_str());
+            .rfind(|f| f.record.source == crate::evidence::Source::Traceroute);
+        let trace_evidence = route.map(|f| f.record.evidence.as_str());
         // The trace stage says so when the target itself gave no answer:
         // then the route ends at the last hop that did.
-        let unanswered = host.facts.iter().any(|f| {
-            f.record.source == crate::evidence::Source::Traceroute
-                && f.claim.starts_with("route path")
-                && f.claim.contains("target did not answer")
+        let unanswered = route.is_some_and(|f| {
+            f.claim.starts_with("route path") && f.claim.contains("target did not answer")
         });
 
         let mut hops = match trace_evidence {
@@ -2306,5 +2316,113 @@ Hop 3: 45.33.32.156         (scanme.nmap.org)                 23.1 ms";
             );
             assert!(hops.iter().all(|h| h["is_target"] == false), "{hops:?}");
         }
+    }
+
+    /// After a retest the map shows the latest route, as the report does,
+    /// also when that is a route traced once before.
+    #[test]
+    fn a_retest_shows_the_latest_route() {
+        use crate::osint::TraceHop;
+        let mut graph = lab();
+        let target = "192.0.2.10";
+        let trace = |graph: &mut Graph, hops: &[(&str, Option<f64>)], claim: &str| {
+            let lines: Vec<String> = hops
+                .iter()
+                .enumerate()
+                .map(|(at, (address, rtt_ms))| {
+                    TraceHop {
+                        hop: at as u8 + 1,
+                        address: (*address).into(),
+                        label: None,
+                        rtt_ms: *rtt_ms,
+                    }
+                    .formatted()
+                })
+                .collect();
+            let record =
+                EvidenceRecord::observed(Source::Traceroute, Confidence::Medium, &lines.join("\n"));
+            graph.apply(Observation::HostMeta {
+                address: target.into(),
+                asn: None,
+                bgp_prefix: None,
+                country: None,
+                ipv6_dns: None,
+                waf_cdn: None,
+                hops: hops
+                    .iter()
+                    .map(|(address, _)| (*address).to_owned())
+                    .filter(|address| address != target && address != "* * *")
+                    .collect(),
+                record: record.clone(),
+            });
+            graph.apply(Observation::Fact {
+                address: target.into(),
+                port: None,
+                protocol: "ip".into(),
+                claim: claim.into(),
+                record,
+            });
+        };
+        let shown = |graph: &Graph| {
+            let cyto = Topology::build(graph).cytoscape(graph);
+            let data = cyto["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["data"]["id"] == format!("host:{target}"))
+                .unwrap()["data"]
+                .clone();
+            let hops: Vec<String> = data["trace_hops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["address"].as_str().unwrap().to_owned())
+                .collect();
+            (data["hop_count"].clone(), data["rtt_ms"].clone(), hops)
+        };
+        let silent = [("198.51.100.1", Some(0.5)), ("198.51.100.2", Some(2.0))];
+        let silent_claim =
+            "route path (2 hops, target did not answer): 198.51.100.1 -> 198.51.100.2";
+        trace(&mut graph, &silent, silent_claim);
+        assert_eq!(
+            shown(&graph),
+            (
+                json!(2),
+                Value::Null,
+                vec!["198.51.100.1".into(), "198.51.100.2".into()]
+            )
+        );
+        let answered = [
+            ("198.51.100.7", Some(1.0)),
+            ("198.51.100.8", Some(3.0)),
+            ("198.51.100.9", Some(5.0)),
+            (target, Some(6.0)),
+        ];
+        trace(
+            &mut graph,
+            &answered,
+            "route path (4 hops (6.0 ms)): 198.51.100.7 -> 198.51.100.8 -> 198.51.100.9 -> 192.0.2.10",
+        );
+        assert_eq!(
+            shown(&graph),
+            (
+                json!(4),
+                json!(6.0),
+                vec![
+                    "198.51.100.7".into(),
+                    "198.51.100.8".into(),
+                    "198.51.100.9".into(),
+                    target.into()
+                ]
+            )
+        );
+        assert_eq!(
+            graph.hosts[target].hops,
+            ["198.51.100.7", "198.51.100.8", "198.51.100.9"]
+        );
+        // The first route again: it is the latest now.
+        trace(&mut graph, &silent, silent_claim);
+        assert_eq!(shown(&graph).2, ["198.51.100.1", "198.51.100.2"]);
+        assert_eq!(graph.hosts[target].hops, ["198.51.100.1", "198.51.100.2"]);
     }
 }

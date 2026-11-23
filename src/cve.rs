@@ -912,7 +912,34 @@ pub(crate) fn port_asks(port: &Port, matched: &str) -> bool {
     lookups.iter().any(|lookup| lookup.matched() == matched)
 }
 
-/// The libraries named by one port's script files that answered.
+/// Whether the port's software stack, as the page shows it now, lists the
+/// library `name` (`jquery`) at a version but not at `version`: a file of
+/// the old version found by an earlier crawl is not what the page uses.
+fn updated_on_page(port: &Port, name: &str, version: &str) -> bool {
+    let shown = crate::webfp::library_name(name).to_ascii_lowercase();
+    if shown.is_empty() {
+        return false;
+    }
+    // The stack keeps three parts of a version (`1.12.4` of `1.12.4.1`).
+    let same = |listed: &str| {
+        listed == version
+            || version
+                .strip_prefix(listed)
+                .is_some_and(|rest| rest.starts_with('.'))
+    };
+    let versions: Vec<&str> = port
+        .http
+        .iter()
+        .flat_map(|http| &http.tech)
+        .map(|entry| crate::graph::tech_name(entry))
+        .filter(|(library, _)| *library == shown)
+        .filter_map(|(_, version)| version)
+        .collect();
+    !versions.is_empty() && !versions.into_iter().any(same)
+}
+
+/// The libraries named by one port's script files that answered, unless
+/// the page's stack shows the library updated since.
 fn script_guesses(port: &Port) -> Vec<Lookup> {
     let key = port.key();
     let mut guesses: Vec<Lookup> = Vec::new();
@@ -930,7 +957,7 @@ fn script_guesses(port: &Port) -> Vec<Lookup> {
             continue;
         };
         let name = found[1].to_ascii_lowercase().replace('.', "-");
-        if !KNOWN_JS.contains(&name.as_str()) {
+        if !KNOWN_JS.contains(&name.as_str()) || updated_on_page(port, &name, &found[2]) {
             continue;
         }
         let guess = Lookup::Package {
@@ -2167,7 +2194,8 @@ fn port_order(key: &str) -> (u32, String) {
 /// Every open port the software of a CVE runs on: those that ask what it
 /// was found by, and those that run the same product and version
 /// (`80/tcp, 443/tcp`). The port it was found on when no open port runs
-/// it; none for a CVE found from a note.
+/// it, unless a rescan found that one closed; none for a CVE found from a
+/// note.
 fn ports_of(
     host: &Host,
     advisory: &Advisory,
@@ -2182,7 +2210,9 @@ fn ports_of(
             .map(Port::key),
     );
     if ports.is_empty() {
-        return Some(found_on.clone());
+        // A port a rescan found closed is not one to close.
+        let closed = host.ports.get(found_on).is_some_and(|port| !port.is_open());
+        return (!closed).then(|| found_on.clone());
     }
     ports.sort_by_key(|key| port_order(key));
     ports.dedup();
@@ -2585,6 +2615,40 @@ mod tests {
                 "pkg jquery@3.4.1 (npm) @Some(\"80/tcp\")",
             ]
         );
+    }
+
+    #[test]
+    fn a_library_the_page_shows_updated_is_not_guessed_from_an_old_file() {
+        let mut host = sample_host();
+        let guesses = |host: &Host| {
+            script_guesses(&host.ports["80/tcp"])
+                .iter()
+                .map(Lookup::matched)
+                .collect::<Vec<_>>()
+        };
+        let stack = |host: &mut Host, tech: &[&str]| {
+            host.ports.get_mut("80/tcp").unwrap().http = Some(crate::graph::HttpInfo {
+                tech: tech.iter().map(|t| t.to_string()).collect(),
+                ..crate::graph::HttpInfo::default()
+            });
+        };
+        assert_eq!(guesses(&host), ["jquery@3.4.1 (npm)"]);
+        // The stack names it without a version, or names other libraries.
+        stack(&mut host, &["jQuery", "Bootstrap 5.3.0"]);
+        assert_eq!(guesses(&host), ["jquery@3.4.1 (npm)"]);
+        // The page loads both versions: the old file is still in use.
+        stack(
+            &mut host,
+            &["jQuery 3.4.1 (older than 3.5.0)", "jQuery 3.7.1"],
+        );
+        assert_eq!(guesses(&host), ["jquery@3.4.1 (npm)"]);
+        // A shorter version of the same release.
+        stack(&mut host, &["jQuery 3.4"]);
+        assert_eq!(guesses(&host), ["jquery@3.4.1 (npm)"]);
+        // It loads 3.7.1 only: the old file is not looked up.
+        stack(&mut host, &["jQuery 3.7.1"]);
+        assert!(guesses(&host).is_empty());
+        assert!(!port_asks(&host.ports["80/tcp"], "jquery@3.4.1 (npm)"));
     }
 
     #[test]

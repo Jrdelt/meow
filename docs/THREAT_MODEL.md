@@ -110,7 +110,7 @@ point elsewhere. The cache keeps the masked reply.
 
 Cloud AI can be turned off completely: **Off** in `meow setup`,
 `meow setup --cloud-off`, or `disable_cloud = true` in `~/.meow/ai.toml`. It is
-also off while `ai.toml` or `~/.meow/ai-usage` cannot be read.
+also off while `config.toml`, `ai.toml` or `~/.meow/ai-usage` cannot be read.
 
 ## How the redaction is verified
 

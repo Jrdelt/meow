@@ -821,6 +821,20 @@ impl From<Vec<String>> for Lookup {
     }
 }
 
+/// Why this system resolves a name to no address, as the `dns` stage's
+/// own DNS questions for its A and AAAA records found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unresolved {
+    /// DNS said the name has no A or AAAA record (NODATA or NXDOMAIN).
+    NoRecords,
+    /// A lookup got no answer (timeout, SERVFAIL, refused).
+    Failed,
+    /// DNS has an address for it, or would not say: this system resolves
+    /// it some other way, or not at all.
+    NotHere,
+}
+
 /// How many of a name's servers are asked, as glibc's resolver does.
 const MAX_SERVERS: usize = 3;
 
@@ -1062,13 +1076,13 @@ pub fn primary_address(addresses: &[String], ipv6: bool) -> Option<String> {
     of_family(ipv6).or_else(|| of_family(!ipv6)).cloned()
 }
 
+/// What the `dns` stage found: `(observations, resolved_ips, summary_text,
+/// why a name has no address)`.
+pub type DnsFound = (Vec<Observation>, Vec<String>, String, Option<Unresolved>);
+
 /// Runs the passive `dns` stage for `target`, whose port scan goes to IPv6
 /// addresses when `ipv6` (`-6`).
-/// Returns `(observations, resolved_ips, summary_text)`.
-pub async fn run_dns(
-    target: &Target,
-    ipv6: bool,
-) -> Result<(Vec<Observation>, Vec<String>, String)> {
+pub async fn run_dns(target: &Target, ipv6: bool) -> Result<DnsFound> {
     let resolver = Resolver::system(build_http_client(Duration::from_secs(6))?);
     let system = match target {
         Target::Host(HostAddr::Name(name)) => system_addresses(name).await,
@@ -1086,7 +1100,7 @@ pub(super) async fn run_dns_with(
     mut resolver: Resolver,
     system: (Vec<String>, Vec<String>),
     ipv6: bool,
-) -> (Vec<Observation>, Vec<String>, String) {
+) -> DnsFound {
     let mut observations = Vec::new();
     let mut resolved_ips = Vec::new();
 
@@ -1095,6 +1109,7 @@ pub(super) async fn run_dns_with(
             observations,
             resolved_ips,
             format!("network range {net} (skipped)"),
+            None,
         ),
         Target::Host(HostAddr::Ip { addr: ip, .. }) => {
             let ip_str = ip.to_canonical().to_string();
@@ -1123,7 +1138,7 @@ pub(super) async fn run_dns_with(
                 Lookup::NoRecords => "no PTR record".to_owned(),
                 _ => "PTR lookup failed".to_owned(),
             };
-            (observations, resolved_ips, summary)
+            (observations, resolved_ips, summary, None)
         }
         Target::Host(HostAddr::Name(domain)) => {
             // The addresses are the system's, as the scanner gets them
@@ -1211,6 +1226,21 @@ pub(super) async fn run_dns_with(
                     resolved_ips.push(ip.clone());
                 }
             }
+
+            // The system gave no address: what DNS said of the A and AAAA
+            // questions, for the scan stages to tell why nothing is up.
+            let unresolved = (!from_system).then(|| {
+                let answers = [&a_answer, &aaaa_answer].map(Option::as_ref);
+                if !(a_recs.is_empty() && aaaa_recs.is_empty()) {
+                    Unresolved::NotHere
+                } else if answers.iter().all(|a| a == &Some(&Lookup::NoRecords)) {
+                    Unresolved::NoRecords
+                } else if answers.iter().any(|a| a == &Some(&Lookup::Failed)) {
+                    Unresolved::Failed
+                } else {
+                    Unresolved::NotHere
+                }
+            });
 
             let primary_address =
                 primary_address(&resolved_ips, ipv6).unwrap_or_else(|| domain.clone());
@@ -1356,7 +1386,7 @@ pub(super) async fn run_dns_with(
                 summary.push_str("; ");
                 summary.push_str(note);
             }
-            (observations, resolved_ips, summary)
+            (observations, resolved_ips, summary, unresolved)
         }
     }
 }

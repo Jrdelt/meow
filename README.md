@@ -58,7 +58,7 @@ After either, run `meow tools` to add any missing scanner, wordlist or location 
 git clone https://github.com/Jrdelt/meow.git && cd meow && ./install.sh
 ```
 
-It adds a C compiler and Rust 1.89 or newer (through `rustup`) if missing, and builds the clone into `~/.cargo/bin/meow`. Then it adds what is missing of `nmap`, `katana`, `feroxbuster`, the wordlist (`~/.meow/wordlists/common.txt`) and the DB-IP Lite location database (`~/.meow/geo/`, fetched again after 30 days). Flags: `--yes`, `--dry-run`, `--no-tools` (no scanners or wordlist), `--no-geo`, `--tools-only` (no build).
+It adds a C compiler and Rust 1.89 or newer (through `rustup`) if missing, and builds the clone into `~/.cargo/bin/meow`. Then it adds any missing `nmap`, `katana`, `feroxbuster`, `traceroute` (Linux), wordlist (`~/.meow/wordlists/common.txt`) and DB-IP Lite location database (`~/.meow/geo/`, refreshed after 30 days). Flags: `--yes`, `--dry-run`, `--no-tools` (no scanners or wordlist), `--no-geo`, `--tools-only` (no build).
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in the clone, with `-Yes`, `-DryRun`, `-NoTools`, `-NoGeo` or `-ToolsOnly`. It uses `winget` or `scoop`. It stops if this folder or one above has a `.cargo`, `.cargo\config`, `.cargo\config.toml`, `rust-toolchain` or `rust-toolchain.toml` that is a link, or that another account owns or can change. A link is fine in a folder only you can change, if it leads to something of yours.
 
@@ -145,7 +145,7 @@ Sessions saved in one folder share its `meow/` folder (`meow/acme/`, `meow/beta/
 - `.gitignore` files keep them out of git. A running session puts back a `.gitignore` of its own that a pull changed.
 - meow asks git whether it tracks session files. That git runs none of the repository's programs and reaches no remote.
 - Older sessions in `~/.meow/workspaces/<name>/` and `./.meow/` keep working. `meow list` shows an old `./.meow/` only from its own folder.
-- A session that came with a cloned, unpacked or copied folder opens only after you accept it, in your default mode. It loses its shell history, last folder and queued scans, and never takes the name of one of yours.
+- A session that came with a cloned, unpacked or copied folder opens only after you accept it, in your default mode. It loses its shell history, last folder, cached answers and queued scans, and never takes a name you use.
 
 On macOS and Linux, meow refuses a folder that another user owns or can write to, also through a shared group, or one inside a folder they can change. A sticky folder like `/tmp` is fine. It checks again at each open, use or delete. On macOS, `staff` write access counts even with an access list, so folders older versions accepted (after `chmod 775 ~`, say) may be refused. On Linux, meow refuses an SMB share, and an NFS or FUSE folder with group write. A path that is not valid UTF-8 is refused. [SECURITY.md](SECURITY.md#known-limits) lists what these checks miss.
 
@@ -327,7 +327,7 @@ meow checks the clone before it fetches, also with `--check`. Remove what the me
 
 - **macOS blocks the `.pkg`** ("cannot be opened because it is from an unidentified developer"): on macOS 15 (Sequoia) and newer, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. On macOS 14 and earlier, Control-click the `.pkg` in Finder and choose **Open**.
 - **`meow recon` is refused in `light` mode:** run `meow mode mild` (or `aggressive`) first.
-- **Missing `nmap`, `katana`, `feroxbuster`, wordlist or location database:** run `meow tools`.
+- **Missing tools, wordlist or location database:** run `meow tools`.
 - **`meow map` opens no browser tab** (SSH, headless Linux): `meow map --no-open` prints the URL. Open it by hand, or forward the local port over SSH.
 - **Cloud or local AI requests fail:** `meow setup --check` names the server or key at fault. For a key (`sk-or-...`, `sk-ant-...`), run `meow setup` again. For Ollama (`http://localhost:11434`) or LM Studio (`http://localhost:1234`), check that it runs and has a model (`ollama list`).
 - **The `udp` stage is skipped:** it runs only in aggressive mode and as root, since UDP scans send raw packets and are slow. To run it yourself and add the result:

@@ -3,13 +3,17 @@
 //! The daily caps (`max_daily_usd`, `max_daily_calls`) hold for the user,
 //! not for one session folder: each cloud call of any session is set
 //! aside in `~/.meow/ai-usage` before it is made (the most it can cost)
-//! and settled after (what it cost). A day is a calendar day where the
-//! user is. The file is private and changed under a lock; when it cannot
-//! be read or written, no cloud call is made. Each session's own record
-//! (`ai_usage` in its `state.db`) stays, for its reports.
+//! and settled after (what it cost). What a call set aside is marked with
+//! the process that makes it: should that process end first (killed, a
+//! crash), the next use of the file settles the call at its input. A day
+//! is a calendar day where the user is. The file is private and changed
+//! under a lock; when it cannot be read or written, no cloud call is
+//! made. Each session's own record (`ai_usage` in its `state.db`) stays,
+//! for its reports.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,8 +24,10 @@ use crate::workspace::{read_private_bounded, write_private_atomic};
 
 /// The file's name in meow's own folder.
 pub const FILE: &str = "ai-usage";
-/// The most the file holds: one day's figures.
-const MAX_BYTES: u64 = 4096;
+/// The most the file holds: one day's figures and the calls running.
+const MAX_BYTES: u64 = 16 * 1024;
+/// The most calls the file marks as running at once.
+pub const MAX_HELD: usize = 32;
 /// How long a change waits for another meow changing the file. Each one
 /// holds it for a read and a write.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -32,8 +38,81 @@ const LOCK_WAIT: Duration = Duration::from_secs(10);
 pub struct Day {
     /// `2026-11-21`, where the user is.
     pub day: String,
+    /// What the day's calls cost, with what running calls set aside.
     pub usd: f64,
     pub calls: u32,
+    /// The calls still running, and what each set aside (in `usd`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<Hold>,
+}
+
+impl Day {
+    /// What running calls have set aside.
+    pub fn held_usd(&self) -> f64 {
+        self.held.iter().fold(0.0, |sum, hold| sum + hold.usd)
+    }
+
+    /// Settles each call whose process has ended at what it is known to
+    /// cost: a call cannot go on without it.
+    fn release_ended(&mut self) {
+        let (ended, running): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|hold| hold.owner.ended());
+        self.held = running;
+        for hold in ended {
+            self.usd = (self.usd - hold.usd + hold.floor.min(hold.usd)).max(0.0);
+        }
+    }
+}
+
+/// What one running request has set aside.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hold {
+    /// The request, as its process numbers them.
+    pub id: u64,
+    /// The process that makes it.
+    pub owner: Owner,
+    /// What it has cost so far and the most its call can add.
+    pub usd: f64,
+    /// What it is settled at should its process end first: what it cost
+    /// before its call, and that call's input.
+    pub floor: f64,
+}
+
+/// A process as the record names it: its id, when it started (in the
+/// system's own unit, 0 where that is not known), the system start that
+/// counts from (Linux) and the set of process ids it is in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub pid: u32,
+    pub start: u64,
+    #[serde(default)]
+    pub boot: String,
+    #[serde(default)]
+    pub space: String,
+}
+
+static THIS_PROCESS: LazyLock<Owner> = LazyLock::new(process::this);
+
+impl Owner {
+    /// This process.
+    pub fn this() -> Owner {
+        THIS_PROCESS.clone()
+    }
+
+    /// Whether the process has ended, or its id names another one now.
+    /// `false` where that cannot be told: what it set aside then stays.
+    pub fn ended(&self) -> bool {
+        let known = |a: &str, b: &str| !a.is_empty() && a != "-" && !b.is_empty() && b != "-";
+        let this = &*THIS_PROCESS;
+        if known(&self.space, &this.space) && self.space != this.space {
+            return false;
+        }
+        if known(&self.boot, &this.boot) && self.boot != this.boot {
+            return true;
+        }
+        process::ended(self)
+    }
 }
 
 /// The day-wide record, kept at one path.
@@ -51,20 +130,25 @@ impl Ledger {
         &self.path
     }
 
-    /// Today's use so far, by every session.
+    /// Today's use so far, by every session. Calls whose process has
+    /// ended count at what they are known to cost.
     pub fn today(&self) -> Result<Day> {
-        self.read(&today_local())
+        let mut day = self.read(&today_local())?;
+        day.release_ended();
+        Ok(day)
     }
 
     /// Changes today's record under the lock. `change` gets today's use as
-    /// it stands; what it leaves there is written back.
+    /// it stands, with the calls whose process has ended settled; what it
+    /// leaves there is written back.
     pub fn update<T>(&self, change: impl FnOnce(&mut Day) -> T) -> Result<T> {
         let _lock = self.lock()?;
         let mut day = self.read(&today_local())?;
         let before = day.clone();
+        day.release_ended();
         let out = change(&mut day);
         if day != before {
-            if !(day.usd.is_finite() && day.usd >= 0.0) {
+            if !valid(&day) {
                 bail!(
                     "refusing to write an invalid amount to {}",
                     self.path.display()
@@ -93,7 +177,7 @@ impl Ledger {
         let text = read_private_bounded(&self.path, MAX_BYTES)?;
         let day: Day = serde_json::from_str(&text)
             .map_err(|_| anyhow!("{} is not a usage record", self.path.display()))?;
-        if !(day.usd.is_finite() && day.usd >= 0.0) {
+        if !valid(&day) {
             bail!("{} holds an invalid amount", self.path.display());
         }
         Ok(if day.day == today { day } else { fresh() })
@@ -116,6 +200,150 @@ impl Ledger {
                 anyhow!(error).context(format!("cannot lock {}", path.display()))
             }
         })
+    }
+}
+
+/// Whether every amount of a record is a number, none below 0, and no
+/// more calls are marked running than [`MAX_HELD`].
+fn valid(day: &Day) -> bool {
+    let amount = |usd: f64| usd.is_finite() && usd >= 0.0;
+    amount(day.usd)
+        && day.held.len() <= MAX_HELD
+        && day
+            .held
+            .iter()
+            .all(|hold| amount(hold.usd) && amount(hold.floor))
+}
+
+/// Which process this is, and whether another has ended.
+#[cfg(unix)]
+mod process {
+    use super::Owner;
+    use crate::procs::identity;
+
+    pub fn this() -> Owner {
+        let pid = std::process::id();
+        Owner {
+            pid,
+            start: libc::pid_t::try_from(pid)
+                .ok()
+                .and_then(identity::seen)
+                .map_or(0, |seen| seen.start),
+            boot: identity::boot(),
+            space: space(),
+        }
+    }
+
+    /// The set of process ids this one is in (a container has its own):
+    /// an id in a record of another set names no process here.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn space() -> String {
+        std::fs::read_link("/proc/self/ns/pid")
+            .map(|link| link.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn space() -> String {
+        String::new()
+    }
+
+    pub fn ended(owner: &Owner) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(owner.pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 sends nothing; it asks whether the process is
+        // there.
+        if unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        if owner.start == 0 {
+            return false;
+        }
+        match identity::seen(pid) {
+            Some(seen) => seen.start != owner.start,
+            // Ended, and not yet collected by its parent.
+            None => identity::ended(pid).is_some(),
+        }
+    }
+}
+
+/// Which process this is, and whether another has ended.
+#[cfg(windows)]
+mod process {
+    use super::Owner;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// When a process was made, in the system's time.
+    fn made_at(process: HANDLE) -> Option<u64> {
+        let mut made = FILETIME::default();
+        let (mut ended, mut kernel, mut user) = (made, made, made);
+        // SAFETY: `process` is an open process handle with the right to
+        // ask this, or the pseudo handle of this process; the four are
+        // valid places for the times the call writes.
+        let read =
+            unsafe { GetProcessTimes(process, &mut made, &mut ended, &mut kernel, &mut user) };
+        (read != 0).then(|| (u64::from(made.dwHighDateTime) << 32) | u64::from(made.dwLowDateTime))
+    }
+
+    pub fn this() -> Owner {
+        Owner {
+            pid: std::process::id(),
+            // SAFETY: the pseudo handle of this process needs no closing.
+            start: made_at(unsafe { GetCurrentProcess() }).unwrap_or(0),
+            boot: String::new(),
+            space: String::new(),
+        }
+    }
+
+    pub fn ended(owner: &Owner) -> bool {
+        // SAFETY: a plain call; the handle it opens is closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner.pid) };
+        if process.is_null() {
+            // SAFETY: reads this thread's last error. No process has that
+            // id; any other failure (no right to ask) cannot tell.
+            return unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
+        }
+        let made = made_at(process);
+        let mut code = 0u32;
+        // SAFETY: `process` is open with the right to ask this; `code` is
+        // a valid place for the exit code.
+        let read = unsafe { GetExitCodeProcess(process, &mut code) };
+        // SAFETY: `process` was opened above and is closed once.
+        unsafe { CloseHandle(process) };
+        (owner.start != 0 && made.is_some_and(|made| made != owner.start))
+            || (read != 0 && code != STILL_ACTIVE as u32)
+    }
+}
+
+/// Elsewhere nothing says whether a process runs: what a call set aside
+/// stays until the day ends.
+#[cfg(not(any(unix, windows)))]
+mod process {
+    use super::Owner;
+
+    pub fn this() -> Owner {
+        Owner {
+            pid: std::process::id(),
+            start: 0,
+            boot: String::new(),
+            space: String::new(),
+        }
+    }
+
+    pub fn ended(_owner: &Owner) -> bool {
+        false
     }
 }
 
@@ -250,6 +478,115 @@ mod tests {
             std::os::unix::fs::symlink(&target, ledger.path()).unwrap();
             assert!(ledger.today().is_err(), "a link is not followed");
         }
+    }
+
+    /// What a call of `owner` set aside: `usd` in all, `floor` of it
+    /// known to be spent.
+    fn held_by(owner: Owner, usd: f64, floor: f64) -> Hold {
+        Hold {
+            id: 7,
+            owner,
+            usd,
+            floor,
+        }
+    }
+
+    /// A process that has ended, and been collected.
+    fn ended_process() -> Owner {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        Owner {
+            pid,
+            ..Owner::this()
+        }
+    }
+
+    /// v0.2.6 review AI-4: a call whose process was killed is settled at
+    /// what it is known to cost the next time the record is used; one of a
+    /// process that runs, or that cannot be told, stays set aside.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn a_call_whose_process_ended_is_settled_at_its_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join(FILE));
+        let this = Owner::this();
+        assert!(this.start > 0, "{this:?}");
+        assert!(!this.ended());
+        let reused = Owner {
+            start: this.start + 1,
+            ..this.clone()
+        };
+        // Its start not known: whether it runs cannot be told.
+        let unknown = Owner {
+            start: 0,
+            ..this.clone()
+        };
+        let mut held = vec![
+            held_by(ended_process(), 0.33, 0.01),
+            held_by(reused, 0.58, 0.04),
+            held_by(this.clone(), 0.20, 0.02),
+            held_by(unknown, 0.30, 0.03),
+        ];
+        // An id of another set of process ids names no process here.
+        if cfg!(target_os = "linux") {
+            let elsewhere = Owner {
+                space: "pid:[1]".into(),
+                ..ended_process()
+            };
+            held.push(held_by(elsewhere, 0.25, 0.05));
+        }
+        let kept: Vec<Hold> = held[2..].to_vec();
+        let record = Day {
+            day: today_local(),
+            // 0.10 spent by calls that ended, and the calls running.
+            usd: 0.10 + held.iter().map(|hold| hold.usd).sum::<f64>(),
+            calls: 5,
+            held,
+        };
+        let text = serde_json::to_string(&record).unwrap();
+        crate::workspace::write_private_atomic(ledger.path(), text.as_bytes()).unwrap();
+        let day = ledger.today().unwrap();
+        let kept_usd: f64 = kept.iter().map(|hold| hold.usd).sum();
+        assert!(
+            (day.usd - (0.10 + 0.01 + 0.04 + kept_usd)).abs() < 1e-9,
+            "{day:?}"
+        );
+        assert_eq!(day.calls, 5);
+        assert_eq!(day.held, kept, "{day:?}");
+        assert!((day.held_usd() - kept_usd).abs() < 1e-9);
+        // Reading changes nothing; the next change writes it.
+        assert_eq!(std::fs::read_to_string(ledger.path()).unwrap(), text);
+        ledger.update(|_| ()).unwrap();
+        let written: Day =
+            serde_json::from_str(&std::fs::read_to_string(ledger.path()).unwrap()).unwrap();
+        assert_eq!(written, day);
+    }
+
+    #[test]
+    fn a_record_without_running_calls_reads_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(dir.path().join(FILE));
+        let old = format!(r#"{{"day":"{}","usd":0.25,"calls":2}}"#, today_local());
+        std::fs::write(ledger.path(), &old).unwrap();
+        let day = ledger.today().unwrap();
+        assert_eq!((day.usd, day.calls, day.held.len()), (0.25, 2, 0));
+        ledger.update(|day| day.calls += 1).unwrap();
+        let text = std::fs::read_to_string(ledger.path()).unwrap();
+        assert!(!text.contains("held"), "{text}");
+        // A running call with an amount that is no number is refused.
+        let bad = format!(
+            r#"{{"day":"{}","usd":0.25,"calls":2,"held":[{{"id":1,"owner":{{"pid":1,"start":1}},"usd":-1.0,"floor":0.0}}]}}"#,
+            today_local()
+        );
+        std::fs::write(ledger.path(), bad).unwrap();
+        assert!(ledger.today().is_err());
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! The external tools `meow recon` drives (nmap, katana, feroxbuster), its
-//! wordlist, and the map's location database: checked before a recon is
-//! queued and offered once on the first session, and installed on request
-//! with the tool part of `install.sh`, of which meow carries its own copy so
-//! no source folder (and no clone) is needed.
+//! The external tools `meow recon` drives (nmap, katana, feroxbuster,
+//! traceroute), its wordlist, and the map's location database: checked
+//! before a recon is queued and offered once on the first session, and
+//! installed on request with the tool part of `install.sh`, of which meow
+//! carries its own copy so no source folder (and no clone) is needed.
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -85,6 +85,20 @@ fn sanitized_path_env() -> Option<std::ffi::OsString> {
     std::env::join_paths(clean).ok()
 }
 
+/// What the route stage (`trace`) runs is called here: `traceroute` (or
+/// `tracepath`), `tracert` on Windows.
+#[cfg(not(windows))]
+const TRACE_TOOL: &str = "traceroute";
+#[cfg(windows)]
+const TRACE_TOOL: &str = "tracert";
+
+/// The program the route stage would run: the first of its tools found.
+fn trace_program() -> Option<PathBuf> {
+    crate::osint::trace_commands("")
+        .into_iter()
+        .find_map(|(program, _)| find_program(program))
+}
+
 /// What `meow recon` would have to skip on this machine.
 pub fn gaps(settings: &ReconSettings) -> Vec<Gap> {
     gaps_with_db(settings, None)
@@ -108,6 +122,12 @@ pub fn gaps_with_db(settings: &ReconSettings, location_db: Option<&str>) -> Vec<
                 stage,
             });
         }
+    }
+    if trace_program().is_none() {
+        out.push(Gap {
+            name: TRACE_TOOL.to_owned(),
+            stage: "the route stage (trace)",
+        });
     }
     if find_wordlist(
         settings.wordlist_path.as_deref(),
@@ -330,6 +350,13 @@ pub fn run(settings: &ReconSettings, location_db: Option<&str>, assume_yes: bool
             None => println!("[!] {safe_prog:<12} not installed"),
         }
     }
+    match trace_program() {
+        Some(path) => println!(
+            "[+] {TRACE_TOOL:<12} {}",
+            sanitize(&path.display().to_string(), 400)
+        ),
+        None => println!("[!] {TRACE_TOOL:<12} not installed"),
+    }
     match find_wordlist(
         settings.wordlist_path.as_deref(),
         settings.wordlist_dir.as_deref(),
@@ -413,6 +440,9 @@ mod tests {
             "meow-no-such-katana",
             "meow-no-such-ferox",
         ];
+        if trace_program().is_none() {
+            expected.push(TRACE_TOOL);
+        }
         if !wordlist_installed {
             expected.push("a wordlist");
         }

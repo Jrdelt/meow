@@ -110,6 +110,35 @@ impl<'a> Ctx<'a> {
         self.target.clone()
     }
 
+    /// Why a scan of a name found nothing up, when the `dns` stage found
+    /// this system resolves it to no address of the family scanned: no up
+    /// check can help that. `None` for an address or a range, or when
+    /// `dns` did not say.
+    pub fn no_address(&self) -> Option<String> {
+        let Target::Host(HostAddr::Name(_)) = self.target else {
+            return None;
+        };
+        let dns = Found::saved(&self.state.db_lock(), self.task.id, Stage::Dns, self.target)?;
+        let ips: Vec<std::net::IpAddr> = dns.ips.iter().filter_map(|ip| ip.parse().ok()).collect();
+        let ipv6 = self.scan_flags().ipv6();
+        let why = match (ips.is_empty(), dns.unresolved) {
+            (true, Some(crate::osint::Unresolved::NoRecords)) => {
+                "the name has no address (no A or AAAA record)"
+            }
+            (true, Some(crate::osint::Unresolved::Failed)) => {
+                "the name did not resolve (DNS lookup failed)"
+            }
+            (true, Some(crate::osint::Unresolved::NotHere)) => {
+                "this system does not resolve the name"
+            }
+            (true, None) => return None,
+            _ if ips.iter().any(|ip| ip.is_ipv6() == ipv6) => return None,
+            _ if ipv6 => "this system resolves the name to no IPv6 address: run again with `-- -4`",
+            _ => "this system resolves the name only to IPv6 addresses: run again with `-- -6`",
+        };
+        Some(format!("; {why}"))
+    }
+
     /// Says how far the stage is, for the map and the HUD.
     pub fn report(&self, progress: Progress) {
         self.state.set_progress(self.task.id, self.stage, progress);

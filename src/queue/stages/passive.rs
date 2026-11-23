@@ -52,7 +52,7 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
     // The family the port scan takes for a name: IPv6 with `-6`, the
     // preset's or the operator's.
     let ipv6 = cx.scan_flags().ipv6();
-    let (observations, ips, summary) = match crate::osint::run_dns(target, ipv6).await {
+    let (observations, ips, summary, unresolved) = match crate::osint::run_dns(target, ipv6).await {
         Ok(res) => res,
         Err(err) => return Ok(StageEnd::Skipped(format!("DNS lookup unavailable: {err}"))),
     };
@@ -71,6 +71,7 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
         primary: crate::osint::primary_address(&ips, ipv6),
         ips,
         cnames,
+        unresolved,
         ..Found::default()
     }
     .checked(target);
@@ -79,12 +80,20 @@ pub(crate) async fn dns(cx: &Ctx<'_>) -> Result<StageEnd> {
     Ok(StageEnd::Done(format!("{summary} ({changed} new facts)")))
 }
 
+/// The addresses the `asn` stage looks up. For a name, only the one the
+/// scan goes to, where its facts go: a lookup of each of its other
+/// addresses made each a host of its own.
+pub(crate) async fn asn_addresses(cx: &Ctx<'_>) -> Vec<std::net::IpAddr> {
+    match cx.target {
+        Target::Host(HostAddr::Name(_)) => route_target(cx).await.into_iter().collect(),
+        target => resolve_target_ips(cx.state, cx.task.id, target).await,
+    }
+}
+
 pub(crate) async fn asn(cx: &Ctx<'_>) -> Result<StageEnd> {
     let state = cx.state;
-    let task = cx.task;
-    let target = cx.target;
     let same_mode = || cx.same_mode();
-    let ips = resolve_target_ips(state, task.id, target).await;
+    let ips = asn_addresses(cx).await;
     if !same_mode() {
         return Ok(StageEnd::ModeChanged);
     }

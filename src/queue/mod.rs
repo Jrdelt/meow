@@ -940,6 +940,10 @@ pub struct Found {
     /// CNAME targets from the `dns` stage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cnames: Vec<String>,
+    /// For a name the system resolves to no address, what the `dns`
+    /// stage's lookups said of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<crate::osint::Unresolved>,
     /// Detected WAF/CDN per host from `headers` / `waf-cdn`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub waf: BTreeMap<String, String>,
@@ -1111,6 +1115,12 @@ impl Found {
     }
 
     fn load(db: &Db, task: i64, stage: Stage, target: &Target) -> Self {
+        Self::saved(db, task, stage, target).unwrap_or_default()
+    }
+
+    /// What `stage` saved, or `None` when it saved nothing: it has not
+    /// run, or it ended without an answer.
+    fn saved(db: &Db, task: i64, stage: Stage, target: &Target) -> Option<Self> {
         db.conn()
             .query_row(
                 "SELECT found FROM task_stages WHERE task_id = ?1 AND stage = ?2",
@@ -1119,8 +1129,7 @@ impl Found {
             )
             .ok()
             .and_then(|json| serde_json::from_str::<Found>(&json).ok())
-            .unwrap_or_default()
-            .checked(target)
+            .map(|found| found.checked(target))
     }
 
     fn save(&self, db: &Db, task: i64, stage: Stage) -> Result<()> {

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds and installs meow with everything it uses, first installing what
 # is missing: a C compiler, the Rust toolchain, the scanners `meow recon`
-# drives (nmap, katana, feroxbuster) and a wordlist for the directory stage.
+# drives (nmap, katana, feroxbuster, traceroute) and a wordlist for the
+# directory stage.
 # For macOS and Linux. `meow update` pulls the latest code and runs this again.
 #
 #   ./install.sh               show the plan, ask once, then do it
@@ -218,6 +219,10 @@ missing_tools=""
 for tool in nmap katana feroxbuster; do
     have "$tool" || missing_tools="$missing_tools $tool"
 done
+# The route stage (trace) runs traceroute, or tracepath. macOS has its own.
+if [ "$os" = linux ] && ! have traceroute && ! have tracepath; then
+    missing_tools="$missing_tools traceroute"
+fi
 missing_tools=${missing_tools# }
 
 # A wordlist anywhere meow looks for one (see queue.rs) is enough.

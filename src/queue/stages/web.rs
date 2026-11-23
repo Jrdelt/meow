@@ -76,9 +76,9 @@ pub(crate) async fn waf_cdn(cx: &Ctx<'_>) -> Result<StageEnd> {
     // lock is not re-entrant.
     let probed = load_probed(state, task.id, target);
     let mut target_hosts: BTreeSet<String> = probed.hosts.keys().cloned().collect();
-    for ip in &dns_found.ips {
-        target_hosts.insert(ip.clone());
-    }
+    // Of a name's addresses, the one the scan goes to: the others were not
+    // looked at, and a verdict on each made each a host.
+    target_hosts.extend(dns_found.primary.iter().cloned());
     for host in hosts_in_target(&state.graph(), target) {
         target_hosts.insert(host.address);
     }

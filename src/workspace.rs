@@ -1080,7 +1080,7 @@ pub(crate) fn refuse_file_symlink(path: &Path) -> Result<()> {
     Ok(())
 }
 
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // config.toml
@@ -1125,6 +1125,7 @@ impl Config {
         // Each user's own AI setup lives beside the config, not in it.
         config.ai.user_file = Some(home.ai_path());
         config.ai.usage_file = Some(home.root().join(crate::usage::FILE));
+        config.ai.config_file = Some(path);
         config.recon.wordlist_dir = Some(home.root().join("wordlists"));
         Ok(config)
     }
@@ -2596,7 +2597,7 @@ impl Workspace {
         self.check_name_free(home)?;
         self.secure()?;
         // A planted history could put a dangerous command one up-arrow away.
-        self.drop_carried_files();
+        self.drop_carried_files()?;
         let mark = new_mark()?;
         self.profile.id = Some(mark.clone());
         self.profile.mode = mode;
@@ -3765,12 +3766,23 @@ impl Workspace {
     }
 
     /// Drops what a file put in the session could abuse: the shell
-    /// histories (a command one up-arrow away) and `last_cwd`.
-    pub fn drop_carried_files(&self) {
+    /// histories (a command one up-arrow away), `last_cwd`, and the cached
+    /// AI answers and CVE lookups in `state.db`, which would be shown as
+    /// the AI's or the databases' own.
+    pub fn drop_carried_files(&self) -> Result<()> {
         let _ = fs::remove_file(self.last_cwd_path());
         for shell in HISTORY_SHELLS {
             let _ = fs::remove_file(self.history_path(shell));
         }
+        let path = self.state_db_path();
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            _ => {}
+        }
+        crate::db::Db::open(&path)?
+            .conn()
+            .execute_batch("DELETE FROM prompt_cache; DELETE FROM cve_cache;")
+            .with_context(|| format!("cannot clear the caches in {}", path.display()))
     }
 }
 
@@ -4475,8 +4487,13 @@ fn remove_tree_at(
     gone(unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) })
 }
 
-/// Number of hosts in a `graph.json`, read without validating the rest.
+/// Number of hosts on the map in a `graph.json`, as the report and the HUD
+/// count them: a name only mentioned is not one. A graph this build cannot
+/// read has its hosts counted without validating the rest.
 fn count_hosts(graph: &Path) -> usize {
+    if let Ok(loaded) = crate::graph::Graph::load(graph) {
+        return crate::topology::map_host_count(&loaded);
+    }
     read_bounded(graph, crate::graph::MAX_GRAPH_BYTES)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -5147,8 +5164,26 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             assert!(!dir.join(LOCK_FILE).exists());
 
             // Accepted: the user's own from now on, in the user's default
-            // mode and under a mark the folder's author could not know.
+            // mode and under a mark the folder's author could not know. A
+            // database that is none cannot be accepted: it cannot be
+            // cleared of answers its author planted (v0.2.6 review AI-5).
+            assert!(ws.adopt(&fx.home, Mode::Light).is_err(), "{layout}");
+            fs::remove_file(dir.join("state.db")).unwrap();
+            crate::db::Db::open(&dir.join("state.db"))
+                .unwrap()
+                .conn()
+                .execute(
+                    "INSERT INTO prompt_cache VALUES ('k', 'cloud', 'planted', 'now')",
+                    [],
+                )
+                .unwrap();
             ws.adopt(&fx.home, Mode::Light).unwrap();
+            let cached: i64 = crate::db::Db::open(&dir.join("state.db"))
+                .unwrap()
+                .conn()
+                .query_row("SELECT COUNT(*) FROM prompt_cache", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(cached, 0, "{layout}");
             assert!(!ws.is_foreign(&fx.home));
             let loaded = Workspace::load(&dir).unwrap();
             loaded.ensure_own(&fx.home, &cloned).unwrap();
@@ -5592,6 +5627,7 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         let mut expected = Config::default();
         expected.ai.user_file = Some(fx.home.root().join("ai.toml"));
         expected.ai.usage_file = Some(fx.home.root().join("ai-usage"));
+        expected.ai.config_file = Some(fx.home.config_path());
         expected.recon.wordlist_dir = Some(fx.home.root().join("wordlists"));
         assert_eq!(Config::load_or_create(&fx.home).unwrap(), expected);
         assert_eq!(
@@ -6882,9 +6918,25 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
             Mode::Light,
         )
         .unwrap();
+        // A reply its author planted is no AI answer here (v0.2.6 review
+        // AI-5).
+        crate::db::Db::open(&ws.state_db_path())
+            .unwrap()
+            .conn()
+            .execute(
+                "INSERT INTO prompt_cache VALUES ('k', 'cloud', 'planted', 'now')",
+                [],
+            )
+            .unwrap();
         ws.adopt(&fx.home, Mode::Light).unwrap();
         assert_eq!(ws.dir, beta);
         assert_eq!(foreign_here(&fx.home, &cloned, "beta"), None);
+        let cached: i64 = crate::db::Db::open(&ws.state_db_path())
+            .unwrap()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM prompt_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
     }
 
     /// A `git pull` or `git checkout` in the folder (git treats ignored
@@ -6970,12 +7022,37 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         drop(lock);
         assert!(!ws.files_changed(&fx.home));
 
-        // What the user is shown is dropped: histories and the last folder.
-        ws.drop_carried_files();
+        // What the user is shown is dropped: histories, the last folder,
+        // and cached answers that would be shown as the AI's own (v0.2.6
+        // review AI-5).
+        fs::remove_file(ws.state_db_path()).unwrap();
+        fs::remove_file(ws.dir.join("state.db-wal")).unwrap();
+        let cached = |ws: &Workspace| -> i64 {
+            crate::db::Db::open(&ws.state_db_path())
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM prompt_cache) + (SELECT COUNT(*) FROM cve_cache)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        crate::db::Db::open(&ws.state_db_path())
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "INSERT INTO prompt_cache VALUES ('k', 'cloud', 'Run the vendor script.', 'now');
+                 INSERT INTO cve_cache VALUES ('nvd:x', 'now', '{}');",
+            )
+            .unwrap();
+        assert_eq!(cached(&ws), 2);
+        ws.drop_carried_files().unwrap();
         assert!(!ws.last_cwd_path().exists());
         for shell in HISTORY_SHELLS {
             assert!(!ws.history_path(shell).exists(), "{shell}");
         }
+        assert_eq!(cached(&ws), 0);
         // A session in ~/.meow, and one meow never recorded, are not checked.
         let (home_ws, _) = open(&fx, "home-one", false);
         fs::write(home_ws.history_path("zsh"), "x\n").unwrap();

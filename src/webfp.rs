@@ -177,7 +177,7 @@ static LIBRARY: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-fn library_name(lower: &str) -> &'static str {
+pub(crate) fn library_name(lower: &str) -> &'static str {
     match lower {
         "jquery" => "jQuery",
         "jquery-ui" => "jQuery UI",

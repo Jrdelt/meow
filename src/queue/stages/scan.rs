@@ -38,9 +38,23 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     let (answered, observations) = read_scan_with_up(&command.output)?;
     let found = Found::of(&observations, target);
     found.save(&state.db_lock(), task.id, stage)?;
+    let unanswered = unanswered_hosts(&observations);
     let (changed, _) = record(state, observations, None);
+    // A blocked or dropped scan says nothing about the ports: the graph
+    // keeps those found open before.
+    let kept = {
+        let graph = state.graph();
+        unanswered.iter().any(|address| {
+            graph
+                .host(address)
+                .is_some_and(|host| host.open_ports().next().is_some())
+        })
+    };
     let silent = if answered == Some(0) {
-        discovery_hint(&cx.scan_flags().shared)
+        cx.no_address()
+            .unwrap_or_else(|| discovery_hint(&cx.scan_flags().shared))
+    } else if kept {
+        "; no port answered, so the open ports found before are kept".to_owned()
     } else {
         String::new()
     };
@@ -49,6 +63,34 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
         found.up,
         found.open_ports()
     )))
+}
+
+/// The hosts up in a scan that answered on no port: every port tried was
+/// filtered, so the scan was blocked or dropped, or the host is off.
+fn unanswered_hosts(observations: &[Observation]) -> Vec<String> {
+    let mut answered = std::collections::BTreeSet::new();
+    for observation in observations {
+        match observation {
+            Observation::Port { address, state, .. } if state == "open" => {
+                answered.insert(address.as_str());
+            }
+            Observation::NotOpen { address, state, .. }
+                if matches!(state.as_str(), "closed" | "unfiltered") =>
+            {
+                answered.insert(address.as_str());
+            }
+            _ => {}
+        }
+    }
+    observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::Host { address, .. } if !answered.contains(address.as_str()) => {
+                Some(address.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
@@ -112,7 +154,9 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
     Found::of(&observations, target).save(&state.db_lock(), task.id, cx.stage)?;
     if answered == Some(0) {
         // No port was scanned: not "no UDP service".
-        let hint = discovery_hint(&flags.shared);
+        let hint = cx
+            .no_address()
+            .unwrap_or_else(|| discovery_hint(&flags.shared));
         return Ok(StageEnd::Skipped(hint.trim_start_matches("; ").to_owned()));
     }
     let (mut open, mut maybe) = (0usize, 0usize);
