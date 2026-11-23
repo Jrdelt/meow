@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State as AxumState};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -339,6 +339,10 @@ pub struct State {
     /// The last "Check now" of each host, by address.
     checks: Mutex<std::collections::HashMap<String, HostCheck>>,
     ws_slots: Arc<tokio::sync::Semaphore>,
+    /// The last state made for the sockets, and the asks for one it
+    /// answers ([`state_message`]).
+    state_made: tokio::sync::Mutex<(u64, Option<Utf8Bytes>)>,
+    state_asks: std::sync::atomic::AtomicU64,
     /// The coordinator's runtime, for work started from any thread.
     handle: tokio::runtime::Handle,
 }
@@ -1390,17 +1394,29 @@ async fn websocket(AxumState(state): AxumState<Shared>, upgrade: WebSocketUpgrad
         .on_upgrade(move |socket| serve_socket(state, socket, permit))
 }
 
-/// The whole state as one message. Made off the session's two async
-/// threads: a large one takes seconds, and the other sockets (a tab saying
-/// who it is to, the HUD) are not kept waiting meanwhile.
+/// The whole state as one message. It is made off the session's two
+/// async threads: a large one takes seconds, and the other sockets (a tab
+/// saying who it is to, the HUD) are not kept waiting meanwhile. One is
+/// made at a time, and every socket that asked before it was begun gets
+/// that same text: many tabs on a large session cost one state, not one
+/// each.
 async fn state_message(state: &Shared) -> Option<Message> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let text = json!({ "type": "state", "key": state.page_key, "state": state.snapshot() });
-        Message::Text(text.to_string().into())
-    })
-    .await
-    .ok()
+    let asked = state.state_asks.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut made = state.state_made.lock().await;
+    if made.0 < asked || made.1.is_none() {
+        // A state made from now on answers every ask so far.
+        let answers = state.state_asks.load(Ordering::SeqCst);
+        let shared = Arc::clone(state);
+        let text = tokio::task::spawn_blocking(move || {
+            let text =
+                json!({ "type": "state", "key": shared.page_key, "state": shared.snapshot() });
+            Utf8Bytes::from(text.to_string())
+        })
+        .await
+        .ok()?;
+        *made = (answers, Some(text));
+    }
+    made.1.clone().map(Message::Text)
 }
 
 /// Pushes a state snapshot on connect and after every change (rate-limited),
@@ -2284,6 +2300,8 @@ impl Coordinator {
             target_generation: std::sync::atomic::AtomicU64::new(0),
             checks: Mutex::new(std::collections::HashMap::new()),
             ws_slots: Arc::new(tokio::sync::Semaphore::new(MAX_WS_CONNECTIONS)),
+            state_made: tokio::sync::Mutex::new((0, None)),
+            state_asks: std::sync::atomic::AtomicU64::new(0),
             handle: runtime.handle().clone(),
         });
 
@@ -3510,6 +3528,58 @@ mod tests {
             format!("{refused:#}").contains("graph is full"),
             "{refused:#}"
         );
+    }
+
+    /// v0.2.6 review MAP-1: sockets that ask for the state while one is
+    /// being made share it; one that asks after a change gets a new one.
+    #[test]
+    fn sockets_asking_for_the_state_at_once_share_one() {
+        let fx = fixture();
+        let state = fx.coordinator.state();
+        let text = |message: Option<Message>| match message {
+            Some(Message::Text(text)) => text,
+            other => panic!("{other:?}"),
+        };
+        state.handle.clone().block_on(async {
+            let making = state.state_made.lock().await;
+            let asks: Vec<_> = (0..4)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move { state_message(&state).await })
+                })
+                .collect();
+            while state.state_asks.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+            drop(making);
+            let mut made = Vec::new();
+            for ask in asks {
+                made.push(text(ask.await.unwrap()));
+            }
+            let first = made[0].as_str().as_ptr();
+            assert!(
+                made.iter().all(|text| text.as_str().as_ptr() == first),
+                "made more than once"
+            );
+            assert!(!made[0].contains("192.0.2.77"));
+            state
+                .execute(Command::Observations {
+                    items: vec![Observation::Host {
+                        address: "192.0.2.77".into(),
+                        os: None,
+                        mac: None,
+                        record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "up"),
+                    }],
+                    ground: false,
+                })
+                .unwrap();
+            let later = text(state_message(&state).await);
+            assert_ne!(later.as_str().as_ptr(), first);
+            assert!(later.contains("192.0.2.77"));
+            let value: Value = serde_json::from_str(&later).unwrap();
+            assert_eq!(value["type"], "state");
+            assert_eq!(value["key"], json!(state.page_key));
+        });
     }
 
     #[test]

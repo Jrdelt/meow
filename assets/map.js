@@ -1755,7 +1755,7 @@
 
   // An AI reply cut off by the session's end is not coming: it is shown
   // as stopped, not running.
-  var AI_STOPPED = 'stopped: the session ended';
+  var AI_STOPPED = 'stopped: the session was closed';
   function aiStill() {
     var reply = state && state.ai;
     if (!reply || typeof reply !== 'object' || !reply.running) { return; }

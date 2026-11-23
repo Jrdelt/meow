@@ -393,7 +393,9 @@ impl AiSettings {
     pub fn effective(&self) -> AiSettings {
         let mut settings = self.clone();
         // The caps as `config.toml` says them now; one that cannot be read
-        // may have been lowered.
+        // may have been lowered. The local AI is still the one `ai.toml`
+        // names.
+        let mut config_error = None;
         if let Some(path) = self.config_file.as_deref() {
             match DailyCaps::load(path) {
                 Ok(caps) => {
@@ -401,38 +403,39 @@ impl AiSettings {
                     settings.max_daily_calls = caps.max_daily_calls;
                 }
                 Err(error) => {
-                    settings.disable_cloud = true;
-                    settings.openrouter_api_key = None;
-                    settings.setup_error = Some(format!(
+                    config_error = Some(format!(
                         "{CONFIG_UNREADABLE} ({}): cloud AI is off until it is fixed",
                         sanitize(&format!("{error:#}"), 200)
                     ));
-                    return settings;
                 }
             }
         }
-        let Some(path) = self.user_file.as_deref() else {
-            return settings;
-        };
-        match AiOverrides::load(path) {
-            Ok(overrides) => {
-                let own_key = overrides
-                    .api_key
-                    .as_deref()
-                    .is_some_and(|key| !key.trim().is_empty());
-                overrides.apply(&mut settings);
-                if !own_key && url_host(&settings.cloud_url) != url_host(&self.cloud_url) {
+        if let Some(path) = self.user_file.as_deref() {
+            match AiOverrides::load(path) {
+                Ok(overrides) => {
+                    let own_key = overrides
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.trim().is_empty());
+                    overrides.apply(&mut settings);
+                    if !own_key && url_host(&settings.cloud_url) != url_host(&self.cloud_url) {
+                        settings.openrouter_api_key = None;
+                    }
+                }
+                Err(error) => {
+                    settings.disable_cloud = true;
                     settings.openrouter_api_key = None;
+                    settings.setup_error = Some(format!(
+                        "ai.toml cannot be read ({}): cloud AI is off until it is fixed",
+                        sanitize(&format!("{error:#}"), 200)
+                    ));
                 }
             }
-            Err(error) => {
-                settings.disable_cloud = true;
-                settings.openrouter_api_key = None;
-                settings.setup_error = Some(format!(
-                    "ai.toml cannot be read ({}): cloud AI is off until it is fixed",
-                    sanitize(&format!("{error:#}"), 200)
-                ));
-            }
+        }
+        if let Some(why) = config_error {
+            settings.disable_cloud = true;
+            settings.openrouter_api_key = None;
+            settings.setup_error = Some(why);
         }
         settings
     }
@@ -1190,6 +1193,10 @@ struct Shared {
     max_usd: f64,
     max_calls: u32,
     id: u64,
+    /// What it last held in the record, and on which day: its mark there
+    /// is lost when an older meow writes the record.
+    day: String,
+    total: f64,
     /// What the request is known to cost should it end before it is
     /// settled (the session closed during a call): what it cost before
     /// that call, and that call's input. Set aside in place of the most.
@@ -1213,17 +1220,24 @@ impl Shared {
     /// it; without it this settles what was set aside at `spent`.
     fn hold(&mut self, spent: f64, most: f64, floor: f64, call: bool) -> Result<()> {
         let (max_usd, max_calls, id) = (self.max_usd, self.max_calls, self.id);
+        let (held_day, held) = (self.day.clone(), self.total);
         let owner = crate::usage::Owner::this();
         let total = spent + most;
         let outcome = self.ledger.update(|today| {
-            // Only this day's record holds what this request set aside.
+            // Only this day's record holds what this request set aside. A
+            // meow of v0.2.6 or older writes it without the marks.
             let at = today
                 .held
                 .iter()
                 .position(|hold| hold.id == id && hold.owner == owner);
-            let mine = at.map_or(0.0, |at| today.held[at].usd);
+            let marked = at.map_or(0.0, |at| today.held[at].usd);
+            let mine = match at {
+                Some(_) => marked,
+                None if today.day == held_day => held,
+                None => 0.0,
+            };
             let others = (today.usd - mine).max(0.0);
-            let running = today.held_usd() - mine;
+            let running = today.held_usd() - marked;
             let ended = (others - running).max(0.0);
             // Written so that a NaN anywhere refuses.
             let fits = others + total <= max_usd;
@@ -1255,9 +1269,11 @@ impl Shared {
                 }
                 (false, None) => {}
             }
-            Ok(())
+            Ok(today.day.clone())
         })?;
-        outcome.map_err(Into::into)
+        self.day = outcome?;
+        self.total = total;
+        Ok(())
     }
 }
 
@@ -1286,6 +1302,8 @@ impl Allowance {
                 max_usd: budget.max_usd,
                 max_calls: budget.max_calls,
                 id: NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                day: String::new(),
+                total: 0.0,
                 floor: 0.0,
                 settled: true,
             }),
@@ -5998,9 +6016,14 @@ mod tests {
             return;
         }
         let (base, seen) = pausing_claude().await;
+        let (local, mock) = mock_models().await;
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         crate::workspace::write_private_atomic(&config, b"[ai]\nmax_daily_usd = 1.0\n").unwrap();
+        // The local AI `meow setup` chose.
+        let setup = dir.path().join("ai.toml");
+        let line = format!("local_url = \"{local}/local\"\n");
+        crate::workspace::write_private_atomic(&setup, line.as_bytes()).unwrap();
         let settings = AiSettings {
             local_url: "http://127.0.0.1:1/v1".into(),
             cloud_url: format!("{base}/claude"),
@@ -6010,6 +6033,7 @@ mod tests {
             openrouter_api_key: Some("sk-ant-test".into()),
             usage_file: Some(dir.path().join(crate::usage::FILE)),
             config_file: Some(config.clone()),
+            user_file: Some(setup),
             ..AiSettings::default()
         };
         let engine = AiEngine::new(
@@ -6051,6 +6075,10 @@ mod tests {
             budget.setup_unreadable && budget.config_unreadable,
             "{budget:?}"
         );
+        // The local AI is still the one `ai.toml` names.
+        let (outcome, _) = run(&engine, Tier::Local, &graph, &vault).await;
+        assert_eq!(outcome.unwrap().text, "local answer");
+        assert_eq!(mock.local.lock().unwrap().len(), 1);
     }
 
     /// v0.2.6 review AI-4: what a call of a session that was killed set
@@ -6098,6 +6126,40 @@ mod tests {
         let day = crate::usage::Ledger::at(&usage).today().unwrap();
         assert!((day.usd - 0.06).abs() < 1e-9, "{day:?}");
         assert!(day.held.is_empty());
+    }
+
+    /// A meow of v0.2.6 still running writes the day-wide record back
+    /// without the marks of running calls: a call of this one is still
+    /// counted once.
+    #[test]
+    fn a_call_is_counted_once_when_an_older_meow_drops_its_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = dir.path().join(crate::usage::FILE);
+        let settings = AiSettings {
+            usage_file: Some(usage.clone()),
+            max_daily_usd: 1.0,
+            ..AiSettings::default()
+        };
+        let db = Db::open_in_memory().unwrap();
+        let ledger = || crate::usage::Ledger::at(&usage);
+        // What the older meow writes: its own call's part, and no marks.
+        let older = |usd: f64| {
+            let day = crate::usage::today_local();
+            let text = format!(r#"{{"day":"{day}","usd":{usd},"calls":2}}"#);
+            crate::workspace::write_private_atomic(&usage, text.as_bytes()).unwrap();
+        };
+        let mut allowance = Allowance::shared(&budget(&db, &settings).unwrap(), ledger());
+        allowance.take_call(0.0, 0.33, 0.01).unwrap();
+        older(0.33 + 0.33);
+        // A model asked after another declined, in the same request.
+        allowance.take_call(0.01, 0.30, 0.02).unwrap();
+        let day = ledger().today().unwrap();
+        assert!((day.usd - 0.64).abs() < 1e-9, "{day:?}");
+        older(0.31 + 0.028);
+        allowance.settle(0.014).unwrap();
+        let day = ledger().today().unwrap();
+        assert!((day.usd - 0.042).abs() < 1e-9, "{day:?}");
+        assert!(day.held.is_empty(), "{day:?}");
     }
 
     /// An `ai.toml` that is there but cannot be read (a typo, a link, a

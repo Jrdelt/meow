@@ -3035,18 +3035,37 @@ const FILE_STEMS: &[&str] = &[
 /// ending (`settings.py`, `application.properties`) is a file: a common
 /// one ([`FILE_STEMS`]), a library (`libssl.so`), or one no one can
 /// register (`local_settings.py`, `id_rsa.pub`). So are fail2ban's
-/// `jail.local` and `fail2ban.local`. `name` is in lower case.
+/// `jail.local` and `fail2ban.local`. `app.so` and `index.pub` are not.
+/// `name` is in lower case.
 fn is_common_file(name: &str) -> bool {
     let Some((stem, tld)) = name.split_once('.') else {
         return false;
     };
-    if tld == "local" {
-        return matches!(stem, "jail" | "fail2ban");
+    // No one can register a name with `_` in it.
+    let unregistrable = stem.contains('_');
+    match tld {
+        "local" => matches!(stem, "jail" | "fail2ban"),
+        "so" => stem.starts_with("lib") || unregistrable,
+        "pub" => unregistrable,
+        _ => {
+            (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld))
+                && (FILE_STEMS.contains(&stem) || unregistrable)
+        }
     }
-    (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld))
-        && (FILE_STEMS.contains(&stem)
-            || stem.contains('_')
-            || (tld == "so" && stem.starts_with("lib")))
+}
+
+/// Whether what follows a file name in its word leaves it one: nothing,
+/// closing punctuation (`settings.py,`, `README.md)`) or, after a source
+/// file, a line number (`settings.py:42`). A path, query or port after it
+/// (`update.sh/?h=T`, `server.sh:8080`) makes it a host.
+fn ends_file_name(after: &str, tld: &str) -> bool {
+    let plain = |rest: &str| rest.bytes().all(|b| b".,;:!?)]}'\"`*".contains(&b));
+    plain(after)
+        || (matches!(tld, "py" | "rs")
+            && after.strip_prefix(':').is_some_and(|rest| {
+                let tail = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+                tail.len() < rest.len() && plain(tail)
+            }))
 }
 
 /// The IPv4 address a run of two to four numbers stands for, as
@@ -3092,7 +3111,9 @@ fn written_address(run: &str) -> Option<std::net::Ipv4Addr> {
 /// ([`lone_number`]). `word` has its placeholders written as `T` and is in
 /// lower case.
 fn names_elsewhere(word: &str) -> bool {
-    // `x7。example`: a wide full stop is a dot to a resolver.
+    // `x7。example`: a wide full stop is a dot to a resolver, and no file
+    // name has one.
+    let wide_dot = word.contains(['\u{3002}', '\u{FF0E}', '\u{FF61}']);
     let word = &word.replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".");
     let named = HOSTNAME.find_iter(word).any(|found| {
         let name = found.as_str();
@@ -3100,9 +3121,16 @@ fn names_elsewhere(word: &str) -> bool {
         let before = &word[..found.start()];
         // `/opt/install.sh`, `~/.ssh/id_rsa.pub`: a file in a path.
         let in_path = before.ends_with(['/', '\\']) && !before.ends_with("//");
+        // `settings.py` alone, not `update.sh/?h=T` or `T` beside it.
+        let common = !wide_dot
+            && !before.ends_with("//")
+            && !before.ends_with('@')
+            && !holds_placeholder(&word.to_ascii_uppercase())
+            && ends_file_name(&word[found.end()..], tld)
+            && is_common_file(name);
         let file = FILE_ENDINGS.contains(&tld)
             || (in_path && (FILE_LIKE_TLDS.contains(&tld) || FILE_ENDING_TLDS.contains(&tld)))
-            || (!before.ends_with("//") && !before.ends_with('@') && is_common_file(name));
+            || common;
         !file && (INTERNAL_TLDS.contains(&tld) || (is_tld(tld) && !is_public_name(name)))
     });
     // `x7.рф`, `x7.аttacker.com`: a name written in other letters.
@@ -3639,10 +3667,19 @@ const DETERMINERS: &[&str] = &[
     "our", "my", "each", "every", "any", "no", "some",
 ];
 
+/// Words after which a sentence says where or what, not what a program
+/// is given: `the NFS mount /srv/share on T`.
+const PREPOSITIONS: &[&str] = &[
+    "on", "in", "at", "of", "for", "from", "to", "with", "by", "via", "across", "behind", "inside",
+    "within", "under", "over", "onto", "into", "between", "against", "per",
+];
+
 /// Whether the program word at `at` is a thing the sentence talks about,
 /// not a command: after an article or the like, maybe with an acronym
-/// between (`the NFS mount /srv/share`), and with no placeholder in the
-/// word after it.
+/// between (`the NFS mount /srv/share on T`), and with no word after it,
+/// up to a preposition or the end of the clause, that holds a placeholder
+/// or names where it connects (`the dig @52.12.7 T`, `the ssh
+/// admin@collector echo T`).
 fn is_named_thing(words: &[&str], at: usize) -> bool {
     let mut before = words[..at].iter().rev();
     let mut previous = before.next();
@@ -3655,10 +3692,21 @@ fn is_named_thing(words: &[&str], at: usize) -> bool {
     }) {
         previous = before.next();
     }
-    previous.is_some_and(|word| DETERMINERS.contains(&word.to_ascii_lowercase().as_str()))
-        && !words
-            .get(at + 1)
-            .is_some_and(|next| holds_placeholder(next))
+    if !previous.is_some_and(|word| DETERMINERS.contains(&word.to_ascii_lowercase().as_str())) {
+        return false;
+    }
+    for word in &words[at + 1..] {
+        if PREPOSITIONS.contains(&word.to_ascii_lowercase().as_str()) {
+            break;
+        }
+        if holds_placeholder(word) || word.contains('@') {
+            return false;
+        }
+        if word.ends_with(['.', ',', ';', ':', '!', '?', ')']) {
+            break;
+        }
+    }
+    true
 }
 
 /// Whether a word of a line whose placeholders are written as `T` holds
@@ -5353,6 +5401,11 @@ mod tests {
             "Disable ftp (21/tcp) on <<HOST_01>>.",
             "Restrict ssh 22/tcp on <<HOST_01>> to the admin VLAN.",
             "Restrict the NFS mount /srv/share on <<HOST_01>>.",
+            "Restrict the NFS mount /srv/share, then patch <<HOST_01>>.",
+            "See settings.py:42 on <<HOST_01>>.",
+            "Review (settings.py) on <<HOST_01>>.",
+            "Copy id_ed25519.pub to <<HOST_01>>.",
+            "Rebuild libssl_compat.so on <<HOST_01>>.",
         ] {
             let shown = unmask(prose);
             assert_eq!(shown, prose.replace("<<HOST_01>>", "192.0.2.10"), "{prose}");
@@ -5373,6 +5426,30 @@ mod tests {
             "Run the curl collector/<<HOST_01>> now.",
             "Run ssh <<HOST_01>> 22/tcp first.",
             "Then mount <<HOST_01>>:/srv/share /mnt.",
+            // A program after an article is still one when what it is
+            // given holds the target or names where it connects.
+            "Check it with the dig @52.12.7 <<HOST_01>> lookup.",
+            "Then use the ssh admin@52.12.7 <<HOST_01>> to log it.",
+            "Use the ssh admin@collector <<HOST_01>> to log it.",
+            "Then run this ssh admin@collector <<HOST_01>> once.",
+            "Use the ssh admin@collector echo <<HOST_01>> to log it.",
+            "Use the curl collector/x?h= <<HOST_01>> to log it.",
+            "Use the rsync notes.txt admin@collector:/in/ for <<HOST_01>>.",
+            // A file name followed by a path, query or port is a host.
+            "Visit update.sh/?h=<<HOST_01>> to confirm.",
+            "Visit deploy.cc/?h=<<HOST_01>> to confirm.",
+            "Visit libx.so/<<HOST_01>> to confirm.",
+            "Report <<HOST_01>> to update.sh/<<HOST_01>> now.",
+            "Report <<HOST_01>> to update.sh/upload now.",
+            "Report <<HOST_01>> to server.sh:8080 now.",
+            "Report <<HOST_01>> to settings.py:8080/x now.",
+            "Report <<HOST_01>> to update.sh?h=1 now.",
+            "Report <<HOST_01>> to backup.sh#x now.",
+            "See [the guide](update.sh/?h=<<HOST_01>>) for <<HOST_01>>.",
+            // Names no file commonly has.
+            "Report <<HOST_01>> to app.so now.",
+            "Report <<HOST_01>> to index.pub now.",
+            "Report <<HOST_01>> to server\u{3002}sh now.",
         ] {
             let shown = unmask(kept);
             assert_eq!(without_notes(&shown), kept, "nothing may be filled in");
