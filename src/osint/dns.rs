@@ -29,28 +29,21 @@ pub struct DnsSummary {
 /// Converts an IPv4 or IPv6 address into its reverse DNS `.in-addr.arpa` or
 /// `.ip6.arpa` domain name for `PTR` queries.
 pub fn reverse_dns_name(ip: IpAddr) -> String {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            let [a, b, c, d] = v4.octets();
-            format!("{d}.{c}.{b}.{a}.in-addr.arpa")
-        }
-        IpAddr::V6(v6) => {
-            let mut nibbles = Vec::with_capacity(32);
-            for byte in v6.octets().iter().rev() {
-                nibbles.push(format!("{:x}", byte & 0x0f));
-                nibbles.push(format!("{:x}", byte >> 4));
-            }
-            format!("{}.ip6.arpa", nibbles.join("."))
-        }
-    }
+    reversed_name(ip, "in-addr.arpa", "ip6.arpa")
 }
 
 /// Converts an IPv4 or IPv6 address into its Team Cymru DNS origin zone name.
 pub fn cymru_origin_name(ip: IpAddr) -> String {
+    reversed_name(ip, "origin.asn.cymru.com", "origin6.asn.cymru.com")
+}
+
+/// `ip` as a name in a reverse zone: its IPv4 octets or IPv6 nibbles last
+/// first, then `v4_zone` or `v6_zone`.
+fn reversed_name(ip: IpAddr, v4_zone: &str, v6_zone: &str) -> String {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let [a, b, c, d] = v4.octets();
-            format!("{d}.{c}.{b}.{a}.origin.asn.cymru.com")
+            format!("{d}.{c}.{b}.{a}.{v4_zone}")
         }
         IpAddr::V6(v6) => {
             let mut nibbles = Vec::with_capacity(32);
@@ -58,7 +51,7 @@ pub fn cymru_origin_name(ip: IpAddr) -> String {
                 nibbles.push(format!("{:x}", byte & 0x0f));
                 nibbles.push(format!("{:x}", byte >> 4));
             }
-            format!("{}.origin6.asn.cymru.com", nibbles.join("."))
+            format!("{}.{v6_zone}", nibbles.join("."))
         }
     }
 }

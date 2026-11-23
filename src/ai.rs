@@ -374,14 +374,6 @@ impl AiOverrides {
     }
 }
 
-/// The host a URL names, in lower case; empty if it names none.
-fn url_host(url: &str) -> String {
-    url::Url::parse(url.trim())
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_default()
-}
-
 impl AiSettings {
     /// These settings with the user's own setup file applied on top.
     ///
@@ -418,7 +410,10 @@ impl AiSettings {
                         .as_deref()
                         .is_some_and(|key| !key.trim().is_empty());
                     overrides.apply(&mut settings);
-                    if !own_key && url_host(&settings.cloud_url) != url_host(&self.cloud_url) {
+                    if !own_key
+                        && crate::setup::url_host(&settings.cloud_url)
+                            != crate::setup::url_host(&self.cloud_url)
+                    {
                         settings.openrouter_api_key = None;
                     }
                 }
@@ -483,7 +478,7 @@ impl AiSettings {
     /// because that address speaks the same protocol. A stand-in on this
     /// machine is the user's own.
     fn env_key_applies(&self) -> bool {
-        let host = url_host(&self.cloud_url);
+        let host = crate::setup::url_host(&self.cloud_url);
         not_own_server(&self.cloud_url).is_none()
             || match self.provider() {
                 CloudProvider::Anthropic => host == "api.anthropic.com",
@@ -645,15 +640,6 @@ fn clean_list(items: &[String], max: usize) -> Vec<String> {
     items.iter().take(max).map(|item| clean(item)).collect()
 }
 
-/// A vault placeholder for a secret (`<<SEC_03>>`) and nothing else. The
-/// graph keeps only these for a key found in a script; checked again here
-/// because a key must never reach a prompt, whatever built the host.
-fn is_secret_placeholder(text: &str) -> bool {
-    text.strip_prefix("<<SEC_")
-        .and_then(|rest| rest.strip_suffix(">>"))
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-}
-
 /// What the web stages found on one port beyond the basics, with only the
 /// fields that hold something.
 fn web_detail(http: &HttpInfo) -> serde_json::Map<String, Value> {
@@ -709,7 +695,10 @@ fn web_detail(http: &HttpInfo) -> serde_json::Map<String, Value> {
     let keys: Vec<&crate::graph::JsSecret> = http
         .js_secrets
         .iter()
-        .filter(|secret| is_secret_placeholder(&secret.token))
+        // The graph keeps only placeholders for a key found in a script;
+        // checked again here because a key must never reach a prompt,
+        // whatever built the host.
+        .filter(|secret| crate::graph::is_secret_placeholder(&secret.token))
         .collect();
     if !keys.is_empty() {
         let shown: Vec<Value> = keys
@@ -1369,20 +1358,10 @@ impl Allowance {
     }
 }
 
-fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &'a str {
-    let remaining = max.saturating_sub(target.len());
-    if remaining == 0 {
-        return "";
-    }
-    if piece.len() <= remaining {
-        target.push_str(piece);
-        return piece;
-    }
-    let mut end = remaining;
-    while !piece.is_char_boundary(end) {
-        end -= 1;
-    }
-    let prefix = &piece[..end];
+/// Appends as much of `piece` to `target` as keeps it within `max` bytes,
+/// cut between two characters; what was appended.
+pub(crate) fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &'a str {
+    let prefix = crate::evidence::head(piece, max.saturating_sub(target.len()));
     target.push_str(prefix);
     prefix
 }
@@ -1568,13 +1547,8 @@ pub fn http_client(url: &str, timeout: Duration) -> Result<reqwest::Client> {
 /// Cuts `text` to at most `max` bytes, between two characters.
 /// (`String::truncate` panics when `max` falls inside one.)
 pub fn cut(text: &mut String, max: usize) {
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
+    let end = crate::evidence::head(text, max).len();
+    text.truncate(end);
 }
 
 /// Reads a whole answer of at most `max` bytes; a longer one is an error.

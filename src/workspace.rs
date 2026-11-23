@@ -498,7 +498,7 @@ pub fn refuse_links_inside(root: &Path) -> Result<()> {
             if *seen > MAX_TREE_ENTRIES {
                 bail!(
                     "{} contains too many entries for a workspace",
-                    root_label(dir)
+                    dir.display()
                 );
             }
             let path = entry
@@ -535,9 +535,6 @@ pub fn refuse_links_inside(root: &Path) -> Result<()> {
             }
         }
         Ok(())
-    }
-    fn root_label(dir: &Path) -> String {
-        dir.display().to_string()
     }
     let mut seen = 0usize;
     walk(root, 0, &mut seen)

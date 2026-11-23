@@ -158,17 +158,7 @@ pub fn parse_ssh_kexinit(bytes: &[u8]) -> Result<SshKexInit> {
 /// reads `SSH_MSG_KEXINIT` (RFC 4253), and closes the socket immediately
 /// without attempting authentication.
 pub async fn audit_ssh_port(address: &str, port: u16) -> Result<(Vec<Observation>, String)> {
-    let connect_addr = match HostAddr::parse(address) {
-        Some(HostAddr::Ip {
-            addr: IpAddr::V6(v6),
-            zone: Some(z),
-        }) => format!("[{v6}%{z}]:{port}"),
-        Some(HostAddr::Ip {
-            addr: IpAddr::V6(v6),
-            zone: None,
-        }) => format!("[{v6}]:{port}"),
-        _ => format!("{address}:{port}"),
-    };
+    let connect_addr = host_port(address, port);
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&connect_addr))
         .await
         .context("SSH connection timed out")?

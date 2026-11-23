@@ -219,8 +219,8 @@ pub struct JsSecret {
     pub file: String,
 }
 
-/// A vault placeholder for a secret, and nothing else.
-fn is_secret_token(text: &str) -> bool {
+/// A vault placeholder for a secret (`<<SEC_03>>`), and nothing else.
+pub(crate) fn is_secret_placeholder(text: &str) -> bool {
     text.strip_prefix("<<SEC_")
         .and_then(|rest| rest.strip_suffix(">>"))
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
@@ -367,7 +367,7 @@ impl HttpInfo {
             secret.file = clean_url(&secret.file);
         }
         // Only a vault placeholder may stand for a key: never the key.
-        self.js_secrets.retain(|s| is_secret_token(&s.token));
+        self.js_secrets.retain(|s| is_secret_placeholder(&s.token));
         self.js_secrets
             .dedup_by(|a, b| a.token == b.token && a.file == b.file);
         self.js_secrets.truncate(32);

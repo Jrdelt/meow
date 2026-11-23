@@ -99,6 +99,12 @@ fn canonical_destination(text: &str, ipv6: bool) -> Option<String> {
         .map(|n| n.to_string())
 }
 
+/// The field just after the first `key` in `fields`.
+fn value_after<'a>(fields: &[&'a str], key: &str) -> Option<&'a str> {
+    let at = fields.iter().position(|field| *field == key)?;
+    fields.get(at + 1).copied()
+}
+
 fn clean_if_name(name: &str) -> Option<String> {
     let cleaned = crate::evidence::sanitize(name, 64);
     (!cleaned.is_empty()).then_some(cleaned)
@@ -201,12 +207,7 @@ pub mod linux {
                 last_destination = None;
                 continue;
             }
-            let after = |key: &str| {
-                fields
-                    .iter()
-                    .position(|f| *f == key)
-                    .and_then(|i| fields.get(i + 1))
-            };
+            let after = |key: &str| value_after(&fields, key);
             let destination = if *first == "nexthop" {
                 last_destination.clone()
             } else {
@@ -215,7 +216,7 @@ pub mod linux {
                 dest
             };
             let (Some(destination), Some(interface)) =
-                (destination, after("dev").and_then(|d| clean_if_name(d)))
+                (destination, after("dev").and_then(clean_if_name))
             else {
                 continue;
             };
@@ -223,7 +224,7 @@ pub mod linux {
                 out,
                 Route {
                     destination,
-                    gateway: after("via").and_then(|g| canonical_ip(g)),
+                    gateway: after("via").and_then(canonical_ip),
                     interface,
                 },
             );
@@ -234,16 +235,11 @@ pub mod linux {
     pub fn neighbors(text: &str, out: &mut Vec<Neighbor>) {
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let after = |key: &str| {
-                fields
-                    .iter()
-                    .position(|f| *f == key)
-                    .and_then(|i| fields.get(i + 1))
-            };
+            let after = |key: &str| value_after(&fields, key);
             let (Some(address), Some(interface), Some(mac)) = (
                 fields.first().and_then(|a| canonical_ip(a)),
-                after("dev").and_then(|d| clean_if_name(d)),
-                after("lladdr").and_then(|m| clean_mac(m)),
+                after("dev").and_then(clean_if_name),
+                after("lladdr").and_then(clean_mac),
             ) else {
                 continue; // FAILED / INCOMPLETE entries have no lladdr
             };
@@ -384,17 +380,12 @@ pub mod macos {
             }
             let Some(name) = &current else { continue };
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let after = |key: &str| {
-                fields
-                    .iter()
-                    .position(|f| *f == key)
-                    .and_then(|i| fields.get(i + 1))
-            };
+            let after = |key: &str| value_after(&fields, key);
             // An address is kept even if its mask cannot be read: a wrong
             // network size is a smaller fault than a missing address.
             let address = match fields.first().copied() {
                 Some("inet") => fields.get(1).and_then(|a| canonical_ip(a)).map(|address| {
-                    let prefix = after("netmask").and_then(|m| prefix_from_mask(m));
+                    let prefix = after("netmask").and_then(prefix_from_mask);
                     (address, prefix.unwrap_or(32))
                 }),
                 Some("inet6") => fields.get(1).and_then(|a| canonical_ip(a)).map(|address| {
@@ -490,15 +481,10 @@ pub mod macos {
                 continue;
             };
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let after = |key: &str| {
-                fields
-                    .iter()
-                    .position(|f| *f == key)
-                    .and_then(|i| fields.get(i + 1))
-            };
+            let after = |key: &str| value_after(&fields, key);
             let (Some(mac), Some(interface)) = (
-                after("at").and_then(|m| clean_mac(m)),
-                after("on").and_then(|d| clean_if_name(d)),
+                after("at").and_then(clean_mac),
+                after("on").and_then(clean_if_name),
             ) else {
                 continue;
             };

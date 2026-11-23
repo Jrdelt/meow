@@ -72,12 +72,7 @@ impl UpdateLock {
                     std::mem::forget(guard);
                     break;
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
+                Err(error) if is_busy(&error) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(LockError::Held { pid: None });
                     }
@@ -106,6 +101,23 @@ impl Drop for HelperLock {
     }
 }
 
+/// Replaces what `file` holds with `line`.
+fn rewrite(file: &mut File, line: &str) -> io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(line.as_bytes())?;
+    file.flush()
+}
+
+/// Whether a failed attempt at a lock means another holds it (or the wait
+/// was interrupted), so trying again may succeed.
+fn is_busy(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
 impl HelperLock {
     /// Takes the lock on `path`, created private if missing, waiting at
     /// most `wait` for another helper ([`LockError::Held`] after that), and
@@ -117,11 +129,7 @@ impl HelperLock {
             match lock.try_write() {
                 Ok(mut guard) => {
                     let line = format!(" {command}\n");
-                    let written = guard
-                        .set_len(0)
-                        .and_then(|()| guard.seek(SeekFrom::Start(0)).map(|_| ()))
-                        .and_then(|()| guard.write_all(line.as_bytes()))
-                        .and_then(|()| guard.flush());
+                    let written = rewrite(&mut guard, &line);
                     if let Err(error) = written {
                         drop(guard);
                         return Err(LockError::Io(error));
@@ -130,12 +138,7 @@ impl HelperLock {
                     std::mem::forget(guard);
                     break;
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
+                Err(error) if is_busy(&error) => {
                     if Instant::now() >= deadline {
                         return Err(LockError::Held { pid: None });
                     }
@@ -323,11 +326,7 @@ impl SessionLock {
                     // fd-lock's mandatory [0, 1) byte-range lock on Windows,
                     // written in a single call so readers never see partial bytes.
                     let line = format!(" {}\n", std::process::id());
-                    let written = guard
-                        .set_len(0)
-                        .and_then(|()| guard.seek(SeekFrom::Start(0)).map(|_| ()))
-                        .and_then(|()| guard.write_all(line.as_bytes()))
-                        .and_then(|()| guard.flush());
+                    let written = rewrite(&mut guard, &line);
                     if let Err(error) = written {
                         drop(guard);
                         return Err(LockError::Io(error));
@@ -338,12 +337,7 @@ impl SessionLock {
                     acquired = true;
                     break;
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
+                Err(error) if is_busy(&error) => {
                     if attempt < 2 {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
@@ -380,12 +374,7 @@ impl SessionLock {
                     drop(guard);
                     return Ok(());
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
+                Err(error) if is_busy(&error) => {
                     if attempt < 2 {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }

@@ -49,25 +49,40 @@ pub const REQUIRED_SECURITY_HEADERS: &[&str] = &[
 // Bounded HTTP helpers
 // ---------------------------------------------------------------------------
 
+/// The user agent of every OSINT web request.
+const OSINT_USER_AGENT: &str = "meow-osint/0.1";
+
 pub(crate) fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT.min(timeout))
         .read_timeout(timeout)
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("meow-osint/0.1")
+        .user_agent(OSINT_USER_AGENT)
         .build()
         .context("cannot create OSINT HTTP client")
 }
 
+/// `address:port` to connect to, an IPv6 address (and its zone) in
+/// brackets; `address` as given otherwise.
+fn host_port(address: &str, port: u16) -> String {
+    match HostAddr::parse(address) {
+        Some(HostAddr::Ip {
+            addr: IpAddr::V6(v6),
+            zone: Some(z),
+        }) => format!("[{v6}%{z}]:{port}"),
+        Some(HostAddr::Ip {
+            addr: IpAddr::V6(v6),
+            zone: None,
+        }) => format!("[{v6}]:{port}"),
+        _ => format!("{address}:{port}"),
+    }
+}
+
 fn configure_osint_command(cmd: &mut tokio::process::Command) {
     cmd.env_clear();
-    if let Some(raw_path) = std::env::var_os("PATH") {
-        let safe_dirs = std::env::split_paths(&raw_path)
-            .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute());
-        if let Ok(joined) = std::env::join_paths(safe_dirs) {
-            cmd.env("PATH", joined);
-        }
+    if let Some(joined) = crate::tools::sanitized_path_env() {
+        cmd.env("PATH", joined);
     }
     cmd.env("LC_ALL", "C").env("LANG", "C");
     #[cfg(windows)]

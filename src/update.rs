@@ -838,14 +838,6 @@ fn resolve_sh() -> PathBuf {
     PathBuf::from("/bin/sh")
 }
 
-fn sanitized_path_env() -> Option<std::ffi::OsString> {
-    let raw = std::env::var_os("PATH")?;
-    let clean: Vec<PathBuf> = std::env::split_paths(&raw)
-        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
-        .collect();
-    std::env::join_paths(clean).ok()
-}
-
 fn is_scp_git_url(url: &str) -> bool {
     if url.contains("://") || url.contains("::") {
         return false;
@@ -1107,7 +1099,7 @@ fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
     for var in GIT_ENV_SCRUB {
         cmd.env_remove(var);
     }
-    if let Some(path) = sanitized_path_env() {
+    if let Some(path) = crate::tools::sanitized_path_env() {
         cmd.env("PATH", path);
     } else {
         cmd.env_remove("PATH");
@@ -1638,7 +1630,7 @@ const SOURCE_COMMIT_ENV: &str = "MEOW_SOURCE_COMMIT";
 #[cfg(unix)]
 fn install_command(dir: &Path, target: &Path, commit: &str) -> Command {
     let mut cmd = Command::new(resolve_sh());
-    if let Some(path) = sanitized_path_env() {
+    if let Some(path) = crate::tools::sanitized_path_env() {
         cmd.env("PATH", path);
     } else {
         cmd.env_remove("PATH");
@@ -1797,7 +1789,7 @@ fn brew_command(brew_bin: &Path) -> Command {
     for var in GIT_ENV_SCRUB {
         cmd.env_remove(var);
     }
-    if let Some(path) = sanitized_path_env() {
+    if let Some(path) = crate::tools::sanitized_path_env() {
         cmd.env("PATH", path);
     } else {
         cmd.env_remove("PATH");
@@ -2844,34 +2836,9 @@ mod tests {
         assert!(parse_homebrew_cellar_exe(&plain_bin).is_none());
     }
 
-    /// Runs git for a test, without system or global config.
+    // Runs git for a test, without system or global config.
     #[cfg(unix)]
-    fn repo_git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args([
-                "-c",
-                "user.name=meow-test",
-                "-c",
-                "user.email=test@example.invalid",
-                "-c",
-                "init.defaultBranch=main",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    }
+    use super::git_traps::git as repo_git;
 
     /// Only the owner may write anything under `path`, whatever the umask.
     #[cfg(unix)]

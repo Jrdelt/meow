@@ -218,11 +218,7 @@ impl GeoDb {
         else {
             return Ok(None);
         };
-        let sane = latitude.is_finite()
-            && longitude.is_finite()
-            && (-90.0..=90.0).contains(&latitude)
-            && (-180.0..=180.0).contains(&longitude);
-        if !sane {
+        if !is_valid_position(latitude, longitude) {
             return Ok(None);
         }
         // The network is a bonus: without the ASN file the place still stands.
@@ -298,9 +294,27 @@ pub fn is_local(address: IpAddr) -> bool {
     }
 }
 
+/// Whether `latitude` and `longitude` name a place on Earth.
+pub(crate) fn is_valid_position(latitude: f64, longitude: f64) -> bool {
+    latitude.is_finite()
+        && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_position_lies_on_earth() {
+        assert!(is_valid_position(90.0, -180.0));
+        assert!(is_valid_position(-90.0, 180.0));
+        assert!(!is_valid_position(90.5, 0.0));
+        assert!(!is_valid_position(0.0, -180.5));
+        assert!(!is_valid_position(f64::NAN, 0.0));
+        assert!(!is_valid_position(0.0, f64::INFINITY));
+    }
 
     #[test]
     fn local_addresses_have_no_place_of_their_own() {

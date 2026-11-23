@@ -105,17 +105,7 @@ pub(super) async fn run_tls_audit_with(
     {
         bail!("invalid address or SNI for TLS audit");
     }
-    let connect_target = match HostAddr::parse(address) {
-        Some(HostAddr::Ip {
-            addr: IpAddr::V6(v6),
-            zone: Some(z),
-        }) => format!("[{v6}%{z}]:{port}"),
-        Some(HostAddr::Ip {
-            addr: IpAddr::V6(v6),
-            zone: None,
-        }) => format!("[{v6}]:{port}"),
-        _ => format!("{address}:{port}"),
-    };
+    let connect_target = host_port(address, port);
 
     let mut result = TlsAuditResult::default();
     let mut openssl_available = false;

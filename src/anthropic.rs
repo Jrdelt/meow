@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::ai::{Allowance, Usage};
+use crate::ai::{append_bounded_utf8, Allowance, Usage};
 use crate::evidence::sanitize;
 
 /// Where the Claude API lives; `/messages` and `/models` hang off it.
@@ -325,24 +325,6 @@ impl Counts {
     fn answered_by(&self, requested: &str) -> String {
         self.model.as_deref().unwrap_or(requested).to_owned()
     }
-}
-
-fn append_bounded_utf8<'a>(target: &mut String, piece: &'a str, max: usize) -> &'a str {
-    let remaining = max.saturating_sub(target.len());
-    if remaining == 0 {
-        return "";
-    }
-    if piece.len() <= remaining {
-        target.push_str(piece);
-        return piece;
-    }
-    let mut end = remaining;
-    while !piece.is_char_boundary(end) {
-        end -= 1;
-    }
-    let prefix = &piece[..end];
-    target.push_str(prefix);
-    prefix
 }
 
 fn sanitize_source_url(raw: &str) -> Option<String> {
@@ -1372,6 +1354,8 @@ mod tests {
         let mut buf = String::new();
         assert_eq!(append_bounded_utf8(&mut buf, "hello ", 9), "hello ");
         assert_eq!(append_bounded_utf8(&mut buf, "ééé", 9), "é");
+        assert_eq!(buf, "hello é");
+        assert_eq!(append_bounded_utf8(&mut buf, "more", 8), "");
         assert_eq!(buf, "hello é");
 
         let mut counts = Counts::default();

@@ -2192,8 +2192,8 @@ impl Vault {
             .flat_map(|i| i.addresses.iter().map(|a| a.split('/').next().unwrap_or(a)))
             .chain(local.routes.iter().filter_map(|r| r.gateway.as_deref()))
             .chain(local.neighbors.iter().map(|n| n.address.as_str()));
-        for address in addresses.map(str::to_owned).collect::<Vec<_>>() {
-            self.register(Kind::Host, &address);
+        for address in addresses {
+            self.register(Kind::Host, address);
         }
     }
 
