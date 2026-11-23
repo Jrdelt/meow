@@ -6,26 +6,6 @@ use super::*;
 // 2. ASN (`asn` task) — Team Cymru DNS + RDAP + offline GeoDb fallback
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AsnInfo {
-    pub asn: u32,
-    pub org: Option<String>,
-    pub bgp_prefix: Option<String>,
-    pub country: Option<String>,
-    pub registry: Option<String>,
-    pub source: Source,
-    pub raw_evidence: String,
-}
-
-impl AsnInfo {
-    pub fn label(&self) -> String {
-        match &self.org {
-            Some(org) if !org.is_empty() => format!("AS{} · {org}", self.asn),
-            _ => format!("AS{}", self.asn),
-        }
-    }
-}
-
 /// Parses a Team Cymru origin TXT record:
 /// `"63949 | 45.33.32.0/24 | US | arin | 2010-02-02"`
 pub fn parse_cymru_origin(txt: &str) -> Option<(u32, Option<String>, Option<String>)> {

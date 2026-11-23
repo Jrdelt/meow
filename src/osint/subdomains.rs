@@ -70,19 +70,10 @@ pub fn parse_crtsh_json(json_text: &str, root: &str, limit: usize) -> Result<Vec
 /// The certificate log asked about public names.
 pub const CRT_SH: &str = "https://crt.sh/";
 
-/// Queries `https://crt.sh/?q=%25.<root_domain>&output=json` passively.
-/// `internal`: the target is internal (see [`is_internal_target`]), and
-/// nothing about it is sent. What is found is recorded on
-/// `primary_address`.
-pub async fn run_subdomains(
-    domain: &str,
-    primary_address: &str,
-    internal: bool,
-) -> Result<(Vec<Observation>, String)> {
-    run_subdomains_at(CRT_SH, domain, primary_address, internal).await
-}
-
-/// [`run_subdomains`] with the log at `crt_sh`.
+/// Queries `<crt_sh>?q=%25.<root_domain>&output=json` passively (the
+/// public log is [`CRT_SH`]). `internal`: the target is internal (see
+/// [`is_internal_target`]), and nothing about it is sent. What is found is
+/// recorded on `primary_address`.
 pub async fn run_subdomains_at(
     crt_sh: &str,
     domain: &str,

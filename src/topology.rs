@@ -507,6 +507,7 @@ impl Topology {
     }
 
     /// (from, to, kind) for every edge.
+    #[cfg(test)]
     pub fn edges(&self) -> Vec<(&Node, &Node, &'static str)> {
         self.graph
             .edge_indices()

@@ -269,10 +269,6 @@ impl Db {
         &self.conn
     }
 
-    pub fn conn_mut(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
-
     /// Cached body for `key`. With `max_age`, only an entry younger than
     /// that is returned; without, any entry (a stale fallback).
     pub fn cache_get(&self, key: &str, max_age: Option<Duration>) -> Result<Option<String>> {

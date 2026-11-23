@@ -646,6 +646,7 @@ pub struct Answer {
 /// Asks Claude one question. `model` is asked first; if a safety classifier
 /// declines, each model of `fallbacks` is asked in turn. `on_text` receives
 /// the reply as it arrives (in one piece for research).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn ask(
     http: &reqwest::Client,
@@ -677,6 +678,7 @@ pub async fn ask(
 /// Like [`ask`], but writes accumulated `Usage` into `spent` after each
 /// attempt (including partial multi-turn or mid-stream failures) so billed
 /// tokens and web searches are never lost when an attempt declines or errors.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn ask_with_spend(
     http: &reqwest::Client,
@@ -707,11 +709,17 @@ pub async fn ask_with_spend(
     .await
 }
 
-/// Like [`ask_with_spend`], invoking `on_reset` between declined attempts so
-/// stateful stream unmaskers never carry unclosed Markdown/HTML state from a
-/// declined model into the next fallback model. Every request it makes (a
-/// model after one declined, a resumed research turn) is first checked
-/// against `allowance`, the day's budget, and counted there.
+/// Asks Claude one question. `model` is asked first; if a safety classifier
+/// declines, each model of `fallbacks` is asked in turn. `on_text` receives
+/// the reply as it arrives (in one piece for research). Accumulated `Usage`
+/// is written into `spent` after each attempt (including partial multi-turn
+/// or mid-stream failures) so billed tokens and web searches are never lost
+/// when an attempt declines or errors. `on_reset` is invoked between
+/// declined attempts so stateful stream unmaskers never carry unclosed
+/// Markdown/HTML state from a declined model into the next fallback model.
+/// Every request it makes (a model after one declined, a resumed research
+/// turn) is first checked against `allowance`, the day's budget, and
+/// counted there.
 #[allow(clippy::too_many_arguments)]
 pub async fn ask_with_spend_and_reset(
     http: &reqwest::Client,

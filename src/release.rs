@@ -185,11 +185,8 @@ pub fn archive_name(version: &str, build: &str) -> String {
     }
 }
 
-/// Checks `bytes` against a `sha256sum` line (`<hex>  <file>`).
-pub fn check_sha256(bytes: &[u8], sum_file: &str) -> Result<()> {
-    check_sha256_for(bytes, sum_file, None)
-}
-
+/// Checks `bytes` against a `sha256sum` line (`<hex>  <file>`). With
+/// `expected_file`, the line must also name that file.
 fn check_sha256_for(bytes: &[u8], sum_file: &str, expected_file: Option<&str>) -> Result<()> {
     let cleaned = sum_file.trim_start_matches('\u{feff}');
     let line = cleaned
@@ -869,10 +866,11 @@ mod tests {
     #[test]
     fn checksums_and_release_urls_are_validated() {
         let sum = "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52  meow.tar.gz\n";
-        assert!(check_sha256(b"meow", sum).is_ok());
-        assert!(check_sha256(
+        assert!(check_sha256_for(b"meow", sum, None).is_ok());
+        assert!(check_sha256_for(
             b"meow",
-            "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52\n"
+            "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52\n",
+            None
         )
         .is_ok());
         // When an archive filename is expected, a bare hash without a filename is refused.
@@ -902,8 +900,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(!bad_name_err.bytes().any(|b| b < 0x20));
-        assert!(check_sha256(b"evil", sum).is_err());
-        assert!(check_sha256(b"meow", "not a digest").is_err());
+        assert!(check_sha256_for(b"evil", sum, None).is_err());
+        assert!(check_sha256_for(b"meow", "not a digest", None).is_err());
 
         assert!(validate_release_url(LATEST_URL, false).is_ok());
         assert!(validate_release_url(

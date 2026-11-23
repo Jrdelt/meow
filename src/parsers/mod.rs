@@ -183,13 +183,6 @@ pub fn read_prefix_capped(path: &Path) -> Result<String> {
     Ok(bytes_to_string_lossy(bytes))
 }
 
-/// Parses up to [`INGEST_CAP`] bytes of a line-oriented tool output file,
-/// trimming an incomplete trailing line when the file exceeded the cap.
-pub fn parse_file_prefix(path: &Path) -> Result<Parsed> {
-    let text = read_prefix_capped(path)?;
-    parse_text(&text).with_context(|| format!("cannot parse {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

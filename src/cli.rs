@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-pub use crate::mode::Mode;
+use crate::mode::Mode;
 use crate::workspace::validate_name;
 
 #[derive(Debug, Parser)]
@@ -103,7 +103,7 @@ pub enum Command {
         check: bool,
         /// The meow checkout to update (default: the folder meow was built from)
         #[arg(long, value_name = "DIR")]
-        source: Option<std::path::PathBuf>,
+        source: Option<PathBuf>,
     },
     /// Delete a saved workspace and everything in it
     #[command(visible_alias = "rm")]

@@ -1134,6 +1134,7 @@ impl Config {
     /// `config.toml` atomically while preserving comments and other sections.
     pub fn save_setup_preferences(
         home: &MeowHome,
+    #[cfg(test)]
         default_mode: Mode,
         cve_enabled: bool,
         nvd_api_key: Option<&str>,
