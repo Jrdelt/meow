@@ -60,13 +60,13 @@ git clone https://github.com/Jrdelt/meow.git && cd meow && ./install.sh
 
 It adds a C compiler and Rust 1.89 or newer (through `rustup`) if missing, and builds the clone into `~/.cargo/bin/meow`. Then it adds what is missing of `nmap`, `katana`, `feroxbuster`, the wordlist (`~/.meow/wordlists/common.txt`) and the DB-IP Lite location database (`~/.meow/geo/`, fetched again after 30 days). Flags: `--yes`, `--dry-run`, `--no-tools` (no scanners or wordlist), `--no-geo`, `--tools-only` (no build).
 
-On Windows, run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in the clone, with `-Yes`, `-DryRun`, `-NoTools`, `-NoGeo` or `-ToolsOnly`. It uses `winget` or `scoop`. It stops if this folder or one above has a `.cargo`, `.cargo\config`, `.cargo\config.toml`, `rust-toolchain` or `rust-toolchain.toml` that is a link, or that another account owns or can change. A `.cargo` link is fine in a folder only you can change, if it leads to a folder of yours.
+On Windows, run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in the clone, with `-Yes`, `-DryRun`, `-NoTools`, `-NoGeo` or `-ToolsOnly`. It uses `winget` or `scoop`. It stops if this folder or one above has a `.cargo`, `.cargo\config`, `.cargo\config.toml`, `rust-toolchain` or `rust-toolchain.toml` that is a link, or that another account owns or can change. A link is fine in a folder only you can change, if it leads to something of yours.
 
 ### Updating
 
 `meow update` upgrades meow itself; `--check` only shows what is new.
 
-- **Release download:** gets the newest release, checks its SHA-256 and replaces meow, nothing else. No pre-release unless meow is one.
+- **Release download:** gets the newest full release, checks its SHA-256 and replaces meow, nothing else.
 - **Homebrew:** `brew update`, then `brew upgrade meow` (`--fetch-HEAD` for `--HEAD`). This also upgrades outdated `nmap`, `katana` and `feroxbuster`.
 - **`install.sh`:** pulls into the folder meow was built from and runs `install.sh --yes`. It rebuilds meow, adds missing data files, and adds only the missing tools it can install without sudo.
 - **`install.ps1`:** pulls, then asks you to close meow and run `install.ps1 -Yes`.
@@ -317,11 +317,11 @@ max_daily_calls = 20
 
 ### `meow update` refuses the clone
 
-meow checks the clone before it fetches or builds, also with `--check`. Remove what the message names, or clone meow again.
+meow checks the clone before it fetches, also with `--check`. Remove what the message names, or clone meow again.
 
-- Submodules and a `.git/commondir` are not allowed.
-- `.git/config`, read without includes, may hold only what `git clone` writes plus `user.name`, `user.email`, `pull.rebase`, `pull.ff`, `gc.auto`, `maintenance.auto` and `maintenance.strategy`.
-- On Windows, a clone right under `C:\` is refused.
+- Refused: submodules, a `.git/commondir` and (macOS, Linux) a folder above that others can write to.
+- `.git/config`, read without includes, may hold only what `git clone` writes and some harmless settings.
+- On Windows, a clone outside your user folder is usually refused.
 
 ### Other problems
 

@@ -105,9 +105,10 @@ function Test-OwnPath([string]$Path) {
 }
 
 # What is wrong with the Cargo or rustup settings $Name in $Dir, or $null
-# (also when there is nothing there). A .cargo folder may be a link (a
-# junction, say) to keep it on another disk: one in a folder only this
-# user can change, to a folder of the user's own.
+# (also when there is nothing there). A .cargo folder or a settings file
+# may be a link (a junction to keep .cargo on another disk, or a file a
+# dotfile manager keeps): one in a folder only this user can change, to
+# something of the user's own.
 function Get-CargoSettingProblem([string]$Dir, [string]$Name) {
     $Path = [System.IO.Path]::Combine($Dir, $Name)
     try {
@@ -122,7 +123,8 @@ function Get-CargoSettingProblem([string]$Dir, [string]$Name) {
         }
         return 'can be changed by another account'
     }
-    if (($Name -ne '.cargo') -or -not (Test-OwnPath $Dir)) {
+    $LinkDir = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not (Test-OwnPath $LinkDir)) {
         return 'is a link'
     }
     $Target = $null
@@ -132,7 +134,7 @@ function Get-CargoSettingProblem([string]$Dir, [string]$Name) {
         $Target = $null
     }
     if ($Target -and -not [System.IO.Path]::IsPathRooted($Target)) {
-        $Target = [System.IO.Path]::Combine($Dir, $Target)
+        $Target = [System.IO.Path]::Combine($LinkDir, $Target)
     }
     if ((-not $Target) -or -not (Test-Path -LiteralPath $Target)) {
         return 'is a link that leads nowhere'
@@ -197,6 +199,12 @@ if (-not $ToolsOnly) {
     Set-Location -LiteralPath $PSScriptRoot
     if (-not (Test-Path -LiteralPath "Cargo.toml") -or -not (Select-String -Path "Cargo.toml" -Pattern '^name = "meow"' -Quiet)) {
         Die "Run this script from the meow repository (Cargo.toml not found next to it)."
+    }
+    # meow update refuses a clone other accounts can change, as one outside
+    # the user folder is by default: C:\ lets every account change what is
+    # made below it.
+    if (-not (Test-OwnPath $PSScriptRoot)) {
+        Warn "Other accounts can change $PSScriptRoot, so meow update will refuse it. Clone meow into your user folder, or run: icacls `"$PSScriptRoot`" /inheritance:r /grant:r `"*S-1-3-4:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-544:(OI)(CI)F`""
     }
 } else {
     # Nothing below needs the folder the user is in, and rustup's cargo and
