@@ -140,4 +140,4 @@ Please report security problems privately through [GitHub's private vulnerabilit
 
 ## License
 
-meow is released under the [MIT License](LICENSE). The LICENSE file also lists the third-party parts meow uses.
+meow is released under the [MIT License](LICENSE). Third-party parts meow uses or downloads are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

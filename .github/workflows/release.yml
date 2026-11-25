@@ -161,16 +161,17 @@ jobs:
           mkdir -p stage dist
           cp LICENSE stage/LICENSE
           cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
+          cp THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md
           case "$BUILD_NAME" in
           windows-*)
             cp "$out/meow.exe" stage/meow.exe
-            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
+            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-NOTICES.md, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
             cp "$out/meow" stage/meow
             chmod 0755 stage/meow
-            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
+            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-NOTICES.md THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
@@ -262,16 +263,17 @@ jobs:
           mkdir -p stage dist
           cp LICENSE stage/LICENSE
           cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
+          cp THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md
           case "$BUILD_NAME" in
           windows-*)
             cp "$out/meow.exe" stage/meow.exe
-            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
+            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-NOTICES.md, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
             cp "$out/meow" stage/meow
             chmod 0755 stage/meow
-            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
+            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-NOTICES.md THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
@@ -363,16 +365,17 @@ jobs:
           mkdir -p stage dist
           cp LICENSE stage/LICENSE
           cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
+          cp THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md
           case "$BUILD_NAME" in
           windows-*)
             cp "$out/meow.exe" stage/meow.exe
-            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
+            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-NOTICES.md, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
             cp "$out/meow" stage/meow
             chmod 0755 stage/meow
-            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
+            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-NOTICES.md THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
@@ -464,16 +467,17 @@ jobs:
           mkdir -p stage dist
           cp LICENSE stage/LICENSE
           cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
+          cp THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md
           case "$BUILD_NAME" in
           windows-*)
             cp "$out/meow.exe" stage/meow.exe
-            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
+            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-NOTICES.md, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
             cp "$out/meow" stage/meow
             chmod 0755 stage/meow
-            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
+            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-NOTICES.md THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
@@ -565,16 +569,17 @@ jobs:
           mkdir -p stage dist
           cp LICENSE stage/LICENSE
           cp assets/cytoscape.LICENSE stage/THIRD-PARTY-CYTOSCAPE.LICENSE
+          cp THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md
           case "$BUILD_NAME" in
           windows-*)
             cp "$out/meow.exe" stage/meow.exe
-            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
+            ARCHIVE_NAME="dist/$name.zip" pwsh -NoProfile -Command 'Compress-Archive -Path stage/meow.exe, stage/LICENSE, stage/THIRD-PARTY-NOTICES.md, stage/THIRD-PARTY-CYTOSCAPE.LICENSE -DestinationPath $env:ARCHIVE_NAME'
             files="$name.zip"
             ;;
           *)
             cp "$out/meow" stage/meow
             chmod 0755 stage/meow
-            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-CYTOSCAPE.LICENSE
+            tar -czf "dist/$name.tar.gz" -C stage meow LICENSE THIRD-PARTY-NOTICES.md THIRD-PARTY-CYTOSCAPE.LICENSE
             files="$name.tar.gz"
             ;;
           esac
