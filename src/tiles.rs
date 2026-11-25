@@ -246,7 +246,7 @@ pub(crate) fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
     match host {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
-        Some(url::Host::Ipv6(v6)) => v6.is_loopback() || v6.to_canonical().is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.to_canonical().is_loopback(),
         None => false,
     }
 }

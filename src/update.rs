@@ -2874,9 +2874,10 @@ mod tests {
     #[cfg(unix)]
     fn set_old_mtime(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
+        use std::time::UNIX_EPOCH;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let file = std::fs::File::options().write(true).open(path).unwrap();
-        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000))
             .unwrap();
     }
 

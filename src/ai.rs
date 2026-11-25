@@ -2973,7 +2973,6 @@ pub fn chat_file_name(address: &str) -> String {
     // and one host's report would carry the other's AI notes. A changed
     // name gets part of a hash of the real one, after a `~`, which no
     // unchanged name can contain.
-    use sha2::Digest;
     let digest = Sha256::digest(address.as_bytes());
     let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!("{stem}~{tag}.md")
