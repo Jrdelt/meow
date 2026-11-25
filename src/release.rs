@@ -741,10 +741,7 @@ mod tests {
         assert_eq!(args[6], exe.clone().into_os_string());
         // The same commands, run without sudo here: the target is never
         // written in place, and nothing is left behind.
-        let status = std::process::Command::new(&args[0])
-            .args(&args[1..])
-            .status()
-            .unwrap();
+        let status = Command::new(&args[0]).args(&args[1..]).status().unwrap();
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
         assert!(!exe.with_file_name(".meow-update-0123456789abcdef").exists());
@@ -752,18 +749,15 @@ mod tests {
         let odd = tmp.path().join("bin").join("me$(touch pwned);ow");
         std::fs::write(&odd, "old").unwrap();
         let args = sudo_replace_args(&new, &odd, "fedcba9876543210");
-        assert!(std::process::Command::new(&args[0])
+        assert!(Command::new(&args[0])
             .args(&args[1..])
             .status()
             .unwrap()
             .success());
-        assert!(
-            !tmp.path().join("bin").join("pwned").exists()
-                && !std::path::Path::new("pwned").exists()
-        );
+        assert!(!tmp.path().join("bin").join("pwned").exists() && !Path::new("pwned").exists());
         // A failed copy leaves the old meow and no staged file.
         let args = sudo_replace_args(&tmp.path().join("missing"), &exe, "1111111111111111");
-        assert!(!std::process::Command::new(&args[0])
+        assert!(!Command::new(&args[0])
             .args(&args[1..])
             .status()
             .unwrap()

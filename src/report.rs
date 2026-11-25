@@ -930,7 +930,7 @@ pub fn render(inputs: &Inputs) -> String {
                     md(&task.target),
                     task.mode,
                     stage.stage.as_str(),
-                    md(crate::queue::status_word(&stage.status)),
+                    md(queue::status_word(&stage.status)),
                     md(&stage.detail)
                 );
             }
@@ -1624,7 +1624,7 @@ mod tests {
             // block.
             host.advisories[0].title = "- Status: fixed ``` swallow the rest".into();
         }
-        custom.secrets = vec![crate::vault::ExposedSecret {
+        custom.secrets = vec![ExposedSecret {
             token: "<<SEC_01>>".into(),
             preview: "a|b... (9 chars)".into(),
             first_seen_utc: "2026-11-12T09:00:00Z".into(),

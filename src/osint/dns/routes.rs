@@ -618,7 +618,7 @@ pub(in crate::osint) mod nrpt {
         fn dword(&self, name: &str) -> Option<u32> {
             let name = wide(name);
             let mut value: u32 = 0;
-            let mut size = std::mem::size_of::<u32>() as u32;
+            let mut size = size_of::<u32>() as u32;
             // SAFETY: `value` holds the `size` bytes of a DWORD.
             let status = unsafe {
                 RegGetValueW(

@@ -2713,7 +2713,7 @@ mod tests {
             ("padded", "almost all structure"),
             ("huge", "more than 16 MB"),
         ] {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let error = client(&format!("{base}/{path}"), None)
                 .nvd_by_cpe("cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*")
                 .await
@@ -3430,7 +3430,7 @@ mod tests {
             )
             .route(
                 "/osv/v1/querybatch",
-                axum::routing::post(|Json(body): Json<Value>| async move {
+                post(|Json(body): Json<Value>| async move {
                     // The jQuery file guessed on port 80 has the vulnerability.
                     let results: Vec<Value> = body["queries"]
                         .as_array()

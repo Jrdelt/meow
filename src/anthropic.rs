@@ -596,7 +596,7 @@ async fn research(
 /// reply, which meow then unmasks and saves.
 fn source_line(title: Option<&str>, url: Option<&str>) -> Option<String> {
     let plain = |text: &str, max: usize| -> String {
-        crate::evidence::sanitize(text, max)
+        sanitize(text, max)
             .chars()
             .filter(|c| {
                 !matches!(

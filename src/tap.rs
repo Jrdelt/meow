@@ -65,10 +65,10 @@ impl TapFilter {
             )
         };
         assert!(
-            align <= std::mem::align_of::<u64>(),
+            align <= align_of::<u64>(),
             "tap_state_t needs {align}-byte alignment"
         );
-        let words = size.div_ceil(std::mem::size_of::<u64>());
+        let words = size.div_ceil(size_of::<u64>());
         let mut filter = Self {
             state: vec![0u64; words].into_boxed_slice(),
             out: Vec::new(),
@@ -193,7 +193,7 @@ mod tests {
         assert!(filter.state.len() * 8 >= size);
         assert!(size > filter.line_max);
         assert_eq!(filter.line_max, 4096);
-        assert_eq!(std::mem::size_of::<TapStats>(), 32);
+        assert_eq!(size_of::<TapStats>(), 32);
     }
 
     #[test]

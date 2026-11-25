@@ -1102,11 +1102,7 @@ fn configure_git_command(cmd: &mut Command, hooks_dir: &Path) {
     for var in GIT_ENV_SCRUB {
         cmd.env_remove(var);
     }
-    if let Some(path) = crate::tools::sanitized_path_env() {
-        cmd.env("PATH", path);
-    } else {
-        cmd.env_remove("PATH");
-    }
+    crate::tools::set_sanitized_path(cmd);
     // No object is fetched unasked (see `NO_REMOTES`), and git never asks
     // for a password on the terminal.
     cmd.env("GIT_NO_LAZY_FETCH", "1")
@@ -1633,11 +1629,7 @@ const SOURCE_COMMIT_ENV: &str = "MEOW_SOURCE_COMMIT";
 #[cfg(unix)]
 fn install_command(dir: &Path, target: &Path, commit: &str) -> Command {
     let mut cmd = Command::new(resolve_sh());
-    if let Some(path) = crate::tools::sanitized_path_env() {
-        cmd.env("PATH", path);
-    } else {
-        cmd.env_remove("PATH");
-    }
+    crate::tools::set_sanitized_path(&mut cmd);
     cmd.arg("install.sh")
         .arg("--yes")
         .env("MEOW_NO_SUDO", "1")
@@ -1792,11 +1784,7 @@ fn brew_command(brew_bin: &Path) -> Command {
     for var in GIT_ENV_SCRUB {
         cmd.env_remove(var);
     }
-    if let Some(path) = crate::tools::sanitized_path_env() {
-        cmd.env("PATH", path);
-    } else {
-        cmd.env_remove("PATH");
-    }
+    crate::tools::set_sanitized_path(&mut cmd);
     cmd
 }
 
@@ -2888,7 +2876,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let file = std::fs::File::options().write(true).open(path).unwrap();
-        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
             .unwrap();
     }
 

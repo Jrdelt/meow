@@ -87,6 +87,16 @@ pub(crate) fn sanitized_path_env() -> Option<std::ffi::OsString> {
     std::env::join_paths(clean).ok()
 }
 
+/// Gives `cmd` the [`sanitized_path_env`] `PATH`, or no `PATH` at all when
+/// there is none.
+pub(crate) fn set_sanitized_path(cmd: &mut Command) {
+    if let Some(path) = sanitized_path_env() {
+        cmd.env("PATH", path);
+    } else {
+        cmd.env_remove("PATH");
+    }
+}
+
 /// What the route stage (`trace`) runs is called here: `traceroute` (or
 /// `tracepath`), `tracert` on Windows.
 #[cfg(not(windows))]
@@ -250,11 +260,7 @@ pub fn install() -> Result<bool> {
             // Never run in the folder the user happens to be in: rustup's
             // cargo and rustc obey a rust-toolchain.toml found there.
             .current_dir(dir.path());
-        if let Some(clean_path) = sanitized_path_env() {
-            cmd.env("PATH", clean_path);
-        } else {
-            cmd.env_remove("PATH");
-        }
+        set_sanitized_path(&mut cmd);
         let status = cmd
             .status()
             .context("cannot run the installer (powershell)")?;
@@ -271,11 +277,7 @@ pub fn install() -> Result<bool> {
             // Not in the folder the user happens to be in: rustup's cargo and
             // rustc obey a rust-toolchain.toml found there.
             .current_dir("/");
-        if let Some(clean_path) = sanitized_path_env() {
-            cmd.env("PATH", clean_path);
-        } else {
-            cmd.env_remove("PATH");
-        }
+        set_sanitized_path(&mut cmd);
         let status = cmd.status().context("cannot run the installer (sh)")?;
         Ok(status.success())
     }
@@ -431,7 +433,7 @@ mod tests {
             .into_iter()
             .map(|g| g.name)
             .collect();
-        let wordlist_installed = crate::queue::find_wordlist(None, None).is_some();
+        let wordlist_installed = find_wordlist(None, None).is_some();
         let mut expected = vec![
             "meow-no-such-nmap",
             "meow-no-such-katana",

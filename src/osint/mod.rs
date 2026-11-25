@@ -81,9 +81,7 @@ fn host_port(address: &str, port: u16) -> String {
 
 fn configure_osint_command(cmd: &mut tokio::process::Command) {
     cmd.env_clear();
-    if let Some(joined) = crate::tools::sanitized_path_env() {
-        cmd.env("PATH", joined);
-    }
+    crate::tools::set_sanitized_path(cmd.as_std_mut());
     cmd.env("LC_ALL", "C").env("LANG", "C");
     #[cfg(windows)]
     {

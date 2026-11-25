@@ -62,9 +62,9 @@ impl UpdateLock {
     /// again every 2 ms, and the first to ask after it is freed has it.
     /// `wait` is time on the clock, so it must cover the updates of all
     /// who may wait at once.
-    pub fn acquire(path: &Path, wait: std::time::Duration) -> Result<Self, LockError> {
+    pub fn acquire(path: &Path, wait: Duration) -> Result<Self, LockError> {
         let mut lock = RwLock::new(open_lock_file(path)?);
-        let deadline = std::time::Instant::now() + wait;
+        let deadline = Instant::now() + wait;
         loop {
             match lock.try_write() {
                 Ok(guard) => {
@@ -73,10 +73,10 @@ impl UpdateLock {
                     break;
                 }
                 Err(error) if is_busy(&error) => {
-                    if std::time::Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
                         return Err(LockError::Held { pid: None });
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => return Err(LockError::Io(error)),
             }
@@ -339,7 +339,7 @@ impl SessionLock {
                 }
                 Err(error) if is_busy(&error) => {
                     if attempt < 2 {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                 }
                 Err(error) => return Err(LockError::Io(error)),
@@ -376,7 +376,7 @@ impl SessionLock {
                 }
                 Err(error) if is_busy(&error) => {
                     if attempt < 2 {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                 }
                 Err(error) => return Err(LockError::Io(error)),
