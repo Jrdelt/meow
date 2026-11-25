@@ -11,7 +11,7 @@
 - **Daily AI cap:** a call blocked only by another session's running call says so. Cap changes in `config.toml` apply at once, and while it cannot be read, cloud AI is off. A killed session's call counts only its input.
 - **Map:** a large session no longer shows "session ended" while its state loads. Reports download only while connected. Screen readers skip the avatar letter and announce error messages.
 - **HUD:** reads big sessions (up to 128 MiB of state) or says it cannot. An AI reply cut off when the session ends shows as stopped, here and on the map.
-- **Docs:** the [threat model](https://github.com/Jrdelt/meow/blob/main/docs/THREAT_MODEL.md)'s outbound table lists what `meow tools` and `meow update` download, some without asking.
+- **Docs:** the README is now a short overview, and the full reference is in the new [user guide](https://github.com/Jrdelt/meow/blob/main/docs/USER_GUIDE.md). The [threat model](https://github.com/Jrdelt/meow/blob/main/docs/THREAT_MODEL.md)'s outbound table lists what `meow tools` and `meow update` download, some without asking.
 
 ---
 

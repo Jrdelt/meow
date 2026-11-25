@@ -1,8 +1,9 @@
 # Fuzzing meow
 
-meow reads text that other people's machines produced. These fuzz targets feed
-random and mutated input to that code to find panics, hangs and memory errors
-before anyone else does.
+Fuzzing means feeding a program large amounts of random and mutated input to
+find crashes. meow reads text that other people's machines produced, so these
+fuzz targets feed that kind of input to its parsers and its C terminal filter,
+to find panics, hangs and memory errors before anyone else does.
 
 | Target | What it fuzzes |
 |---|---|
@@ -29,7 +30,8 @@ CC=clang CFLAGS=-fsanitize=address,fuzzer-no-link \
 ```
 
 `CC=clang CFLAGS=-fsanitize=address,fuzzer-no-link` builds the C filter with
-AddressSanitizer and coverage instrumentation. An out-of-bounds read or write
+AddressSanitizer (a compiler feature that catches memory errors) and coverage
+instrumentation. An out-of-bounds read or write
 in C then stops the run like a Rust panic does, and the fuzzer can see which
 paths through the C code an input reaches. (In a two-minute run that lifted
 `tap_filter` from 145 covered edges to 641.)

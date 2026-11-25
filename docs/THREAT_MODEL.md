@@ -1,9 +1,9 @@
 # Threat model
 
-What meow protects, whom it does not trust, what leaves your machine, and how
-the masking of private values is tested. [SECURITY.md](../SECURITY.md) has the
-reporting policy, the full scope and the known limits.
-[ARCHITECTURE.md](ARCHITECTURE.md) explains the parts named here.
+This page covers what meow protects, what it does not trust, what leaves your
+machine, and how the masking of private values is tested.
+[SECURITY.md](../SECURITY.md) has the reporting policy, the full scope and the
+known limits. [ARCHITECTURE.md](ARCHITECTURE.md) explains the parts named here.
 
 File references point at the source as of v0.2.8 and may drift.
 
@@ -174,7 +174,7 @@ are fuzzed with cargo-fuzz and AddressSanitizer ([fuzz/README.md](../fuzz/README
 | Surface | Protection |
 |---|---|
 | Map server | Binds to `127.0.0.1` only. A 256-bit token is required (Bearer header or `?token=`, never a cookie) and compared in constant time. `Host` must be loopback and `Origin` meow's own. Connection, WebSocket and frame limits (src/coordinator.rs) |
-| Map page | Strict CSP (`default-src 'none'`, scripts from itself only), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `no-store` (src/webui.rs). The page ignores any socket that does not prove it is its own session |
+| Map page | Strict Content Security Policy (`default-src 'none'`, scripts from itself only), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `no-store` (src/webui.rs). The page ignores any socket that does not prove it is its own session |
 | Browser opener | A private `0600` page; the token never goes on a command line |
 | Helper commands | Loopback HTTP with the token, no proxy, no redirects. `runtime.json` is trusted only while its session holds the lock (src/ipc.rs) |
 | Files | `0700` folders and `0600` files, opened without following links. Folders others can write to are refused (src/workspace.rs, src/perms.rs) |
@@ -209,5 +209,5 @@ SECURITY.md lists every known limit. In short:
   reached over an `ssh -L` forward and, on Linux, one run by root.
 - Masking can miss a name shaped like an advisory ID, and free-text notes. This
   is why notes are not sent by default.
-- With OpenRouter, a day can end slightly over the cap.
+- With OpenRouter, a day can end over the cap.
 - Light mode cannot stop a command you type yourself.

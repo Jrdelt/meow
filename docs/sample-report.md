@@ -1,7 +1,11 @@
-<!-- Sample output. Made by `meow report` in a session where the saved scan
-docs/demo/scan.nmap (lab addresses) was printed with `cat`, so no host was
-scanned; the CVEs are real NVD/OSV matches for the versions in it. Only the
-folder path in the command trail was shortened. -->
+> **Sample output.** This is an example of the `REPORT.md` file that
+> `meow report` writes. It was made in a session where the saved scan
+> [docs/demo/scan.nmap](demo/scan.nmap) (lab addresses) was printed with
+> `cat`, so no host was scanned. The CVEs are real NVD and OSV matches for the
+> versions in that scan. Everything below the line is the report as meow
+> wrote it, except that the folder path in the command trail was shortened.
+
+---
 
 # Audit report: lab
 
