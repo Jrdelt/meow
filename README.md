@@ -145,7 +145,7 @@ Sessions saved in one folder share its `meow/` folder (`meow/acme/`, `meow/beta/
 - `.gitignore` files keep them out of git. A running session restores its own `.gitignore` if a pull changed it.
 - meow asks git whether it tracks session files, running none of the repository's programs and reaching no remote.
 - Older sessions in `~/.meow/workspaces/<name>/` and `./.meow/` keep working. `meow list` shows an old `./.meow/` only from its own folder.
-- A session in a cloned, unpacked or copied folder opens only after you accept it, in your default mode. It loses its shell history, last folder, cached answers and queued scans, and never takes a name you use.
+- A session from a cloned, unpacked or copied folder opens only after you accept it, in your default mode. It loses its shell history, last folder, cached answers and queued scans, and never takes a name you use.
 
 On macOS and Linux, meow refuses a folder another user owns or can write to, also through a shared group, or one inside a folder they can change. A sticky folder like `/tmp` is fine. It checks again at each open, use or delete. On macOS, `staff` write access counts even with an access list, so folders older versions accepted (after `chmod 775 ~`, say) may be refused. On Linux, meow refuses an SMB share, and an NFS or FUSE folder with group write. Paths must be valid UTF-8. [SECURITY.md](SECURITY.md#known-limits) lists what these checks miss.
 
