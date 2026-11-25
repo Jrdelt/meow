@@ -1,11 +1,13 @@
 # How meow works
 
-meow is one Rust binary with one small C11 file in it. It sits between you and
-your shell, reads a copy of everything the shell prints, and turns what it
+meow is one Rust program with one small C11 file in it. It sits between you
+and your shell, reads a copy of everything the shell prints, and turns what it
 recognises into a graph of hosts, ports, services and findings. Everything
 else (the HUD, the map, the report, the AI tiers) reads that graph.
 
-File references point at the source as of v0.2.7 and may drift.
+This page is about the design. For how to use meow, see the
+[user guide](USER_GUIDE.md). File references point at the source as of v0.2.7
+and may drift.
 
 ```mermaid
 flowchart LR
@@ -30,10 +32,14 @@ flowchart LR
 ## 1. Capturing output
 
 - **Starting the shell.** `shims::prepare` (src/shims.rs) writes per-session
-  startup files for zsh, bash, fish or PowerShell. Their hooks append each
-  command to the session's `replay.sh`. They do not touch output.
+  startup files for zsh, bash or PowerShell. Their hooks append each command
+  to the session's `replay.sh` (the command trail in the report). They do not
+  touch output. fish gets no startup files or hooks, only a history of its
+  own, so it has no command trail; its output is captured like any other
+  shell's.
 - **The PTY host.** `pty::run_session` (src/pty.rs) runs the shell on a
-  pseudo-terminal. It reads 4 KiB at a time and always writes the chunk to
+  pseudo-terminal (PTY), the same kind of virtual terminal a terminal app
+  gives a shell. It reads 4 KiB at a time and always writes the chunk to
   your terminal first. Only then does it offer a copy to a bounded queue of
   256 chunks. When the queue is full the copy is dropped and counted, so a
   slow parser can never stall your terminal.
@@ -168,10 +174,11 @@ says what that includes); otherwise it gets masked text, like a cloud server.
 
 ## 8. Tests
 
-- Over 740 tests run on macOS, Linux and Windows on every push to `main`
-  (`.github/workflows/checks.yml`): `cargo fmt`, `clippy -D warnings`, a build
-  at the 1.89 minimum Rust version, a Windows cross-clippy, and a RustSec
-  dependency audit.
+- Over 740 tests run on macOS, Linux and Windows on every push to `main` and
+  every pull request (`.github/workflows/checks.yml`). The same workflow runs
+  `cargo fmt`, `clippy -D warnings`, a compile check (`cargo check`) with
+  Rust 1.89 (the oldest supported version), a Windows cross-clippy, and a
+  RustSec dependency audit.
 - Parser tests cover hostile input: entity expansion, deep nesting, huge
   attributes, escape-injected fields, and lines packed with addresses.
 - Four fuzz targets (`fuzz/`) cover the parsers and the C filter. They run
