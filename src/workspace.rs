@@ -684,7 +684,7 @@ fn windows_system32_dir() -> PathBuf {
         }
         Some(p)
     };
-    std::env::var_os("SystemRoot")
+    env::var_os("SystemRoot")
         .and_then(|v| valid_root(&v))
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
         .join("System32")

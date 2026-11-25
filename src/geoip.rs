@@ -362,7 +362,7 @@ mod tests {
 
         // A file far too large to be one is refused before it is read
         // (sparse here: it takes no disk space).
-        let huge = std::fs::File::create(dir.path().join(CITY_FILE)).unwrap();
+        let huge = fs::File::create(dir.path().join(CITY_FILE)).unwrap();
         huge.set_len(MAX_CITY_BYTES + 1).unwrap();
         assert!(db.available());
         let error = db.lookup("8.8.8.8".parse().unwrap()).unwrap_err();
@@ -377,17 +377,17 @@ mod tests {
     fn symlinks_and_pipes_are_refused_without_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("outside.mmdb");
-        std::fs::write(&outside, b"not mmdb").unwrap();
+        fs::write(&outside, b"not mmdb").unwrap();
 
         let geo = dir.path().join("geo");
-        std::fs::create_dir(&geo).unwrap();
+        fs::create_dir(&geo).unwrap();
         let city = geo.join(CITY_FILE);
         std::os::unix::fs::symlink(&outside, &city).unwrap();
 
         let db = GeoDb::new(&geo);
         assert!(!db.available());
         assert!(db.lookup("8.8.8.8".parse().unwrap()).is_err());
-        std::fs::remove_file(&city).unwrap();
+        fs::remove_file(&city).unwrap();
 
         let c_path = std::ffi::CString::new(city.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);

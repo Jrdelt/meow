@@ -1025,8 +1025,7 @@ mod windows {
         // Room for a TOKEN_USER and the longest SID (68 bytes), in u64
         // words so it is aligned for the structure.
         let mut buffer = vec![0u64; 64];
-        let size =
-            u32::try_from(std::mem::size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
+        let size = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
         let mut used = 0u32;
         // SAFETY: the token is open for queries; the buffer is `size`
         // writable bytes, aligned for a TOKEN_USER and alive through the

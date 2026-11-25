@@ -484,20 +484,20 @@ pub(super) mod windows_dns {
         length: i32,
     ) -> Option<SocketAddr> {
         let length = usize::try_from(length).ok()?;
-        if sockaddr.is_null() || length < std::mem::size_of::<SOCKADDR>() {
+        if sockaddr.is_null() || length < size_of::<SOCKADDR>() {
             return None;
         }
         // SAFETY: not null, and at least a SOCKADDR long.
         let family = unsafe { sockaddr.read_unaligned() }.sa_family;
         match family {
-            AF_INET if length >= std::mem::size_of::<SOCKADDR_IN>() => {
+            AF_INET if length >= size_of::<SOCKADDR_IN>() => {
                 // SAFETY: an AF_INET address this long is a SOCKADDR_IN.
                 let v4 = unsafe { sockaddr.cast::<SOCKADDR_IN>().read_unaligned() };
                 // SAFETY: every variant of the union is the same 4 bytes.
                 let octets = unsafe { v4.sin_addr.S_un.S_addr }.to_ne_bytes();
                 Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), 53))
             }
-            AF_INET6 if length >= std::mem::size_of::<SOCKADDR_IN6>() => {
+            AF_INET6 if length >= size_of::<SOCKADDR_IN6>() => {
                 // SAFETY: an AF_INET6 address this long is a SOCKADDR_IN6.
                 let v6 = unsafe { sockaddr.cast::<SOCKADDR_IN6>().read_unaligned() };
                 // SAFETY: the variants of each union are the same bytes.

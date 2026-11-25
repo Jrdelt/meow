@@ -953,36 +953,36 @@ mod tests {
     fn a_moved_session_keeps_its_fish_history() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("fish")).unwrap();
+        fs::create_dir_all(data.join("fish")).unwrap();
         // Named through a link, as a folder typed at the prompt may be.
         let real = tmp.path().join("real");
-        std::fs::create_dir_all(real.join("proj/meow/acme")).unwrap();
+        fs::create_dir_all(real.join("proj/meow/acme")).unwrap();
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let old = link.join("proj/meow/acme");
         let name = fish_history_name(&old);
-        std::fs::write(fish_history_in(&data, &old), "- cmd: echo mine\n").unwrap();
-        std::fs::rename(real.join("proj"), real.join("moved")).unwrap();
+        fs::write(fish_history_in(&data, &old), "- cmd: echo mine\n").unwrap();
+        fs::rename(real.join("proj"), real.join("moved")).unwrap();
         // Gone, it has the name it had.
         assert_eq!(fish_history_name(&old), name);
-        let real_proj = std::fs::canonicalize(&real).unwrap().join("proj/meow/acme");
+        let real_proj = fs::canonicalize(&real).unwrap().join("proj/meow/acme");
         assert_eq!(resolved(&old), real_proj);
         // `..` in what is gone is not guessed at.
         assert_eq!(resolved(&link.join("x/../y")), link.join("x/../y"));
         let new = real.join("moved/meow/acme");
         assert_ne!(fish_history_name(&new), name);
         // Another session's list there before.
-        std::fs::write(fish_history_in(&data, &new), "- cmd: theirs\n").unwrap();
+        fs::write(fish_history_in(&data, &new), "- cmd: theirs\n").unwrap();
         move_fish_history_in(&data, &old, &new);
         assert!(!fish_history_in(&data, &old).exists());
         assert_eq!(
-            std::fs::read_to_string(fish_history_in(&data, &new)).unwrap(),
+            fs::read_to_string(fish_history_in(&data, &new)).unwrap(),
             "- cmd: echo mine\n"
         );
         // Moved again with no list of its own: the one there goes.
         let again = tmp.path().join("again/meow/acme");
-        std::fs::create_dir_all(&again).unwrap();
-        std::fs::write(fish_history_in(&data, &again), "- cmd: theirs\n").unwrap();
+        fs::create_dir_all(&again).unwrap();
+        fs::write(fish_history_in(&data, &again), "- cmd: theirs\n").unwrap();
         move_fish_history_in(&data, &old, &again);
         assert!(!fish_history_in(&data, &again).exists());
     }
@@ -1025,7 +1025,7 @@ mod tests {
         // meow refuses to open a session at such a path; the hooks must
         // still keep it one quoted word.
         let odd = tmp.path().join("p@HISTORY@$(touch x)@HOOKS@'@REPLAY@");
-        std::fs::rename(&made.dir, &odd).unwrap();
+        fs::rename(&made.dir, &odd).unwrap();
         let ws = Workspace { dir: odd, ..made };
         prepare(&ws, "bash", None).unwrap();
         let hooks = read(ws.tmp_dir().join("shell").join("hooks.bash"));

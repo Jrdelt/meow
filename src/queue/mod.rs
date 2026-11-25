@@ -1168,7 +1168,7 @@ pub fn clear_tool_leftovers(tmp: &Path) -> usize {
         let (Some(name), Ok(kind)) = (name.to_str(), entry.file_type()) else {
             continue;
         };
-        let gone = if kind.is_dir() && name.starts_with(runner::RUN_DIR_PREFIX) {
+        let gone = if kind.is_dir() && name.starts_with(RUN_DIR_PREFIX) {
             std::fs::remove_dir_all(entry.path()).is_ok()
         } else if kind.is_file() && is_stage_output(name) {
             std::fs::remove_file(entry.path()).is_ok()

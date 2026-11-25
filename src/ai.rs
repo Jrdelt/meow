@@ -1646,12 +1646,7 @@ impl StreamLines {
 /// Whether `raw` names this machine itself: `localhost` or a loopback
 /// address (including IPv4-mapped IPv6 `[::ffff:127.0.0.1]`).
 pub fn is_loopback_url(raw: &str) -> bool {
-    url::Url::parse(raw.trim()).is_ok_and(|url| match url.host() {
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
-        None => false,
-    })
+    url::Url::parse(raw.trim()).is_ok_and(|url| crate::tiles::is_loopback_host(url.host()))
 }
 
 /// Parses a single line of Linux `/proc/net/tcp` or `/proc/net/tcp6` and
@@ -2979,7 +2974,7 @@ pub fn chat_file_name(address: &str) -> String {
     // name gets part of a hash of the real one, after a `~`, which no
     // unchanged name can contain.
     use sha2::Digest;
-    let digest = sha2::Sha256::digest(address.as_bytes());
+    let digest = Sha256::digest(address.as_bytes());
     let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!("{stem}~{tag}.md")
 }
@@ -4486,6 +4481,68 @@ mod tests {
         assert_eq!(listener_uids(table, 11434), [998]);
         assert!(listener_uids(table, 8080).is_empty());
         assert!(listener_uids("garbage\nmore garbage", 1234).is_empty());
+    }
+
+    #[test]
+    fn loopback_urls_agree_with_the_map_s_loopback_hosts() {
+        for (raw, here) in [
+            // localhost, in any case, and nothing that only starts with it.
+            ("http://localhost:11434/v1", true),
+            ("http://LocalHost:11434", true),
+            ("ws://LOCALHOST", true),
+            ("foo://LOCALHOST/v1", true),
+            ("  http://localhost:1234/v1  ", true),
+            ("http://localhost./v1", false),
+            ("http://localhost%2e/v1", false),
+            ("http://loc%61lhost/v1", true),
+            ("http://\u{ff4c}\u{ff4f}\u{ff43}\u{ff41}\u{ff4c}\u{ff48}\u{ff4f}\u{ff53}\u{ff54}/v1", true),
+            ("http://l\u{43e}calhost/v1", false),
+            ("http://localhost.localdomain/v1", false),
+            ("http://localhost.example.com/v1", false),
+            // 127.0.0.0/8 in every spelling the URL parser accepts.
+            ("http://127.0.0.1:8080", true),
+            ("http://127.255.255.254/v1", true),
+            ("http://127.1/v1", true),
+            ("http://0x7f000001/v1", true),
+            ("http://2130706433/v1", true),
+            ("http://127.0.0.1./v1", true),
+            ("http://127.0.0.1.nip.io/v1", false),
+            ("http://126.255.255.255/v1", false),
+            ("http://128.0.0.1/v1", false),
+            // ::1 and IPv4-mapped loopback; not IPv4-compatible ::127.0.0.1.
+            ("http://[::1]:11434/v1", true),
+            ("http://[0:0:0:0:0:0:0:1]/v1", true),
+            ("http://[::ffff:127.0.0.1]:1234/v1", true),
+            ("http://[::ffff:7f01:203]/v1", true),
+            ("http://[::ffff:128.0.0.1]/v1", false),
+            ("http://[::127.0.0.1]/v1", false),
+            ("http://[::2]/v1", false),
+            ("http://[fe80::1]/v1", false),
+            ("http://[::1%25lo]/v1", false),
+            // Any address is not this machine's own.
+            ("http://0.0.0.0:11434/v1", false),
+            ("http://0/v1", false),
+            ("http://[::]:11434/v1", false),
+            // The host decides, not the user name, password or port.
+            ("http://user:pass@localhost:11434/v1", true),
+            ("http://evil.example@127.0.0.1/v1", true),
+            ("http://localhost@evil.example/v1", false),
+            ("http://127.0.0.1@evil.example/v1", false),
+            ("http://localhost:0/v1", true),
+            // Nothing that does not parse, and no URL without a host.
+            ("http://127.0.0.1:99999/v1", false),
+            ("localhost:11434", false),
+            ("http://", false),
+            ("", false),
+            ("not a url", false),
+            ("file:///etc/hosts", false),
+            ("file://localhost/etc/hosts", false),
+        ] {
+            assert_eq!(is_loopback_url(raw), here, "{raw}");
+            let host = url::Url::parse(raw.trim()).ok();
+            let map = crate::tiles::is_loopback_host(host.as_ref().and_then(url::Url::host));
+            assert_eq!(map, here, "{raw}");
+        }
     }
 
     #[tokio::test]

@@ -840,8 +840,8 @@ fn setup_claude(settings: &AiSettings, own: &mut AiOverrides) -> Result<bool> {
         return Ok(false);
     }
     let mut next = own.clone();
-    use_claude(&mut next, &settings.effective());
     let effective = settings.effective();
+    use_claude(&mut next, &effective);
     let triage_now = crate::evidence::sanitize(
         next.cloud_model
             .as_deref()

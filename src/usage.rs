@@ -551,7 +551,7 @@ mod tests {
             held,
         };
         let text = serde_json::to_string(&record).unwrap();
-        crate::workspace::write_private_atomic(ledger.path(), text.as_bytes()).unwrap();
+        write_private_atomic(ledger.path(), text.as_bytes()).unwrap();
         let day = ledger.today().unwrap();
         let kept_usd: f64 = kept.iter().map(|hold| hold.usd).sum();
         assert!(

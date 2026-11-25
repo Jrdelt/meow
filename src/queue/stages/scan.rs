@@ -68,7 +68,7 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
 /// The hosts up in a scan that answered on no port: every port tried was
 /// filtered, so the scan was blocked or dropped, or the host is off.
 fn unanswered_hosts(observations: &[Observation]) -> Vec<String> {
-    let mut answered = std::collections::BTreeSet::new();
+    let mut answered = BTreeSet::new();
     for observation in observations {
         match observation {
             Observation::Port { address, state, .. } if state == "open" => {

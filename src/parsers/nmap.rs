@@ -997,7 +997,7 @@ mod tests {
         assert!(port
             .facts
             .iter()
-            .all(|f| f.record.source == crate::evidence::Source::NmapXml));
+            .all(|f| f.record.source == Source::NmapXml));
     }
 
     #[test]

@@ -589,7 +589,7 @@ mod job {
                 job,
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_ref(&info).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             ) != 0;
             if !configured || AssignProcessToJobObject(job, process as _) == 0 {
                 CloseHandle(job);
@@ -853,7 +853,7 @@ fn ignore_end_signals() {
 pub fn guard_main() -> u8 {
     use std::io::{IsTerminal, Read};
 
-    let input = std::io::stdin();
+    let input = io::stdin();
     // SAFETY: fstat on descriptor 0 into a zeroed, correctly sized buffer.
     let is_pipe = unsafe {
         let mut stat: libc::stat = std::mem::zeroed();

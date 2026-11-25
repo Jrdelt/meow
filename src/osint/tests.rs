@@ -752,7 +752,7 @@ pub(crate) async fn stand_in_doh_saying(status: u8, a: Option<[u8; 4]>) -> (Stri
                 Some(ip) => format!(
                     r#"{{"Status":{status},"Answer":[{{"name":"{}","type":1,"TTL":60,"data":"{}"}}]}}"#,
                     field("name"),
-                    std::net::Ipv4Addr::from(ip)
+                    Ipv4Addr::from(ip)
                 ),
                 None => format!(r#"{{"Status":{status},"Answer":[]}}"#),
             };
@@ -1625,9 +1625,8 @@ fn windows_dns_servers_are_read_from_socket_addresses() {
     };
     let size = |n: usize| i32::try_from(n).unwrap();
     // SAFETY: each pointer is to a live socket address at least that long.
-    let read =
-        |ptr: *const SOCKADDR, len: i32| unsafe { dns::windows_dns::socket_address(ptr, len) };
-    let len4 = size(std::mem::size_of::<SOCKADDR_IN>());
+    let read = |ptr: *const SOCKADDR, len: i32| unsafe { windows_dns::socket_address(ptr, len) };
+    let len4 = size(size_of::<SOCKADDR_IN>());
     assert_eq!(
         read(std::ptr::from_ref(&v4).cast(), len4),
         Some("192.0.2.53:53".parse().unwrap())
@@ -1647,7 +1646,7 @@ fn windows_dns_servers_are_read_from_socket_addresses() {
             sin6_scope_id: scope,
         },
     };
-    let len6 = size(std::mem::size_of::<SOCKADDR_IN6>());
+    let len6 = size(size_of::<SOCKADDR_IN6>());
     let link = v6("fe80::53", 7);
     assert_eq!(
         read(std::ptr::from_ref(&link).cast(), len6),
@@ -1662,7 +1661,7 @@ fn windows_dns_servers_are_read_from_socket_addresses() {
     let placeholder = v6("fec0:0:0:ffff::1", 0);
     assert_eq!(read(std::ptr::from_ref(&placeholder).cast(), len6), None);
     // The real list: every server on port 53, none a stand-in.
-    for server in dns::windows_dns::servers() {
+    for server in windows_dns::servers() {
         assert_eq!(server.port(), 53);
         assert!(!server.ip().to_string().starts_with("fec0:"), "{server}");
     }
@@ -1775,7 +1774,7 @@ async fn a_tls_audit_replaces_what_was_listed_only_when_every_check_answered() {
     let audit = |openssl: std::path::PathBuf| {
         let tools = &tools;
         async move {
-            let (observations, _) = super::tls::run_tls_audit_with(
+            let (observations, _) = run_tls_audit_with(
                 tools,
                 Some(openssl),
                 "192.0.2.40",

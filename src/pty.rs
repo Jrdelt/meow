@@ -118,7 +118,7 @@ fn panic_ends_the_session() -> bool {
 
 /// `thread::spawn` for the PTY host's own threads: named, so that a panic on
 /// one of them still gives the terminal back.
-fn spawn_pty<F, T>(work: F) -> thread::JoinHandle<T>
+fn spawn_pty<F, T>(work: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,

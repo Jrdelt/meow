@@ -405,7 +405,7 @@ impl State {
     }
 
     /// Tool flag overrides from this workspace's `profile.toml`.
-    pub fn profile_recon(&self) -> crate::queue::PresetOverride {
+    pub fn profile_recon(&self) -> queue::PresetOverride {
         lock(&self.workspace).profile.recon.clone()
     }
 
@@ -1357,7 +1357,7 @@ fn markdown_download(markdown: String, filename: &str) -> Response {
 
 async fn get_report(AxumState(state): AxumState<Shared>) -> Response {
     let inputs = state.report_inputs();
-    let filename = format!("report-{}", crate::ai::chat_file_name(&inputs.session));
+    let filename = format!("report-{}", ai::chat_file_name(&inputs.session));
     let markdown = crate::report::render(&inputs);
     markdown_download(markdown, &filename)
 }
@@ -1370,7 +1370,7 @@ async fn get_host_report(
     let Some(markdown) = crate::report::render_host_report(&inputs, &address) else {
         return refuse(StatusCode::NOT_FOUND, "unknown host");
     };
-    let filename = format!("report-{}", crate::ai::chat_file_name(&address));
+    let filename = format!("report-{}", ai::chat_file_name(&address));
     markdown_download(markdown, &filename)
 }
 
@@ -1627,7 +1627,7 @@ const MAX_CACHED_PLACES: usize = 1024;
 /// pictures. A newer selection wins: a stale answer is dropped.
 /// One connection attempt to `port`: accepted, refused, or no answer.
 async fn try_port(ip: std::net::IpAddr, port: u16) -> PortCheck {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let attempt = tokio::time::timeout(
         CHECK_TIMEOUT,
         tokio::net::TcpStream::connect(SocketAddr::new(ip, port)),
@@ -1921,7 +1921,7 @@ async fn location_loop(state: Shared) {
     let settings = state.config.location.clone();
     let mut revision = state.revision.subscribe();
     let mut last_key: Option<String> = None;
-    let mut retry_at: Option<std::time::Instant> = None;
+    let mut retry_at: Option<Instant> = None;
     loop {
         let _ = revision.borrow_and_update();
         let (key, plan) = {
@@ -1931,7 +1931,7 @@ async fn location_loop(state: Shared) {
                 location::plan(&settings, &graph.local),
             )
         };
-        let retry = retry_at.is_some_and(|at| std::time::Instant::now() >= at);
+        let retry = retry_at.is_some_and(|at| Instant::now() >= at);
         if last_key.as_deref() != Some(key.as_str()) || retry {
             last_key = Some(key);
             retry_at = None;
@@ -1948,7 +1948,7 @@ async fn location_loop(state: Shared) {
                                     (Some(Box::new(view)), None)
                                 }
                                 Some(Err(error)) => {
-                                    retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
+                                    retry_at = Some(Instant::now() + LOCATE_RETRY);
                                     (None, Some(format!("{error:#}")))
                                 }
                                 None => (None, None),
@@ -1962,7 +1962,7 @@ async fn location_loop(state: Shared) {
                             }
                         }
                         Err(error) => {
-                            retry_at = Some(std::time::Instant::now() + LOCATE_RETRY);
+                            retry_at = Some(Instant::now() + LOCATE_RETRY);
                             Location::Unavailable {
                                 reason: format!("{error:#}"),
                             }
@@ -2003,7 +2003,7 @@ async fn location_loop(state: Shared) {
         }
         let wait = retry_at
             .map(|at| {
-                at.saturating_duration_since(std::time::Instant::now())
+                at.saturating_duration_since(Instant::now())
                     .min(LOCATE_EVERY)
             })
             .unwrap_or(LOCATE_EVERY);
@@ -2643,10 +2643,10 @@ mod tests {
             .execute(Command::SetMode { mode: Mode::Mild })
             .unwrap();
         assert_eq!(check().unwrap()["checking"], true);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let result = loop {
             let result = state.snapshot()["checks"]["127.0.0.1"].clone();
-            if result["status"] != "checking" || std::time::Instant::now() > deadline {
+            if result["status"] != "checking" || Instant::now() > deadline {
                 break result;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -2680,9 +2680,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             block_on(async move {
-                let app = axum::Router::new().route(
+                let app = Router::new().route(
                     "/tiles/{z}/{x}/{y}",
-                    axum::routing::get(|| async {
+                    get(|| async {
                         ASKED.fetch_add(1, Ordering::SeqCst);
                         JPEG
                     }),
@@ -2721,10 +2721,10 @@ mod tests {
                     address: Some("8.8.8.8".into()),
                 })
                 .unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(10);
             let target = loop {
                 let target = state.snapshot()["target"].clone();
-                if target["status"] != "looking" || std::time::Instant::now() > deadline {
+                if target["status"] != "looking" || Instant::now() > deadline {
                     break target;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -2766,15 +2766,15 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             block_on(async move {
-                let app = axum::Router::new()
+                let app = Router::new()
                     .route(
                         "/json",
-                        axum::routing::get(|| async {
-                            axum::Json(json!({ "ip": "203.0.113.7", "city": "Spokane",
+                        get(|| async {
+                            Json(json!({ "ip": "203.0.113.7", "city": "Spokane",
                                 "region": "Washington", "country": "US", "loc": "47.6588,-117.4260" }))
                         }),
                     )
-                    .route("/tiles/{z}/{x}/{y}", axum::routing::get(|| async { JPEG }));
+                    .route("/tiles/{z}/{x}/{y}", get(|| async { JPEG }));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(listener.local_addr().unwrap()).unwrap();
                 axum::serve(listener, app).await.unwrap();
@@ -2823,10 +2823,10 @@ mod tests {
         assert_eq!(state.snapshot()["location"], Value::Null);
         state.execute(Command::Locate).unwrap();
         state.execute(Command::Locate).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let location = loop {
             let location = state.snapshot()["location"].clone();
-            if !location.is_null() || std::time::Instant::now() > deadline {
+            if !location.is_null() || Instant::now() > deadline {
                 break location;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -2880,10 +2880,10 @@ mod tests {
                     address: address.map(str::to_owned),
                 })
                 .unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let target = state.snapshot()["target"].clone();
-                if target["status"] != "looking" || std::time::Instant::now() > deadline {
+                if target["status"] != "looking" || Instant::now() > deadline {
                     break target;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -3748,7 +3748,7 @@ mod tests {
             sink(line);
         }
         let state = fx.coordinator.state();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let done = state.graph().host("10.0.0.5").is_some_and(|h| {
                 h.ports.contains_key("8080/tcp")
@@ -3761,7 +3761,7 @@ mod tests {
                 break;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "tap lines never reached the graph"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -3927,13 +3927,13 @@ mod tests {
     fn session_over(
         tmp: &tempfile::TempDir,
         mode: Mode,
-        plant: impl FnOnce(&crate::db::Db),
+        plant: impl FnOnce(&Db),
     ) -> (SessionLock, Coordinator) {
         let home = MeowHome::at(tmp.path().join(".meow")).unwrap();
         let (mut workspace, _) =
             Workspace::open_or_create(&home, tmp.path(), "acme", false, Mode::Light).unwrap();
         workspace.set_mode(mode).unwrap();
-        plant(&crate::db::Db::open(&workspace.state_db_path()).unwrap());
+        plant(&Db::open(&workspace.state_db_path()).unwrap());
         let lock = SessionLock::acquire(&workspace.lock_path()).unwrap();
         let mut config = Config::default();
         config.cve.enabled = false;
@@ -4699,7 +4699,7 @@ mod tests {
         );
 
         assert_eq!(ask(Tier::Local, "10.0.0.5").unwrap()["started"], true);
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let status = state.snapshot()["ai"].clone();
             if status["running"] == false && status["summary"].is_string() {
@@ -4717,7 +4717,7 @@ mod tests {
             }
             assert!(status["error"].is_null(), "{status}");
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "the AI request never finished: {status}"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -4735,7 +4735,7 @@ mod tests {
 
         // With a CVE found, [R] starts. No key is set here, so it ends
         // without asking anyone.
-        if std::env::var(crate::ai::API_KEY_ENV).is_err() {
+        if std::env::var(ai::API_KEY_ENV).is_err() {
             state.graph().add_advisory(
                 "10.0.0.5",
                 crate::graph::Advisory {
@@ -4753,9 +4753,9 @@ mod tests {
                 },
             );
             assert_eq!(ask(Tier::Research, "10.0.0.5").unwrap()["started"], true);
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + Duration::from_secs(20);
             while state.snapshot()["ai"]["running"] == true {
-                assert!(std::time::Instant::now() < deadline);
+                assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(20));
             }
         }

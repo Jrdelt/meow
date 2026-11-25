@@ -2877,7 +2877,7 @@ mod tests {
         for advisory in &mut graph.hosts.get_mut("10.10.10.5").unwrap().advisories {
             advisory.fixed_in = Some("1.20.1".into());
         }
-        let mut message: serde_json::Value = serde_json::from_str(&state_message(&graph)).unwrap();
+        let mut message: Value = serde_json::from_str(&state_message(&graph)).unwrap();
         message["state"]["notices"] = json!([ {
             "at": "2026-11-12T09:41:00Z",
             "text": "3 new CVEs for 10.10.10.5 (1 known exploited), found by software version. \
@@ -2930,11 +2930,11 @@ mod tests {
     /// A state whose tasks are `runs`: (id, target, the status of each
     /// stage), newest first. `closed` is a stage the end of the session
     /// stopped, `not run` one it left out.
-    fn runs_message(runs: &[(i64, &str, &[&str])]) -> serde_json::Value {
-        let tasks: Vec<serde_json::Value> = runs
+    fn runs_message(runs: &[(i64, &str, &[&str])]) -> Value {
+        let tasks: Vec<Value> = runs
             .iter()
             .map(|(id, target, statuses)| {
-                let stages: Vec<serde_json::Value> = queue::STAGES
+                let stages: Vec<Value> = queue::STAGES
                     .iter()
                     .zip(*statuses)
                     .map(|(stage, status)| {
@@ -2954,8 +2954,7 @@ mod tests {
                     "created_utc": "", "stages": stages })
             })
             .collect();
-        let mut message: serde_json::Value =
-            serde_json::from_str(&state_message(&Graph::default())).unwrap();
+        let mut message: Value = serde_json::from_str(&state_message(&Graph::default())).unwrap();
         message["state"]["now_utc"] = json!("2026-11-12T10:00:42Z");
         message["state"]["tasks"] = json!(tasks);
         message
@@ -3177,7 +3176,7 @@ mod tests {
         let mut model = shown(&message);
         assert!(screen(&model, 160, 40).contains("trace 0:42 · 3 results so far"));
         model.age = Duration::from_secs(3);
-        let tick = |running: serde_json::Value| {
+        let tick = |running: Value| {
             json!({ "type": "progress", "key": "k", "now_utc": "2026-11-12T10:00:50Z",
                 "running": running })
             .to_string()
@@ -3220,8 +3219,7 @@ mod tests {
 
     #[test]
     fn only_the_newest_run_of_a_target_is_shown() {
-        let mut message: serde_json::Value =
-            serde_json::from_str(&state_message(&graph())).unwrap();
+        let mut message: Value = serde_json::from_str(&state_message(&graph())).unwrap();
         let run = |id: i64, status: &str| {
             json!({ "id": id, "target": "10.10.10.5", "mode": "mild", "extra_flags": [], "created_utc": "",
                 "stages": [ { "stage": "ports", "status": status, "detail": "" } ] })
@@ -3236,8 +3234,8 @@ mod tests {
     }
 
     /// A state with one recon task whose stages have `statuses`, in order.
-    fn recon_message(statuses: &[&str], running: serde_json::Value) -> serde_json::Value {
-        let stages: Vec<serde_json::Value> = queue::STAGES
+    fn recon_message(statuses: &[&str], running: Value) -> Value {
+        let stages: Vec<Value> = queue::STAGES
             .iter()
             .zip(statuses)
             .map(|(stage, status)| {
@@ -3250,8 +3248,7 @@ mod tests {
                 row
             })
             .collect();
-        let mut message: serde_json::Value =
-            serde_json::from_str(&state_message(&Graph::default())).unwrap();
+        let mut message: Value = serde_json::from_str(&state_message(&Graph::default())).unwrap();
         message["state"]["now_utc"] = json!("2026-11-12T10:00:42Z");
         message["state"]["tasks"] = json!([ { "id": 7, "target": "192.0.2.5", "mode": "mild",
             "extra_flags": [], "created_utc": "", "stages": stages } ]);
@@ -3263,7 +3260,7 @@ mod tests {
         "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending",
     ];
 
-    fn shown(message: &serde_json::Value) -> Model {
+    fn shown(message: &Value) -> Model {
         let mut model = Model::new(true);
         model.apply_message(&message.to_string());
         assert_eq!(model.status, "", "the state was not read");
@@ -3563,7 +3560,7 @@ mod tests {
         for (index, detail) in details {
             message["state"]["tasks"][0]["stages"][index]["detail"] = json!(detail);
         }
-        let set = |message: &mut serde_json::Value, index: usize, key: &str, value: &str| {
+        let set = |message: &mut Value, index: usize, key: &str, value: &str| {
             message["state"]["tasks"][0]["stages"][index][key] = json!(value);
         };
         // Stage 4 failed: it is named, and why, though a later stage has a
