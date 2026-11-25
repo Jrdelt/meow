@@ -5,7 +5,7 @@ your shell, reads a copy of everything the shell prints, and turns what it
 recognises into a graph of hosts, ports, services and findings. Everything
 else (the HUD, the map, the report, the AI tiers) reads that graph.
 
-File references point at the source as of v0.2.7 and may drift.
+File references point at the source as of v0.2.8 and may drift.
 
 ```mermaid
 flowchart LR

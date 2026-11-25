@@ -5,7 +5,7 @@ the masking of private values is tested. [SECURITY.md](../SECURITY.md) has the
 reporting policy, the full scope and the known limits.
 [ARCHITECTURE.md](ARCHITECTURE.md) explains the parts named here.
 
-File references point at the source as of v0.2.7 and may drift.
+File references point at the source as of v0.2.8 and may drift.
 
 ## What meow protects
 

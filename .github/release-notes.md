@@ -1,12 +1,17 @@
-### What's New in `meow` v0.2.7
+### What's New in `meow` v0.2.8
 
-- **New look for the live map.** A dark theme with one top bar for the session, its counts and its status. The topology is drawn dark too: each device sits on a plate, a host with CVEs is ringed amber (or red when one is known exploited, critical or high), and the selected device is outlined in lime.
-- **Map: back to all hosts.** An **All hosts** button beside the selected host's name, and **Esc**, bring the host list back and put the keyboard on it. Before, only a click on an empty part of the drawing did.
-- **HUD and setup read in every terminal theme.** Secondary text, idle borders, panel titles and the key line no longer vanish in themes such as Solarized Dark. The selected row and the current setup step are black on lime.
-- **Security: `url` 2.5.9** fixes RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs.
-- **Dependencies:** cc 1.11.2, clap 4.6.8, petgraph 0.8, rusqlite 0.43, sha2 0.11.
-- **Fuzzing:** four cargo-fuzz targets cover the parsers and the C11 terminal filter, the C code under AddressSanitizer. They run weekly in CI.
-- **Docs:** a demo, map screenshots and a sample report in the README; [architecture](https://github.com/Jrdelt/meow/blob/main/docs/ARCHITECTURE.md) and [threat model](https://github.com/Jrdelt/meow/blob/main/docs/THREAT_MODEL.md).
+- **Security: `meow update` from source checks folders above.** On macOS and Linux, before any fetch, it refuses a clone in a folder another user owns or can write to (even /tmp, even via a relative `--source`), and a `~/.meow` another user could move.
+- **Security: no planted AI answers.** A session that came with a cloned or copied folder, or whose files changed outside meow, loses its cached AI answers and CVE lookups.
+- **`meow update` from source:** links to cargo settings files (as dotfile managers make) and common git settings now pass. Its build folder gets a `CACHEDIR.TAG` and, on macOS, is left out of Time Machine. On Windows, a clone others can change is refused with the `icacls` command that makes it yours alone.
+- **Git checks:** at exit meow waits for a running one and no longer wrongly drops your shell history. Unreadable repositories get one note; a project's own `Meow/` on Linux gets no session-file warnings.
+- **Rescans:** a port a rescan finds closed or filtered leaves the open list; its CVEs move to a port with the same software, or go. Only SYN, connect, UDP and SCTP INIT scans the host answered close a port.
+- **Recon results:** a guessed JS CVE goes once the page shows only another version. The map shows the latest traceroute. `waf-cdn` and `asn` add no extra hosts.
+- **Smaller recon fixes:** `meow tools` and `install.sh` check for traceroute and add it on Linux. A name with no address says why instead of suggesting `-Pn`. `meow list` and `meow add` count only map hosts.
+- **AI replies fill in more.** Lines naming a common file, package, setting, size or port (`my.cnf`, `22/tcp`) get your target's name and address back. Code, commands and lines naming other hosts stay masked.
+- **Daily AI cap:** a call blocked only by another session's running call says so. Cap changes in `config.toml` apply at once, and while it cannot be read, cloud AI is off. A killed session's call counts only its input.
+- **Map:** a large session no longer shows "session ended" while its state loads. Reports download only while connected. Screen readers skip the avatar letter and announce error messages.
+- **HUD:** reads big sessions (up to 128 MiB of state) or says it cannot. An AI reply cut off when the session ends shows as stopped, here and on the map.
+- **Docs:** the [threat model](https://github.com/Jrdelt/meow/blob/main/docs/THREAT_MODEL.md)'s outbound table lists what `meow tools` and `meow update` download, some without asking.
 
 ---
 
