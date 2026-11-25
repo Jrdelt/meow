@@ -9,7 +9,7 @@
 </head>
 <body>
 <header>
-  <span class="logo">meow</span>
+  <h1 class="logo" aria-label="meow map">meow</h1>
   <span class="target"><span id="avatar" class="avatar" aria-hidden="true"></span><span id="session"></span></span>
   <div id="status">
     <span id="counts"></span>
@@ -30,7 +30,7 @@
           title="Fill the window with the map (Esc goes back)">Expand</button>
       </div>
       <div id="stage">
-        <div id="scroller"><div id="cy"></div></div>
+        <div id="scroller" tabindex="0" role="region" aria-label="Topology drawing; the Hosts list has the same hosts"><div id="cy"></div></div>
         <div id="where"></div>
         <div id="legend"></div>
       </div>
