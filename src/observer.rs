@@ -193,6 +193,17 @@ pub mod linux {
     }
 
     /// `ip route show` / `ip -6 route show`
+    /// The default routes of `ip route show table all` that are in a table
+    /// other than the main one (the main table's carry no `table` word).
+    pub fn policy_defaults(text: &str) -> String {
+        text.lines()
+            .filter(|line| {
+                line.starts_with("default ") && line.split_whitespace().any(|w| w == "table")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
     pub fn routes(text: &str, ipv6: bool, out: &mut Vec<Route>) {
         let mut last_destination: Option<String> = None;
         for line in text.lines() {
@@ -2079,6 +2090,20 @@ pub fn observe(targets: &[IpAddr]) -> LocalNet {
             true,
             &mut local.routes,
         );
+        // Full-tunnel VPNs (wg-quick, a Tailscale exit node, NetworkManager,
+        // Mullvad) put their default route in a table of their own, which
+        // the main table above leaves out: their default routes say a VPN
+        // carries all traffic (no location lookup then).
+        for (args, ipv6) in [
+            (&["route", "show", "table", "all"][..], false),
+            (&["-6", "route", "show", "table", "all"][..], true),
+        ] {
+            linux::routes(
+                &linux::policy_defaults(&run("ip", args, notes)),
+                ipv6,
+                &mut local.routes,
+            );
+        }
         linux::neighbors(&run("ip", &["neigh", "show"], notes), &mut local.neighbors);
         if let Ok(proc_arp) = std::fs::read_to_string("/proc/net/arp") {
             linux::proc_arp(&proc_arp, &mut local.neighbors);
@@ -2256,6 +2281,25 @@ mod tests {
                 "udp/0.0.0.0:68",
             ]
         );
+    }
+
+    /// wg-quick with `AllowedIPs = 0.0.0.0/0` puts the default route in
+    /// table 51820: the tunnel carries all traffic, though the main table
+    /// still names eth0.
+    #[test]
+    fn a_vpn_default_route_in_a_table_of_its_own_carries_all_traffic() {
+        let mut local = linux_fixture();
+        assert_eq!(active_vpns(&local), [("tun0".to_owned(), false)]);
+        let all = "default via 192.168.1.1 dev eth0 proto dhcp metric 100\n\
+                   default dev tun0 table 51820 scope link\n\
+                   10.10.14.0/23 dev tun0 table 51820 scope link\n\
+                   local 10.10.14.3 dev tun0 table local proto kernel scope host src 10.10.14.3\n";
+        assert_eq!(
+            linux::policy_defaults(all),
+            "default dev tun0 table 51820 scope link\n"
+        );
+        linux::routes(&linux::policy_defaults(all), false, &mut local.routes);
+        assert_eq!(active_vpns(&local), [("tun0".to_owned(), true)]);
     }
 
     #[test]
