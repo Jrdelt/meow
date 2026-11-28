@@ -59,6 +59,10 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("claude-mythos-5", 10.0, 50.0),
     ("claude-opus-5-5", 4.0, 20.0),
     ("claude-opus-5", 5.0, 25.0),
+    // Opus 4 and 4.1 were listed at three times the later Opus 4 models.
+    ("claude-opus-4-0", 15.0, 75.0),
+    ("claude-opus-4-1", 15.0, 75.0),
+    ("claude-opus-4-2025", 15.0, 75.0),
     ("claude-opus-4", 5.0, 25.0),
     ("claude-sonnet-5", 2.0, 10.0),
     ("claude-sonnet-4", 3.0, 15.0),
@@ -276,6 +280,10 @@ struct Counts {
     input: u64,
     output: u64,
     searches: u32,
+    /// A streamed reply began (`message_start`) and has not said what its
+    /// output came to (`message_delta`): it was cut off, and the API bills
+    /// what it generated, which may be up to the whole reply allowance.
+    open: bool,
     /// The model that answered, which is not the requested one after a
     /// fallback.
     model: Option<String>,
@@ -312,11 +320,16 @@ impl Counts {
 
     fn usage(&self, requested: &str) -> Usage {
         let model = self.model.as_deref().unwrap_or(requested);
+        let output = if self.open {
+            self.output.max(u64::from(MAX_TOKENS))
+        } else {
+            self.output
+        };
         Usage {
-            cost_usd: cost_usd(model, self.input, self.output, self.searches),
+            cost_usd: cost_usd(model, self.input, output, self.searches),
             web_search_requests: self.searches,
             prompt_tokens: self.input,
-            completion_tokens: self.output,
+            completion_tokens: output,
         }
     }
 
@@ -409,6 +422,7 @@ async fn triage(
                         counts.set_model(message.get("model").and_then(Value::as_str));
                         counts.read(message.get("usage").unwrap_or(&Value::Null));
                     }
+                    counts.open = true;
                 }
                 "content_block_delta" => {
                     // Only the answer is shown; thinking stays with the model.
@@ -431,6 +445,9 @@ async fn triage(
                 }
                 "message_delta" => {
                     counts.read(event.get("usage").unwrap_or(&Value::Null));
+                    if event.pointer("/usage/output_tokens").is_some() {
+                        counts.open = false;
+                    }
                     if let Some(reason) =
                         event.pointer("/delta/stop_reason").and_then(Value::as_str)
                     {
@@ -1321,6 +1338,11 @@ mod tests {
         assert_eq!(per_million("claude-opus-5"), (5.0, 25.0));
         assert_eq!(per_million("claude-opus-4-6"), (5.0, 25.0));
         assert_eq!(per_million("claude-opus-4-8"), (5.0, 25.0));
+        assert_eq!(per_million("claude-opus-4-5-20251101"), (5.0, 25.0));
+        // Opus 4 and 4.1, listed at three times the later ones.
+        assert_eq!(per_million("claude-opus-4-1-20250805"), (15.0, 75.0));
+        assert_eq!(per_million("claude-opus-4-20250514"), (15.0, 75.0));
+        assert_eq!(per_million("claude-opus-4-0"), (15.0, 75.0));
         assert_eq!(per_million("claude-sonnet-5-5"), (2.0, 10.0));
         assert_eq!(per_million("claude-sonnet-4-6"), (3.0, 15.0));
         assert_eq!(per_million("claude-haiku-5-5"), (0.10, 0.50));
@@ -1372,6 +1394,24 @@ mod tests {
         }));
         assert_eq!(counts.input, u64::MAX);
         assert_eq!(counts.searches, u32::MAX);
+    }
+
+    /// A streamed reply that began and was cut off before it said what its
+    /// output came to is counted at the whole reply allowance: the API bills
+    /// what it generated. One that finished counts what it says.
+    #[test]
+    fn a_reply_cut_off_after_it_began_counts_the_whole_reply_allowance() {
+        let model = "claude-opus-5-5";
+        let mut counts = Counts::default();
+        counts.read(&json!({ "input_tokens": 500, "output_tokens": 1 }));
+        counts.open = true;
+        let cut = counts.usage(model);
+        assert_eq!(cut.completion_tokens, u64::from(MAX_TOKENS));
+        let whole = cost_usd(model, 500, u64::from(MAX_TOKENS), 0);
+        assert!((cut.cost_usd - whole).abs() < 1e-9, "{}", cut.cost_usd);
+        counts.read(&json!({ "output_tokens": 250 }));
+        counts.open = false;
+        assert_eq!(counts.usage(model).completion_tokens, 250);
     }
 
     #[tokio::test]

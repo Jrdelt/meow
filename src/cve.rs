@@ -401,6 +401,13 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The most platforms a version range is kept to. A configuration naming
+/// more (no real one does) leaves its ranges unconstrained: reported, not
+/// missed, and one record cannot make every range carry thousands.
+const MAX_PLATFORMS: usize = 32;
+/// The most version ranges kept from one record.
+const MAX_RANGES_PER_CVE: usize = 512;
+
 /// The operating systems a configuration node names as a mere platform:
 /// every entry is an `o` CPE that is not itself vulnerable.
 fn platform_node(node: &Value) -> Option<Vec<String>> {
@@ -418,7 +425,7 @@ fn platform_node(node: &Value) -> Option<Vec<String>> {
             return None;
         }
         let name = format!("{} {}", parts.vendor, parts.product);
-        if !names.contains(&name) {
+        if names.len() <= MAX_PLATFORMS && !names.contains(&name) {
             names.push(name);
         }
     }
@@ -439,21 +446,28 @@ fn ranges_from_configurations(cve: &Value, out: &mut Vec<VersionRange>) {
             .flatten()
             .collect();
         // "A running on B": the vulnerable product only counts on B.
-        let only_on: Vec<String> =
+        let mut only_on: Vec<String> =
             if configuration.get("operator").and_then(Value::as_str) == Some("AND") {
-                nodes
+                let names: BTreeSet<String> = nodes
                     .iter()
                     .filter_map(|node| platform_node(node))
                     .flatten()
-                    .collect()
+                    .collect();
+                names.into_iter().collect()
             } else {
                 Vec::new()
             };
+        if only_on.len() > MAX_PLATFORMS {
+            only_on.clear();
+        }
         for matched in nodes
             .iter()
             .filter_map(|n| n.get("cpeMatch").and_then(Value::as_array))
             .flatten()
         {
+            if out.len() >= MAX_RANGES_PER_CVE {
+                return;
+            }
             if matched.get("vulnerable").and_then(Value::as_bool) == Some(false) {
                 continue;
             }
@@ -1333,6 +1347,11 @@ impl CveClient {
                 }
                 read_json_bounded(response, "NVD", NVD_MAX_BYTES).await?
             };
+            // An answer without its list is not "no CVEs": it would be
+            // cached as such and clear the host's earlier matches.
+            if !body.get("vulnerabilities").is_some_and(Value::is_array) {
+                bail!("NVD answered without its list of vulnerabilities");
+            }
             let page_items = body
                 .get("vulnerabilities")
                 .and_then(Value::as_array)
@@ -1404,6 +1423,16 @@ impl CveClient {
                     .flatten()
                     .filter_map(|v| text_field(v, "cveID"))
                     .collect();
+                // The catalog is never empty: an empty one is a bad answer,
+                // which must not replace a good copy for seven days. The
+                // copy kept is used; with none, nothing is flagged this time.
+                if ids.is_empty() {
+                    return Ok(self
+                        .stale(KEY)
+                        .as_deref()
+                        .and_then(parse)
+                        .unwrap_or_default());
+                }
                 self.store(KEY, &serde_json::to_string(&ids)?);
                 Ok(ids)
             }
@@ -1466,6 +1495,15 @@ impl CveClient {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            // One result per query, in order: fewer would leave packages
+            // unanswered and read as having no vulnerability.
+            if results.len() != queries.len() {
+                bail!(
+                    "OSV answered {} results for {} packages",
+                    results.len(),
+                    queries.len()
+                );
+            }
             let mut next = Vec::new();
             for ((index, _), result) in pending.iter().zip(&results) {
                 for vuln in result
@@ -2390,6 +2428,43 @@ fn push_advisory(grounding: &mut Grounding, advisory: Advisory) {
 mod tests {
     use super::*;
     use crate::graph::{Graph, Observation};
+
+    /// A record whose one configuration pairs thousands of platforms with
+    /// thousands of ranges is read in bounded time and memory.
+    #[test]
+    fn a_record_of_thousands_of_platforms_and_ranges_stays_bounded() {
+        let platforms: Vec<Value> = (0..6000)
+            .map(|i| json!({ "vulnerable": false, "criteria": format!("cpe:2.3:o:v{i}:os{i}:*:*:*:*:*:*:*:*") }))
+            .collect();
+        let ranges: Vec<Value> = (0..6000)
+            .map(|i| json!({ "vulnerable": true, "criteria": format!("cpe:2.3:a:x:p{i}:*:*:*:*:*:*:*:*"), "versionEndExcluding": "2.0" }))
+            .collect();
+        let body = json!({ "vulnerabilities": [ { "cve": {
+            "id": "CVE-2026-00001", "vulnStatus": "Analyzed",
+            "descriptions": [ { "lang": "en", "value": "x" } ],
+            "configurations": [ { "operator": "AND", "nodes": [
+                { "cpeMatch": ranges }, { "cpeMatch": platforms } ] } ] } } ] });
+        let started = Instant::now();
+        let parsed = parse_nvd(&body);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let ranges = &parsed[0].ranges;
+        assert!(ranges.len() <= MAX_RANGES_PER_CVE, "{}", ranges.len());
+        assert!(ranges.iter().all(|r| r.only_on.len() <= MAX_PLATFORMS));
+    }
+
+    /// An NVD answer without its list of vulnerabilities is a failed
+    /// lookup, not "no CVEs": it is not cached, and the host keeps its
+    /// earlier matches.
+    #[tokio::test]
+    async fn an_nvd_answer_without_its_list_is_an_error() {
+        let app = Router::new().route("/nvd", get(|| async { Json(json!({})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = client(&base, None).with_nvd_pace(Duration::from_millis(1));
+        let err = client.nvd_by_keyword("nginx", "1.18.0").await.unwrap_err();
+        assert!(format!("{err:#}").contains("without its list"), "{err:#}");
+    }
 
     #[test]
     fn a_surer_match_keeps_the_known_exploited_flag() {
