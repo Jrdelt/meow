@@ -328,9 +328,12 @@ const BUILTIN_DOMAINS: &[&str] = &[
     "HKEY_CURRENT_CONFIG",
 ];
 
-/// The (domain, user) spans of each `DOMAIN\user` account in `text`, by
-/// their ranges; either is `None` when it says nothing about the target.
-fn domain_users(text: &str) -> Vec<(Option<(usize, usize)>, Option<(usize, usize)>)> {
+/// Where a part of a text starts and ends.
+type Range = (usize, usize);
+
+/// The (domain, user) ranges of each `DOMAIN\user` account in `text`;
+/// either is `None` when it says nothing about the target.
+fn domain_users(text: &str) -> Vec<(Option<Range>, Option<Range>)> {
     DOMAIN_USER
         .captures_iter(text)
         .filter_map(|found| {
