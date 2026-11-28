@@ -120,7 +120,8 @@ enabled = true
 
 [recon]
 # `meow recon` settings. Each tool run is stopped after this many seconds,
-# or when its output file grows past the cap.
+# or when its output file grows past the cap (50 MB at most: what meow can
+# read back).
 stage_timeout_secs = 1800
 output_cap_mb = 50
 # Wordlist for feroxbuster. Standard seclists/dirb paths are tried otherwise;
@@ -2681,9 +2682,16 @@ impl Workspace {
         })
     }
 
+    /// Switches to `mode` once it is saved: a profile that cannot be
+    /// written leaves the mode as it was, as the error says.
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
+        let previous = self.profile.mode;
         self.profile.mode = mode;
-        self.save_profile()
+        let saved = self.save_profile();
+        if saved.is_err() {
+            self.profile.mode = previous;
+        }
+        saved
     }
 
     fn save_profile(&self) -> Result<()> {
@@ -4795,6 +4803,13 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sid)) {
         assert!(!created);
         assert_eq!(again.profile.mode, Mode::Aggressive);
         assert_eq!(Workspace::load(&ws.dir).unwrap(), again);
+
+        // A profile that cannot be written (a folder in its place): the
+        // switch is refused, and the mode stays the one in the file.
+        std::fs::remove_file(ws.profile_path()).unwrap();
+        std::fs::create_dir(ws.profile_path()).unwrap();
+        assert!(ws.set_mode(Mode::Light).is_err());
+        assert_eq!(ws.profile.mode, Mode::Aggressive);
     }
 
     #[test]

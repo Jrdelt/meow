@@ -1607,7 +1607,12 @@ impl CveClient {
                 }
             };
             let (found, truncated) = match result {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    // Two failures in a row stop the lookups, not two in all.
+                    nvd_failures = 0;
+                    transport_failures = 0;
+                    pair
+                }
                 Err(error) => {
                     let msg = format!("{error:#}");
                     let is_http_status = msg.contains("NVD answered HTTP ");
@@ -2369,10 +2374,13 @@ fn push_advisory(grounding: &mut Grounding, advisory: Advisory) {
         .find(|a| a.id == advisory.id)
     {
         Some(existing) => {
-            existing.kev |= advisory.kev;
+            // Known exploited by either match stays known exploited, also when
+            // the surer match replaces the other.
+            let kev = existing.kev || advisory.kev;
             if advisory.record.confidence > existing.record.confidence {
                 *existing = advisory;
             }
+            existing.kev = kev;
         }
         None => grounding.advisories.push(advisory),
     }
@@ -2382,6 +2390,29 @@ fn push_advisory(grounding: &mut Grounding, advisory: Advisory) {
 mod tests {
     use super::*;
     use crate::graph::{Graph, Observation};
+
+    #[test]
+    fn a_surer_match_keeps_the_known_exploited_flag() {
+        let advisory = |kev: bool, confidence: Confidence| Advisory {
+            kev,
+            id: "CVE-2021-41773".into(),
+            title: String::new(),
+            severity: None,
+            cvss: None,
+            matched: String::new(),
+            port: None,
+            references: Vec::new(),
+            fixed_in: None,
+            last_affected: None,
+            record: EvidenceRecord::observed(Source::NvdApi, confidence, "x"),
+        };
+        let mut grounding = Grounding::default();
+        push_advisory(&mut grounding, advisory(true, Confidence::Low));
+        push_advisory(&mut grounding, advisory(false, Confidence::High));
+        assert_eq!(grounding.advisories.len(), 1);
+        assert!(grounding.advisories[0].kev);
+        assert_eq!(grounding.advisories[0].record.confidence, Confidence::High);
+    }
     use axum::extract::{Path, Query, State};
     use axum::routing::{get, post};
     use axum::{Json, Router};

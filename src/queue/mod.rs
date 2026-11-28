@@ -256,7 +256,14 @@ impl ReconSettings {
     fn limits(&self) -> RunLimits {
         RunLimits {
             timeout: Duration::from_secs(self.stage_timeout_secs.max(1)),
-            cap_bytes: self.output_cap_mb.max(1).saturating_mul(1024 * 1024),
+            // No more than a stage's results can be read back: above that, a
+            // finished scan would fail to parse (or a crawl be cut) after
+            // all its run time.
+            cap_bytes: self
+                .output_cap_mb
+                .max(1)
+                .saturating_mul(1024 * 1024)
+                .min(crate::parsers::INGEST_CAP),
         }
     }
 }

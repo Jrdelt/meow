@@ -149,13 +149,36 @@ pub(super) fn script_expression(builtin: &[&str], chosen: &[String]) -> String {
     parts.join(" or ")
 }
 
-/// Which of `flags` are high-rate (`-T4`, `-T5`, "-A").
-pub fn high_rate_flags(flags: &[String]) -> Vec<&str> {
-    flags
-        .iter()
-        .map(String::as_str)
-        .filter(|flag| HIGH_RATE_FLAGS.contains(flag))
-        .collect()
+/// Which of `flags` are high-rate: `-T4`, `-T5` (also written `-T 4`),
+/// `-A`, and the rate and parallelism floors (`--min-rate 1000`).
+pub fn high_rate_flags(flags: &[String]) -> Vec<String> {
+    const FLOORS: &[&str] = &["--min-rate", "--min-parallelism", "--min-hostgroup"];
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let flag = flags[i].as_str();
+        let value = flags.get(i + 1).map(String::as_str);
+        if HIGH_RATE_FLAGS.contains(&flag) {
+            found.push(flag.to_owned());
+        } else if flag == "-T" && matches!(value, Some("4" | "5")) {
+            found.push(format!("-T {}", value.unwrap_or_default()));
+            i += 1;
+        } else if FLOORS.contains(&flag) {
+            found.push(
+                format!("{flag} {}", value.unwrap_or_default())
+                    .trim_end()
+                    .to_owned(),
+            );
+            i += 1;
+        } else if FLOORS
+            .iter()
+            .any(|floor| flag.starts_with(&format!("{floor}=")))
+        {
+            found.push(flag.to_owned());
+        }
+        i += 1;
+    }
+    found
 }
 
 fn is_port_spec(val: &str) -> bool {
@@ -788,7 +811,7 @@ pub fn crawl_command(
     output: &Path,
 ) -> ToolCommand {
     let depth = preset.katana_depth.to_string();
-    ToolCommand {
+    let mut command = ToolCommand {
         program: settings.katana.clone(),
         args: strings(&[
             "-u",
@@ -811,7 +834,13 @@ pub fn crawl_command(
             &path_arg(output),
         ]),
         output: output.to_path_buf(),
+    };
+    // A rate-limited mode holds the crawl to the same requests per second
+    // as the directory stage; katana's own default is 150.
+    if let Some(rate) = preset.ferox_rate_limit {
+        command.args.extend(["-rl".to_owned(), rate.to_string()]);
     }
+    command
 }
 
 /// Stage 4: directory and endpoint inventory. `--rate-limit` (with

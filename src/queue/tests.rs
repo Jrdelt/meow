@@ -465,9 +465,10 @@ fn web_stage_commands_match_the_mode_rules() {
 
     assert_eq!(
         args(&crawl_command(&settings, &mild, url, out)),
-        "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -fs fqdn -dr -ct 5m -d 2 -o /t/out.jsonl"
+        "-u https://app.lab.local:8443 -jsonl -silent -nc -jc -fs fqdn -dr -ct 5m -d 2 -o /t/out.jsonl -rl 20"
     );
-    assert!(args(&crawl_command(&settings, &aggressive, url, out)).contains(" -d 4 "));
+    let fast = args(&crawl_command(&settings, &aggressive, url, out));
+    assert!(fast.contains(" -d 4 ") && !fast.contains("-rl"), "{fast}");
 
     let wordlist = Path::new("/usr/share/wordlists/common.txt");
     assert_eq!(
@@ -520,6 +521,19 @@ fn presets_layer_builtin_config_and_profile() {
     assert_eq!(
         high_rate_flags(&strings(&["-sS", "-T5", "-A", "-T3"])),
         ["-T5", "-A"]
+    );
+    // The same flags written another way are high-rate too.
+    assert_eq!(
+        high_rate_flags(&strings(&[
+            "-T",
+            "4",
+            "--min-rate",
+            "100000",
+            "--min-parallelism=500",
+            "-T",
+            "2"
+        ])),
+        ["-T 4", "--min-rate 100000", "--min-parallelism=500"]
     );
 }
 

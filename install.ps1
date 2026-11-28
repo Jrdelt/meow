@@ -247,7 +247,10 @@ function Test-MsvcInstalled {
         $VsWhere = Join-Path $Pf86 "Microsoft Visual Studio\Installer\vswhere.exe"
         if (Test-Path -LiteralPath $VsWhere) {
             try {
-                $Found = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath 2>$null
+                # The MSVC tools component itself: Build Tools register it under
+                # the VCTools workload, a full Visual Studio under NativeDesktop.
+                $VcTools = if ($IsArm64) { "Microsoft.VisualStudio.Component.VC.Tools.ARM64" } else { "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" }
+                $Found = & $VsWhere -latest -products * -requires $VcTools -property installationPath 2>$null
                 if ($Found) { return $true }
             } catch {}
         }
@@ -605,8 +608,9 @@ try {
         }
         $NowUtc = [DateTime]::UtcNow
         $Months = @(
-            $NowUtc.ToString("yyyy-MM"),
-            (New-Object DateTime($NowUtc.Year, $NowUtc.Month, 1)).AddMonths(-1).ToString("yyyy-MM")
+            # Gregorian year and month whatever the locale's calendar (th-TH, ar-SA).
+            $NowUtc.ToString("yyyy-MM", [Globalization.CultureInfo]::InvariantCulture),
+            (New-Object DateTime($NowUtc.Year, $NowUtc.Month, 1)).AddMonths(-1).ToString("yyyy-MM", [Globalization.CultureInfo]::InvariantCulture)
         )
         $script:GeoPart = Join-Path $GeoDir (".$Name." + [System.Guid]::NewGuid().ToString("N"))
         foreach ($Month in $Months) {
