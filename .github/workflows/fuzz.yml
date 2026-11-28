@@ -14,8 +14,15 @@ on:
         description: Seconds per target
         default: "300"
 
+# Read-only: the jobs only check out the code and upload a crash input.
 permissions:
   contents: read
+
+# One fuzz run at a time; a new one waits rather than cancelling a run that
+# may be about to find something.
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,11 +53,12 @@ jobs:
           CC: clang
           CFLAGS: -fsanitize=address,fuzzer-no-link
           SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+          TARGET: ${{ matrix.target }}
         run: |
           case "$SECONDS_PER_TARGET" in ''|*[!0-9]*) echo "seconds must be a number"; exit 1;; esac
-          mkdir -p "fuzz/corpus/${{ matrix.target }}"
-          cp fuzz/seeds/${{ matrix.target }}/* "fuzz/corpus/${{ matrix.target }}/"
-          cargo +nightly fuzz run ${{ matrix.target }} "fuzz/corpus/${{ matrix.target }}" -- \
+          mkdir -p "fuzz/corpus/$TARGET"
+          cp "fuzz/seeds/$TARGET"/* "fuzz/corpus/$TARGET/"
+          cargo +nightly fuzz run "$TARGET" "fuzz/corpus/$TARGET" -- \
             -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048
       - name: Keep the crashing input
         if: failure()
