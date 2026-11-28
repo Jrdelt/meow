@@ -296,6 +296,58 @@ static NAMED_USER: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 
+/// An account written `DOMAIN\user` on its own, as nmap's SMB scripts and
+/// Windows tools print it (`TESTBOX\ron (RID: 1000)`): group 1 the NetBIOS
+/// domain, group 2 the user. Not inside a path (`C:\Windows\System32`,
+/// `\\server\share`): the domain must begin the text or follow a space,
+/// a comma, a bracket, a quote, `=` or `:`.
+static DOMAIN_USER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:^|[\s,(\[{"'=:])([A-Za-z][A-Za-z0-9_-]{0,14})\\([A-Za-z0-9][A-Za-z0-9._$-]{0,63})"#,
+    )
+    .expect("valid regex")
+});
+
+/// The `DOMAIN` of `DOMAIN\user` that names no host: Windows' built-in
+/// principals (`NT AUTHORITY\SYSTEM`, `BUILTIN\Administrators`) and
+/// registry hives (`HKLM\SOFTWARE`). In upper case.
+const BUILTIN_DOMAINS: &[&str] = &[
+    "AUTHORITY",
+    "BUILTIN",
+    "SERVICE",
+    "WORKGROUP",
+    "HKLM",
+    "HKCU",
+    "HKCR",
+    "HKU",
+    "HKCC",
+    "HKEY_LOCAL_MACHINE",
+    "HKEY_CURRENT_USER",
+    "HKEY_CLASSES_ROOT",
+    "HKEY_USERS",
+    "HKEY_CURRENT_CONFIG",
+];
+
+/// The (domain, user) spans of each `DOMAIN\user` account in `text`, by
+/// their ranges; either is `None` when it says nothing about the target.
+fn domain_users(text: &str) -> Vec<(Option<(usize, usize)>, Option<(usize, usize)>)> {
+    DOMAIN_USER
+        .captures_iter(text)
+        .filter_map(|found| {
+            let domain = found.get(1)?;
+            let user = found.get(2)?;
+            if BUILTIN_DOMAINS.contains(&domain.as_str().to_ascii_uppercase().as_str()) {
+                return None;
+            }
+            let user_value = user.as_str().trim_end_matches('.');
+            let user =
+                is_user_name(user_value).then(|| (user.start(), user.start() + user_value.len()));
+            let domain = (!is_common_word(domain.as_str())).then(|| (domain.start(), domain.end()));
+            (domain.is_some() || user.is_some()).then_some((domain, user))
+        })
+        .collect()
+}
+
 /// Login names every system has: they tell nothing about the target.
 const COMMON_USERS: &[&str] = &[
     "root",
@@ -1615,11 +1667,15 @@ fn is_public_name(name: &str) -> bool {
 
 /// A name under a real top-level domain that is neither a file name
 /// (`install.sh`) nor a public site's: masked wherever it is not one part
-/// of a path. `name` is in lower case.
+/// of a path. `name` is in lower case. The endings are [`PUBLIC_TLDS`] and
+/// every two-letter country code of the root zone (`.ge`, `.az`, `.nu`):
+/// those that are also file endings count only past two parts.
 fn is_public_host_name(name: &str) -> bool {
     let labels: Vec<&str> = name.split('.').collect();
     let tld = labels.last().copied().unwrap_or("");
-    if !PUBLIC_TLDS.contains(&tld) || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
+    if !tld.bytes().all(|b| b.is_ascii_lowercase())
+        || !(PUBLIC_TLDS.contains(&tld) || (tld.len() == 2 && ROOT_TLDS.contains(tld)))
+    {
         return false;
     }
     if labels.len() == 2 && FILE_LIKE_TLDS.contains(&tld) {
@@ -2127,6 +2183,14 @@ impl Vault {
             // What its scan text calls it, wherever its request was masked
             // first (an earlier session's names are in state.db).
             let taught: Vec<String> = host_texts(host).flat_map(taught_words).collect();
+            // The `CN=` and `OU=` names of its full scan text, registered: a
+            // request carries the text cut short, and a cut just after
+            // `CN=FILESRV01,` leaves a name no pattern finds there. Like
+            // every taught word, it is looked for as a word only in
+            // requests about this host (`looks_for`).
+            for name in host_texts(host).flat_map(dn_names) {
+                self.register(Kind::Dom, &name);
+            }
             if !taught.is_empty() {
                 self.taught_words.extend(taught.iter().cloned());
                 self.taught_by
@@ -2425,6 +2489,14 @@ impl Vault {
                 spans.push((part.start(), part.start() + value.len(), Kind::User));
             }
         }
+        for (domain, user) in domain_users(text) {
+            if let Some((start, end)) = domain {
+                spans.push((start, end, Kind::Dom));
+            }
+            if let Some((start, end)) = user {
+                spans.push((start, end, Kind::User));
+            }
+        }
         whole(&FS_PATH, Kind::Path, &mut spans);
         for found in EMAIL_USER.captures_iter(text) {
             let part = found.get(1).expect("group 1 always participates");
@@ -2520,6 +2592,15 @@ impl Vault {
             .collect();
         for user in users {
             self.register(Kind::User, &user);
+        }
+        for (domain, user) in domain_users(text) {
+            if let Some((start, end)) = domain {
+                self.learnt_word(&text[start..end]);
+                self.register(Kind::Dom, &text[start..end]);
+            }
+            if let Some((start, end)) = user {
+                self.register(Kind::User, &text[start..end]);
+            }
         }
     }
 
@@ -4367,6 +4448,79 @@ mod tests {
         ] {
             assert_eq!(vault.mask_text(public), public);
         }
+    }
+
+    /// An LDAP name in a host's scan text goes out masked in a request
+    /// about it even where the request's copy was cut right after it, so
+    /// that it no longer ends in the comma the pattern needs.
+    #[test]
+    fn an_ldap_name_cut_off_in_a_request_is_still_masked() {
+        let mut graph = Graph::default();
+        graph.apply(Observation::Script {
+            address: "10.20.0.7".into(),
+            port: Some(389),
+            protocol: "tcp".into(),
+            id: "ldap-rootdse".into(),
+            output:
+                "dnsHostName: x  serverName: CN=FILESRV01,OU=Finance Servers,DC=corp,DC=example"
+                    .into(),
+            record: EvidenceRecord::observed(Source::NmapXml, Confidence::High, "x"),
+        });
+        let mut vault = Vault::ephemeral();
+        vault.register_graph(&graph);
+        vault.scope_to(&graph.hosts["10.20.0.7"]);
+        let masked = vault.mask_text("serverName: CN=FILESRV01 \u{2026}");
+        assert!(!masked.contains("FILESRV01"), "{masked}");
+    }
+
+    /// `DOMAIN\user` from nmap's SMB scripts: both parts are masked, also
+    /// the user without a lead phrase such as `logged in as`. Built-in
+    /// principals and registry keys are left alone.
+    #[test]
+    fn domain_backslash_user_accounts_are_masked() {
+        let mut vault = Vault::ephemeral();
+        for text in [
+            "TESTBOX\\ron (RID: 1000)",
+            "Users logged in: TESTBOX\\ron since 2026-11-01",
+            "smb-enum-sessions: ACMECORP\\jsmith, ACMECORP\\svc_backup",
+        ] {
+            let masked = vault.mask_text(text);
+            for secret in ["TESTBOX", "ron", "ACMECORP", "jsmith", "svc_backup"] {
+                let word = regex::Regex::new(&format!(r"\b{secret}\b")).unwrap();
+                assert!(!word.is_match(&masked), "{secret} in {masked}");
+            }
+        }
+        for public in [
+            "NT AUTHORITY\\SYSTEM",
+            "BUILTIN\\Administrators",
+            "HKLM\\SOFTWARE\\Microsoft",
+        ] {
+            assert_eq!(vault.mask_text(public), public);
+        }
+    }
+
+    /// A host name the graph never registered, under a country code the
+    /// short list of endings left out, goes out masked (a mail banner).
+    #[test]
+    fn names_under_every_country_code_are_masked() {
+        let mut vault = Vault::ephemeral();
+        for (text, name) in [
+            ("220 mx1.acme-bank.ge ESMTP Postfix", "mx1.acme-bank.ge"),
+            ("smtp-commands: relay.acme.nu Hello", "relay.acme.nu"),
+            (
+                "Location: https://portal.example.az/login",
+                "portal.example.az",
+            ),
+        ] {
+            let masked = vault.mask_text(text);
+            assert!(!masked.contains(name), "{text} -> {masked}");
+        }
+        // A two-part file name under an ending that is also a file type
+        // stays readable.
+        assert_eq!(
+            vault.mask_text("ran setup.sh and run.py"),
+            "ran setup.sh and run.py"
+        );
     }
 
     #[test]
