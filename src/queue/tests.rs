@@ -2186,6 +2186,76 @@ fn the_scan_flags_are_the_preset_s_and_the_operator_s() {
 /// its facts on, not at whatever the scanner's own lookup gives next (a
 /// name with several addresses in changing order), and the route goes
 /// there too. With the preset's `-6`, at its IPv6 address.
+/// A switch to light mode after the queue's check and before a stage made
+/// its context: the stage does not start, so its scanner never runs.
+#[cfg(unix)]
+#[test]
+fn a_stage_that_starts_in_light_mode_runs_no_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = no_cve_config();
+    config.recon.nmap = stand_in_nmap(dir.path(), true);
+    // Light, as a switch the moment before would leave it.
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Light, config);
+    let state = coordinator.state();
+    let target = Target::parse("192.0.2.9").unwrap();
+    let id = enqueue(&state.db_lock(), "192.0.2.9", Mode::Mild, &[]).unwrap();
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for stage in [Stage::Ports, Stage::Udp, Stage::Dns] {
+        let end = runtime
+            .block_on(run_stage(&state, &task, &target, stage))
+            .unwrap();
+        assert!(matches!(end, StageEnd::ModeChanged), "{stage:?}");
+    }
+    assert!(!dir.path().join("calls").exists(), "nmap was run");
+    coordinator.shutdown();
+}
+
+/// A name the system resolves only to addresses meow never probes for a
+/// name (here the cloud metadata service): no scanner is given the name,
+/// which it would resolve again and scan.
+#[cfg(unix)]
+#[test]
+fn a_name_that_resolves_only_to_blocked_addresses_is_not_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = no_cve_config();
+    config.recon.nmap = stand_in_nmap(dir.path(), true);
+    let (_tmp, coordinator) = quiet_coordinator(Mode::Aggressive, config);
+    let state = coordinator.state();
+    let name = "metadata.example.org";
+    let target = Target::parse(name).unwrap();
+    let id = enqueue(&state.db_lock(), name, Mode::Aggressive, &[]).unwrap();
+    // What the dns stage saves when every system address was dropped.
+    Found {
+        unresolved: Some(crate::osint::Unresolved::Blocked),
+        ..Found::default()
+    }
+    .save(&state.db_lock(), id, Stage::Dns)
+    .unwrap();
+    let task = task(&state.db_lock(), id).unwrap().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for stage in [Stage::Ports, Stage::Udp] {
+        let mut cx = stages::Ctx::new(&state, &task, &target, stage).unwrap();
+        cx.privileged = true;
+        let end = match stage {
+            Stage::Ports => runtime.block_on(stages::ports(&cx)),
+            _ => runtime.block_on(stages::udp(&cx)),
+        };
+        match end.unwrap() {
+            StageEnd::Skipped(why) => assert!(why.contains("does not scan"), "{why}"),
+            _ => panic!("{stage:?} ran"),
+        }
+    }
+    assert!(!dir.path().join("calls").exists(), "nmap was run");
+    coordinator.shutdown();
+}
+
 #[cfg(unix)]
 #[test]
 fn a_name_is_scanned_and_traced_at_the_address_its_facts_go_on() {

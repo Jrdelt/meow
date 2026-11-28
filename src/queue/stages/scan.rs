@@ -13,6 +13,9 @@ pub(crate) async fn ports(cx: &Ctx<'_>) -> Result<StageEnd> {
     let limits = cx.limits;
     let privileged = cx.privileged;
     let out = |suffix: &str| cx.out(suffix);
+    if let Some(why) = cx.blocked_name() {
+        return Ok(StageEnd::Skipped(why));
+    }
     let (command, notices) = ports_command(
         &settings,
         &preset,
@@ -111,6 +114,9 @@ pub(crate) async fn udp(cx: &Ctx<'_>) -> Result<StageEnd> {
         return Ok(StageEnd::Skipped(format!(
             "UDP scanning needs root (nmap -sU sends raw packets): start the session with sudo, or run `sudo nmap -sU -sV -p {UDP_PORTS} {target}` and `meow add` its XML"
         )));
+    }
+    if let Some(why) = cx.blocked_name() {
+        return Ok(StageEnd::Skipped(why));
     }
     // A host where the TCP scan went; a network only where it found hosts.
     let scan_target = cx.scan_target();

@@ -815,6 +815,10 @@ pub enum Unresolved {
     /// DNS has an address for it, or would not say: this system resolves
     /// it some other way, or not at all.
     NotHere,
+    /// This system resolves it, but only to addresses never probed for a
+    /// name (loopback, link-local, a cloud metadata service): no scan may
+    /// be given the name, which the scanner would resolve again.
+    Blocked,
 }
 
 /// How many of a name's servers are asked, as glibc's resolver does.
@@ -1211,18 +1215,25 @@ pub(super) async fn run_dns_with(
 
             // The system gave no address: what DNS said of the A and AAAA
             // questions, for the scan stages to tell why nothing is up.
-            let unresolved = (!from_system).then(|| {
-                let answers = [&a_answer, &aaaa_answer].map(Option::as_ref);
-                if !(a_recs.is_empty() && aaaa_recs.is_empty()) {
-                    Unresolved::NotHere
-                } else if answers.iter().all(|a| a == &Some(&Lookup::NoRecords)) {
-                    Unresolved::NoRecords
-                } else if answers.iter().any(|a| a == &Some(&Lookup::Failed)) {
-                    Unresolved::Failed
-                } else {
-                    Unresolved::NotHere
-                }
-            });
+            let blocked = from_system
+                && resolved_ips.is_empty()
+                && !(a_recs.is_empty() && aaaa_recs.is_empty());
+            let unresolved = if blocked {
+                Some(Unresolved::Blocked)
+            } else {
+                (!from_system).then(|| {
+                    let answers = [&a_answer, &aaaa_answer].map(Option::as_ref);
+                    if !(a_recs.is_empty() && aaaa_recs.is_empty()) {
+                        Unresolved::NotHere
+                    } else if answers.iter().all(|a| a == &Some(&Lookup::NoRecords)) {
+                        Unresolved::NoRecords
+                    } else if answers.iter().any(|a| a == &Some(&Lookup::Failed)) {
+                        Unresolved::Failed
+                    } else {
+                        Unresolved::NotHere
+                    }
+                })
+            };
 
             let primary_address =
                 primary_address(&resolved_ips, ipv6).unwrap_or_else(|| domain.clone());

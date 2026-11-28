@@ -1405,6 +1405,12 @@ async fn run_stage(
     stage: Stage,
 ) -> Result<StageEnd> {
     let cx = stages::Ctx::new(state, task, target, stage)?;
+    // The loop checked for light mode a moment ago, but a switch since then
+    // is the mode this context took, and `same_mode` would hold for the
+    // whole stage: light mode sends nothing, so the stage does not start.
+    if cx.mode == Mode::Light {
+        return Ok(StageEnd::ModeChanged);
+    }
     match stage {
         Stage::Lan => stages::lan(&cx).await,
         Stage::Dns => stages::dns(&cx).await,

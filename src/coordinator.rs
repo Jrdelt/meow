@@ -1270,7 +1270,13 @@ async fn guard(AxumState(state): AxumState<Shared>, request: Request, next: Next
 /// without the token cannot keep one of the connection slots by asking
 /// again and again.
 fn refuse(status: StatusCode, message: &str) -> Response {
-    let mut response = deny(status, message);
+    closing(deny(status, message))
+}
+
+/// `response`, after which the connection is closed: every answer to a
+/// request without the token ends so, so such a client cannot keep one of
+/// the connection slots (it could hold all of them with keep-alive).
+fn closing(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::CONNECTION, HeaderValue::from_static("close"));
@@ -1293,10 +1299,10 @@ async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response
         if request.method() == axum::http::Method::GET {
             match request.uri().path() {
                 "/" if fetch_says(headers, "sec-fetch-mode", "navigate") => {
-                    return webui::reload_page()
+                    return closing(webui::reload_page())
                 }
                 "/reload.js" if fetch_says(headers, "sec-fetch-site", "same-origin") => {
-                    return webui::reload_script()
+                    return closing(webui::reload_script())
                 }
                 _ => {}
             }
@@ -1313,10 +1319,7 @@ async fn check_and_run(state: &Shared, request: Request, next: Next) -> Response
         {
             let mut response = webui::stale_page();
             *response.status_mut() = StatusCode::UNAUTHORIZED;
-            response
-                .headers_mut()
-                .insert(header::CONNECTION, HeaderValue::from_static("close"));
-            return response;
+            return closing(response);
         }
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong session token");
     }
@@ -3087,20 +3090,31 @@ mod tests {
         use std::io::{Read, Write};
         let fx = fixture();
         let port = fx.coordinator.info().port;
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+        // Refused, and the two pages a reload of a map tab gets without the
+        // token: a client that keeps asking for those must not keep the
+        // connection either.
+        for (path, status) in [("/api/state", "401"), ("/", "200"), ("/reload.js", "200")] {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+            )
             .unwrap();
-        write!(
-            stream,
-            "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-        )
-        .unwrap();
-        // Reading to the end only returns once the server has hung up.
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).expect("closed, not kept");
-        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
-        assert!(reply.to_ascii_lowercase().contains("connection: close"));
+            // Reading to the end only returns once the server has hung up.
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).expect("closed, not kept");
+            assert!(
+                reply.starts_with(&format!("HTTP/1.1 {status}")),
+                "{path}: {reply}"
+            );
+            assert!(
+                reply.to_ascii_lowercase().contains("connection: close"),
+                "{path}: {reply}"
+            );
+        }
         fx.coordinator.shutdown();
     }
 

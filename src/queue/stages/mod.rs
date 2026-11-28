@@ -110,6 +110,24 @@ impl<'a> Ctx<'a> {
         self.target.clone()
     }
 
+    /// Why a name must not be scanned: the `dns` stage found that this
+    /// system resolves it, but only to addresses meow never probes for a
+    /// name (loopback, link-local, a cloud metadata service). Given the
+    /// name, nmap would resolve it again and scan those. `None` for an
+    /// address or a range, or when `dns` did not run.
+    pub fn blocked_name(&self) -> Option<String> {
+        let Target::Host(HostAddr::Name(name)) = self.target else {
+            return None;
+        };
+        let dns = Found::saved(&self.state.db_lock(), self.task.id, Stage::Dns, self.target)?;
+        (dns.unresolved == Some(crate::osint::Unresolved::Blocked)).then(|| {
+            format!(
+                "{name} resolves only to addresses meow does not scan for a name \
+                 (loopback, link-local or a cloud metadata service)"
+            )
+        })
+    }
+
     /// Why a scan of a name found nothing up, when the `dns` stage found
     /// this system resolves it to no address of the family scanned: no up
     /// check can help that. `None` for an address or a range, or when
@@ -130,6 +148,9 @@ impl<'a> Ctx<'a> {
             }
             (true, Some(crate::osint::Unresolved::NotHere)) => {
                 "this system does not resolve the name"
+            }
+            (true, Some(crate::osint::Unresolved::Blocked)) => {
+                "this system resolves the name only to addresses meow does not scan"
             }
             (true, None) => return None,
             _ if ips.iter().any(|ip| ip.is_ipv6() == ipv6) => return None,

@@ -1687,11 +1687,25 @@ fn refuse_submodules(dir: &Path) -> Result<()> {
 /// folder it names, which the ownership checks never see. A plain clone
 /// has none.
 fn refuse_shared_git_dir(dir: &Path) -> Result<()> {
-    if std::fs::symlink_metadata(dir.join(".git").join("commondir")).is_ok() {
+    let git = dir.join(".git");
+    if std::fs::symlink_metadata(git.join("commondir")).is_ok() {
         bail!(
             "refusing to update {}: its .git/commondir makes git use another folder's settings",
             sanitize(&dir.display().to_string(), 400)
         );
+    }
+    // `git clone --shared` or `--reference`: git reads objects it does not
+    // have from the folders these name, which the ownership checks never
+    // see. An object planted there under the id of a coming blob would be
+    // checked out, and built. A plain clone has neither file.
+    for name in ["alternates", "http-alternates"] {
+        if std::fs::symlink_metadata(git.join("objects").join("info").join(name)).is_ok() {
+            bail!(
+                "refusing to update {}: its .git/objects/info/{name} makes git read objects \
+                 from another folder; clone it again without --shared or --reference",
+                sanitize(&dir.display().to_string(), 400)
+            );
+        }
     }
     Ok(())
 }
@@ -3159,6 +3173,33 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains(".git/commondir"), "{err:#}");
+    }
+
+    /// A clone made with `--shared` or `--reference` reads missing objects
+    /// from another folder: refused like `commondir`.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_that_borrows_objects_from_another_folder_is_refused() {
+        for name in ["alternates", "http-alternates"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let clone = sample_checkout(tmp.path(), |_| {});
+            let other = tmp.path().join("other-objects");
+            std::fs::create_dir(&other).unwrap();
+            let info = clone.join(".git/objects/info");
+            std::fs::create_dir_all(&info).unwrap();
+            std::fs::write(info.join(name), format!("{}\n", other.display())).unwrap();
+            private_tree(&clone);
+
+            let err = run_here(&UpdateArgs {
+                check: true,
+                source: Some(clone.clone()),
+            })
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!(".git/objects/info/{name}")),
+                "{name}: {err:#}"
+            );
+        }
     }
 
     /// PoC (SUP-1): with a promisor remote over ssh and a sparse index
