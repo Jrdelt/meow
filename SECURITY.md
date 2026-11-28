@@ -41,6 +41,7 @@ Out of scope: the systems you scan, and nmap, katana or feroxbuster themselves.
   - Linked work trees, submodules, repositories meow's git cannot read and, on macOS and Linux, shared or other users' `.git` folders get only the `.gitignore` files: no git check, and a pull during a session goes unnoticed.
   - A file copied over the shell history during a session is not noticed. After an end meow did not see, a `graph.json` or history replaced without git looks like meow's own rewrite.
 - **Scans:** a program a scan tool starts in a session or process group of its own (`setsid`, `sudo` with its own terminal) is not stopped.
+- **Terminal capture:** meow reads the terminal as a stream. A line it has already recorded stays recorded if output later moves the cursor up and erases it, so text a program printed and then hid that way can still become a finding.
 - **Local AI:** a local AI server gets unmasked text and keys when meow sees it is yours.
   - On Linux that includes a server run by root or a system account (user ID below 1000), and a port with no listener meow can see (forwarded into a container or network namespace).
   - Everywhere, it includes a port you forward to another machine (`ssh -L`).

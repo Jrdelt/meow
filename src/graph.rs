@@ -2638,12 +2638,19 @@ impl Graph {
                     entry.state = "open".to_owned();
                 }
                 let mut http = entry.http.clone().unwrap_or_default();
-                http.scheme = if scheme.eq_ignore_ascii_case("https") {
-                    "https"
-                } else {
-                    "http"
+                // Text in the terminal or a log is anyone's (a page shown by
+                // curl can print a `Server:` line under any URL): it fills
+                // what no probe has said, and stays a fact of its own, but
+                // never rewrites a probe's scheme, server or redirect.
+                let from_text = matches!(record.source, Source::PtyRegex | Source::LogRegex);
+                if !from_text || http.scheme.is_empty() {
+                    http.scheme = if scheme.eq_ignore_ascii_case("https") {
+                        "https"
+                    } else {
+                        "http"
+                    }
+                    .to_owned();
                 }
-                .to_owned();
                 if let Some(server) = clean_opt(server) {
                     let claim = format!("HTTP Server header: {server}");
                     push_fact(
@@ -2653,14 +2660,18 @@ impl Graph {
                             record: record.clone(),
                         },
                     );
-                    http.server = Some(server);
+                    if !from_text || http.server.is_none() {
+                        http.server = Some(server);
+                    }
                 }
                 // Where a server sends its visitors is not what it is called:
                 // the target of a redirect stays a fact about this port.
                 if let Some(location) = clean_url_opt(location) {
                     let claim = format!("HTTP Location header: {location}");
                     push_fact(&mut entry.facts, Fact { claim, record });
-                    http.location = Some(location);
+                    if !from_text || http.location.is_none() {
+                        http.location = Some(location);
+                    }
                 }
                 entry.http = Some(http);
                 entry.http != before || entry.state != before_state
@@ -3710,6 +3721,46 @@ mod tests {
         assert!(graph.tally.weight > before + ITEM_OVERHEAD);
         // What is measured after loading counts them too.
         assert!(graph.measure() >= graph.tally.weight - before);
+    }
+
+    #[test]
+    fn terminal_text_does_not_rewrite_a_probed_web_server() {
+        let http = |source: Source, scheme: &str, server: &str| Observation::Http {
+            address: "10.0.0.5".into(),
+            port: 443,
+            scheme: scheme.into(),
+            server: Some(server.into()),
+            location: None,
+            record: EvidenceRecord::observed(source, Confidence::Medium, "x"),
+        };
+        let mut graph = Graph::default();
+        graph.apply(http(Source::HttpHeader, "https", "nginx/1.25.3"));
+        // A page shown by curl prints `see http://10.0.0.5:443/` and a
+        // `Server:` line of its choosing.
+        graph.apply(http(Source::PtyRegex, "http", "Apache/2.2.3 (CentOS)"));
+        let port = &graph.hosts["10.0.0.5"].ports["443/tcp"];
+        let info = port.http.as_ref().unwrap();
+        assert_eq!(info.scheme, "https");
+        assert_eq!(info.server.as_deref(), Some("nginx/1.25.3"));
+        // What the text said is kept, as a fact of its own source.
+        assert!(port
+            .facts
+            .iter()
+            .any(|f| f.claim.contains("Apache/2.2.3") && f.record.source == Source::PtyRegex));
+        // Where no probe has said anything, text fills it in.
+        graph.apply(Observation::Http {
+            address: "10.0.0.6".into(),
+            port: 8080,
+            scheme: "http".into(),
+            server: Some("Jetty(9.4.z)".into()),
+            location: None,
+            record: EvidenceRecord::observed(Source::PtyRegex, Confidence::Medium, "x"),
+        });
+        let filled = graph.hosts["10.0.0.6"].ports["8080/tcp"]
+            .http
+            .as_ref()
+            .unwrap();
+        assert_eq!(filled.server.as_deref(), Some("Jetty(9.4.z)"));
     }
 
     #[test]

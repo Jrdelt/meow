@@ -78,6 +78,11 @@ typedef struct tap_state {
     uint8_t csi_alt_hit; /* a parameter was 47, 1047 or 1049 */
     uint8_t csi_sub;     /* a ':' sub-parameter was seen */
     uint8_t str_is_osc;  /* current string is an OSC (BEL terminates it) */
+    uint8_t concealed;   /* SGR 8 in effect: text is drawn invisible */
+    uint8_t cursor_lost; /* cursor restored to a saved place: text written now goes where the filter cannot tell */
+    uint8_t csi_conceal; /* this sequence as SGR: 0 no change, 1 conceal, 2 reveal */
+    uint8_t csi_skip;    /* SGR colour arguments still to pass over */
+    uint8_t csi_color;   /* the last parameter opened a 38/48/58 colour */
 
     uint8_t u8_need; /* UTF-8 continuation bytes still expected */
     uint8_t u8_have; /* bytes collected in u8_buf */

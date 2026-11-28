@@ -21,6 +21,7 @@ static void line_reset(tap_state_t *st)
     st->line_bad = 0;
     st->line_truncated = 0;
     st->pending_cr = 0;
+    st->cursor_lost = 0;
 }
 
 /* Append one whole character (1-4 bytes). Never splits a character. */
@@ -35,7 +36,14 @@ static void line_push(tap_state_t *st, const uint8_t *bytes, uint32_t n)
         /* Bare CR followed by text: the line is being overwritten. */
         line_reset(st);
     }
-    if (st->line_truncated) {
+    if (st->concealed || st->line_truncated) {
+        /* Concealed (SGR 8): the screen shows nothing there. */
+        return;
+    }
+    if (st->cursor_lost) {
+        /* Written at a restored cursor: the line is not what the screen
+         * shows, so it is dropped rather than misread. */
+        st->line_bad = TAP_BAD_MAX + 1u;
         return;
     }
     if (st->line_len + n > TAP_LINE_MAX) {
@@ -71,6 +79,59 @@ static void line_mark_bad(tap_state_t *st)
     }
     if (st->line_bad < 255u) {
         st->line_bad++;
+    }
+}
+
+/* The line is not what the screen shows any more: it is dropped, not
+ * misread. */
+static void line_drop(tap_state_t *st)
+{
+    if (st->alt_screen) {
+        return;
+    }
+    st->line_bad = TAP_BAD_MAX + 1u;
+}
+
+/* The cursor went back to a place the filter does not know (DECRC, SCORC):
+ * nothing changes on screen until text is written there. */
+static void cursor_restored(tap_state_t *st)
+{
+    if (!st->alt_screen) {
+        st->cursor_lost = 1;
+    }
+}
+
+static uint32_t line_chars(const tap_state_t *st)
+{
+    uint32_t i;
+    uint32_t n = 0;
+
+    for (i = 0; i < st->line_len; i++) {
+        if ((st->line[i] & 0xC0u) != 0x80u) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Keeps the first `keep` characters: the cursor moved to the column after
+ * them, and what follows overwrites the rest. */
+static void line_keep_chars(tap_state_t *st, uint32_t keep)
+{
+    uint32_t i;
+    uint32_t n = 0;
+
+    if (st->alt_screen || st->line_truncated) {
+        return;
+    }
+    for (i = 0; i < st->line_len; i++) {
+        if ((st->line[i] & 0xC0u) != 0x80u) {
+            if (n == keep) {
+                st->line_len = i;
+                return;
+            }
+            n++;
+        }
     }
 }
 
@@ -390,6 +451,9 @@ static void escape(tap_state_t *st, uint8_t b, tap_out_t *out)
         st->csi_nparams = 0;
         st->csi_alt_hit = 0;
         st->csi_sub = 0;
+        st->csi_conceal = 0;
+        st->csi_skip = 0;
+        st->csi_color = 0;
     } else if (b == ']') {
         string_begin(st, 1);
     } else if (b == 'P' || b == 'X' || b == '^' || b == '_') {
@@ -397,10 +461,15 @@ static void escape(tap_state_t *st, uint8_t b, tap_out_t *out)
     } else if (b <= 0x2F) {
         st->mode = TAP_ESC_INTER;
     } else if (b == 'c') {
-        /* RIS: full reset returns to the main screen. */
+        /* RIS: full reset returns to the main screen, text visible again. */
         st->mode = TAP_GROUND;
         st->last_cup_row = 0;
+        st->concealed = 0;
         set_alt_screen(st, 0);
+    } else if (b == '8') {
+        /* DECRC: back to a saved cursor position the filter does not know. */
+        st->mode = TAP_GROUND;
+        cursor_restored(st);
     } else if (b <= 0x7E) {
         st->mode = TAP_GROUND; /* two-byte escape, e.g. ESC 7 / ESC = */
     } else if (b == 0x7F) {
@@ -437,6 +506,21 @@ static void csi_param_end(tap_state_t *st)
     if (v == 47 || v == 1047 || v == 1049) {
         st->csi_alt_hit = 1;
     }
+    /* SGR: which of conceal (8) and reveal (28, 0) comes last. The
+     * arguments of a 38/48/58 colour (5;n or 2;r;g;b) are passed over:
+     * `38;5;8` is colour 8, not conceal. */
+    if (st->csi_skip > 0) {
+        st->csi_skip--;
+    } else if (st->csi_color) {
+        st->csi_color = 0;
+        st->csi_skip = (uint8_t)((v == 2) ? 3u : (v == 5) ? 1u : 0u);
+    } else if (v == 38 || v == 48 || v == 58) {
+        st->csi_color = 1;
+    } else if (v == 8) {
+        st->csi_conceal = 1;
+    } else if (v == 28 || v == 0) {
+        st->csi_conceal = 2;
+    }
     if (st->csi_nparams < 255) {
         st->csi_nparams++;
     }
@@ -464,10 +548,51 @@ static void csi_dispatch(tap_state_t *st, uint8_t final, tap_out_t *out)
     if (st->csi_private != 0) {
         return;
     }
-    if (final == 'K' && (st->csi_first == 2 || (st->csi_first == 0 && st->pending_cr))) {
-        line_reset(st); /* EL 2 or CR + EL 0: erase whole line (spinner redraw) */
+    if (final == 'm') {
+        /* SGR: only concealed text matters here. */
+        if (st->csi_conceal == 1) {
+            st->concealed = 1;
+        } else if (st->csi_conceal == 2) {
+            st->concealed = 0;
+        }
+        return;
+    }
+    /* The filter's cursor is at the end of its line, or at column 1 after
+     * a CR (`pending_cr`). */
+    if (final == 'K' && (st->csi_first == 2 || (st->csi_first == 0 && st->pending_cr) ||
+                         (st->csi_first == 1 && !st->pending_cr))) {
+        /* EL 2, CR + EL 0, or EL 1 at the end: erase the whole line. */
+        line_reset(st);
+    } else if (final == 'J' && (st->csi_first >= 1 || st->pending_cr)) {
+        /* ED 1, 2, 3, or CR + ED 0: the line is erased with the screen. */
+        line_reset(st);
+    } else if (final == 'X' && st->pending_cr) {
+        /* ECH after a CR: the first n characters erased. All of them is an
+         * empty line; some of them, a line the filter cannot show. */
+        uint32_t n = (st->csi_first == 0) ? 1u : st->csi_first;
+        if (n >= line_chars(st)) {
+            line_reset(st);
+        } else {
+            line_drop(st);
+        }
+    } else if (final == 'D' && !st->pending_cr) {
+        /* CUB at the end of the line: back n characters, which what follows
+         * overwrites, as a backspace does. */
+        uint32_t n = (st->csi_first == 0) ? 1u : st->csi_first;
+        if (n > TAP_LINE_MAX) {
+            n = TAP_LINE_MAX;
+        }
+        while (n-- > 0) {
+            line_pop(st);
+        }
     } else if (final == 'G' && st->csi_first <= 1) {
         st->pending_cr = 1; /* CHA 1: cursor to column 1, same as bare CR */
+    } else if (final == 'G') {
+        /* CHA n: what follows overwrites from column n on. */
+        st->pending_cr = 0;
+        line_keep_chars(st, st->csi_first - 1u);
+    } else if (final == 'u' && st->csi_nparams <= 1 && st->csi_first == 0) {
+        cursor_restored(st); /* SCORC: back to a saved cursor position */
     } else if ((final == 'E' || final == 'F') && !st->alt_screen) {
         /* CNL / CPL: Windows ConPTY and TUIs jump to the next/previous row. */
         st->last_cup_row = 0;

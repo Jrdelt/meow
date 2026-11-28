@@ -254,6 +254,57 @@ mod tests {
         assert_eq!(lines, ["Finished"]);
     }
 
+    /// Text a scanned host prints and then hides with an escape sequence
+    /// the terminal honours: the screen shows nothing there, so no
+    /// observation may come of it. Erase to the start of the line (EL 1),
+    /// erase the screen (ED), erase characters after a CR (ECH), cursor
+    /// back (CUB) over it, concealed text (SGR 8).
+    #[test]
+    fn text_the_screen_hides_is_not_recorded() {
+        let report = "Nmap scan report for 10.0.0.9";
+        let port = "22/tcp open ssh OpenSSH 7.2p1";
+        let cases: [Vec<u8>; 7] = [
+            format!("{report}\x1b[1K\n{port}\x1b[1K\n").into_bytes(),
+            format!("{report}\x1b[2J\n").into_bytes(),
+            format!("{report}\r\x1b[J\n").into_bytes(),
+            format!("{report}\r\x1b[200X\n").into_bytes(),
+            format!("{report}\x1b[{}D\n", report.len()).into_bytes(),
+            format!("\x1b[8m{report}\n{port}\x1b[0m\n").into_bytes(),
+            format!("\x1b[1;8m{report}\x1b[28m\n").into_bytes(),
+        ];
+        for input in &cases {
+            let lines = feed_all(&[input]);
+            assert!(
+                lines.iter().all(|line| line.trim().is_empty()),
+                "{:?} -> {lines:?}",
+                String::from_utf8_lossy(input)
+            );
+            assert_eq!(feed_bytewise(input), lines);
+        }
+        // Concealed text ends where the terminal shows text again.
+        assert_eq!(feed_all(&[b"\x1b[8mhidden\x1b[0mshown\n"]), ["shown"]);
+        // A colour argument of 8 is a colour, not conceal.
+        assert_eq!(
+            feed_all(&[b"\x1b[38;5;8mgrey\x1b[48;2;8;8;8m text\x1b[0m\n"]),
+            ["grey text"]
+        );
+        // Part of a line erased after a CR, or text written at a restored
+        // cursor: what the screen shows is not known, the line is dropped
+        // rather than misread. A restore with nothing written after it
+        // changes nothing.
+        assert!(feed_all(&[b"10.0.0.9 open\r\x1b[3X\n"]).is_empty());
+        assert!(feed_all(&[b"10.0.0.9 open\x1b8 x\n"]).is_empty());
+        assert!(feed_all(&[b"10.0.0.9 open\x1b[u x\n"]).is_empty());
+        assert_eq!(
+            feed_all(&[b"10.0.0.9 open\x1b8\nnext\n"]),
+            ["10.0.0.9 open", "next"]
+        );
+        // CHA n: what follows overwrites from column n.
+        assert_eq!(feed_all(&[b"port 8080\x1b[6G9090\n"]), ["port 9090"]);
+        // Ordinary output is unchanged: CUB inside a typed command line.
+        assert_eq!(feed_all(&[b"$ nmpa\x1b[2Dap\n"]), ["$ nmap"]);
+    }
+
     #[test]
     fn erase_line_and_column_one_rewind() {
         let lines = feed_all(&[b"spin |\x1b[2K\x1b[1Gspin /\x1b[2K\x1b[Gdone\n"]);
